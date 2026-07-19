@@ -1,0 +1,53 @@
+COPE 0.1.1 FOR WINDOWS
+======================
+
+FIRST INSTALL
+
+1. Extract this entire zip.
+2. Double-click install.cmd.
+3. Complete the one-time work-account and Edge setup when prompted.
+4. Open a new PowerShell window.
+5. Run:
+
+   cope
+
+THAT IS THE NORMAL LAUNCH COMMAND
+
+You do not need npm run start, node dist\src\cli\main.js, or the old
+copilot-agent command for everyday use.
+
+OPEN A PROJECT
+
+   cope C:\path\to\project
+
+OPEN A STANDALONE FILE
+
+   cope "C:\Users\V0X8\Downloads\Fork-item_prep_1st_shift_dashboard_v.12.9.04.html"
+
+Cope will offer to create a small Git-backed workspace beside the file. The
+original stays untouched until a task finishes and you approve copying the
+verified result back.
+
+RUN A TASK DIRECTLY
+
+From inside a Git project:
+
+   cope "fix the failing tests"
+
+Or target a project from anywhere:
+
+   cope -C C:\path\to\project "fix the failing tests"
+
+HELP
+
+   cope help
+   cope doctor
+
+Inside Cope, type /help to see the short interactive command list.
+Advanced recovery and automation commands are under:
+
+   cope help advanced
+
+UNINSTALL
+
+Double-click uninstall.cmd.

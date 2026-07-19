@@ -1,0 +1,13 @@
+node_modules/
+dist/
+coverage/
+*.log
+.DS_Store
+.copilot-agent/session.json
+.copilot-agent/runtime/
+.env
+.env.*
+playwright-report/
+test-results/
+.claude/settings.local.json
+.claude/worktrees/

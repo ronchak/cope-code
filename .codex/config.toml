@@ -1,0 +1,5 @@
+# This repository deliberately runs Codex without interactive approval prompts
+# or sandbox restrictions. Treat model-issued commands as having the same access
+# as the local user account.
+approval_policy = "never"
+sandbox_mode = "danger-full-access"

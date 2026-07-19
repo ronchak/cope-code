@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "synthetic-copilot-page-states/v1",
+  "identity": "Synthetic Work Account",
+  "states": {
+    "ready": ["shell", "conversation", "composer", "send", "identity", "protection"],
+    "streaming": ["shell", "conversation", "identity", "protection", "streaming"],
+    "signed-out": ["shell", "signed-out"],
+    "mfa": ["shell", "mfa"],
+    "consent": ["shell", "consent"],
+    "throttled": ["shell", "conversation", "composer", "identity", "protection", "throttled"],
+    "service-error": ["shell", "conversation", "composer", "identity", "protection", "service-error"],
+    "modal": ["shell", "conversation", "composer", "identity", "protection", "modal"],
+    "changed-selector": ["shell", "identity", "protection"],
+    "unknown": []
+  }
+}

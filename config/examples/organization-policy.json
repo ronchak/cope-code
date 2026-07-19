@@ -1,0 +1,139 @@
+{
+  "schema_version": "cba-policy/1",
+  "policy_id": "REPLACE_WITH_ORGANIZATION_POLICY_ID",
+  "revision": "REPLACE_WITH_APPROVED_REVISION",
+  "layer": "organization",
+  "default_decision": "deny",
+  "capabilities": {
+    "tools": {
+      "allow": [
+        "list_files",
+        "search_text",
+        "read_file",
+        "git_status",
+        "git_diff",
+        "apply_patch",
+        "run_command",
+        "request_user_input",
+        "request_capability",
+        "complete_task"
+      ],
+      "unmatched": "deny"
+    },
+    "paths": {
+      "read": {
+        "allow": ["**"],
+        "unmatched": "deny"
+      },
+      "write": {
+        "allow": ["**"],
+        "unmatched": "deny"
+      },
+      "create": {
+        "allow": ["**"],
+        "unmatched": "deny"
+      },
+      "delete": {
+        "allow": ["**"],
+        "unmatched": "deny"
+      },
+      "excluded": [
+        ".git",
+        ".git/**",
+        "**/.git",
+        "**/.git/**",
+        ".cba",
+        ".cba/**",
+        ".copilot-agent",
+        ".copilot-agent/**",
+        "node_modules",
+        "node_modules/**",
+        ".env",
+        ".env.*",
+        "**/.env",
+        "**/.env.*",
+        "**/*.pem",
+        "**/*.pfx",
+        "**/*.p12",
+        "**/*.key",
+        "**/credentials*"
+      ],
+      "protected": [
+        ".git",
+        ".git/**",
+        "**/.git",
+        "**/.git/**",
+        ".cba",
+        ".cba/**",
+        ".copilot-agent",
+        ".copilot-agent/**",
+        ".env",
+        ".env.*",
+        "**/.env",
+        "**/.env.*",
+        "**/*.pem",
+        "**/*.pfx",
+        "**/*.p12",
+        "**/*.key",
+        "**/credentials*",
+        ".github/workflows/**",
+        ".gitlab-ci.yml",
+        "azure-pipelines.yml",
+        "Jenkinsfile"
+      ]
+    },
+    "commands": {
+      "ids": {
+        "unmatched": "allow"
+      },
+      "categories": {
+        "allow": ["build", "test", "lint", "typecheck", "analysis"],
+        "deny": ["deploy", "publish", "release", "remote"],
+        "unmatched": "deny"
+      },
+      "risks": {
+        "low": "allow",
+        "medium": "allow",
+        "high": "deny"
+      },
+      "side_effects": "allow",
+      "max_timeout_ms": 900000
+    },
+    "disclosure": {
+      "classifications": {
+        "allow": ["public", "internal"],
+        "ask": ["confidential"],
+        "deny": ["restricted", "secret", "credential"],
+        "unmatched": "deny"
+      },
+      "secrets": "deny",
+      "max_bytes_per_operation": 262144,
+      "max_files_per_operation": 20
+    },
+    "network": {
+      "access": "deny"
+    },
+    "changes": {
+      "create_files": "allow",
+      "delete_files": "ask",
+      "dependency_manifests": "ask",
+      "local_commits": "deny",
+      "max_files_per_operation": 20,
+      "max_changed_lines_per_operation": 1000,
+      "on_limit_exceeded": "deny"
+    },
+    "budgets": {
+      "elapsed_ms": 3600000,
+      "turns": 40,
+      "operations": 160,
+      "read_files": 80,
+      "changed_files": 30,
+      "changed_lines": 2000,
+      "disclosed_bytes": 2000000,
+      "commands": 30,
+      "command_output_bytes": 1000000,
+      "protocol_repairs": 4
+    },
+    "budget_exceeded": "deny"
+  }
+}

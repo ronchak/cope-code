@@ -1,0 +1,204 @@
+{
+  "schema_version": "cba-repository-config/1",
+  "classification": "internal",
+  "policy": {
+    "schema_version": "cba-policy/1",
+    "policy_id": "REPLACE_WITH_REPOSITORY_POLICY_ID",
+    "revision": "REPLACE_WITH_APPROVED_REVISION",
+    "layer": "repository",
+    "default_decision": "deny",
+    "capabilities": {
+      "tools": {
+        "allow": [
+          "list_files",
+          "search_text",
+          "read_file",
+          "git_status",
+          "git_diff",
+          "apply_patch",
+          "run_command",
+          "request_user_input",
+          "request_capability",
+          "complete_task"
+        ],
+        "unmatched": "deny"
+      },
+      "paths": {
+        "read": {
+          "allow": ["**"],
+          "unmatched": "deny"
+        },
+        "write": {
+          "allow": ["src/**", "tests/**", "docs/**", "README.md"],
+          "ask": ["package.json", "tsconfig.json"],
+          "unmatched": "deny"
+        },
+        "create": {
+          "allow": ["src/**", "tests/**", "docs/**"],
+          "ask": ["README.md"],
+          "unmatched": "deny"
+        },
+        "delete": {
+          "ask": ["src/**", "tests/**", "docs/**"],
+          "unmatched": "deny"
+        },
+        "excluded": [
+          ".git",
+          ".git/**",
+          "**/.git",
+          "**/.git/**",
+          ".cba",
+          ".cba/**",
+          ".copilot-agent",
+          ".copilot-agent/**",
+          "node_modules",
+          "node_modules/**",
+          "dist",
+          "dist/**",
+          "coverage",
+          "coverage/**",
+          ".env",
+          ".env.*",
+          "**/.env",
+          "**/.env.*",
+          "**/*.pem",
+          "**/*.pfx",
+          "**/*.p12",
+          "**/*.key",
+          "**/credentials*"
+        ],
+        "protected": [
+          ".git",
+          ".git/**",
+          "**/.git",
+          "**/.git/**",
+          ".cba",
+          ".cba/**",
+          ".copilot-agent",
+          ".copilot-agent/**",
+          ".env",
+          ".env.*",
+          "**/.env",
+          "**/.env.*",
+          "**/*.pem",
+          "**/*.pfx",
+          "**/*.p12",
+          "**/*.key",
+          "**/credentials*",
+          ".github/workflows/**"
+        ]
+      },
+      "commands": {
+        "ids": {
+          "allow": ["npm.test", "npm.build"],
+          "unmatched": "deny"
+        },
+        "categories": {
+          "allow": ["test", "build"],
+          "unmatched": "deny"
+        },
+        "risks": {
+          "low": "allow",
+          "medium": "allow",
+          "high": "deny"
+        },
+        "side_effects": "allow",
+        "max_timeout_ms": 600000
+      },
+      "disclosure": {
+        "classifications": {
+          "allow": ["internal"],
+          "unmatched": "deny"
+        },
+        "secrets": "deny",
+        "max_bytes_per_operation": 262144,
+        "max_files_per_operation": 20
+      },
+      "network": {
+        "access": "deny"
+      },
+      "changes": {
+        "create_files": "allow",
+        "delete_files": "ask",
+        "dependency_manifests": "ask",
+        "local_commits": "deny",
+        "max_files_per_operation": 20,
+        "max_changed_lines_per_operation": 1000,
+        "on_limit_exceeded": "ask"
+      },
+      "budgets": {
+        "elapsed_ms": 3600000,
+        "turns": 40,
+        "operations": 160,
+        "read_files": 80,
+        "changed_files": 30,
+        "changed_lines": 2000,
+        "disclosed_bytes": 2000000,
+        "commands": 30,
+        "command_output_bytes": 1000000,
+        "protocol_repairs": 4
+      },
+      "budget_exceeded": "ask"
+    }
+  },
+  "grant_defaults": {
+    "readable_paths": ["**"],
+    "writable_paths": ["src/**", "tests/**", "docs/**", "README.md"],
+    "disclosure_classifications": ["internal"]
+  },
+  "commands": [
+    {
+      "id": "npm.test",
+      "description": "Run the repository test script without a shell shim.",
+      "category": "test",
+      "risk": "low",
+      "sideEffects": true,
+      "networkRequired": false,
+      "executable": "C:\\Program Files\\nodejs\\node.exe",
+      "fixedArguments": [
+        "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js",
+        "run",
+        "test"
+      ],
+      "workingDirectory": ".",
+      "timeoutMs": 300000,
+      "maxTimeoutMs": 600000,
+      "maxOutputBytes": 524288,
+      "successExitCodes": [0]
+    },
+    {
+      "id": "npm.build",
+      "description": "Run the repository build script without a shell shim.",
+      "category": "build",
+      "risk": "low",
+      "sideEffects": true,
+      "networkRequired": false,
+      "executable": "C:\\Program Files\\nodejs\\node.exe",
+      "fixedArguments": [
+        "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js",
+        "run",
+        "build"
+      ],
+      "workingDirectory": ".",
+      "timeoutMs": 180000,
+      "maxTimeoutMs": 300000,
+      "maxOutputBytes": 524288,
+      "successExitCodes": [0]
+    }
+  ],
+  "completion": {
+    "required_command_ids": ["npm.test"],
+    "require_validation_after_last_mutation": true
+  },
+  "limits": {
+    "max_file_bytes": 1048576,
+    "max_read_bytes": 262144,
+    "max_search_output_bytes": 262144,
+    "max_diff_bytes": 524288,
+    "max_checkpoint_bytes": 16777216,
+    "max_patch_bytes": 1048576
+  },
+  "retention": {
+    "retain_source_artifacts_on_completion": false
+  }
+}

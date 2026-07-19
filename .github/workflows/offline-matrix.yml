@@ -1,0 +1,46 @@
+name: offline-matrix
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  offline:
+    name: offline-${{ matrix.tuple }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tuple: windows-x64
+            os: windows-2025
+          - tuple: macos-arm64
+            os: macos-26
+          - tuple: macos-x64
+            os: macos-15-intel
+    # Hosted offline lanes are regression evidence, not owner-tuple live certification.
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run check
+      - if: runner.os == 'macOS'
+        run: sh -n scripts/install-macos.sh scripts/uninstall-macos.sh
+      - if: runner.os == 'macOS'
+        name: Clean-home install, uninstall, and reinstall smoke (not live certification)
+        run: |
+          clean_home="$RUNNER_TEMP/cope clean home"
+          mkdir -p "$clean_home"
+          chmod 700 "$clean_home"
+          export HOME="$clean_home"
+          export COPE_INSTALL_PREFIX="$HOME/.local"
+          node_bin=$(dirname "$(command -v node)")
+          export PATH="$node_bin:/usr/bin:/bin:/usr/sbin:/sbin"
+          ./scripts/install-macos.sh --skip-build --skip-setup
+          ./scripts/uninstall-macos.sh
+          ./scripts/install-macos.sh --skip-build --skip-setup
+          "$COPE_INSTALL_PREFIX/bin/cope" --version
+          ./scripts/uninstall-macos.sh

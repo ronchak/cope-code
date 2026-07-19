@@ -1,0 +1,23 @@
+{
+  "schema_version": "cba-scripted-fixture/1",
+  "turns": [
+    {
+      "expected_content_contains": "COPILOT BROWSER AGENT CONTRACT",
+      "conversation_id": "fixture-conversation-example",
+      "response": {
+        "status": "completed",
+        "response_id": "fixture-response-{{TURN_ID}}",
+        "content": "I will inspect the bounded repository inventory.\n\n```cba/1\n{\"protocol\":\"cba/1\",\"message_type\":\"tool_request\",\"message_id\":\"fixture_message_0001\",\"task_id\":\"{{TASK_ID}}\",\"turn_id\":1,\"operations\":[{\"operation_id\":\"fixture_operation_list_0001\",\"tool\":\"list_files\",\"arguments\":{\"path\":\".\",\"max_depth\":2,\"max_results\":100}}]}\n```"
+      }
+    },
+    {
+      "expected_content_contains": "\"message_type\":\"tool_result\"",
+      "conversation_id": "fixture-conversation-example",
+      "response": {
+        "status": "completed",
+        "response_id": "fixture-response-{{TURN_ID}}",
+        "content": "The requested repository inventory was returned by the local harness.\n\n```cba/1\n{\"protocol\":\"cba/1\",\"message_type\":\"tool_request\",\"message_id\":\"fixture_message_0002\",\"task_id\":\"{{TASK_ID}}\",\"turn_id\":2,\"operations\":[{\"operation_id\":\"fixture_operation_complete_0002\",\"tool\":\"complete_task\",\"arguments\":{\"summary\":\"Inspected the bounded repository inventory without modifying files.\",\"acceptance_criteria\":[{\"criterion\":\"Repository inventory was inspected\",\"status\":\"satisfied\",\"evidence\":\"list_files completed successfully in turn 1\"}],\"validation\":[],\"skipped_validation\":[\"No validation command was required for this read-only fixture\"],\"remaining_risks\":[],\"follow_up\":[]}}]}\n```"
+      }
+    }
+  ]
+}
