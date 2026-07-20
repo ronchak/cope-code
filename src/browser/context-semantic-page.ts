@@ -59,8 +59,9 @@ export class ContextSemanticPage implements SemanticPage {
     return selected;
   }
 
+  /** External Microsoft authentication hosts retain the long manual window. */
   public isManualAuthenticationRedirect(): boolean {
-    return isPotentialManualAuthenticationUrl(this.#activePage.url(), this.#config);
+    return isReusableExternalAuthenticationUrl(this.#activePage.url(), this.#config);
   }
 
   public async currentUrl(): Promise<string> {
@@ -236,7 +237,7 @@ function isPotentialManualAuthenticationUrl(
     !isConfiguredCopilotUrl(value, config.entryUrl);
 }
 
-/** At launch, do not reuse arbitrary pages on the configured host as auth pages. */
+/** At launch and in the outer retry loop, trust only external auth hosts by URL. */
 function isReusableExternalAuthenticationUrl(
   value: string,
   config: CopilotPageSelectionConfig,
