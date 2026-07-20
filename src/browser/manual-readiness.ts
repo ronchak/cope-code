@@ -13,8 +13,8 @@ export interface ManualReadinessDependencies {
  * Browser pages often expose only part of the certified surface while the app
  * hydrates. Continuous non-manual states receive one bounded hydration period,
  * even if their diagnostic classification changes while the page is unstable.
- * States that require operator action, including sign-in, MFA, consent, or a
- * visible blocking dialog, may consume the full manual-readiness window.
+ * Only states that genuinely require the operator to sign in, complete MFA, or
+ * grant consent may consume the full manual-readiness window.
  */
 export async function waitForStableManualReadiness(
   observe: (maxWaitMs: number, signal?: AbortSignal) => Promise<BrowserStateInspection>,
@@ -106,9 +106,9 @@ export async function waitForStableManualReadiness(
 }
 
 /**
- * Explicit authentication states and visible blocking dialogs remain open for
- * operator action. Every other non-ready state must recover during its bounded
- * hydration window or return a diagnostic instead of appearing hung.
+ * Only explicit manual-authentication states remain open-ended. Every other
+ * non-ready state must either recover during its bounded hydration window or
+ * return a diagnostic instead of leaving the terminal apparently hung.
  */
 export function isTerminalManualReadinessState(
   state: BrowserStateInspection["classification"]["state"],
@@ -116,14 +116,13 @@ export function isTerminalManualReadinessState(
   return state !== "ready" &&
     state !== "sign-in-required" &&
     state !== "mfa-required" &&
-    state !== "consent-required" &&
-    state !== "blocking-modal";
+    state !== "consent-required";
 }
 
 function isImmediatelyUnsafe(
   state: BrowserStateInspection["classification"]["state"],
 ): boolean {
-  return state === "unapproved-host";
+  return state === "unapproved-host" || state === "blocking-modal";
 }
 
 async function sleepWithAbort(milliseconds: number, signal?: AbortSignal): Promise<void> {
