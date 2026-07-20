@@ -1,16 +1,22 @@
-import { spawn } from "node:child_process";
 import { access, lstat, readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { parseBrowserConfig, parseRepositoryConfig } from "../config/loader.js";
-import { DEFAULT_GIT_EXECUTABLE } from "../repository/boundary.js";
 import { RepositoryBoundary } from "../repository/index.js";
 import { errorMessage } from "../shared/errors.js";
 import type { CliCommand } from "./arguments.js";
+import {
+  probeNpmVersion,
+  runDoctorProbe,
+  type DoctorProbeDependencies,
+} from "./doctor-probe.js";
 import { configurationPaths, inspectMachineConfiguration } from "./onboarding.js";
 import { hint, keyValue, section, success, warning, type Writable } from "./presentation.js";
-import { resolveDefaultGitExecutable, type HostPlatform } from "../platform/index.js";
-import { runHostProbe } from "../platform/common.js";
+import {
+  resolveDefaultGitExecutable,
+  runHostProbe,
+  type HostPlatform,
+} from "../platform/index.js";
 import { verifyDedicatedProfileRoot, verifyPrivateStateHome } from "../platform/private-storage.js";
 
 interface Check {
@@ -24,8 +30,10 @@ export async function executeDoctorCommand(
   command: Extract<CliCommand, { readonly command: "doctor" }>,
   io: { readonly stdout: Writable; readonly stderr: Writable },
   host: HostPlatform,
+  dependencies: DoctorProbeDependencies = {},
 ): Promise<number> {
   const checks: Check[] = [];
+  const probeRunner = dependencies.runProbe ?? runHostProbe;
   const nodeMajor = Number.parseInt(process.versions.node.split(".")[0] ?? "0", 10);
   const nodeOk = nodeMajor >= 24;
   checks.push({
@@ -35,16 +43,15 @@ export async function executeDoctorCommand(
     required: true,
   });
 
-  const npmExecutable = path.join(path.dirname(process.execPath), host.platform === "win32" ? "npm.cmd" : "npm");
-  const npm = await probe(npmExecutable, ["--version"], process.cwd(), host);
+  const npm = await probeNpmVersion(host, process.cwd(), dependencies);
   const npmMajor = Number.parseInt(npm.stdout.trim().split(".")[0] ?? "0", 10);
-  const npmOk = npm.code === 0 && Number.isSafeInteger(npmMajor) && npmMajor >= 11;
+  const npmOk = npm.exitCode === 0 && Number.isSafeInteger(npmMajor) && npmMajor >= 11;
   checks.push({
     name: "npm",
     ok: npmOk,
     detail: runtimeFloorDetail(
       "npm",
-      npm.code === 0 ? `v${npm.stdout.trim()}` : npm.stderr.trim() || npmExecutable,
+      npm.exitCode === 0 ? `v${npm.stdout.trim()}` : npm.stderr.trim() || npm.npmCli || "npm unavailable",
       11,
       npmOk,
     ),
@@ -53,7 +60,7 @@ export async function executeDoctorCommand(
 
   try {
     if (host.liveBrowserSupported) {
-      await host.verifyEligibility({ liveBrowser: true, cwd: process.cwd(), runProbe: runHostProbe });
+      await host.verifyEligibility({ liveBrowser: true, cwd: process.cwd(), runProbe: probeRunner });
     } else {
       host.assertNonPrivileged();
     }
@@ -66,11 +73,11 @@ export async function executeDoctorCommand(
   }
 
   const gitExecutable = resolveDefaultGitExecutable(host);
-  const git = await probe(gitExecutable, ["--version"], process.cwd(), host);
+  const git = await runDoctorProbe(probeRunner, gitExecutable, ["--version"], process.cwd(), host);
   checks.push({
     name: "Git",
-    ok: git.code === 0 && /^git version /u.test(git.stdout),
-    detail: git.code === 0 ? git.stdout.trim() : git.stderr.trim() || gitExecutable,
+    ok: git.exitCode === 0 && /^git version /u.test(git.stdout),
+    detail: git.exitCode === 0 ? git.stdout.trim() : git.stderr.trim() || gitExecutable,
     required: true,
   });
 
@@ -151,28 +158,4 @@ export async function executeDoctorCommand(
 
 export function runtimeFloorDetail(product: "Node.js" | "npm", observed: string, minimumMajor: number, ok: boolean): string {
   return ok ? observed : `${observed}; requires ${product} ${String(minimumMajor)}+`;
-}
-
-async function probe(executable: string, args: readonly string[], cwd: string, host: HostPlatform): Promise<{
-  readonly code: number | null;
-  readonly stdout: string;
-  readonly stderr: string;
-}> {
-  return new Promise((resolve) => {
-    const child = spawn(executable, args, {
-      cwd,
-      windowsHide: host.platform === "win32",
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: host.probeEnvironment(process.env),
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => { stdout += chunk.slice(0, 8192); });
-    child.stderr.on("data", (chunk: string) => { stderr += chunk.slice(0, 8192); });
-    child.once("error", (error) => resolve({ code: null, stdout, stderr: String(error) }));
-    child.once("close", (code) => resolve({ code, stdout, stderr }));
-  });
 }
