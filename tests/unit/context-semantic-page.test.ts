@@ -101,6 +101,32 @@ test("launch follows an approved replacement page when the original navigation t
   assert.equal(replacement.defaultNavigationTimeout, config.waits.actionMs);
 });
 
+test("a resolved navigation that remains about:blank fails within the action bound", async () => {
+  const startupBlank = new FakePage("about:blank");
+  const context = new FakeContext([startupBlank]);
+  const navigationPage = new FakePage("about:blank");
+  navigationPage.onGoto = async () => null;
+  context.nextPage = navigationPage;
+  const config = browserConfig({
+    actionMs: 40,
+    pollMs: 5,
+    minimumStableMs: 10,
+  });
+
+  const startedAt = performance.now();
+  await assert.rejects(
+    openTrackedCopilotPage(context.asContext(), config),
+    (error: unknown) =>
+      error instanceof AgentError &&
+      error.code === "TRANSPORT_UNAVAILABLE" &&
+      error.details.diagnosticCode === "EDGE_NAVIGATION_NO_ALLOWED_PAGE",
+  );
+  const elapsed = performance.now() - startedAt;
+
+  assert.equal(navigationPage.currentUrl, "about:blank");
+  assert.ok(elapsed < 500, `blank-page failure exceeded its bound: ${String(elapsed)} ms`);
+});
+
 test("tracked semantic page moves from Microsoft authentication to the returned Copilot tab", async () => {
   const authentication = new FakePage(authUrl);
   const context = new FakeContext([authentication]);
@@ -142,7 +168,9 @@ test("multiple approved Copilot pages remain an ambiguity hard stop", () => {
   );
 });
 
-function browserConfig(): EdgeLaunchConfig {
+function browserConfig(
+  waitOverrides: Partial<EdgeLaunchConfig["waits"]> = {},
+): EdgeLaunchConfig {
   const expectedIdentity = "Ronak Chakraborty";
   return {
     entryUrl,
@@ -164,6 +192,7 @@ function browserConfig(): EdgeLaunchConfig {
       pollMs: 100,
       stableSamples: 3,
       minimumStableMs: 300,
+      ...waitOverrides,
     },
     profileDirectory: path.resolve("synthetic-edge-profile"),
   };
