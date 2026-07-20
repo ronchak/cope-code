@@ -71,17 +71,20 @@ export async function waitForStableManualReadiness(
         ) {
           return inspection;
         }
-      } else {
-        const hydrationMs = Math.min(
-          Math.max(waits.minimumStableMs, waits.actionMs),
-          maxWaitMs,
-        );
-        if (
-          terminalPeriodSamples >= waits.stableSamples &&
-          observedAt - terminalPeriodSince >= hydrationMs
-        ) {
-          return inspection;
-        }
+      }
+
+      // The action-bound fallback applies to every continuous non-manual
+      // period, including hostile states that alternate and therefore never
+      // satisfy the same-diagnostic short quorum.
+      const hydrationMs = Math.min(
+        Math.max(waits.minimumStableMs, waits.actionMs),
+        maxWaitMs,
+      );
+      if (
+        terminalPeriodSamples >= waits.stableSamples &&
+        observedAt - terminalPeriodSince >= hydrationMs
+      ) {
+        return inspection;
       }
     } else {
       terminalPeriodSince = 0;
