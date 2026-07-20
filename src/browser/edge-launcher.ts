@@ -38,6 +38,10 @@ export interface EdgeLauncherDependencies {
   readonly launchPersistentContext?: PersistentContextLauncher;
 }
 
+export interface EdgeReadinessInspector {
+  inspectState(): Promise<BrowserStateInspection>;
+}
+
 /** Owns the visible Edge lifecycle while delegating model operations to the adapter. */
 export class EdgeCopilotTransport implements ModelTransport {
   public readonly transportKind = "visible-edge-m365-copilot/v1";
@@ -134,7 +138,7 @@ export class EdgeCopilotTransport implements ModelTransport {
     signal?: AbortSignal,
   ): Promise<BrowserStateInspection> {
     return waitForStableManualReadiness(
-      (sliceMs, activeSignal) => this.#adapter.waitForManualReadiness(sliceMs, activeSignal),
+      (_sliceMs, activeSignal) => inspectEdgeReadinessOnce(this.#adapter, activeSignal),
       this.#readinessWaits,
       maxWaitMs ?? this.#readinessWaits.manualReadinessMs,
       signal,
@@ -186,6 +190,21 @@ export class EdgeCopilotTransport implements ModelTransport {
       await this.#lock.release();
     }
   }
+}
+
+/**
+ * Perform exactly one page inspection for the outer readiness state machine.
+ * This avoids nesting the adapter's broad host-level manual-wait loop inside the
+ * stricter Edge redirect classifier. The outer loop owns all retries and waits.
+ */
+export async function inspectEdgeReadinessOnce(
+  inspector: EdgeReadinessInspector,
+  signal?: AbortSignal,
+): Promise<BrowserStateInspection> {
+  signal?.throwIfAborted();
+  const inspection = await inspector.inspectState();
+  signal?.throwIfAborted();
+  return inspection;
 }
 
 /**
