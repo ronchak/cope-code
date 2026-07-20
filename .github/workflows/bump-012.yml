@@ -75,7 +75,7 @@ The runtime requires Node.js 24 or newer. Authentication remains manual in a ded
             .digest('hex');
           const preservationFile = 'tests/unit/windows-preservation.test.ts';
           const preservation = await readFile(preservationFile, 'utf8');
-          const pattern = /(\"scripts\/install-windows\.ps1\": \.")[a-f0-9]{64}(\")/u;
+          const pattern = /(\"scripts\/install-windows\.ps1\": \")[a-f0-9]{64}(\")/u;
           if (!pattern.test(preservation)) throw new Error('Missing frozen Windows installer hash');
           await writeFile(
             preservationFile,
