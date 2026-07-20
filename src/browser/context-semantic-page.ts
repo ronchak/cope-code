@@ -12,6 +12,7 @@ import type { GroupSnapshot, LocatorGroup, SemanticPage } from "./contracts.js";
 import { PlaywrightSemanticPage } from "./playwright-semantic-page.js";
 
 export interface CopilotPageSelectionConfig {
+  readonly entryUrl: string;
   readonly approvedHosts: readonly ApprovedHost[];
   readonly manualAuthenticationHosts?: readonly ApprovedHost[];
 }
@@ -59,10 +60,7 @@ export class ContextSemanticPage implements SemanticPage {
   }
 
   public isManualAuthenticationRedirect(): boolean {
-    return isApprovedUrl(
-      this.#activePage.url(),
-      this.#config.manualAuthenticationHosts ?? [],
-    ) && !isApprovedUrl(this.#activePage.url(), this.#config.approvedHosts);
+    return isManualAuthenticationUrl(this.#activePage.url(), this.#config);
   }
 
   public async currentUrl(): Promise<string> {
@@ -105,10 +103,10 @@ export class ContextSemanticPage implements SemanticPage {
 }
 
 /**
- * Prefer the unique approved Copilot page. While authentication is in progress,
- * select the newest approved Microsoft authentication page so a popup or
- * replacement tab cannot leave the adapter pinned to an older sign-in surface.
- * A second approved Copilot page is ambiguous and remains a hard stop.
+ * Prefer the unique configured Copilot page, not merely any page on the same
+ * approved host. While authentication is in progress, select the newest
+ * approved Microsoft authentication page so a popup or replacement tab cannot
+ * leave the adapter pinned to an older sign-in surface.
  */
 export function selectActiveCopilotPage(
   pages: readonly Page[],
@@ -116,7 +114,7 @@ export function selectActiveCopilotPage(
   preferred?: Page,
 ): Page {
   const openPages = pages.filter((page) => !page.isClosed());
-  const approved = openPages.filter((page) => isApprovedUrl(page.url(), config.approvedHosts));
+  const approved = openPages.filter((page) => isConfiguredCopilotUrl(page.url(), config.entryUrl));
   if (approved.length > 1) {
     throw new AgentError("TRANSPORT_INDETERMINATE", "Multiple approved Copilot pages are open", {
       diagnosticCode: "AMBIGUOUS_COPILOT_PAGE",
@@ -126,7 +124,7 @@ export function selectActiveCopilotPage(
   if (approved.length === 1) return approved[0]!;
 
   const authentication = openPages.filter((page) =>
-    isApprovedUrl(page.url(), config.manualAuthenticationHosts ?? []));
+    isManualAuthenticationUrl(page.url(), config));
   const newestAuthentication = authentication.at(-1);
   if (newestAuthentication !== undefined) return newestAuthentication;
 
@@ -139,10 +137,10 @@ export function selectActiveCopilotPage(
 }
 
 /**
- * Reuse an existing approved or in-progress Microsoft authentication page.
- * Otherwise create a fresh tab, navigate it explicitly, and bring the tracked
- * result to the foreground. Arbitrary startup blank tabs are never selected as
- * the navigation target.
+ * Reuse an existing configured Copilot or in-progress Microsoft authentication
+ * page. Otherwise create a fresh tab, navigate it explicitly, and bring the
+ * tracked result to the foreground. Arbitrary startup blank tabs and unrelated
+ * pages on the approved host are never selected as navigation targets.
  */
 export async function openTrackedCopilotPage(
   context: BrowserContext,
@@ -150,7 +148,7 @@ export async function openTrackedCopilotPage(
 ): Promise<ContextSemanticPage> {
   const existing = context.pages();
   const approved = existing.filter((page) =>
-    !page.isClosed() && isApprovedUrl(page.url(), config.approvedHosts));
+    !page.isClosed() && isConfiguredCopilotUrl(page.url(), config.entryUrl));
   if (approved.length > 1) {
     throw new AgentError("TRANSPORT_INDETERMINATE", "Multiple approved Copilot pages are open", {
       diagnosticCode: "AMBIGUOUS_COPILOT_PAGE",
@@ -161,7 +159,7 @@ export async function openTrackedCopilotPage(
   let initial = approved[0];
   if (initial === undefined) {
     const authentication = existing.filter((page) =>
-      !page.isClosed() && isApprovedUrl(page.url(), config.manualAuthenticationHosts ?? []));
+      !page.isClosed() && isManualAuthenticationUrl(page.url(), config));
     initial = authentication.at(-1);
   }
 
@@ -190,6 +188,32 @@ export async function openTrackedCopilotPage(
   return tracked;
 }
 
+function isConfiguredCopilotUrl(value: string, entryValue: string): boolean {
+  try {
+    const actual = new URL(value);
+    const entry = new URL(entryValue);
+    if (actual.origin !== entry.origin) return false;
+    const basePath = normalizedPath(entry.pathname);
+    const actualPath = normalizedPath(actual.pathname);
+    return basePath === "/" || actualPath === basePath || actualPath.startsWith(`${basePath}/`);
+  } catch {
+    return false;
+  }
+}
+
+function isManualAuthenticationUrl(
+  value: string,
+  config: CopilotPageSelectionConfig,
+): boolean {
+  return isApprovedUrl(value, config.manualAuthenticationHosts ?? []) &&
+    !isApprovedUrl(value, config.approvedHosts);
+}
+
+function normalizedPath(value: string): string {
+  const withoutTrailingSlash = value.replace(/\/+$/u, "");
+  return withoutTrailingSlash === "" ? "/" : withoutTrailingSlash;
+}
+
 async function waitForAllowedReplacementPage(
   context: BrowserContext,
   config: EdgeLaunchConfig,
@@ -198,8 +222,8 @@ async function waitForAllowedReplacementPage(
   for (;;) {
     if (context.pages().some((page) =>
       !page.isClosed() && (
-        isApprovedUrl(page.url(), config.approvedHosts) ||
-        isApprovedUrl(page.url(), config.manualAuthenticationHosts ?? [])
+        isConfiguredCopilotUrl(page.url(), config.entryUrl) ||
+        isManualAuthenticationUrl(page.url(), config)
       ))) {
       return true;
     }
