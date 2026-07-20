@@ -31,13 +31,20 @@ class ActionLocator {
   public nth(_index: number): Locator { return this as unknown as Locator; }
   public async isVisible(): Promise<boolean> { return true; }
   public async isEnabled(): Promise<boolean> { return true; }
-  public async fill(value: string): Promise<void> { this.page.actions.push(`fill:${value}`); }
+  public async innerText(): Promise<string> { return this.page.composer; }
+  public async inputValue(): Promise<string> { return this.page.composer; }
+  public async getAttribute(_name: string): Promise<string | null> { return null; }
+  public async fill(value: string): Promise<void> {
+    this.page.composer = value;
+    this.page.actions.push(`fill:${value}`);
+  }
   public async click(): Promise<void> { this.page.actions.push("click"); }
   public async press(key: string): Promise<void> { this.page.actions.push(`press:${key}`); }
 }
 
 class ActionPage {
   public closed = false;
+  public composer = "";
   public readonly actions: string[] = [];
 
   public constructor(public currentUrl: string) {}
@@ -101,6 +108,25 @@ test("activation without the post-fill observation is rejected", async () => {
       error.details.diagnosticCode === "POST_FILL_OBSERVATION_REQUIRED",
   );
   assert.deepEqual(page.actions, ["fill:hello"]);
+});
+
+test("composer content changed after fill is rejected before send", async () => {
+  const page = new ActionPage(`${entryUrl}/conversation/one`);
+  const context = new ActionContext([page]);
+  const tracked = createTracked(context, page);
+
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  await tracked.fill(composerGroup, "trusted prompt with marker");
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  page.composer = "different draft";
+
+  await assert.rejects(
+    tracked.click(sendGroup),
+    (error: unknown) =>
+      error instanceof AgentError &&
+      error.details.diagnosticCode === "COMPOSER_CONTENT_CHANGED_BEFORE_SUBMIT",
+  );
+  assert.deepEqual(page.actions, ["fill:trusted prompt with marker"]);
 });
 
 test("a replacement Copilot tab cannot receive a fill without a new observation", async () => {
