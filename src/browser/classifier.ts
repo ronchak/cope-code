@@ -31,6 +31,7 @@ export interface PageClassification {
 }
 
 export interface ClassifierRequirements {
+  readonly entryUrl: string;
   readonly approvedHosts: readonly ApprovedHost[];
   readonly expectedIdentity: string | TextPattern;
   readonly requireProtectionIndicator: boolean;
@@ -72,6 +73,9 @@ export function classifyCopilotPage(
 ): PageClassification {
   if (!isApprovedUrl(observation.url, requirements.approvedHosts)) {
     return result("unapproved-host", false, "HOST_NOT_APPROVED");
+  }
+  if (!isWithinConfiguredCopilotPath(observation.url, requirements.entryUrl)) {
+    return result("unapproved-host", false, "COPILOT_SURFACE_NOT_APPROVED");
   }
 
   if (matches(observation, contract, "mfa")) {
@@ -202,6 +206,28 @@ function identityTokens(value: string): readonly string[] {
     .replace(/\p{M}/gu, "")
     .toLocaleLowerCase()
     .match(/[\p{L}\p{N}]+/gu) ?? [];
+}
+
+/**
+ * Broad host approval is not enough once the UI contract includes semantic
+ * fallbacks. Submission-capable classification is limited to the configured
+ * Copilot entry path and its descendants, such as /chat/conversation/... .
+ */
+function isWithinConfiguredCopilotPath(value: string, entryValue: string): boolean {
+  try {
+    const actual = new URL(value);
+    const entry = new URL(entryValue);
+    const basePath = normalizedPath(entry.pathname);
+    const actualPath = normalizedPath(actual.pathname);
+    return basePath === "/" || actualPath === basePath || actualPath.startsWith(`${basePath}/`);
+  } catch {
+    return false;
+  }
+}
+
+function normalizedPath(value: string): string {
+  const withoutTrailingSlash = value.replace(/\/+$/u, "");
+  return withoutTrailingSlash === "" ? "/" : withoutTrailingSlash;
 }
 
 function result(
