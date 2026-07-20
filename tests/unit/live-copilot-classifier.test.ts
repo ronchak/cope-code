@@ -186,4 +186,35 @@ test("the baseline contract carries the current M365 locator revision and semant
       candidate.kind === "role" && candidate.role === "link"),
     false,
   );
+
+  const sendCss = contract.groups.send.candidates.find((candidate) => candidate.kind === "css");
+  assert.ok(sendCss?.kind === "css");
+  const sendSelectors = sendCss.selector.split(",").map((selector) => selector.trim());
+  assert.equal(
+    sendSelectors.every((selector) =>
+      selector.startsWith("button") || selector.startsWith('[role="button"]')),
+    true,
+  );
+  assert.equal(
+    sendSelectors.some((selector) => selector === '[data-testid*="send" i]'),
+    false,
+  );
+
+  assert.equal(
+    contract.groups.protection.candidates.some((candidate) => candidate.kind === "text"),
+    false,
+  );
+  assert.equal(
+    contract.groups.protection.candidates.some((candidate) => candidate.kind === "test-id"),
+    true,
+  );
+  assert.equal(
+    contract.groups.protection.candidates.some((candidate) =>
+      candidate.kind === "role" && (candidate.role === "status" || candidate.role === "img")),
+    true,
+  );
+  assert.equal(
+    contract.groups.protection.candidates.some((candidate) => candidate.kind === "css"),
+    true,
+  );
 });
