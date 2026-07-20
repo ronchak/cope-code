@@ -55,7 +55,13 @@ export class ContextSemanticPage implements SemanticPage {
     this.#config = config;
     this.#activePage = initialPage;
     this.#actionMs = actionMs;
+    for (const page of context.pages()) this.#configurePage(page);
     this.#configurePage(initialPage);
+    if (typeof context.on === "function") {
+      context.on("page", (page) => {
+        this.#configurePage(page);
+      });
+    }
   }
 
   public async focusActivePage(force = false): Promise<Page> {
@@ -281,6 +287,9 @@ export class ContextSemanticPage implements SemanticPage {
 
   #configurePage(page: Page): void {
     if (this.#configuredPages.has(page)) return;
+    // Construct the delegate first so its native-dialog listener is active
+    // before navigation, foregrounding, or the first semantic snapshot.
+    this.#delegate(page);
     page.setDefaultTimeout(this.#actionMs);
     page.setDefaultNavigationTimeout(this.#actionMs);
     this.#configuredPages.add(page);
@@ -351,55 +360,57 @@ export async function openTrackedCopilotPage(
   }
 
   let initial = approved[0];
-  if (initial === undefined) {
-    const authentication = existing.filter((page) =>
-      !page.isClosed() && isReusableExternalAuthenticationUrl(page.url(), config));
-    initial = authentication.at(-1);
-  }
-
-  if (initial === undefined) {
-    initial = await context.newPage();
-    initial.setDefaultTimeout(config.waits.actionMs);
-    initial.setDefaultNavigationTimeout(config.waits.actionMs);
-    await initial.bringToFront().catch(() => undefined);
-    const navigationDeadline = performance.now() + config.waits.actionMs;
-    let navigationError: unknown;
-    try {
-      await initial.goto(config.entryUrl, {
-        waitUntil: "domcontentloaded",
-        timeout: config.waits.actionMs,
-      });
-    } catch (error) {
-      navigationError = error;
-    }
-    if (!hasAllowedPage(context, config)) {
-      const replacementFound = await waitForAllowedReplacementPage(
-        context,
-        config,
-        navigationDeadline,
-      );
-      if (!replacementFound) {
-        if (navigationError !== undefined) throw navigationError;
-        throw new AgentError(
-          "TRANSPORT_UNAVAILABLE",
-          "The dedicated Edge session did not open the configured Copilot surface",
-          {
-            diagnosticCode: "EDGE_NAVIGATION_NO_ALLOWED_PAGE",
-            next: "Close the dedicated Edge window, run cope setup --force, and retry.",
-          },
-        );
-      }
-    }
-  }
-
-  const tracked = new ContextSemanticPage(
+  let tracked: ContextSemanticPage;
+if (initial === undefined) {
+  initial = await context.newPage();
+  // Install the native-dialog listener before navigation can execute page
+  // script or open a replacement authentication window.
+  tracked = new ContextSemanticPage(
     context,
     config,
     initial,
     config.waits.actionMs,
   );
-  await tracked.focusActivePage(true);
-  return tracked;
+  await initial.bringToFront().catch(() => undefined);
+  const navigationDeadline = performance.now() + config.waits.actionMs;
+  let navigationError: unknown;
+  try {
+    await initial.goto(config.entryUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: config.waits.actionMs,
+    });
+  } catch (error) {
+    navigationError = error;
+  }
+  if (!hasAllowedPage(context, config)) {
+    const replacementFound = await waitForAllowedReplacementPage(
+      context,
+      config,
+      navigationDeadline,
+    );
+    if (!replacementFound) {
+      if (navigationError !== undefined) throw navigationError;
+      throw new AgentError(
+        "TRANSPORT_UNAVAILABLE",
+        "The dedicated Edge session did not open the configured Copilot surface",
+        {
+          diagnosticCode: "EDGE_NAVIGATION_NO_ALLOWED_PAGE",
+          next: "Close the dedicated Edge window, run cope setup --force, and retry.",
+        },
+      );
+    }
+  }
+} else {
+  tracked = new ContextSemanticPage(
+    context,
+    config,
+    initial,
+    config.waits.actionMs,
+  );
+}
+
+await tracked.focusActivePage(true);
+return tracked;
 }
 
 function isConfiguredCopilotUrl(value: string, entryValue: string): boolean {

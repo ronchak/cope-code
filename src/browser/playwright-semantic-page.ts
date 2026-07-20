@@ -20,9 +20,11 @@ export class PlaywrightSemanticPage implements SemanticPage {
     // Do not accept, dismiss, inspect, or automate unknown browser dialogs.
     // Leaving the dialog visible blocks consequential actions and the sticky
     // signal makes the adapter fail closed until the session is restarted.
-    page.on("dialog", () => {
-      this.#nativeDialogDetected = true;
-    });
+    if (typeof page.on === "function") {
+      page.on("dialog", () => {
+        this.#nativeDialogDetected = true;
+      });
+    }
   }
 
   public async currentUrl(): Promise<string> {
