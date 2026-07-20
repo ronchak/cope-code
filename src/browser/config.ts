@@ -112,7 +112,7 @@ export function createBaselineCopilotUiContract(
         { kind: "role", role: "button", name: pattern("send|submit") },
         {
           kind: "css",
-          selector: 'button[aria-label*="send" i], [role="button"][aria-label*="send" i], [data-testid*="send" i]',
+          selector: 'button[aria-label*="send" i], [role="button"][aria-label*="send" i], button[data-testid*="send" i], [role="button"][data-testid*="send" i]',
         },
       ],
       "presence",
@@ -161,8 +161,13 @@ export function createBaselineCopilotUiContract(
     protection: group(
       "protection",
       [
-        { kind: "text", text: pattern("enterprise data protection|protected") },
+        { kind: "role", role: "status", name: pattern("enterprise data protection|commercial data protection|protected") },
+        { kind: "role", role: "img", name: pattern("enterprise data protection|commercial data protection|protected") },
         { kind: "test-id", testId: pattern("protection|commercial-data-protection") },
+        {
+          kind: "css",
+          selector: '[aria-label*="enterprise data protection" i], [aria-label*="commercial data protection" i], [title*="enterprise data protection" i], [title*="commercial data protection" i], [data-testid*="protection" i], [data-testid*="commercial-data-protection" i]',
+        },
       ],
       "text",
     ),
