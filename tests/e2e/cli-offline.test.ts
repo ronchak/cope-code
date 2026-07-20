@@ -14,6 +14,7 @@ import {
 } from "../../src/policy/index.js";
 import { serializeProtocolEnvelope, type ProtocolMessage } from "../../src/protocol/index.js";
 import { DEFAULT_GIT_EXECUTABLE } from "../../src/repository/boundary.js";
+import { createStandardUserHost } from "../helpers/standard-user-host.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -111,7 +112,7 @@ test("runnable CLI completes a policy-loaded offline fixture session", async (co
   const exitCode = await executeCommand(command, {
     stdout: { write: (value) => { stdout += value; } },
     stderr: { write: (value) => { stderr += value; } },
-  });
+  }, { host: createStandardUserHost() });
 
   assert.equal(exitCode, 0, stderr || stdout);
   const lines = stdout.trim().split("\n");

@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
 
 import { AgentError } from "../shared/errors.js";
-import { defaultProfileHome, selectEnvironment, uniquePaths } from "./common.js";
+import { selectEnvironment, uniquePaths } from "./common.js";
 import type { HostPlatform } from "./contracts.js";
 
 export class WindowsHostPlatform implements HostPlatform {
@@ -23,7 +23,9 @@ export class WindowsHostPlatform implements HostPlatform {
     return path.win32.join(environment.LOCALAPPDATA, "CopilotBrowserAgent");
   }
 
-  public profileHome(stateHome: string): string { return defaultProfileHome(stateHome); }
+  public profileHome(stateHome: string): string {
+    return path.win32.join(path.win32.dirname(stateHome), "CopilotBrowserAgentEdgeProfile");
+  }
 
   public edgeExecutableCandidates(environment: NodeJS.ProcessEnv = process.env): readonly string[] {
     return uniquePaths([

@@ -12,9 +12,10 @@ import {
   verifyDarwinPrivateStateHome,
 } from "../../src/platform/private-storage.js";
 
-const host = new DarwinHostPlatform(process.arch, () => process.getuid?.());
+const host = new DarwinHostPlatform();
+const darwinOnly = { skip: process.platform !== "darwin" };
 
-test("Darwin state storage requires exact private ownership and modes", async (context) => {
+test("Darwin state storage requires exact private ownership and modes", darwinOnly, async (context) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "cope-private-state-"));
   context.after(async () => rm(temporary, { recursive: true, force: true }));
   const stateHome = await preparePrivateStateHome(path.join(temporary, "state"), host);
@@ -33,7 +34,7 @@ test("Darwin state storage requires exact private ownership and modes", async (c
   );
 });
 
-test("Darwin private storage refuses broad roots, links, and unbounded trees", async (context) => {
+test("Darwin private storage refuses broad roots, links, and unbounded trees", darwinOnly, async (context) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "cope-private-unsafe-"));
   context.after(async () => rm(temporary, { recursive: true, force: true }));
   const broad = path.join(temporary, "broad");
@@ -58,7 +59,7 @@ test("Darwin private storage refuses broad roots, links, and unbounded trees", a
   );
 });
 
-test("Darwin profile verifies its private root and Cope files without imposing modes on Edge data", async (context) => {
+test("Darwin profile verifies its private root and Cope files without imposing modes on Edge data", darwinOnly, async (context) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "cope-private-profile-"));
   context.after(async () => rm(temporary, { recursive: true, force: true }));
   const profile = path.join(temporary, "profile");

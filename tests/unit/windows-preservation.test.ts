@@ -13,9 +13,9 @@ const WINDOWS_BASELINE_HASHES = {
   "uninstall-cope.cmd": "28ef4abdc66216ea2ddb02f730e084f21179d7842a42a391ceb60d6468d02fdc",
 } as const;
 
-test("frozen Windows install and uninstall surfaces remain byte-identical", async () => {
+test("frozen Windows install and uninstall surfaces remain canonically byte-identical", async () => {
   for (const [filename, expected] of Object.entries(WINDOWS_BASELINE_HASHES)) {
-    const bytes = await readFile(path.resolve(filename));
+    const bytes = await canonicalTextBytes(filename);
     assert.equal(createHash("sha256").update(bytes).digest("hex"), expected, filename);
   }
 });
@@ -38,4 +38,9 @@ async function sourceFiles(directory: string): Promise<string[]> {
     else if (entry.isFile() && filename.endsWith(".ts")) files.push(filename);
   }
   return files;
+}
+
+async function canonicalTextBytes(filename: string): Promise<Buffer> {
+  const content = await readFile(path.resolve(filename), "utf8");
+  return Buffer.from(content.replaceAll("\r\n", "\n"), "utf8");
 }

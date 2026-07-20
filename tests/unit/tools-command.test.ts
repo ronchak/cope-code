@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -193,7 +193,7 @@ test("process runner uses no shell, a controlled environment/cwd, bounded output
       executable: process.execPath,
       fixedArguments: [
         "-e",
-        "console.log(process.argv[1]); console.log(process.cwd()); console.log(process.env.CBA_TEST_SECRET ?? 'not-inherited'); console.error('password=abcdefghijklmnop')",
+        "console.log(process.argv[1]); console.log('cwd=' + process.cwd()); console.log(process.env.CBA_TEST_SECRET ?? 'not-inherited'); console.error('password=abcdefghijklmnop')",
       ],
       parameters: [{ name: "value", kind: "string", pattern: "[\\s\\S]+", maxLength: 100 }],
       maxOutputBytes: 4_096,
@@ -258,7 +258,9 @@ test("process runner uses no shell, a controlled environment/cwd, bounded output
   });
   assert.equal(outcome.outcome, "success");
   assert.equal(outcome.stdout.includes(literal), true);
-  assert.equal(outcome.stdout.includes(root), true);
+  const observedCwd = outputValue(outcome.stdout, "cwd");
+  const canonicalCwd = await realpath(observedCwd);
+  assert.equal(boundary.pathKey(canonicalCwd), boundary.pathKey(boundary.root));
   assert.equal(outcome.stdout.includes("not-inherited"), true);
   assert.equal(outcome.stdout.includes("must-not-leak"), false);
   assert.equal(outcome.stderr.includes("abcdefghijklmnop"), false);
@@ -282,6 +284,13 @@ test("process runner uses no shell, a controlled environment/cwd, bounded output
   assert.equal(repositoryControlled.outcome, "policy-denied");
   assert.match(repositoryControlled.error ?? "", /Repository-writable executables/);
 });
+
+function outputValue(output: string, key: string): string {
+  const prefix = `${key}=`;
+  const line = output.split(/\r?\n/u).find((candidate) => candidate.startsWith(prefix));
+  if (line === undefined) assert.fail(`Missing ${key} output marker`);
+  return line.slice(prefix.length);
+}
 
 test("process runner classifies timeout and caller cancellation and terminates the process tree", async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "cba-runner-stop-"));
