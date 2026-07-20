@@ -74,10 +74,10 @@ export function classifyCopilotPage(
   if (!isApprovedUrl(observation.url, requirements.approvedHosts)) {
     return result("unapproved-host", false, "HOST_NOT_APPROVED");
   }
-  if (!isWithinConfiguredCopilotPath(observation.url, requirements.entryUrl)) {
-    return result("unapproved-host", false, "COPILOT_SURFACE_NOT_APPROVED");
-  }
 
+  // Same-host Microsoft transitions can temporarily leave the configured chat
+  // path. Keep only explicit manual-authentication evidence retryable; arbitrary
+  // approved-host pages still fail the path check below.
   if (matches(observation, contract, "mfa")) {
     return result("mfa-required", true, "MANUAL_MFA_REQUIRED");
   }
@@ -87,6 +87,11 @@ export function classifyCopilotPage(
   if (matches(observation, contract, "signed-out")) {
     return result("sign-in-required", true, "MANUAL_SIGN_IN_REQUIRED");
   }
+
+  if (!isWithinConfiguredCopilotPath(observation.url, requirements.entryUrl)) {
+    return result("unapproved-host", false, "COPILOT_SURFACE_NOT_APPROVED");
+  }
+
   if (matches(observation, contract, "throttled")) {
     return result("throttled", true, "SERVICE_THROTTLED");
   }
