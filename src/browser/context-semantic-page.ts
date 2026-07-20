@@ -130,7 +130,7 @@ export class ContextSemanticPage implements SemanticPage {
 
   /** Send activation requires a completed post-fill observation on the same page. */
   public async click(group: LocatorGroup): Promise<void> {
-    const page = await this.#verifiedActivationPage();
+    const page = await this.#activationPageOrThrow();
     try {
       await this.#delegate(page).click(group);
     } finally {
@@ -140,11 +140,36 @@ export class ContextSemanticPage implements SemanticPage {
 
   /** Enter activation follows the same post-fill page-identity requirements. */
   public async press(group: LocatorGroup, key: "Enter"): Promise<void> {
-    const page = await this.#verifiedActivationPage();
+    const page = await this.#activationPageOrThrow();
     try {
       await this.#delegate(page).press(group, key);
     } finally {
       this.#clearFilledPagePin();
+    }
+  }
+
+  /**
+   * Every failure before delegating click or Enter is conclusively
+   * pre-dispatch. Preserve that fact for the adapter so a guarded failure
+   * remains safely retryable instead of being treated as indeterminate.
+   */
+  async #activationPageOrThrow(): Promise<Page> {
+    try {
+      return await this.#verifiedActivationPage();
+    } catch (error) {
+      if (error instanceof AgentError && error.details.dispatchAttempted === false) {
+        throw error;
+      }
+      const diagnosticCode =
+        error instanceof AgentError && typeof error.details.diagnosticCode === "string"
+          ? error.details.diagnosticCode
+          : "PRE_ACTIVATION_GUARD_FAILED";
+      throw new AgentError(
+        "TRANSPORT_INDETERMINATE",
+        "The Copilot pre-activation guard blocked browser activation",
+        { diagnosticCode, dispatchAttempted: false },
+        { cause: error },
+      );
     }
   }
 

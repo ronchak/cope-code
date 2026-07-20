@@ -13,6 +13,7 @@ import type {
   SemanticPage,
 } from "../../src/browser/contracts.js";
 import { MutableBrowserKillSwitch } from "../../src/browser/kill-switch.js";
+import { AgentError } from "../../src/shared/errors.js";
 
 type ActivationMode = "submitted" | "not-submitted" | "indeterminate";
 
@@ -26,6 +27,7 @@ class DynamicFakePage implements SemanticPage {
   public streaming = false;
   public sendEnabled = true;
   public activationMode: ActivationMode = "submitted";
+  public preActivationDiagnostic: string | undefined = undefined;
   public fillCalls = 0;
   public activationCalls = 0;
 
@@ -50,11 +52,22 @@ class DynamicFakePage implements SemanticPage {
   }
 
   public async click(): Promise<void> {
+    this.#assertPreActivationGuard();
     await this.#activate();
   }
 
   public async press(): Promise<void> {
+    this.#assertPreActivationGuard();
     await this.#activate();
+  }
+
+  #assertPreActivationGuard(): void {
+    if (this.preActivationDiagnostic === undefined) return;
+    throw new AgentError(
+      "TRANSPORT_INDETERMINATE",
+      "Synthetic pre-activation guard blocked dispatch",
+      { diagnosticCode: this.preActivationDiagnostic, dispatchAttempted: false },
+    );
   }
 
   async #activate(): Promise<void> {
@@ -227,6 +240,22 @@ test("indeterminate activation cannot be retried until marker evidence resolves 
   page.userMessages.push(receipt.transportMarker ?? "missing marker");
   const recovered = await adapter.resolveSubmission(request);
   assert.equal(recovered.status, "submitted");
+  assert.equal(page.activationCalls, 1);
+});
+
+test("pre-activation guard failures are known not-submitted and safely retryable", async () => {
+  const { adapter, page } = makeHarness();
+  page.preActivationDiagnostic = "COMPOSER_CONTENT_CHANGED_BEFORE_SUBMIT";
+
+  const first = await adapter.submit(request);
+  assert.equal(first.status, "not-submitted");
+  assert.equal(first.diagnosticCode, "COMPOSER_CONTENT_CHANGED_BEFORE_SUBMIT");
+  assert.equal(page.activationCalls, 0);
+
+  page.preActivationDiagnostic = undefined;
+  page.url = "https://copilot.example.test/chat/conversation-2";
+  const retry = await adapter.submit(request);
+  assert.equal(retry.status, "submitted");
   assert.equal(page.activationCalls, 1);
 });
 

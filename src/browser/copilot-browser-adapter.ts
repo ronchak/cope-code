@@ -306,7 +306,22 @@ export class CopilotBrowserAdapter implements ModelTransport {
       } else {
         await this.#page.press(this.#config.uiContract.groups.composer, "Enter");
       }
-    } catch {
+    } catch (error) {
+      const diagnosticCode = knownPreActivationDiagnostic(error);
+      if (diagnosticCode !== undefined) {
+        record.activationAttempted = false;
+        if (establishedConversation === undefined) {
+          this.#taskConversations.delete(request.taskId);
+        }
+        record.receipt = this.#receipt(
+          request,
+          "not-submitted",
+          conversationId,
+          marker,
+          diagnosticCode,
+        );
+        return record.receipt;
+      }
       // Playwright can throw after dispatch. Resolve only through page evidence.
     }
 
@@ -855,6 +870,16 @@ export function createTaskMarker(
     "utf8",
   ).toString("base64url");
   return `${TASK_MARKER_PREFIX}${encoded}${TASK_MARKER_SUFFIX}`;
+}
+
+function knownPreActivationDiagnostic(error: unknown): string | undefined {
+  if (!(error instanceof AgentError) || error.details.dispatchAttempted !== false) {
+    return undefined;
+  }
+  const diagnosticCode = error.details.diagnosticCode;
+  return typeof diagnosticCode === "string" && diagnosticCode.length > 0
+    ? diagnosticCode
+    : "PRE_ACTIVATION_GUARD_FAILED";
 }
 
 function responseTexts(observation: CopilotPageObservation): readonly string[] {
