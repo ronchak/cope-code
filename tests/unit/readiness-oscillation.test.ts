@@ -61,6 +61,32 @@ test("alternating non-manual diagnostics share one bounded hydration window", as
   assert.equal(now, waits.actionMs);
 });
 
+test("alternating immediately unsafe diagnostics cannot consume the manual window", async () => {
+  let now = 0;
+  let calls = 0;
+
+  const result = await waitForStableManualReadiness(
+    async () => {
+      const current = calls % 2 === 0
+        ? inspection("unapproved-host", "HOST_NOT_APPROVED")
+        : inspection("blocking-modal", "UNEXPECTED_BLOCKING_MODAL");
+      calls += 1;
+      return current;
+    },
+    waits,
+    waits.manualReadinessMs,
+    undefined,
+    {
+      monotonicNow: () => now,
+      sleep: async (milliseconds) => { now += milliseconds; },
+    },
+  );
+
+  assert.equal(result.classification.state, "unapproved-host");
+  assert.equal(calls, 5);
+  assert.equal(now, waits.actionMs);
+});
+
 function inspection(state: CopilotPageState, diagnosticCode: string): BrowserStateInspection {
   return {
     classification: { state, retryable: false, diagnosticCode },
