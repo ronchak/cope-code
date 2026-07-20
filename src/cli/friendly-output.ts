@@ -55,6 +55,21 @@ export function renderHumanError(error: unknown): string {
   const message = errorMessage(error);
   const lines = [`\n${red(symbols.error)} ${bold(message)}`];
   if (error instanceof AgentError) {
+    const summary = error.details.summary;
+    if (typeof summary === "string" && summary.length > 0 && summary !== message) {
+      lines.push(`\n${summary}`);
+    }
+    const diagnosticCode = error.details.diagnosticCode;
+    const state = error.details.state;
+    if (typeof diagnosticCode === "string" && diagnosticCode.length > 0) {
+      const stateSuffix = typeof state === "string" && state.length > 0 ? ` (${state})` : "";
+      lines.push(`\n${dim(`Diagnostic: ${diagnosticCode}${stateSuffix}`)}`);
+    }
+    const missingSignals = error.details.missingSignals;
+    if (Array.isArray(missingSignals)) {
+      const signals = missingSignals.filter((value): value is string => typeof value === "string" && value.length > 0);
+      if (signals.length > 0) lines.push(`${dim(`Missing browser signals: ${signals.join(", ")}`)}`);
+    }
     const next = error.details.next;
     if (typeof next === "string" && next.length > 0) lines.push(`\n${cyan("Next:")} ${next}`);
     const problems = error.details.problems;
