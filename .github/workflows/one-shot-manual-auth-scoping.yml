@@ -1,0 +1,191 @@
+name: one-shot-manual-auth-scoping
+
+on:
+  push:
+    branches:
+      - agent/fix-visible-copilot-readiness-stall
+
+permissions:
+  contents: write
+
+jobs:
+  harden:
+    if: github.event.head_commit.message == 'Trigger scoped manual-auth locator hardening'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/fix-visible-copilot-readiness-stall
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Scope manual authentication evidence
+        shell: python
+        run: |
+          from pathlib import Path
+
+          config_path = Path("src/browser/config.ts")
+          config = config_path.read_text(encoding="utf-8")
+          old = '''    "signed-out": group(
+                "signed-out",
+                [
+                  { kind: "role", role: "button", name: pattern("sign in|log in") },
+                  { kind: "role", role: "link", name: pattern("sign in|log in") },
+                ],
+                "presence",
+              ),
+              mfa: group(
+                "mfa",
+                [{ kind: "text", text: pattern("approve sign.in|verification code|multi.factor") }],
+                "presence",
+              ),
+              consent: group(
+                "consent",
+                [{ kind: "text", text: pattern("permissions requested|consent|accept") }],
+                "presence",
+              ),
+          '''
+          new = '''    "signed-out": group(
+                "signed-out",
+                [
+                  { kind: "role", role: "button", name: pattern("sign in|log in|use another account") },
+                  { kind: "test-id", testId: pattern("sign.?in|login|account.?picker") },
+                  {
+                    kind: "css",
+                    selector: [
+                      'button[aria-label*="sign in" i]',
+                      'button[aria-label*="log in" i]',
+                      '[role="button"][aria-label*="sign in" i]',
+                      '[role="button"][aria-label*="log in" i]',
+                      'button[data-testid*="sign-in" i]',
+                      'button[data-testid*="signin" i]',
+                      '[role="button"][data-testid*="sign-in" i]',
+                      '[role="button"][data-testid*="signin" i]',
+                    ].join(", "),
+                  },
+                ],
+                "presence",
+              ),
+              mfa: group(
+                "mfa",
+                [
+                  { kind: "role", role: "textbox", name: pattern("verification code|security code|one.time code|passcode") },
+                  { kind: "label", label: pattern("verification code|security code|one.time code|passcode") },
+                  { kind: "placeholder", placeholder: pattern("verification code|security code|one.time code|passcode") },
+                  { kind: "role", role: "status", name: pattern("approve sign.in|check your authenticator|verification required") },
+                  { kind: "test-id", testId: pattern("mfa|multi.factor|verification.code|one.time.code|otp") },
+                  {
+                    kind: "css",
+                    selector: [
+                      'input[autocomplete="one-time-code"]',
+                      'input[name*="otp" i]',
+                      'input[name*="verification" i]',
+                      'input[id*="verification" i]',
+                      '[aria-label*="verification code" i]',
+                      '[aria-label*="security code" i]',
+                      '[data-testid*="mfa" i]',
+                      '[data-testid*="otp" i]',
+                    ].join(", "),
+                  },
+                ],
+                "presence",
+              ),
+              consent: group(
+                "consent",
+                [
+                  { kind: "role", role: "dialog", name: pattern("permissions requested|consent|review permissions|allow access") },
+                  { kind: "test-id", testId: pattern("consent|permissions") },
+                  {
+                    kind: "css",
+                    selector: [
+                      'form[action*="consent" i]',
+                      '[data-testid*="consent" i]',
+                      '[data-testid*="permission" i]',
+                      '[aria-label*="permissions requested" i]',
+                      '[aria-label*="consent" i]',
+                    ].join(", "),
+                  },
+                ],
+                "presence",
+              ),
+          '''
+          if config.count(old) != 1:
+              raise RuntimeError("manual-auth locator block changed unexpectedly")
+          config_path.write_text(config.replace(old, new), encoding="utf-8", newline="\n")
+
+          test_path = Path("tests/unit/manual-auth-locator-scoping.test.ts")
+          if test_path.exists():
+              raise RuntimeError("manual-auth locator test already exists")
+          test_path.write_text('''import assert from "node:assert/strict";
+          import test from "node:test";
+          import type { Locator, Page } from "playwright-core";
+
+          import { createBaselineCopilotUiContract } from "../../src/browser/config.js";
+          import { PlaywrightSemanticPage } from "../../src/browser/playwright-semantic-page.js";
+
+          class ProbeLocator {
+            public constructor(private readonly visible: boolean) {}
+
+            public async count(): Promise<number> { return this.visible ? 1 : 0; }
+            public nth(_index: number): Locator { return this as unknown as Locator; }
+            public async isVisible(): Promise<boolean> { return this.visible; }
+            public async isEnabled(): Promise<boolean> { return this.visible; }
+            public async innerText(): Promise<string> {
+              return "Please accept the consent request and enter a verification code to sign in.";
+            }
+            public async getAttribute(_name: string): Promise<string | null> { return null; }
+            public async inputValue(): Promise<string> { return ""; }
+          }
+
+          class TextOnlyPage {
+            public textQueries = 0;
+
+            public on(_event: string, _listener: (...args: readonly unknown[]) => void): this { return this; }
+            public getByText(): Locator {
+              this.textQueries += 1;
+              return new ProbeLocator(true) as unknown as Locator;
+            }
+            public getByRole(): Locator { return new ProbeLocator(false) as unknown as Locator; }
+            public getByLabel(): Locator { return new ProbeLocator(false) as unknown as Locator; }
+            public getByPlaceholder(): Locator { return new ProbeLocator(false) as unknown as Locator; }
+            public getByTestId(): Locator { return new ProbeLocator(false) as unknown as Locator; }
+            public locator(): Locator { return new ProbeLocator(false) as unknown as Locator; }
+            public asPage(): Page { return this as unknown as Page; }
+          }
+
+          test("manual authentication signals never scan free conversation text", async () => {
+            const contract = createBaselineCopilotUiContract("Ronak Chakraborty");
+            const probe = new TextOnlyPage();
+            const page = new PlaywrightSemanticPage(probe.asPage());
+
+            for (const signal of ["signed-out", "mfa", "consent"] as const) {
+              assert.equal(
+                contract.groups[signal].candidates.some((candidate) => candidate.kind === "text"),
+                false,
+                `${signal} must not contain a free-text locator`,
+              );
+              const snapshot = await page.snapshot(contract.groups[signal]);
+              assert.equal(snapshot.visibleElements, 0, signal);
+            }
+
+            assert.equal(
+              contract.groups["signed-out"].candidates.some(
+                (candidate) => candidate.kind === "role" && candidate.role === "link",
+              ),
+              false,
+            );
+            assert.equal(probe.textQueries, 0);
+          });
+          '''.replace(/^          /gm, ""), encoding="utf-8", newline="\n")
+      - run: npm ci --no-audit --no-fund
+      - run: npm run check
+      - name: Commit scoped manual-auth locators
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/browser/config.ts tests/unit/manual-auth-locator-scoping.test.ts
+          git commit -m "Scope manual-auth evidence to authentication controls"
+          git push origin HEAD:agent/fix-visible-copilot-readiness-stall
