@@ -142,7 +142,13 @@ export class EdgeCopilotTransport implements ModelTransport {
         isTerminalInspection: (inspection) => {
           const state = inspection.classification.state;
           if (!isTerminalManualReadinessState(state)) return false;
-          return state !== "unapproved-host" || !this.#semanticPage.isManualAuthenticationRedirect();
+          if (state !== "unapproved-host") return true;
+          // A different allowlisted Microsoft authentication host is permitted
+          // to remain manual. An approved-host page outside the configured chat
+          // path is not an authentication redirect and must fail on the short
+          // stable quorum instead of consuming the ten-minute manual window.
+          return inspection.classification.diagnosticCode !== "HOST_NOT_APPROVED" ||
+            !this.#semanticPage.isManualAuthenticationRedirect();
         },
       },
     );
