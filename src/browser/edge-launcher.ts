@@ -1,4 +1,4 @@
-import { chromium, type BrowserContext, type Page } from "playwright-core";
+import { chromium, type BrowserContext } from "playwright-core";
 
 import { AgentError } from "../shared/errors.js";
 import type {
@@ -12,11 +12,11 @@ import type {
 } from "../transport/model-transport.js";
 import { CopilotBrowserAdapter, type BrowserStateInspection } from "./copilot-browser-adapter.js";
 import {
-  isApprovedUrl,
   validateEdgeLaunchConfig,
   type BrowserWaitConfig,
   type EdgeLaunchConfig,
 } from "./config.js";
+import { ContextSemanticPage, openTrackedCopilotPage } from "./context-semantic-page.js";
 import {
   assertKillSwitchEnabled,
   MutableBrowserKillSwitch,
@@ -26,7 +26,6 @@ import {
   isTerminalManualReadinessState,
   waitForStableManualReadiness,
 } from "./manual-readiness.js";
-import { PlaywrightSemanticPage } from "./playwright-semantic-page.js";
 import { ExclusiveProfileLock, prepareDedicatedProfile } from "./profile-lock.js";
 import { CURRENT_HOST_PLATFORM, type HostPlatform } from "../platform/index.js";
 import { verifyDedicatedProfileRoot } from "../platform/private-storage.js";
@@ -44,27 +43,27 @@ export class EdgeCopilotTransport implements ModelTransport {
   public readonly transportKind = "visible-edge-m365-copilot/v1";
 
   readonly #context: BrowserContext;
+  readonly #semanticPage: ContextSemanticPage;
   readonly #adapter: CopilotBrowserAdapter;
   readonly #lock: ExclusiveProfileLock;
   readonly #killSwitch: BrowserKillSwitch;
   readonly #readinessWaits: BrowserWaitConfig;
-  readonly #isManualAuthenticationRedirect: () => boolean;
   #closed = false;
 
   private constructor(
     context: BrowserContext,
+    semanticPage: ContextSemanticPage,
     adapter: CopilotBrowserAdapter,
     lock: ExclusiveProfileLock,
     killSwitch: BrowserKillSwitch,
     readinessWaits: BrowserWaitConfig,
-    isManualAuthenticationRedirect: () => boolean,
   ) {
     this.#context = context;
+    this.#semanticPage = semanticPage;
     this.#adapter = adapter;
     this.#lock = lock;
     this.#killSwitch = killSwitch;
     this.#readinessWaits = readinessWaits;
-    this.#isManualAuthenticationRedirect = isManualAuthenticationRedirect;
   }
 
   public static async launch(
@@ -93,26 +92,22 @@ export class EdgeCopilotTransport implements ModelTransport {
         },
         dependencies.launchPersistentContext,
       );
-      const page = await selectOrOpenApprovedPage(context, config);
-      page.setDefaultTimeout(config.waits.actionMs);
-      page.setDefaultNavigationTimeout(config.waits.actionMs);
+      const semanticPage = await openTrackedCopilotPage(context, config);
       const {
         profileDirectory: _profileDirectory,
         edgeExecutable: _edgeExecutable,
         ...adapterConfig
       } = config;
-      const adapter = new CopilotBrowserAdapter(new PlaywrightSemanticPage(page), adapterConfig, {
+      const adapter = new CopilotBrowserAdapter(semanticPage, adapterConfig, {
         killSwitch,
       });
-      const isManualAuthenticationRedirect = (): boolean =>
-        isApprovedUrl(page.url(), config.manualAuthenticationHosts ?? []);
       return new EdgeCopilotTransport(
         context,
+        semanticPage,
         adapter,
         lock,
         killSwitch,
         config.waits,
-        isManualAuthenticationRedirect,
       );
     } catch (error) {
       if (context !== undefined) await context.close().catch(() => undefined);
@@ -121,7 +116,11 @@ export class EdgeCopilotTransport implements ModelTransport {
       throw new AgentError(
         "TRANSPORT_UNAVAILABLE",
         "Could not launch the visible Microsoft Edge transport",
-        { diagnosticCode: "EDGE_LAUNCH_FAILED" },
+        {
+          diagnosticCode: "EDGE_LAUNCH_FAILED",
+          next: "Close the dedicated Edge window, run cope setup --force, and retry.",
+        },
+        { cause: error },
       );
     }
   }
@@ -143,7 +142,7 @@ export class EdgeCopilotTransport implements ModelTransport {
         isTerminalInspection: (inspection) => {
           const state = inspection.classification.state;
           if (!isTerminalManualReadinessState(state)) return false;
-          return state !== "unapproved-host" || !this.#isManualAuthenticationRedirect();
+          return state !== "unapproved-host" || !this.#semanticPage.isManualAuthenticationRedirect();
         },
       },
     );
@@ -203,30 +202,4 @@ export async function launchEdgeCopilotTransport(
   dependencies: EdgeLauncherDependencies = {},
 ): Promise<EdgeCopilotTransport> {
   return EdgeCopilotTransport.launch(config, dependencies);
-}
-
-async function selectOrOpenApprovedPage(
-  context: BrowserContext,
-  config: EdgeLaunchConfig,
-): Promise<Page> {
-  const approvedPages = context.pages().filter((page) =>
-    isApprovedUrl(page.url(), config.approvedHosts),
-  );
-  if (approvedPages.length > 1) {
-    throw new AgentError("TRANSPORT_INDETERMINATE", "Multiple approved Copilot pages are open", {
-      diagnosticCode: "AMBIGUOUS_COPILOT_PAGE",
-      pageCount: approvedPages.length,
-    });
-  }
-  const existing = approvedPages[0];
-  if (existing !== undefined) return existing;
-  const blank = context.pages().find((page) => page.url() === "about:blank");
-  const page = blank ?? (await context.newPage());
-  // Navigation is restricted to the explicitly approved entry URL. Redirects
-  // for manual authentication remain visible and are never automated.
-  await page.goto(config.entryUrl, {
-    waitUntil: "domcontentloaded",
-    timeout: config.waits.actionMs,
-  });
-  return page;
 }
