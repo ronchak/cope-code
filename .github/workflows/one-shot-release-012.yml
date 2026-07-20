@@ -1,17 +1,16 @@
 name: one-shot-cope-012-release
-# Triggered only by an explicit follow-up commit.
 
 on:
-  push:
+  pull_request:
     branches:
-      - agent/fix-visible-copilot-readiness-stall
+      - main
 
 permissions:
   contents: write
 
 jobs:
   release:
-    if: github.event.head_commit.message == 'Run verified 0.1.2 release bump'
+    if: github.event.pull_request.head.ref == 'agent/fix-visible-copilot-readiness-stall'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,17 +21,31 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - name: Apply coherent 0.1.2 release metadata
+      - id: bump
+        name: Apply coherent 0.1.2 release metadata
         shell: python
         run: |
           from __future__ import annotations
 
           import hashlib
           import json
+          import os
           from pathlib import Path
 
           OLD = "0.1.1"
           NEW = "0.1.2"
+
+          package = Path("package.json")
+          package_json = json.loads(package.read_text(encoding="utf-8"))
+          current = package_json.get("version")
+          if current == NEW:
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write("changed=false\n")
+              raise SystemExit(0)
+          if current != OLD:
+              raise RuntimeError(f"Unexpected package version: {current!r}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("changed=true\n")
 
           def replace_exact(path: str, old: str, new: str, expected: int) -> None:
               file = Path(path)
@@ -42,10 +55,6 @@ jobs:
                   raise RuntimeError(f"{path}: expected {expected} occurrences of {old!r}, found {count}")
               file.write_text(text.replace(old, new), encoding="utf-8", newline="\n")
 
-          package = Path("package.json")
-          package_json = json.loads(package.read_text(encoding="utf-8"))
-          if package_json.get("version") != OLD:
-              raise RuntimeError(f"package.json version is not {OLD}")
           package_json["version"] = NEW
           package.write_text(json.dumps(package_json, indent=2) + "\n", encoding="utf-8", newline="\n")
 
@@ -123,14 +132,18 @@ The Windows installer still performs the same packed global installation. Its ba
           if not historical.exists() or OLD not in historical.read_text(encoding="utf-8"):
               raise RuntimeError("historical 0.1.1 release notes are missing or were altered")
 
-      - name: Verify the lockfile change is version-only
+      - if: steps.bump.outputs.changed == 'true'
+        name: Verify the lockfile change is version-only
         shell: bash
         run: |
           git diff -- package-lock.json
           test "$(git diff --numstat -- package-lock.json | awk '{print $1+$2}')" -eq 4
-      - run: npm ci --no-audit --no-fund
-      - run: npm run check
-      - name: Commit release bump
+      - if: steps.bump.outputs.changed == 'true'
+        run: npm ci --no-audit --no-fund
+      - if: steps.bump.outputs.changed == 'true'
+        run: npm run check
+      - if: steps.bump.outputs.changed == 'true'
+        name: Commit release bump
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
