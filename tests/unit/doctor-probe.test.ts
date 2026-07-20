@@ -10,9 +10,20 @@ import {
   probeNpmVersion,
   runDoctorProbe,
 } from "../../src/cli/doctor-probe.js";
-import { WindowsHostPlatform } from "../../src/platform/index.js";
+import {
+  CURRENT_HOST_PLATFORM,
+  WindowsHostPlatform,
+} from "../../src/platform/index.js";
 
 const host = new WindowsHostPlatform("x64");
+
+test("doctor resolves and executes the real npm CLI on the current target runner", async () => {
+  const result = await probeNpmVersion(CURRENT_HOST_PLATFORM, process.cwd());
+
+  assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+  assert.match(result.stdout.trim(), /^\d+\.\d+\.\d+(?:[-+].*)?$/u);
+  assert.equal(result.npmCli === undefined ? false : isNpmCliEntryPoint(result.npmCli), true);
+});
 
 test("doctor runs npm's JavaScript CLI through Node instead of spawning npm.cmd", async () => {
   const npmCli = "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js";
