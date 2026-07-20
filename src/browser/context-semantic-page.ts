@@ -85,9 +85,10 @@ export class ContextSemanticPage implements SemanticPage {
 
   /**
    * Consequential actions stay pinned to the exact page and URL used by the
-   * immediately preceding observation. If a replacement tab appears or the
-   * observed tab navigates after verification, fail closed and let the caller
-   * re-observe rather than typing or clicking in a different conversation.
+   * immediately preceding observation. If a replacement tab appears, a second
+   * Copilot page creates ambiguity, or the observed tab navigates after
+   * verification, fail closed and let the caller re-observe rather than typing
+   * or clicking in a different conversation.
    */
   public async fill(group: LocatorGroup, value: string): Promise<void> {
     const page = this.#verifiedActionPage();
@@ -105,8 +106,14 @@ export class ContextSemanticPage implements SemanticPage {
   }
 
   #verifiedActionPage(): Page {
+    const selected = selectActiveCopilotPage(
+      this.#context.pages(),
+      this.#config,
+      this.#activePage,
+    );
     const currentUrl = this.#activePage.url();
     if (
+      selected !== this.#activePage ||
       this.#activePage.isClosed() ||
       this.#observedUrl === undefined ||
       currentUrl !== this.#observedUrl
