@@ -55,9 +55,14 @@ replace_exact(
 )
 replace_exact("scripts/install-windows.ps1", OLD, NEW, 2)
 replace_exact("START-HERE.txt", OLD, NEW, 1)
-replace_exact("README.md", OLD, NEW, 1)
 replace_exact("docs/WINDOWS-TARGET.md", OLD, NEW, 1)
-replace_exact("tests/unit/cli-user-experience.test.ts", OLD, NEW, 3)
+replace_exact("tests/unit/cli-user-experience.test.ts", OLD, NEW, 4)
+replace_exact(
+    "tests/unit/cli-user-experience.test.ts",
+    r"v0\.1\.1",
+    r"v0\.1\.2",
+    2,
+)
 
 installer_bytes = (
     Path("scripts/install-windows.ps1")
@@ -99,11 +104,11 @@ Cope 0.1.2 fixes the first live target-machine Edge transport failures found aft
 - Unrelated M365 and Office pages cannot qualify as authentication redirects by host alone.
 - Persistent unknown and other non-authentication browser states now return a bounded diagnostic instead of appearing hung for the full manual-authentication window.
 - The current Microsoft 365 Copilot locator contract covers the live composer and account-control variants while preserving identity, protection, host, and actionability gates.
-- Exact email identity matching, ordered display-name matching, assistant-response ownership, and replacement-page timeouts are regression-tested.
+- Exact email identity matching, ordered display-name matching, assistant-response ownership, replacement-page timeouts, and alternating hostile readiness states are regression-tested.
 
 ## Distribution
 
-The Windows installer still performs the same packed global installation. Its banner and post-install version assertion now require 0.1.2. Historical 0.1.1 release notes remain unchanged.
+The Windows installer still performs the same packed global installation. Its banner and post-install version assertion now require 0.1.2. Historical 0.1.1 release notes and documentation remain unchanged.
 """,
     encoding="utf-8",
     newline="\n",
