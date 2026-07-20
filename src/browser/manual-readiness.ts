@@ -6,6 +6,7 @@ import type { BrowserWaitConfig } from "./config.js";
 export interface ManualReadinessDependencies {
   readonly monotonicNow?: () => number;
   readonly sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
+  readonly isTerminalInspection?: (inspection: BrowserStateInspection) => boolean;
 }
 
 /**
@@ -26,6 +27,9 @@ export async function waitForStableManualReadiness(
   }
   const monotonicNow = dependencies.monotonicNow ?? (() => performance.now());
   const sleep = dependencies.sleep ?? sleepWithAbort;
+  const isTerminalInspection = dependencies.isTerminalInspection ??
+    ((inspection: BrowserStateInspection) =>
+      isTerminalManualReadinessState(inspection.classification.state));
   const deadline = monotonicNow() + maxWaitMs;
   let lastInspection: BrowserStateInspection | undefined;
   let terminalKey: string | undefined;
@@ -42,7 +46,7 @@ export async function waitForStableManualReadiness(
     if (inspection.classification.state === "ready") return inspection;
 
     const observedAt = monotonicNow();
-    if (isTerminalManualReadinessState(inspection.classification.state)) {
+    if (isTerminalInspection(inspection)) {
       const nextKey = `${inspection.classification.state}:${inspection.classification.diagnosticCode}`;
       if (nextKey === terminalKey) {
         terminalSamples += 1;
