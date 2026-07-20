@@ -91,6 +91,23 @@ test("an email wrapped in account-button text still verifies the exact configure
   assert.equal(classification.state, "ready");
 });
 
+test("an address that merely contains the configured email is rejected", async () => {
+  const expectedIdentity = "ronak@example.com";
+  const contract = createBaselineCopilotUiContract(expectedIdentity);
+  const observation = await observeCopilotPage(
+    new LiveShapePage("Work account notronak@example.com"),
+    contract,
+  );
+
+  const classification = classifyCopilotPage(observation, contract, {
+    approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
+    expectedIdentity,
+    requireProtectionIndicator: true,
+  });
+
+  assert.equal(classification.state, "identity-unverified");
+});
+
 test("identity token matching does not accept a different visible account", async () => {
   const expectedIdentity = "Ronak Chakraborty";
   const contract = createBaselineCopilotUiContract(expectedIdentity);
