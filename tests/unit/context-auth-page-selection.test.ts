@@ -14,12 +14,28 @@ class UrlPage {
 const selectionConfig = {
   entryUrl: "https://m365.cloud.microsoft/chat",
   approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
-  manualAuthenticationHosts: [{ hostname: "login.microsoftonline.com" }],
+  manualAuthenticationHosts: [
+    { hostname: "m365.cloud.microsoft" },
+    { hostname: "login.microsoftonline.com" },
+  ],
 } as const;
 
-test("a newer Microsoft authentication tab replaces the previously tracked auth page", () => {
+test("a newer external Microsoft authentication tab replaces the previously tracked auth page", () => {
   const older = new UrlPage("https://login.microsoftonline.com/common/oauth2/authorize?step=one");
   const newer = new UrlPage("https://login.microsoftonline.com/common/oauth2/authorize?step=two");
+
+  const selected = selectActiveCopilotPage(
+    [older.asPage(), newer.asPage()],
+    selectionConfig,
+    older.asPage(),
+  );
+
+  assert.equal(selected, newer.asPage());
+});
+
+test("a newer same-host authentication tab replaces the previously tracked auth page", () => {
+  const older = new UrlPage("https://m365.cloud.microsoft/auth/continue?step=one");
+  const newer = new UrlPage("https://m365.cloud.microsoft/auth/continue?step=two");
 
   const selected = selectActiveCopilotPage(
     [older.asPage(), newer.asPage()],
