@@ -120,10 +120,10 @@ export function createBaselineCopilotUiContract(
     responses: group(
       "responses",
       [
-        { kind: "test-id", testId: pattern("assistant.*message|response") },
+        { kind: "test-id", testId: pattern("assistant.*message|ai.*message|response.*message|message.*response") },
         {
           kind: "css",
-          selector: '[data-content="ai-message"], [data-author="assistant"], [data-testid*="assistant" i][data-testid*="message" i], [data-testid*="response" i]',
+          selector: '[data-content="ai-message"], [data-author="assistant"], [data-testid*="assistant" i][data-testid*="message" i], [data-testid*="response" i][data-testid*="message" i]',
         },
       ],
       "text",
@@ -154,8 +154,8 @@ export function createBaselineCopilotUiContract(
       [
         { kind: "role", role: "button", name: expectedIdentity },
         { kind: "role", role: "button", name: flexibleIdentity },
-        { kind: "text", text: expectedIdentity },
-        { kind: "text", text: flexibleIdentity },
+        { kind: "role", role: "link", name: expectedIdentity },
+        { kind: "role", role: "link", name: flexibleIdentity },
       ],
       "text",
       50,
