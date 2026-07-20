@@ -22,7 +22,10 @@ import {
   MutableBrowserKillSwitch,
   type BrowserKillSwitch,
 } from "./kill-switch.js";
-import { waitForStableManualReadiness } from "./manual-readiness.js";
+import {
+  isTerminalManualReadinessState,
+  waitForStableManualReadiness,
+} from "./manual-readiness.js";
 import { PlaywrightSemanticPage } from "./playwright-semantic-page.js";
 import { ExclusiveProfileLock, prepareDedicatedProfile } from "./profile-lock.js";
 import { CURRENT_HOST_PLATFORM, type HostPlatform } from "../platform/index.js";
@@ -45,6 +48,7 @@ export class EdgeCopilotTransport implements ModelTransport {
   readonly #lock: ExclusiveProfileLock;
   readonly #killSwitch: BrowserKillSwitch;
   readonly #readinessWaits: BrowserWaitConfig;
+  readonly #isManualAuthenticationRedirect: () => boolean;
   #closed = false;
 
   private constructor(
@@ -53,12 +57,14 @@ export class EdgeCopilotTransport implements ModelTransport {
     lock: ExclusiveProfileLock,
     killSwitch: BrowserKillSwitch,
     readinessWaits: BrowserWaitConfig,
+    isManualAuthenticationRedirect: () => boolean,
   ) {
     this.#context = context;
     this.#adapter = adapter;
     this.#lock = lock;
     this.#killSwitch = killSwitch;
     this.#readinessWaits = readinessWaits;
+    this.#isManualAuthenticationRedirect = isManualAuthenticationRedirect;
   }
 
   public static async launch(
@@ -98,7 +104,16 @@ export class EdgeCopilotTransport implements ModelTransport {
       const adapter = new CopilotBrowserAdapter(new PlaywrightSemanticPage(page), adapterConfig, {
         killSwitch,
       });
-      return new EdgeCopilotTransport(context, adapter, lock, killSwitch, config.waits);
+      const isManualAuthenticationRedirect = (): boolean =>
+        isApprovedUrl(page.url(), config.manualAuthenticationHosts ?? []);
+      return new EdgeCopilotTransport(
+        context,
+        adapter,
+        lock,
+        killSwitch,
+        config.waits,
+        isManualAuthenticationRedirect,
+      );
     } catch (error) {
       if (context !== undefined) await context.close().catch(() => undefined);
       await lock.release();
@@ -124,6 +139,13 @@ export class EdgeCopilotTransport implements ModelTransport {
       this.#readinessWaits,
       maxWaitMs ?? this.#readinessWaits.manualReadinessMs,
       signal,
+      {
+        isTerminalInspection: (inspection) => {
+          const state = inspection.classification.state;
+          if (!isTerminalManualReadinessState(state)) return false;
+          return state !== "unapproved-host" || !this.#isManualAuthenticationRedirect();
+        },
+      },
     );
   }
 
