@@ -48,6 +48,13 @@ class SignalPage implements SemanticPage {
 
 const identity = "Synthetic Work Account";
 const contract = createBaselineCopilotUiContract(identity);
+const readySignals = new Set<CopilotSignal>([
+  "shell",
+  "conversation",
+  "composer",
+  "identity",
+  "protection",
+]);
 const requirements = {
   entryUrl: "https://m365.cloud.microsoft/chat",
   approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
@@ -74,19 +81,34 @@ test("an arbitrary same-host page cannot become ready outside the configured cha
   const observation = await observeCopilotPage(
     new SignalPage(
       "https://m365.cloud.microsoft/search",
-      new Set<CopilotSignal>([
-        "shell",
-        "conversation",
-        "composer",
-        "identity",
-        "protection",
-      ]),
+      readySignals,
       identity,
     ),
     contract,
   );
 
   const classification = classifyCopilotPage(observation, contract, requirements);
+  assert.equal(classification.state, "unapproved-host");
+  assert.equal(classification.diagnosticCode, "COPILOT_SURFACE_NOT_APPROVED");
+});
+
+test("a secondary approved host cannot impersonate the configured Copilot origin", async () => {
+  const observation = await observeCopilotPage(
+    new SignalPage(
+      "https://alternate.example.test/chat/conversation/synthetic",
+      readySignals,
+      identity,
+    ),
+    contract,
+  );
+
+  const classification = classifyCopilotPage(observation, contract, {
+    ...requirements,
+    approvedHosts: [
+      ...requirements.approvedHosts,
+      { hostname: "alternate.example.test" },
+    ],
+  });
   assert.equal(classification.state, "unapproved-host");
   assert.equal(classification.diagnosticCode, "COPILOT_SURFACE_NOT_APPROVED");
 });
