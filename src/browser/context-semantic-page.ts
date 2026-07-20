@@ -22,17 +22,25 @@ export interface CopilotPageSelectionConfig {
 export class ContextSemanticPage implements SemanticPage {
   readonly #context: BrowserContext;
   readonly #config: CopilotPageSelectionConfig;
+  readonly #actionMs: number;
   readonly #delegates = new WeakMap<Page, PlaywrightSemanticPage>();
+  readonly #configuredPages = new WeakSet<Page>();
   #activePage: Page;
 
   public constructor(
     context: BrowserContext,
     config: CopilotPageSelectionConfig,
     initialPage: Page,
+    actionMs: number,
   ) {
+    if (!Number.isSafeInteger(actionMs) || actionMs <= 0) {
+      throw new TypeError("Context page action timeout must be a positive integer");
+    }
     this.#context = context;
     this.#config = config;
     this.#activePage = initialPage;
+    this.#actionMs = actionMs;
+    this.#configurePage(initialPage);
   }
 
   public async focusActivePage(force = false): Promise<Page> {
@@ -43,6 +51,7 @@ export class ContextSemanticPage implements SemanticPage {
     );
     const changed = selected !== this.#activePage;
     this.#activePage = selected;
+    this.#configurePage(selected);
     if (force || changed) await selected.bringToFront().catch(() => undefined);
     return selected;
   }
@@ -75,6 +84,13 @@ export class ContextSemanticPage implements SemanticPage {
   public async press(group: LocatorGroup, key: "Enter"): Promise<void> {
     const page = await this.focusActivePage();
     await this.#delegate(page).press(group, key);
+  }
+
+  #configurePage(page: Page): void {
+    if (this.#configuredPages.has(page)) return;
+    page.setDefaultTimeout(this.#actionMs);
+    page.setDefaultNavigationTimeout(this.#actionMs);
+    this.#configuredPages.add(page);
   }
 
   #delegate(page: Page): PlaywrightSemanticPage {
@@ -167,11 +183,12 @@ export async function openTrackedCopilotPage(
     }
   }
 
-  for (const page of context.pages()) {
-    page.setDefaultTimeout(config.waits.actionMs);
-    page.setDefaultNavigationTimeout(config.waits.actionMs);
-  }
-  const tracked = new ContextSemanticPage(context, config, initial);
+  const tracked = new ContextSemanticPage(
+    context,
+    config,
+    initial,
+    config.waits.actionMs,
+  );
   await tracked.focusActivePage(true);
   return tracked;
 }
