@@ -8,11 +8,17 @@ import { runMachinePreflight } from "../../src/preflight/machine.js";
 import { DEFAULT_GIT_EXECUTABLE } from "../../src/repository/boundary.js";
 import { AgentError } from "../../src/shared/errors.js";
 import { UnsupportedHostPlatform } from "../../src/platform/index.js";
+import { createStandardUserHost } from "../helpers/standard-user-host.js";
 
-test("offline preflight verifies Node, Git, and a local repository without Edge", async () => {
+test("offline preflight verifies Node, Git, and a local repository without Edge", async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-preflight-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
   initializeGitRepository(root);
-  const result = await runMachinePreflight({ repositoryRoot: root, liveBrowser: false });
+  const result = await runMachinePreflight({
+    repositoryRoot: root,
+    liveBrowser: false,
+    host: createStandardUserHost(),
+  });
   assert.match(result.gitVersion, /^git version /);
   assert.equal(await realpath(result.repositoryTopLevel), await realpath(root));
 });
@@ -39,7 +45,11 @@ test("preflight fails before transport startup when the worktree contains a nest
   await writeFile(path.join(root, "embedded", "source.txt"), "nested content\n");
 
   await assert.rejects(
-    runMachinePreflight({ repositoryRoot: root, liveBrowser: false }),
+    runMachinePreflight({
+      repositoryRoot: root,
+      liveBrowser: false,
+      host: createStandardUserHost(),
+    }),
     (error: unknown) =>
       error instanceof AgentError &&
       error.code === "UNSUPPORTED_FILE" &&
