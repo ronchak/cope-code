@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -259,7 +259,8 @@ test("process runner uses no shell, a controlled environment/cwd, bounded output
   assert.equal(outcome.outcome, "success");
   assert.equal(outcome.stdout.includes(literal), true);
   const observedCwd = outputValue(outcome.stdout, "cwd");
-  assert.equal(normalizePath(observedCwd), normalizePath(boundary.root));
+  const canonicalCwd = await realpath(observedCwd);
+  assert.equal(boundary.pathKey(canonicalCwd), boundary.pathKey(boundary.root));
   assert.equal(outcome.stdout.includes("not-inherited"), true);
   assert.equal(outcome.stdout.includes("must-not-leak"), false);
   assert.equal(outcome.stderr.includes("abcdefghijklmnop"), false);
@@ -289,11 +290,6 @@ function outputValue(output: string, key: string): string {
   const line = output.split(/\r?\n/u).find((candidate) => candidate.startsWith(prefix));
   if (line === undefined) assert.fail(`Missing ${key} output marker`);
   return line.slice(prefix.length);
-}
-
-function normalizePath(value: string): string {
-  const normalized = path.resolve(value.trim());
-  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
 test("process runner classifies timeout and caller cancellation and terminates the process tree", async (context) => {
