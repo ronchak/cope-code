@@ -75,9 +75,20 @@ export function classifyCopilotPage(
     return result("unapproved-host", false, "HOST_NOT_APPROVED");
   }
 
-  // Same-host Microsoft transitions can temporarily leave the configured chat
-  // path. Keep only explicit manual-authentication evidence retryable; arbitrary
-  // approved-host pages still fail the path check below.
+  const withinConfiguredSurface = isWithinConfiguredCopilotPath(
+    observation.url,
+    requirements.entryUrl,
+  );
+  const sameOriginAuthentication = !withinConfiguredSurface &&
+    isSameOriginAuthenticationUrl(observation.url, requirements.entryUrl);
+
+  // Generic sign-in, MFA, and consent text on an unrelated approved-host page
+  // must not buy the ten-minute manual window. Outside the configured chat path,
+  // the URL itself must also have a genuine authentication shape.
+  if (!withinConfiguredSurface && !sameOriginAuthentication) {
+    return result("unapproved-host", false, "COPILOT_SURFACE_NOT_APPROVED");
+  }
+
   if (matches(observation, contract, "mfa")) {
     return result("mfa-required", true, "MANUAL_MFA_REQUIRED");
   }
@@ -88,7 +99,10 @@ export function classifyCopilotPage(
     return result("sign-in-required", true, "MANUAL_SIGN_IN_REQUIRED");
   }
 
-  if (!isWithinConfiguredCopilotPath(observation.url, requirements.entryUrl)) {
+  // A same-origin authentication-shaped URL without explicit visible manual
+  // evidence stays bounded. External Microsoft login hosts are handled by the
+  // Edge transport's separately validated authentication-redirect exception.
+  if (!withinConfiguredSurface) {
     return result("unapproved-host", false, "COPILOT_SURFACE_NOT_APPROVED");
   }
 
@@ -247,6 +261,37 @@ function isWithinConfiguredCopilotPath(value: string, entryValue: string): boole
   } catch {
     return false;
   }
+}
+
+function isSameOriginAuthenticationUrl(value: string, entryValue: string): boolean {
+  let actual: URL;
+  let entry: URL;
+  try {
+    actual = new URL(value);
+    entry = new URL(entryValue);
+  } catch {
+    return false;
+  }
+  if (actual.origin !== entry.origin) return false;
+
+  const path = normalizedPath(actual.pathname).toLowerCase();
+  if (/(?:^|\/)(?:auth|authorize|federation|kmsi|login|oauth2?|ppsecure|sas|signin)(?:\/|$|\.)/iu.test(path)) {
+    return true;
+  }
+
+  const oauthCoreCount = [
+    "client_id",
+    "code_challenge",
+    "redirect_uri",
+    "response_type",
+  ].filter((key) => actual.searchParams.has(key)).length;
+  const oauthSupportCount = [
+    "login_hint",
+    "prompt",
+    "sso_reload",
+    "state",
+  ].filter((key) => actual.searchParams.has(key)).length;
+  return oauthCoreCount >= 2 || (oauthCoreCount >= 1 && oauthSupportCount >= 1);
 }
 
 function normalizedPath(value: string): string {
