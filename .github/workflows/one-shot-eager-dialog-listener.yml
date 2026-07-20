@@ -1,0 +1,323 @@
+name: one-shot-eager-dialog-listener
+
+on:
+  push:
+    branches:
+      - agent/fix-visible-copilot-readiness-stall
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.event.head_commit.message == 'Trigger eager dialog listener attachment'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/fix-visible-copilot-readiness-stall
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Attach native-dialog guards before inspection
+        shell: python
+        run: |
+          from pathlib import Path
+          from textwrap import dedent
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              file = Path(path)
+              text = file.read_text(encoding="utf-8")
+              if text.count(old) != 1:
+                  raise RuntimeError(f"{path}: expected exactly one replacement target")
+              file.write_text(text.replace(old, new), encoding="utf-8", newline="\n")
+
+          replace_once(
+              "src/browser/context-semantic-page.ts",
+              dedent("""\
+                  this.#activePage = initialPage;
+                  this.#actionMs = actionMs;
+                  this.#configurePage(initialPage);
+              """),
+              dedent("""\
+                  this.#activePage = initialPage;
+                  this.#actionMs = actionMs;
+                  for (const page of context.pages()) this.#configurePage(page);
+                  this.#configurePage(initialPage);
+                  if (typeof context.on === "function") {
+                    context.on("page", (page) => {
+                      this.#configurePage(page);
+                    });
+                  }
+              """),
+          )
+
+          replace_once(
+              "src/browser/context-semantic-page.ts",
+              dedent("""\
+                #configurePage(page: Page): void {
+                  if (this.#configuredPages.has(page)) return;
+                  page.setDefaultTimeout(this.#actionMs);
+                  page.setDefaultNavigationTimeout(this.#actionMs);
+                  this.#configuredPages.add(page);
+                }
+              """),
+              dedent("""\
+                #configurePage(page: Page): void {
+                  if (this.#configuredPages.has(page)) return;
+                  // Construct the delegate first so its native-dialog listener is active
+                  // before navigation, foregrounding, or the first semantic snapshot.
+                  this.#delegate(page);
+                  page.setDefaultTimeout(this.#actionMs);
+                  page.setDefaultNavigationTimeout(this.#actionMs);
+                  this.#configuredPages.add(page);
+                }
+              """),
+          )
+
+          replace_once(
+              "src/browser/playwright-semantic-page.ts",
+              dedent("""\
+                  page.on("dialog", () => {
+                    this.#nativeDialogDetected = true;
+                  });
+              """),
+              dedent("""\
+                  if (typeof page.on === "function") {
+                    page.on("dialog", () => {
+                      this.#nativeDialogDetected = true;
+                    });
+                  }
+              """),
+          )
+
+          replace_once(
+              "src/browser/context-semantic-page.ts",
+              dedent("""\
+                if (initial === undefined) {
+                  initial = await context.newPage();
+                  initial.setDefaultTimeout(config.waits.actionMs);
+                  initial.setDefaultNavigationTimeout(config.waits.actionMs);
+                  await initial.bringToFront().catch(() => undefined);
+                  const navigationDeadline = performance.now() + config.waits.actionMs;
+                  let navigationError: unknown;
+                  try {
+                    await initial.goto(config.entryUrl, {
+                      waitUntil: "domcontentloaded",
+                      timeout: config.waits.actionMs,
+                    });
+                  } catch (error) {
+                    navigationError = error;
+                  }
+                  if (!hasAllowedPage(context, config)) {
+                    const replacementFound = await waitForAllowedReplacementPage(
+                      context,
+                      config,
+                      navigationDeadline,
+                    );
+                    if (!replacementFound) {
+                      if (navigationError !== undefined) throw navigationError;
+                      throw new AgentError(
+                        "TRANSPORT_UNAVAILABLE",
+                        "The dedicated Edge session did not open the configured Copilot surface",
+                        {
+                          diagnosticCode: "EDGE_NAVIGATION_NO_ALLOWED_PAGE",
+                          next: "Close the dedicated Edge window, run cope setup --force, and retry.",
+                        },
+                      );
+                    }
+                  }
+                }
+
+                const tracked = new ContextSemanticPage(
+                  context,
+                  config,
+                  initial,
+                  config.waits.actionMs,
+                );
+                await tracked.focusActivePage(true);
+                return tracked;
+              """),
+              dedent("""\
+                let tracked: ContextSemanticPage;
+                if (initial === undefined) {
+                  initial = await context.newPage();
+                  // Install the native-dialog listener before navigation can execute page
+                  // script or open a replacement authentication window.
+                  tracked = new ContextSemanticPage(
+                    context,
+                    config,
+                    initial,
+                    config.waits.actionMs,
+                  );
+                  await initial.bringToFront().catch(() => undefined);
+                  const navigationDeadline = performance.now() + config.waits.actionMs;
+                  let navigationError: unknown;
+                  try {
+                    await initial.goto(config.entryUrl, {
+                      waitUntil: "domcontentloaded",
+                      timeout: config.waits.actionMs,
+                    });
+                  } catch (error) {
+                    navigationError = error;
+                  }
+                  if (!hasAllowedPage(context, config)) {
+                    const replacementFound = await waitForAllowedReplacementPage(
+                      context,
+                      config,
+                      navigationDeadline,
+                    );
+                    if (!replacementFound) {
+                      if (navigationError !== undefined) throw navigationError;
+                      throw new AgentError(
+                        "TRANSPORT_UNAVAILABLE",
+                        "The dedicated Edge session did not open the configured Copilot surface",
+                        {
+                          diagnosticCode: "EDGE_NAVIGATION_NO_ALLOWED_PAGE",
+                          next: "Close the dedicated Edge window, run cope setup --force, and retry.",
+                        },
+                      );
+                    }
+                  }
+                } else {
+                  tracked = new ContextSemanticPage(
+                    context,
+                    config,
+                    initial,
+                    config.waits.actionMs,
+                  );
+                }
+
+                await tracked.focusActivePage(true);
+                return tracked;
+              """),
+          )
+
+          test_path = Path("tests/unit/context-dialog-listener.test.ts")
+          if test_path.exists():
+              raise RuntimeError("context dialog-listener test already exists")
+          test_path.write_text(dedent("""\
+          import assert from "node:assert/strict";
+          import test from "node:test";
+          import type { BrowserContext, Page } from "playwright-core";
+
+          import { ContextSemanticPage } from "../../src/browser/context-semantic-page.js";
+          import type { LocatorGroup } from "../../src/browser/contracts.js";
+
+          const entryUrl = "https://m365.cloud.microsoft/chat";
+          const modalGroup: LocatorGroup = {
+            signal: "modal",
+            candidates: [{ kind: "role", role: "dialog" }],
+            minimumCandidateMatches: 1,
+            maximumElements: 1,
+            capture: "presence",
+          };
+          const selectionConfig = {
+            entryUrl,
+            approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
+            manualAuthenticationHosts: [{ hostname: "login.microsoftonline.com" }],
+          } as const;
+
+          class DialogPage {
+            public closed = false;
+            readonly #listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+
+            public constructor(public currentUrl: string) {}
+
+            public url(): string { return this.currentUrl; }
+            public isClosed(): boolean { return this.closed; }
+            public setDefaultTimeout(_milliseconds: number): void {}
+            public setDefaultNavigationTimeout(_milliseconds: number): void {}
+            public async bringToFront(): Promise<void> {}
+            public on(event: string, listener: (...args: unknown[]) => void): this {
+              const listeners = this.#listeners.get(event) ?? [];
+              listeners.push(listener);
+              this.#listeners.set(event, listeners);
+              return this;
+            }
+            public emitDialog(): void {
+              for (const listener of this.#listeners.get("dialog") ?? []) listener({});
+            }
+            public listenerCount(event: string): number {
+              return this.#listeners.get(event)?.length ?? 0;
+            }
+            public asPage(): Page { return this as unknown as Page; }
+          }
+
+          class DialogContext {
+            public readonly pageList: DialogPage[];
+            readonly #pageListeners: Array<(page: Page) => void> = [];
+
+            public constructor(pages: readonly DialogPage[]) {
+              this.pageList = [...pages];
+            }
+
+            public pages(): Page[] { return this.pageList.map((page) => page.asPage()); }
+            public on(event: string, listener: (page: Page) => void): this {
+              if (event === "page") this.#pageListeners.push(listener);
+              return this;
+            }
+            public addPage(page: DialogPage): void {
+              this.pageList.push(page);
+              for (const listener of this.#pageListeners) listener(page.asPage());
+            }
+            public asContext(): BrowserContext { return this as unknown as BrowserContext; }
+          }
+
+          test("the initial page has its native-dialog listener before the first snapshot", async () => {
+            const page = new DialogPage(`${entryUrl}/conversation/initial`);
+            const context = new DialogContext([page]);
+            const tracked = new ContextSemanticPage(
+              context.asContext(),
+              selectionConfig,
+              page.asPage(),
+              1_000,
+            );
+
+            assert.equal(page.listenerCount("dialog"), 1);
+            page.emitDialog();
+            const snapshot = await tracked.snapshot(modalGroup);
+
+            assert.equal(snapshot.matchedCandidates, 1);
+            assert.equal(snapshot.visibleElements, 1);
+            assert.equal(snapshot.enabledElements, 0);
+          });
+
+          test("a replacement page is guarded before it is selected or inspected", async () => {
+            const chat = new DialogPage(`${entryUrl}/conversation/initial`);
+            const context = new DialogContext([chat]);
+            const tracked = new ContextSemanticPage(
+              context.asContext(),
+              selectionConfig,
+              chat.asPage(),
+              1_000,
+            );
+            const authentication = new DialogPage(
+              "https://login.microsoftonline.com/common/oauth2/authorize?step=signin",
+            );
+
+            context.addPage(authentication);
+            assert.equal(authentication.listenerCount("dialog"), 1);
+            authentication.emitDialog();
+            assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+            const snapshot = await tracked.snapshot(modalGroup);
+
+            assert.equal(snapshot.matchedCandidates, 1);
+            assert.equal(snapshot.visibleElements, 1);
+            assert.equal(snapshot.enabledElements, 0);
+          });
+          """), encoding="utf-8", newline="\n")
+      - run: npm ci --no-audit --no-fund
+      - run: npm run check
+      - name: Commit eager dialog-listener attachment
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/browser/context-semantic-page.ts src/browser/playwright-semantic-page.ts tests/unit/context-dialog-listener.test.ts
+          git rm .github/workflows/one-shot-eager-dialog-listener.yml
+          git commit -m "Attach native-dialog guards before page inspection"
+          git pull --rebase origin agent/fix-visible-copilot-readiness-stall
+          git push origin HEAD:agent/fix-visible-copilot-readiness-stall
