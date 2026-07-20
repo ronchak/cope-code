@@ -11,18 +11,34 @@ class UrlPage {
   public asPage(): Page { return this as unknown as Page; }
 }
 
+const selectionConfig = {
+  entryUrl: "https://m365.cloud.microsoft/chat",
+  approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
+  manualAuthenticationHosts: [{ hostname: "login.microsoftonline.com" }],
+} as const;
+
 test("a newer Microsoft authentication tab replaces the previously tracked auth page", () => {
   const older = new UrlPage("https://login.microsoftonline.com/common/oauth2/authorize?step=one");
   const newer = new UrlPage("https://login.microsoftonline.com/common/oauth2/authorize?step=two");
 
   const selected = selectActiveCopilotPage(
     [older.asPage(), newer.asPage()],
-    {
-      approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
-      manualAuthenticationHosts: [{ hostname: "login.microsoftonline.com" }],
-    },
+    selectionConfig,
     older.asPage(),
   );
 
   assert.equal(selected, newer.asPage());
+});
+
+test("an unrelated page on the approved host does not displace the configured chat surface", () => {
+  const unrelated = new UrlPage("https://m365.cloud.microsoft/search");
+  const chat = new UrlPage("https://m365.cloud.microsoft/chat/conversation/synthetic");
+
+  const selected = selectActiveCopilotPage(
+    [unrelated.asPage(), chat.asPage()],
+    selectionConfig,
+    unrelated.asPage(),
+  );
+
+  assert.equal(selected, chat.asPage());
 });
