@@ -175,10 +175,10 @@ function identityTextMatches(snapshot: GroupSnapshot, expected: string | TextPat
 }
 
 /**
- * Microsoft account buttons commonly render a display name in surname-first
- * order or wrap the configured email in additional account text. The locator is
- * already restricted to identity candidates; comparison tolerates those
- * presentation differences without accepting a different email address.
+ * Microsoft account controls commonly render a display name in surname-first
+ * order or wrap the configured email in additional account text. Matching is
+ * limited to complete email addresses or contiguous display-name token order,
+ * including the common last-name-first rotation.
  */
 function identityStringMatches(candidate: string, expected: string): boolean {
   const expectedComparable = expected.normalize("NFKC").trim().toLocaleLowerCase();
@@ -190,8 +190,13 @@ function identityStringMatches(candidate: string, expected: string): boolean {
   }
 
   const expectedTokens = identityTokens(expectedComparable);
-  const candidateTokens = new Set(identityTokens(candidateComparable));
-  return expectedTokens.length > 0 && expectedTokens.every((token) => candidateTokens.has(token));
+  const candidateTokens = identityTokens(candidateComparable);
+  if (expectedTokens.length === 0) return false;
+  const surnameFirst = expectedTokens.length < 2
+    ? expectedTokens
+    : [expectedTokens.at(-1)!, ...expectedTokens.slice(0, -1)];
+  return containsTokenSequence(candidateTokens, expectedTokens) ||
+    containsTokenSequence(candidateTokens, surnameFirst);
 }
 
 function extractEmailAddresses(value: string): readonly string[] {
@@ -206,6 +211,17 @@ function identityTokens(value: string): readonly string[] {
     .replace(/\p{M}/gu, "")
     .toLocaleLowerCase()
     .match(/[\p{L}\p{N}]+/gu) ?? [];
+}
+
+function containsTokenSequence(
+  candidate: readonly string[],
+  expected: readonly string[],
+): boolean {
+  if (expected.length === 0 || expected.length > candidate.length) return false;
+  for (let start = 0; start <= candidate.length - expected.length; start += 1) {
+    if (expected.every((token, offset) => candidate[start + offset] === token)) return true;
+  }
+  return false;
 }
 
 /**
