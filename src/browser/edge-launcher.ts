@@ -139,17 +139,10 @@ export class EdgeCopilotTransport implements ModelTransport {
       maxWaitMs ?? this.#readinessWaits.manualReadinessMs,
       signal,
       {
-        isTerminalInspection: (inspection) => {
-          const state = inspection.classification.state;
-          if (!isTerminalManualReadinessState(state)) return false;
-          if (state !== "unapproved-host") return true;
-          // A different allowlisted Microsoft authentication host is permitted
-          // to remain manual. An approved-host page outside the configured chat
-          // path is not an authentication redirect and must fail on the short
-          // stable quorum instead of consuming the ten-minute manual window.
-          return inspection.classification.diagnosticCode !== "HOST_NOT_APPROVED" ||
-            !this.#semanticPage.isManualAuthenticationRedirect();
-        },
+        isTerminalInspection: (inspection) => isTerminalEdgeReadinessInspection(
+          inspection,
+          this.#semanticPage.isManualAuthenticationRedirect(),
+        ),
       },
     );
   }
@@ -193,6 +186,24 @@ export class EdgeCopilotTransport implements ModelTransport {
       await this.#lock.release();
     }
   }
+}
+
+/**
+ * Only a host-level rejection on an explicitly allowlisted Microsoft
+ * authentication redirect may retain the long manual window. A page on the
+ * approved M365 host but outside the configured chat surface has a different
+ * diagnostic and remains a bounded failure even though that host also appears
+ * in the manual-authentication allowlist.
+ */
+export function isTerminalEdgeReadinessInspection(
+  inspection: BrowserStateInspection,
+  isManualAuthenticationRedirect: boolean,
+): boolean {
+  const state = inspection.classification.state;
+  if (!isTerminalManualReadinessState(state)) return false;
+  if (state !== "unapproved-host") return true;
+  return inspection.classification.diagnosticCode !== "HOST_NOT_APPROVED" ||
+    !isManualAuthenticationRedirect;
 }
 
 export async function launchDedicatedPersistentContext(
