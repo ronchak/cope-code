@@ -11,7 +11,7 @@ import { renderHumanError } from "../../src/cli/friendly-output.js";
 import { AgentError } from "../../src/shared/errors.js";
 
 const waits: BrowserWaitConfig = {
-  actionMs: 15_000,
+  actionMs: 1_000,
   submissionConfirmationMs: 12_000,
   responseMs: 180_000,
   manualReadinessMs: 5_000,
@@ -62,7 +62,7 @@ test("a transient identity miss does not abort visible Edge readiness", async ()
   assert.equal(now, waits.pollMs);
 });
 
-test("a persistent unsafe readiness state still fails closed after a stable quorum", async () => {
+test("a persistent identity mismatch still fails closed after the UI hydration window", async () => {
   let now = 0;
   let calls = 0;
   const blocked = inspection("identity-unverified", "IDENTITY_NOT_VERIFIED");
@@ -79,6 +79,27 @@ test("a persistent unsafe readiness state still fails closed after a stable quor
   );
 
   assert.equal(result.classification.state, "identity-unverified");
+  assert.equal(calls, 5);
+  assert.equal(now, waits.actionMs);
+});
+
+test("an unapproved non-authentication host still fails on the short stable quorum", async () => {
+  let now = 0;
+  let calls = 0;
+  const blocked = inspection("unapproved-host", "HOST_NOT_APPROVED");
+
+  const result = await waitForStableManualReadiness(
+    async () => { calls += 1; return blocked; },
+    waits,
+    waits.manualReadinessMs,
+    undefined,
+    {
+      monotonicNow: () => now,
+      sleep: async (milliseconds) => { now += milliseconds; },
+    },
+  );
+
+  assert.equal(result.classification.state, "unapproved-host");
   assert.equal(calls, 4);
   assert.equal(now, waits.minimumStableMs);
 });
