@@ -176,5 +176,14 @@ test("the baseline contract carries the current M365 locator revision and semant
   assert.equal(contract.version, "copilot-ui/v1:m365-2026-07");
   assert.equal(contract.groups.composer.candidates.some((candidate) => candidate.kind === "label"), true);
   assert.equal(contract.groups.composer.candidates.some((candidate) => candidate.kind === "css"), true);
-  assert.equal(contract.groups.identity.candidates.length >= 4, true);
+  assert.deepEqual(
+    contract.groups.identity.candidates.map((candidate) =>
+      candidate.kind === "role" ? candidate.role : candidate.kind),
+    ["button", "button"],
+  );
+  assert.equal(
+    contract.groups.identity.candidates.some((candidate) =>
+      candidate.kind === "role" && candidate.role === "link"),
+    false,
+  );
 });
