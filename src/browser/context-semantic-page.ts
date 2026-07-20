@@ -18,9 +18,9 @@ export interface CopilotPageSelectionConfig {
 }
 
 /**
- * Tracks the page that currently owns the approved Copilot or Microsoft manual
- * authentication surface. Microsoft may replace the original navigation tab;
- * the adapter must not remain pinned to a stale about:blank page.
+ * Tracks the page that currently owns the configured Copilot or Microsoft
+ * manual-authentication surface. Microsoft may replace the original navigation
+ * tab; the adapter must not remain pinned to a stale about:blank page.
  */
 export class ContextSemanticPage implements SemanticPage {
   readonly #context: BrowserContext;
@@ -60,7 +60,7 @@ export class ContextSemanticPage implements SemanticPage {
   }
 
   public isManualAuthenticationRedirect(): boolean {
-    return isManualAuthenticationUrl(this.#activePage.url(), this.#config);
+    return isPotentialManualAuthenticationUrl(this.#activePage.url(), this.#config);
   }
 
   public async currentUrl(): Promise<string> {
@@ -105,7 +105,7 @@ export class ContextSemanticPage implements SemanticPage {
 /**
  * Prefer the unique configured Copilot page, not merely any page on the same
  * approved host. While authentication is in progress, select the newest
- * approved Microsoft authentication page so a popup or replacement tab cannot
+ * allowed Microsoft authentication page so a popup or replacement tab cannot
  * leave the adapter pinned to an older sign-in surface.
  */
 export function selectActiveCopilotPage(
@@ -124,7 +124,7 @@ export function selectActiveCopilotPage(
   if (approved.length === 1) return approved[0]!;
 
   const authentication = openPages.filter((page) =>
-    isManualAuthenticationUrl(page.url(), config));
+    isPotentialManualAuthenticationUrl(page.url(), config));
   const newestAuthentication = authentication.at(-1);
   if (newestAuthentication !== undefined) return newestAuthentication;
 
@@ -137,10 +137,11 @@ export function selectActiveCopilotPage(
 }
 
 /**
- * Reuse an existing configured Copilot or in-progress Microsoft authentication
- * page. Otherwise create a fresh tab, navigate it explicitly, and bring the
- * tracked result to the foreground. Arbitrary startup blank tabs and unrelated
- * pages on the approved host are never selected as navigation targets.
+ * Reuse an existing configured Copilot page or an external Microsoft
+ * authentication page. Otherwise create a fresh tab and navigate it explicitly.
+ * An unrelated same-host page is never mistaken for an existing auth session at
+ * launch, but a same-host auth transition that appears after navigation begins
+ * can still be followed and must present explicit auth evidence to the classifier.
  */
 export async function openTrackedCopilotPage(
   context: BrowserContext,
@@ -159,7 +160,7 @@ export async function openTrackedCopilotPage(
   let initial = approved[0];
   if (initial === undefined) {
     const authentication = existing.filter((page) =>
-      !page.isClosed() && isManualAuthenticationUrl(page.url(), config));
+      !page.isClosed() && isReusableExternalAuthenticationUrl(page.url(), config));
     initial = authentication.at(-1);
   }
 
@@ -168,13 +169,33 @@ export async function openTrackedCopilotPage(
     initial.setDefaultTimeout(config.waits.actionMs);
     initial.setDefaultNavigationTimeout(config.waits.actionMs);
     await initial.bringToFront().catch(() => undefined);
+    const navigationDeadline = performance.now() + config.waits.actionMs;
+    let navigationError: unknown;
     try {
       await initial.goto(config.entryUrl, {
         waitUntil: "domcontentloaded",
         timeout: config.waits.actionMs,
       });
     } catch (error) {
-      if (!await waitForAllowedReplacementPage(context, config)) throw error;
+      navigationError = error;
+    }
+    if (!hasAllowedPage(context, config)) {
+      const replacementFound = await waitForAllowedReplacementPage(
+        context,
+        config,
+        navigationDeadline,
+      );
+      if (!replacementFound) {
+        if (navigationError !== undefined) throw navigationError;
+        throw new AgentError(
+          "TRANSPORT_UNAVAILABLE",
+          "The dedicated Edge session did not open the configured Copilot surface",
+          {
+            diagnosticCode: "EDGE_NAVIGATION_NO_ALLOWED_PAGE",
+            next: "Close the dedicated Edge window, run cope setup --force, and retry.",
+          },
+        );
+      }
     }
   }
 
@@ -201,11 +222,26 @@ function isConfiguredCopilotUrl(value: string, entryValue: string): boolean {
   }
 }
 
-function isManualAuthenticationUrl(
+/**
+ * Manual authentication can occur on a separate Microsoft host or on a path
+ * outside the configured chat surface on the same host. Selection is safe
+ * because the classifier still requires explicit sign-in, MFA, or consent
+ * evidence before granting the long manual window.
+ */
+function isPotentialManualAuthenticationUrl(
   value: string,
   config: CopilotPageSelectionConfig,
 ): boolean {
   return isApprovedUrl(value, config.manualAuthenticationHosts ?? []) &&
+    !isConfiguredCopilotUrl(value, config.entryUrl);
+}
+
+/** At launch, do not reuse arbitrary pages on the configured host as auth pages. */
+function isReusableExternalAuthenticationUrl(
+  value: string,
+  config: CopilotPageSelectionConfig,
+): boolean {
+  return isPotentialManualAuthenticationUrl(value, config) &&
     !isApprovedUrl(value, config.approvedHosts);
 }
 
@@ -214,19 +250,21 @@ function normalizedPath(value: string): string {
   return withoutTrailingSlash === "" ? "/" : withoutTrailingSlash;
 }
 
+function hasAllowedPage(context: BrowserContext, config: EdgeLaunchConfig): boolean {
+  return context.pages().some((page) =>
+    !page.isClosed() && (
+      isConfiguredCopilotUrl(page.url(), config.entryUrl) ||
+      isPotentialManualAuthenticationUrl(page.url(), config)
+    ));
+}
+
 async function waitForAllowedReplacementPage(
   context: BrowserContext,
   config: EdgeLaunchConfig,
+  deadline: number,
 ): Promise<boolean> {
-  const deadline = performance.now() + config.waits.actionMs;
   for (;;) {
-    if (context.pages().some((page) =>
-      !page.isClosed() && (
-        isConfiguredCopilotUrl(page.url(), config.entryUrl) ||
-        isManualAuthenticationUrl(page.url(), config)
-      ))) {
-      return true;
-    }
+    if (hasAllowedPage(context, config)) return true;
     const remaining = deadline - performance.now();
     if (remaining <= 0) return false;
     await delay(Math.min(config.waits.pollMs, remaining));
