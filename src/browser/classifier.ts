@@ -89,13 +89,29 @@ export function classifyCopilotPage(
     return result("unapproved-host", false, "COPILOT_SURFACE_NOT_APPROVED");
   }
 
-  if (matches(observation, contract, "mfa")) {
+  const shell = matches(observation, contract, "shell");
+  const conversation = matches(observation, contract, "conversation");
+  const composer = matches(observation, contract, "composer");
+  const actionableComposer = groupActionable(
+    observation.composer,
+    contract.groups.composer.minimumCandidateMatches,
+  );
+  const identity = matches(observation, contract, "identity");
+  const expectedIdentity = identity && identityTextMatches(observation.identity, requirements.expectedIdentity);
+  const protection = matches(observation, contract, "protection");
+  const modal = matches(observation, contract, "modal");
+
+  // On an already actionable configured chat, manual-authentication phrases or
+  // links can be ordinary conversation content. They only override that surface
+  // when the composer is not actionable or a real blocking dialog is visible.
+  const manualEvidenceCanOverride = !withinConfiguredSurface || !actionableComposer || modal;
+  if (manualEvidenceCanOverride && matches(observation, contract, "mfa")) {
     return result("mfa-required", true, "MANUAL_MFA_REQUIRED");
   }
-  if (matches(observation, contract, "consent")) {
+  if (manualEvidenceCanOverride && matches(observation, contract, "consent")) {
     return result("consent-required", true, "MANUAL_CONSENT_REQUIRED");
   }
-  if (matches(observation, contract, "signed-out")) {
+  if (manualEvidenceCanOverride && matches(observation, contract, "signed-out")) {
     return result("sign-in-required", true, "MANUAL_SIGN_IN_REQUIRED");
   }
 
@@ -112,20 +128,9 @@ export function classifyCopilotPage(
   if (matches(observation, contract, "service-error")) {
     return result("service-error", true, "COPILOT_SERVICE_ERROR");
   }
-  if (matches(observation, contract, "modal")) {
+  if (modal) {
     return result("blocking-modal", false, "UNEXPECTED_BLOCKING_MODAL");
   }
-
-  const shell = matches(observation, contract, "shell");
-  const conversation = matches(observation, contract, "conversation");
-  const composer = matches(observation, contract, "composer");
-  const actionableComposer = groupActionable(
-    observation.composer,
-    contract.groups.composer.minimumCandidateMatches,
-  );
-  const identity = matches(observation, contract, "identity");
-  const expectedIdentity = identity && identityTextMatches(observation.identity, requirements.expectedIdentity);
-  const protection = matches(observation, contract, "protection");
 
   if (
     conversation &&
