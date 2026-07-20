@@ -96,6 +96,10 @@ export function classifyCopilotPage(
   const shell = matches(observation, contract, "shell");
   const conversation = matches(observation, contract, "conversation");
   const composer = matches(observation, contract, "composer");
+  const actionableComposer = groupActionable(
+    observation.composer,
+    contract.groups.composer.minimumCandidateMatches,
+  );
   const identity = matches(observation, contract, "identity");
   const expectedIdentity = identity && identityTextMatches(observation.identity, requirements.expectedIdentity);
   const protection = matches(observation, contract, "protection");
@@ -111,16 +115,21 @@ export function classifyCopilotPage(
 
   if (
     conversation &&
-    composer &&
+    actionableComposer &&
     expectedIdentity &&
     (!requirements.requireProtectionIndicator || protection)
   ) {
     return result("ready", true, "READY");
   }
-  if (conversation && composer && !expectedIdentity) {
+  if (conversation && actionableComposer && !expectedIdentity) {
     return result("identity-unverified", false, "IDENTITY_NOT_VERIFIED");
   }
-  if (conversation && composer && requirements.requireProtectionIndicator && !protection) {
+  if (
+    conversation &&
+    actionableComposer &&
+    requirements.requireProtectionIndicator &&
+    !protection
+  ) {
     return result("protection-unverified", false, "PROTECTION_NOT_VERIFIED");
   }
   if (shell || conversation || composer || identity || protection) {
@@ -135,6 +144,10 @@ export function groupMatches(snapshot: GroupSnapshot, minimumCandidateMatches: n
   );
 }
 
+function groupActionable(snapshot: GroupSnapshot, minimumCandidateMatches: number): boolean {
+  return snapshot.matchedCandidates >= minimumCandidateMatches && snapshot.enabledElements > 0;
+}
+
 function matches(
   observation: CopilotPageObservation,
   contract: CopilotUiContract,
@@ -144,10 +157,45 @@ function matches(
 }
 
 function identityTextMatches(snapshot: GroupSnapshot, expected: string | TextPattern): boolean {
+  if (typeof expected !== "string") {
+    return snapshot.elements.some(
+      (element) =>
+        matchesText(expected, element.text) || matchesText(expected, element.accessibleLabel),
+    );
+  }
   return snapshot.elements.some(
     (element) =>
-      matchesText(expected, element.text) || matchesText(expected, element.accessibleLabel),
+      identityStringMatches(element.text, expected) ||
+      identityStringMatches(element.accessibleLabel, expected),
   );
+}
+
+/**
+ * Microsoft account buttons commonly render a display name in surname-first
+ * order or wrap the configured email in additional account text. The locator is
+ * already restricted to account/profile controls; comparison here tolerates
+ * those presentation differences without accepting a different identity.
+ */
+function identityStringMatches(candidate: string, expected: string): boolean {
+  const expectedComparable = expected.normalize("NFKC").trim().toLocaleLowerCase();
+  const candidateComparable = candidate.normalize("NFKC").trim().toLocaleLowerCase();
+  if (expectedComparable === "" || candidateComparable === "") return false;
+
+  if (expectedComparable.includes("@")) {
+    return candidateComparable === expectedComparable || candidateComparable.includes(expectedComparable);
+  }
+
+  const expectedTokens = identityTokens(expectedComparable);
+  const candidateTokens = new Set(identityTokens(candidateComparable));
+  return expectedTokens.length > 0 && expectedTokens.every((token) => candidateTokens.has(token));
+}
+
+function identityTokens(value: string): readonly string[] {
+  return value
+    .normalize("NFKD")
+    .replace(/\p{M}/gu, "")
+    .toLocaleLowerCase()
+    .match(/[\p{L}\p{N}]+/gu) ?? [];
 }
 
 function result(
