@@ -1,4 +1,4 @@
-COPE 0.1.1 FOR WINDOWS
+COPE 0.1.2 FOR WINDOWS
 ======================
 
 FIRST INSTALL
