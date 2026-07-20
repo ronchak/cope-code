@@ -1,3 +1,5 @@
+import { setTimeout as delay } from "node:timers/promises";
+
 import type { BrowserContext, Page } from "playwright-core";
 
 import { AgentError } from "../shared/errors.js";
@@ -174,12 +176,7 @@ export async function openTrackedCopilotPage(
         timeout: config.waits.actionMs,
       });
     } catch (error) {
-      const replacementExists = context.pages().some((page) =>
-        !page.isClosed() && (
-          isApprovedUrl(page.url(), config.approvedHosts) ||
-          isApprovedUrl(page.url(), config.manualAuthenticationHosts ?? [])
-        ));
-      if (!replacementExists) throw error;
+      if (!await waitForAllowedReplacementPage(context, config)) throw error;
     }
   }
 
@@ -191,4 +188,23 @@ export async function openTrackedCopilotPage(
   );
   await tracked.focusActivePage(true);
   return tracked;
+}
+
+async function waitForAllowedReplacementPage(
+  context: BrowserContext,
+  config: EdgeLaunchConfig,
+): Promise<boolean> {
+  const deadline = performance.now() + config.waits.actionMs;
+  for (;;) {
+    if (context.pages().some((page) =>
+      !page.isClosed() && (
+        isApprovedUrl(page.url(), config.approvedHosts) ||
+        isApprovedUrl(page.url(), config.manualAuthenticationHosts ?? [])
+      ))) {
+      return true;
+    }
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) return false;
+    await delay(Math.min(config.waits.pollMs, remaining));
+  }
 }
