@@ -173,8 +173,8 @@ function identityTextMatches(snapshot: GroupSnapshot, expected: string | TextPat
 /**
  * Microsoft account buttons commonly render a display name in surname-first
  * order or wrap the configured email in additional account text. The locator is
- * already restricted to account/profile controls; comparison here tolerates
- * those presentation differences without accepting a different identity.
+ * already restricted to identity candidates; comparison tolerates those
+ * presentation differences without accepting a different email address.
  */
 function identityStringMatches(candidate: string, expected: string): boolean {
   const expectedComparable = expected.normalize("NFKC").trim().toLocaleLowerCase();
@@ -182,12 +182,18 @@ function identityStringMatches(candidate: string, expected: string): boolean {
   if (expectedComparable === "" || candidateComparable === "") return false;
 
   if (expectedComparable.includes("@")) {
-    return candidateComparable === expectedComparable || candidateComparable.includes(expectedComparable);
+    return extractEmailAddresses(candidateComparable).includes(expectedComparable);
   }
 
   const expectedTokens = identityTokens(expectedComparable);
   const candidateTokens = new Set(identityTokens(candidateComparable));
   return expectedTokens.length > 0 && expectedTokens.every((token) => candidateTokens.has(token));
+}
+
+function extractEmailAddresses(value: string): readonly string[] {
+  return value.match(
+    /[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+/giu,
+  )?.map((entry) => entry.toLocaleLowerCase()) ?? [];
 }
 
 function identityTokens(value: string): readonly string[] {
