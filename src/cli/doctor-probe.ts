@@ -66,6 +66,13 @@ export async function probeNpmVersion(
       stderr: "npm CLI could not be located in the active Node.js installation",
     };
   }
+  if (!isNpmCliEntryPoint(npmCli)) {
+    return {
+      exitCode: null,
+      stdout: "",
+      stderr: "Resolved package-manager entrypoint is not npm/bin/npm-cli.js",
+    };
+  }
   const result = await runDoctorProbe(
     dependencies.runProbe ?? runHostProbe,
     process.execPath,
@@ -79,7 +86,6 @@ export async function probeNpmVersion(
 export async function resolveNpmCliForCurrentRuntime(): Promise<string | undefined> {
   const executableDirectory = path.dirname(process.execPath);
   const candidates = unique([
-    process.env.npm_execpath,
     path.join(executableDirectory, "node_modules", "npm", "bin", "npm-cli.js"),
     path.resolve(executableDirectory, "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
     process.env.ProgramFiles === undefined
@@ -97,6 +103,7 @@ export async function resolveNpmCliForCurrentRuntime(): Promise<string | undefin
   ].filter((candidate): candidate is string => candidate !== undefined && candidate.length > 0));
 
   for (const candidate of candidates) {
+    if (!isNpmCliEntryPoint(candidate)) continue;
     try {
       await access(candidate, constants.F_OK);
       return path.resolve(candidate);
@@ -105,6 +112,17 @@ export async function resolveNpmCliForCurrentRuntime(): Promise<string | undefin
     }
   }
   return undefined;
+}
+
+export function isNpmCliEntryPoint(candidate: string): boolean {
+  const parts = candidate
+    .replaceAll("\\", "/")
+    .split("/")
+    .filter((part) => part.length > 0)
+    .map((part) => part.toLowerCase());
+  return parts.at(-1) === "npm-cli.js" &&
+    parts.at(-2) === "bin" &&
+    parts.at(-3) === "npm";
 }
 
 function unique(values: readonly string[]): readonly string[] {
