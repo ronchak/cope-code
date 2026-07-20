@@ -73,7 +73,6 @@ test("broad Office and M365 allowlist entries are not reusable authentication pa
     "https://m365copilot.com/",
     "https://office.com/",
     "https://www.office.com/",
-    "https://login.microsoftonline.com/",
   ]) {
     assert.equal(
       isGenuineManualAuthenticationUrl(value, selectionConfig),
@@ -83,8 +82,9 @@ test("broad Office and M365 allowlist entries are not reusable authentication pa
   }
 });
 
-test("OAuth query or authentication path evidence qualifies an allowlisted Microsoft redirect", () => {
+test("dedicated login hosts or explicit auth evidence qualify an allowlisted Microsoft redirect", () => {
   for (const value of [
+    "https://login.microsoftonline.com/",
     "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=synthetic",
     "https://login.live.com/oauth20_authorize.srf?client_id=synthetic",
     "https://office.com/auth/continue?state=synthetic",
