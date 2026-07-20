@@ -104,8 +104,9 @@ export class ContextSemanticPage implements SemanticPage {
 
 /**
  * Prefer the unique approved Copilot page. While authentication is in progress,
- * retain the current approved Microsoft auth page or select the newest one. A
- * second approved Copilot page is ambiguous and remains a hard stop.
+ * select the newest approved Microsoft authentication page so a popup or
+ * replacement tab cannot leave the adapter pinned to an older sign-in surface.
+ * A second approved Copilot page is ambiguous and remains a hard stop.
  */
 export function selectActiveCopilotPage(
   pages: readonly Page[],
@@ -124,7 +125,6 @@ export function selectActiveCopilotPage(
 
   const authentication = openPages.filter((page) =>
     isApprovedUrl(page.url(), config.manualAuthenticationHosts ?? []));
-  if (preferred !== undefined && authentication.includes(preferred)) return preferred;
   const newestAuthentication = authentication.at(-1);
   if (newestAuthentication !== undefined) return newestAuthentication;
 
