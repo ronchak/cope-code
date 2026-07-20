@@ -35,14 +35,15 @@ export class ContextSemanticPage implements SemanticPage {
     this.#activePage = initialPage;
   }
 
-  public async focusActivePage(): Promise<Page> {
+  public async focusActivePage(force = false): Promise<Page> {
     const selected = selectActiveCopilotPage(
       this.#context.pages(),
       this.#config,
       this.#activePage,
     );
+    const changed = selected !== this.#activePage;
     this.#activePage = selected;
-    await selected.bringToFront().catch(() => undefined);
+    if (force || changed) await selected.bringToFront().catch(() => undefined);
     return selected;
   }
 
@@ -171,6 +172,6 @@ export async function openTrackedCopilotPage(
     page.setDefaultNavigationTimeout(config.waits.actionMs);
   }
   const tracked = new ContextSemanticPage(context, config, initial);
-  await tracked.focusActivePage();
+  await tracked.focusActivePage(true);
   return tracked;
 }
