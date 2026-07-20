@@ -154,8 +154,6 @@ export function createBaselineCopilotUiContract(
       [
         { kind: "role", role: "button", name: expectedIdentity },
         { kind: "role", role: "button", name: flexibleIdentity },
-        { kind: "role", role: "link", name: expectedIdentity },
-        { kind: "role", role: "link", name: flexibleIdentity },
       ],
       "text",
       50,
