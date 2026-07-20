@@ -13,8 +13,8 @@ export interface ManualReadinessDependencies {
  * Browser pages often expose only part of the certified surface while the app
  * hydrates. Continuous non-manual states receive one bounded hydration period,
  * even if their diagnostic classification changes while the page is unstable.
- * Only states that genuinely require the operator to sign in, complete MFA, or
- * grant consent may consume the full manual-readiness window.
+ * States that require operator action, including sign-in, MFA, consent, or a
+ * visible blocking dialog, may consume the full manual-readiness window.
  */
 export async function waitForStableManualReadiness(
   observe: (maxWaitMs: number, signal?: AbortSignal) => Promise<BrowserStateInspection>,
@@ -39,6 +39,9 @@ export async function waitForStableManualReadiness(
   let stableKey: string | undefined;
   let stableKeySince = 0;
   let stableKeySamples = 0;
+  let unsafePeriodSince = 0;
+  let unsafeSamples = 0;
+  let lastUnsafeInspection: BrowserStateInspection | undefined;
 
   for (;;) {
     const beforeObservation = monotonicNow();
@@ -50,7 +53,27 @@ export async function waitForStableManualReadiness(
     if (inspection.classification.state === "ready") return inspection;
 
     const observedAt = monotonicNow();
-    if (isTerminalInspection(inspection)) {
+    const terminalInspection = isTerminalInspection(inspection);
+    const hydrationMs = Math.min(
+      Math.max(waits.minimumStableMs, waits.actionMs),
+      maxWaitMs,
+    );
+
+    // A visible dialog may legitimately need operator action, but it must not
+    // let a repeatedly observed hostile host evade the bounded unsafe window.
+    if (terminalInspection && isImmediatelyUnsafe(inspection.classification.state)) {
+      if (unsafeSamples === 0) unsafePeriodSince = observedAt;
+      unsafeSamples += 1;
+      lastUnsafeInspection = inspection;
+    }
+    if (
+      unsafeSamples >= waits.stableSamples &&
+      observedAt - unsafePeriodSince >= hydrationMs
+    ) {
+      return lastUnsafeInspection ?? inspection;
+    }
+
+    if (terminalInspection) {
       if (terminalPeriodSamples === 0) terminalPeriodSince = observedAt;
       terminalPeriodSamples += 1;
 
@@ -74,12 +97,8 @@ export async function waitForStableManualReadiness(
       }
 
       // The action-bound fallback applies to every continuous non-manual
-      // period, including hostile states that alternate and therefore never
-      // satisfy the same-diagnostic short quorum.
-      const hydrationMs = Math.min(
-        Math.max(waits.minimumStableMs, waits.actionMs),
-        maxWaitMs,
-      );
+      // period, including states that alternate and therefore never satisfy the
+      // same-diagnostic short quorum.
       if (
         terminalPeriodSamples >= waits.stableSamples &&
         observedAt - terminalPeriodSince >= hydrationMs
@@ -106,9 +125,9 @@ export async function waitForStableManualReadiness(
 }
 
 /**
- * Only explicit manual-authentication states remain open-ended. Every other
- * non-ready state must either recover during its bounded hydration window or
- * return a diagnostic instead of leaving the terminal apparently hung.
+ * Explicit authentication states and visible blocking dialogs remain open for
+ * operator action. Every other non-ready state must recover during its bounded
+ * hydration window or return a diagnostic instead of appearing hung.
  */
 export function isTerminalManualReadinessState(
   state: BrowserStateInspection["classification"]["state"],
@@ -116,13 +135,14 @@ export function isTerminalManualReadinessState(
   return state !== "ready" &&
     state !== "sign-in-required" &&
     state !== "mfa-required" &&
-    state !== "consent-required";
+    state !== "consent-required" &&
+    state !== "blocking-modal";
 }
 
 function isImmediatelyUnsafe(
   state: BrowserStateInspection["classification"]["state"],
 ): boolean {
-  return state === "unapproved-host" || state === "blocking-modal";
+  return state === "unapproved-host";
 }
 
 async function sleepWithAbort(milliseconds: number, signal?: AbortSignal): Promise<void> {
