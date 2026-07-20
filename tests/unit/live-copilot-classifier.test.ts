@@ -84,6 +84,23 @@ test("surname-first Microsoft account text verifies the configured display name"
   assert.equal(classification.state, "ready");
 });
 
+test("surname-first matching preserves first and middle name order", async () => {
+  const expectedIdentity = "Ronak Kumar Chakraborty";
+  const contract = createBaselineCopilotUiContract(expectedIdentity);
+  const observation = await observeCopilotPage(
+    new LiveShapePage("Chakraborty, Ronak Kumar"),
+    contract,
+  );
+
+  const classification = classifyCopilotPage(
+    observation,
+    contract,
+    requirements(expectedIdentity),
+  );
+
+  assert.equal(classification.state, "ready");
+});
+
 test("an email wrapped in account-button text still verifies the exact configured address", async () => {
   const expectedIdentity = "ronak@example.com";
   const contract = createBaselineCopilotUiContract(expectedIdentity);
@@ -118,11 +135,11 @@ test("an address that merely contains the configured email is rejected", async (
   assert.equal(classification.state, "identity-unverified");
 });
 
-test("identity token matching does not accept a different visible account", async () => {
+test("identity token matching rejects extra name tokens between expected tokens", async () => {
   const expectedIdentity = "Ronak Chakraborty";
   const contract = createBaselineCopilotUiContract(expectedIdentity);
   const observation = await observeCopilotPage(
-    new LiveShapePage("Ronak Other"),
+    new LiveShapePage("Ronak Other Chakraborty"),
     contract,
   );
 
