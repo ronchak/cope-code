@@ -3,6 +3,7 @@ import test from "node:test";
 
 import type { BrowserStateInspection } from "../../src/browser/copilot-browser-adapter.js";
 import { browserReadinessGuidance } from "../../src/browser/diagnostics.js";
+import { isTerminalEdgeReadinessInspection } from "../../src/browser/edge-launcher.js";
 import {
   isTerminalManualReadinessState,
   waitForStableManualReadiness,
@@ -131,6 +132,37 @@ test("an approved manual-authentication redirect can return to Copilot", async (
   assert.equal(result.classification.state, "ready");
   assert.equal(calls, 3);
   assert.equal(now, waits.pollMs * 2);
+});
+
+test("only a host-level Microsoft authentication redirect receives the long manual window", () => {
+  assert.equal(
+    isTerminalEdgeReadinessInspection(
+      inspection("unapproved-host", "HOST_NOT_APPROVED"),
+      true,
+    ),
+    false,
+  );
+  assert.equal(
+    isTerminalEdgeReadinessInspection(
+      inspection("unapproved-host", "HOST_NOT_APPROVED"),
+      false,
+    ),
+    true,
+  );
+  assert.equal(
+    isTerminalEdgeReadinessInspection(
+      inspection("unapproved-host", "COPILOT_SURFACE_NOT_APPROVED"),
+      true,
+    ),
+    true,
+  );
+  assert.equal(
+    isTerminalEdgeReadinessInspection(
+      inspection("sign-in-required", "MANUAL_SIGN_IN_REQUIRED"),
+      false,
+    ),
+    false,
+  );
 });
 
 test("a transient unknown page can hydrate into the certified Copilot surface", async () => {
