@@ -5,6 +5,7 @@ import type { BrowserContext, Page, Response } from "playwright-core";
 
 import {
   ContextSemanticPage,
+  isGenuineManualAuthenticationUrl,
   openTrackedCopilotPage,
   selectActiveCopilotPage,
 } from "../../src/browser/context-semantic-page.js";
@@ -127,6 +128,27 @@ test("a resolved navigation that remains about:blank fails within the action bou
   assert.ok(elapsed < 500, `blank-page failure exceeded its bound: ${String(elapsed)} ms`);
 });
 
+test("an unrelated pre-existing Office tab cannot satisfy replacement-page discovery", async () => {
+  const officeRoot = new FakePage("https://www.office.com/");
+  const context = new FakeContext([officeRoot]);
+  const navigationPage = new FakePage("about:blank");
+  navigationPage.onGoto = async () => null;
+  context.nextPage = navigationPage;
+  const config = browserConfig({
+    actionMs: 40,
+    pollMs: 5,
+    minimumStableMs: 10,
+  });
+
+  await assert.rejects(
+    openTrackedCopilotPage(context.asContext(), config),
+    (error: unknown) =>
+      error instanceof AgentError &&
+      error.details.diagnosticCode === "EDGE_NAVIGATION_NO_ALLOWED_PAGE",
+  );
+  assert.equal(officeRoot.frontCount, 0);
+});
+
 test("tracked semantic page moves from Microsoft authentication to the returned Copilot tab", async () => {
   const authentication = new FakePage(authUrl);
   const context = new FakeContext([authentication]);
@@ -149,6 +171,31 @@ test("tracked semantic page moves from Microsoft authentication to the returned 
   assert.ok(approved.frontCount >= 1);
   assert.equal(approved.defaultTimeout, config.waits.actionMs);
   assert.equal(approved.defaultNavigationTimeout, config.waits.actionMs);
+});
+
+test("broad Office hosts require genuine authentication evidence", () => {
+  const config = browserConfig();
+
+  assert.equal(isGenuineManualAuthenticationUrl("https://www.office.com/", config), false);
+  assert.equal(
+    isGenuineManualAuthenticationUrl("https://m365.cloud.microsoft/search?state=opaque", config),
+    false,
+  );
+  assert.equal(
+    isGenuineManualAuthenticationUrl("https://www.office.com/?state=opaque&prompt=login", config),
+    false,
+  );
+  assert.equal(
+    isGenuineManualAuthenticationUrl(
+      "https://www.office.com/oauth2/authorize?client_id=client&state=opaque",
+      config,
+    ),
+    true,
+  );
+  assert.equal(
+    isGenuineManualAuthenticationUrl("https://login.microsoftonline.com/", config),
+    true,
+  );
 });
 
 test("same-host pages outside the chat path do not inherit the long URL-only auth window", async () => {
@@ -193,6 +240,8 @@ function browserConfig(
     manualAuthenticationHosts: [
       { hostname: "login.microsoftonline.com" },
       { hostname: "m365.cloud.microsoft" },
+      { hostname: "office.com" },
+      { hostname: "www.office.com" },
     ],
     uiContract: createBaselineCopilotUiContract(expectedIdentity),
     expectedIdentity,
