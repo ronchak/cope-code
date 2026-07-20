@@ -6,6 +6,7 @@ import test from "node:test";
 
 import { executeDoctorCommand } from "../../src/cli/doctor.js";
 import {
+  isNpmCliEntryPoint,
   probeNpmVersion,
   runDoctorProbe,
 } from "../../src/cli/doctor-probe.js";
@@ -34,6 +35,26 @@ test("doctor runs npm's JavaScript CLI through Node instead of spawning npm.cmd"
   assert.equal(observedWindowsHide, true);
   assert.equal(result.exitCode, 0);
   assert.equal(result.stdout, "11.13.0\n");
+});
+
+test("doctor never mistakes pnpm, Yarn, or a generic Corepack shim for npm", async () => {
+  assert.equal(isNpmCliEntryPoint("C:\\corepack\\pnpm.cjs"), false);
+  assert.equal(isNpmCliEntryPoint("C:\\corepack\\yarn.js"), false);
+  assert.equal(isNpmCliEntryPoint("C:\\tools\\npm-cli.js"), false);
+  assert.equal(isNpmCliEntryPoint("C:\\nodejs\\node_modules\\npm\\bin\\npm-cli.js"), true);
+
+  let invoked = false;
+  const result = await probeNpmVersion(host, "C:\\repo", {
+    resolveNpmCli: async () => "C:\\corepack\\pnpm.cjs",
+    runProbe: async () => {
+      invoked = true;
+      return { exitCode: 0, stdout: "10.0.0\n", stderr: "" };
+    },
+  });
+
+  assert.equal(invoked, false);
+  assert.equal(result.exitCode, null);
+  assert.match(result.stderr, /not npm\/bin\/npm-cli\.js/u);
 });
 
 test("doctor converts spawn failures into failed probe results", async () => {
