@@ -27,6 +27,7 @@ class LiveShapePage implements SemanticPage {
   public constructor(
     private readonly identityText: string,
     private readonly composerEnabled = true,
+    private readonly extraSignals: ReadonlySet<CopilotSignal> = new Set(),
   ) {}
 
   public async currentUrl(): Promise<string> {
@@ -34,7 +35,7 @@ class LiveShapePage implements SemanticPage {
   }
 
   public async snapshot(group: LocatorGroup): Promise<GroupSnapshot> {
-    const visible = readySignals.has(group.signal);
+    const visible = readySignals.has(group.signal) || this.extraSignals.has(group.signal);
     const enabled = visible && (group.signal !== "composer" || this.composerEnabled);
     return {
       signal: group.signal,
@@ -168,6 +169,48 @@ test("a visible but disabled composer never qualifies the page as ready", async 
 
   assert.equal(classification.state, "changed-selector");
   assert.equal(classification.diagnosticCode, "UI_CONTRACT_QUORUM_FAILED");
+});
+
+test("incidental auth evidence in conversation content cannot override an actionable chat", async () => {
+  const expectedIdentity = "Ronak Chakraborty";
+  const contract = createBaselineCopilotUiContract(expectedIdentity);
+  const observation = await observeCopilotPage(
+    new LiveShapePage(
+      expectedIdentity,
+      true,
+      new Set<CopilotSignal>(["signed-out", "mfa", "consent"]),
+    ),
+    contract,
+  );
+
+  const classification = classifyCopilotPage(
+    observation,
+    contract,
+    requirements(expectedIdentity),
+  );
+
+  assert.equal(classification.state, "ready");
+});
+
+test("manual auth evidence still blocks a configured chat without an actionable composer", async () => {
+  const expectedIdentity = "Ronak Chakraborty";
+  const contract = createBaselineCopilotUiContract(expectedIdentity);
+  const observation = await observeCopilotPage(
+    new LiveShapePage(
+      expectedIdentity,
+      false,
+      new Set<CopilotSignal>(["mfa"]),
+    ),
+    contract,
+  );
+
+  const classification = classifyCopilotPage(
+    observation,
+    contract,
+    requirements(expectedIdentity),
+  );
+
+  assert.equal(classification.state, "mfa-required");
 });
 
 test("the baseline contract carries the current M365 locator revision and semantic fallbacks", () => {
