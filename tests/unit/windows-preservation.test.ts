@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
@@ -15,7 +16,7 @@ const WINDOWS_BASELINE_HASHES = {
 
 test("frozen Windows install and uninstall surfaces remain byte-identical", async () => {
   for (const [filename, expected] of Object.entries(WINDOWS_BASELINE_HASHES)) {
-    const bytes = await readFile(path.resolve(filename));
+    const bytes = gitBlobBytes(filename);
     assert.equal(createHash("sha256").update(bytes).digest("hex"), expected, filename);
   }
 });
@@ -38,4 +39,14 @@ async function sourceFiles(directory: string): Promise<string[]> {
     else if (entry.isFile() && filename.endsWith(".ts")) files.push(filename);
   }
   return files;
+}
+
+function gitBlobBytes(filename: string): Buffer {
+  const result = spawnSync("git", ["show", `HEAD:${filename}`], {
+    cwd: path.resolve("."),
+    encoding: "buffer",
+    maxBuffer: 1024 * 1024,
+  });
+  assert.equal(result.status, 0, `Unable to hash ${filename} from Git: ${result.stderr.toString("utf8")}`);
+  return Buffer.from(result.stdout);
 }

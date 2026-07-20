@@ -258,7 +258,8 @@ test("process runner uses no shell, a controlled environment/cwd, bounded output
   });
   assert.equal(outcome.outcome, "success");
   assert.equal(outcome.stdout.includes(literal), true);
-  assert.equal(outcome.stdout.includes(root), true);
+  const observedCwd = outcome.stdout.split(/\r?\n/u)[1] ?? "";
+  assert.equal(normalizePath(observedCwd), normalizePath(root));
   assert.equal(outcome.stdout.includes("not-inherited"), true);
   assert.equal(outcome.stdout.includes("must-not-leak"), false);
   assert.equal(outcome.stderr.includes("abcdefghijklmnop"), false);
@@ -282,6 +283,11 @@ test("process runner uses no shell, a controlled environment/cwd, bounded output
   assert.equal(repositoryControlled.outcome, "policy-denied");
   assert.match(repositoryControlled.error ?? "", /Repository-writable executables/);
 });
+
+function normalizePath(value: string): string {
+  const normalized = path.normalize(value.trim());
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
 
 test("process runner classifies timeout and caller cancellation and terminates the process tree", async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "cba-runner-stop-"));
