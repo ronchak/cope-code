@@ -11,10 +11,10 @@ export interface ManualReadinessDependencies {
 
 /**
  * Browser pages often expose only part of the certified surface while the app
- * hydrates. Non-manual states therefore have to remain unchanged for a bounded
- * quorum before launch treats them as final. Only states that genuinely require
- * the operator to sign in, complete MFA, or grant consent may consume the full
- * manual-readiness window.
+ * hydrates. Continuous non-manual states receive one bounded hydration period,
+ * even if their diagnostic classification changes while the page is unstable.
+ * Only states that genuinely require the operator to sign in, complete MFA, or
+ * grant consent may consume the full manual-readiness window.
  */
 export async function waitForStableManualReadiness(
   observe: (maxWaitMs: number, signal?: AbortSignal) => Promise<BrowserStateInspection>,
@@ -34,9 +34,11 @@ export async function waitForStableManualReadiness(
       isTerminalManualReadinessState(inspection.classification.state));
   const deadline = monotonicNow() + maxWaitMs;
   let lastInspection: BrowserStateInspection | undefined;
-  let terminalKey: string | undefined;
-  let terminalSamples = 0;
-  let terminalSince = 0;
+  let terminalPeriodSince = 0;
+  let terminalPeriodSamples = 0;
+  let stableKey: string | undefined;
+  let stableKeySince = 0;
+  let stableKeySamples = 0;
 
   for (;;) {
     const beforeObservation = monotonicNow();
@@ -49,29 +51,44 @@ export async function waitForStableManualReadiness(
 
     const observedAt = monotonicNow();
     if (isTerminalInspection(inspection)) {
+      if (terminalPeriodSamples === 0) terminalPeriodSince = observedAt;
+      terminalPeriodSamples += 1;
+
       const nextKey = `${inspection.classification.state}:${inspection.classification.diagnosticCode}`;
-      if (nextKey === terminalKey) {
-        terminalSamples += 1;
+      if (nextKey === stableKey) {
+        stableKeySamples += 1;
       } else {
-        terminalKey = nextKey;
-        terminalSamples = 1;
-        terminalSince = observedAt;
+        stableKey = nextKey;
+        stableKeySince = observedAt;
+        stableKeySamples = 1;
       }
-      const requiredStableMs = terminalStabilityMs(
-        inspection.classification.state,
-        waits,
-        maxWaitMs,
-      );
-      if (
-        terminalSamples >= waits.stableSamples &&
-        observedAt - terminalSince >= requiredStableMs
-      ) {
-        return inspection;
+
+      if (isImmediatelyUnsafe(inspection.classification.state)) {
+        const shortStableMs = Math.min(waits.minimumStableMs, maxWaitMs);
+        if (
+          stableKeySamples >= waits.stableSamples &&
+          observedAt - stableKeySince >= shortStableMs
+        ) {
+          return inspection;
+        }
+      } else {
+        const hydrationMs = Math.min(
+          Math.max(waits.minimumStableMs, waits.actionMs),
+          maxWaitMs,
+        );
+        if (
+          terminalPeriodSamples >= waits.stableSamples &&
+          observedAt - terminalPeriodSince >= hydrationMs
+        ) {
+          return inspection;
+        }
       }
     } else {
-      terminalKey = undefined;
-      terminalSamples = 0;
-      terminalSince = 0;
+      terminalPeriodSince = 0;
+      terminalPeriodSamples = 0;
+      stableKey = undefined;
+      stableKeySince = 0;
+      stableKeySamples = 0;
     }
 
     const remainingAfterObservation = deadline - observedAt;
@@ -99,16 +116,10 @@ export function isTerminalManualReadinessState(
     state !== "consent-required";
 }
 
-function terminalStabilityMs(
+function isImmediatelyUnsafe(
   state: BrowserStateInspection["classification"]["state"],
-  waits: BrowserWaitConfig,
-  maxWaitMs: number,
-): number {
-  const immediatelyUnsafe = state === "unapproved-host" || state === "blocking-modal";
-  const desired = immediatelyUnsafe
-    ? waits.minimumStableMs
-    : Math.max(waits.minimumStableMs, waits.actionMs);
-  return Math.min(desired, maxWaitMs);
+): boolean {
+  return state === "unapproved-host" || state === "blocking-modal";
 }
 
 async function sleepWithAbort(milliseconds: number, signal?: AbortSignal): Promise<void> {
