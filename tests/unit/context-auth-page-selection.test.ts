@@ -67,6 +67,36 @@ test("an unrelated page on the approved host does not displace the configured ch
   assert.equal(selected, chat.asPage());
 });
 
+test("a newer authentication popup takes precedence over an older configured chat", () => {
+  const chat = new UrlPage("https://m365.cloud.microsoft/chat/conversation/synthetic");
+  const authentication = new UrlPage(
+    "https://login.microsoftonline.com/common/oauth2/authorize?step=signin",
+  );
+
+  const selected = selectActiveCopilotPage(
+    [chat.asPage(), authentication.asPage()],
+    selectionConfig,
+    chat.asPage(),
+  );
+
+  assert.equal(selected, authentication.asPage());
+});
+
+test("a newer configured chat takes precedence after authentication returns", () => {
+  const authentication = new UrlPage(
+    "https://login.microsoftonline.com/common/oauth2/authorize?step=signin",
+  );
+  const chat = new UrlPage("https://m365.cloud.microsoft/chat/conversation/returned");
+
+  const selected = selectActiveCopilotPage(
+    [authentication.asPage(), chat.asPage()],
+    selectionConfig,
+    authentication.asPage(),
+  );
+
+  assert.equal(selected, chat.asPage());
+});
+
 test("broad Office and M365 allowlist entries are not reusable authentication pages by host alone", () => {
   for (const value of [
     "https://m365.cloud.microsoft/search",

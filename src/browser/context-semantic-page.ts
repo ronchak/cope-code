@@ -307,19 +307,21 @@ export function selectActiveCopilotPage(
   preferred?: Page,
 ): Page {
   const openPages = pages.filter((page) => !page.isClosed());
-  const approved = openPages.filter((page) => isConfiguredCopilotUrl(page.url(), config.entryUrl));
-  if (approved.length > 1) {
+  const configured = openPages.filter((page) =>
+    isConfiguredCopilotUrl(page.url(), config.entryUrl));
+  if (configured.length > 1) {
     throw new AgentError("TRANSPORT_INDETERMINATE", "Multiple approved Copilot pages are open", {
       diagnosticCode: "AMBIGUOUS_COPILOT_PAGE",
-      pageCount: approved.length,
+      pageCount: configured.length,
     });
   }
-  if (approved.length === 1) return approved[0]!;
 
   const authentication = openPages.filter((page) =>
     isGenuineManualAuthenticationUrl(page.url(), config));
-  const newestAuthentication = authentication.at(-1);
-  if (newestAuthentication !== undefined) return newestAuthentication;
+  const configuredPage = configured[0];
+  const newestEligible = openPages.findLast((page) =>
+    page === configuredPage || authentication.includes(page));
+  if (newestEligible !== undefined) return newestEligible;
 
   if (preferred !== undefined && !preferred.isClosed()) return preferred;
   const newestOpenPage = openPages.at(-1);

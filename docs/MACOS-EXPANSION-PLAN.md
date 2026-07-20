@@ -24,13 +24,14 @@ The draft had the right overall direction, but it was not safe to execute unchan
 - Snapshot SHA-256: `d1c39e49c929969c079270f1d711daf78512929612d4084a553306f5a8a2ce4b`
 - Snapshot scope: 160 source/config/test/doc/install files; excludes `.git`, `.agents`, `.claude`, `.codex`, worktrees, `dist`, and `node_modules`; stored read-only (`0444`).
 - `package-lock.json` SHA-256: `f3e928ad783dd4a30312524298cf56daba70826393341fbfee34f35b43f7200f`
-- Windows wrapper SHA-256 values:
+- Baseline Windows wrapper SHA-256 values (historical 0.1.1 snapshot; not current release hashes):
   - `scripts/install-windows.ps1`: `8f00cb314fea2be37f19db667c3e78ccd975a6cdb612ddd063b1119d3fb354e6`
   - `scripts/uninstall-windows.ps1`: `16b6d9eafb74ac06a2900d9f31f98018e49ec25b78742019b5ad830fb1796a50`
   - `install.cmd`: `8d56b5ac60e1f4365993927d1bc5d40ac11963208c7588954888fc3b62ce474c`
   - `install-cope.cmd`: `3ab30bf64882799b88f9e95883be507b7be325072d2a66f701a44b79f2a14794`
   - `uninstall.cmd`: `79af0b5fbb73ef97274737f367b456006f3dff9b33785a76698ee3620bb5abbb`
   - `uninstall-cope.cmd`: `28ef4abdc66216ea2ddb02f730e084f21179d7842a42a391ceb60d6468d02fdc`
+- Current release-preservation hashes are authoritative in `tests/unit/windows-preservation.test.ts`. For Cope 0.1.2, `scripts/install-windows.ps1` is `fc61cc22fd84a84b1d3973234874c942de0613f0ee48d1c7b06acd57bbe62b3d`.
 - Baseline build: passes under system Node 22.
 - Baseline test: 181 passed, 4 failed; every failure is the expected Node 24 floor in preflight/E2E.
 - Verification runtime: bundled Node 24.14.0, used by prepending its directory to `PATH`; no system runtime is installed or changed.
