@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   harden:
-    if: github.event.head_commit.message == 'Trigger pre-activation outcome hardening'
+    if: github.event.head_commit.message == 'Trigger corrected pre-activation outcome hardening'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,231 +26,183 @@ jobs:
         run: |
           from pathlib import Path
 
-          def replace_exact(path: str, old: str, new: str) -> None:
+          def replace_once(path: str, old: str, new: str) -> None:
               file = Path(path)
               text = file.read_text(encoding="utf-8")
               if text.count(old) != 1:
                   raise RuntimeError(f"{path}: expected exactly one replacement target")
               file.write_text(text.replace(old, new), encoding="utf-8", newline="\n")
 
-          replace_exact(
-              "src/browser/context-semantic-page.ts",
-              '''  public async click(group: LocatorGroup): Promise<void> {
-            const page = await this.#verifiedActivationPage();
-            try {
-              await this.#delegate(page).click(group);
-            } finally {
-              this.#clearFilledPagePin();
-            }
-          }
-
-          /** Enter activation follows the same post-fill page-identity requirements. */
-          public async press(group: LocatorGroup, key: "Enter"): Promise<void> {
-            const page = await this.#verifiedActivationPage();
-            try {
-              await this.#delegate(page).press(group, key);
-            } finally {
-              this.#clearFilledPagePin();
-            }
-          }
-
-          #verifiedObservedPage(): Page {
-          '''.replace(/^          /gm, ""),
-              '''  public async click(group: LocatorGroup): Promise<void> {
-            const page = await this.#activationPageOrThrow();
-            try {
-              await this.#delegate(page).click(group);
-            } finally {
-              this.#clearFilledPagePin();
-            }
-          }
-
-          /** Enter activation follows the same post-fill page-identity requirements. */
-          public async press(group: LocatorGroup, key: "Enter"): Promise<void> {
-            const page = await this.#activationPageOrThrow();
-            try {
-              await this.#delegate(page).press(group, key);
-            } finally {
-              this.#clearFilledPagePin();
-            }
-          }
-
-          /**
-           * Every failure before delegating click or Enter is conclusively
-           * pre-dispatch. Preserve that fact for the adapter so a guarded failure
-           * remains safely retryable instead of being treated as indeterminate.
-           */
-          async #activationPageOrThrow(): Promise<Page> {
-            try {
-              return await this.#verifiedActivationPage();
-            } catch (error) {
-              if (error instanceof AgentError && error.details.dispatchAttempted === false) {
-                throw error;
-              }
-              const diagnosticCode =
-                error instanceof AgentError && typeof error.details.diagnosticCode === "string"
-                  ? error.details.diagnosticCode
-                  : "PRE_ACTIVATION_GUARD_FAILED";
-              throw new AgentError(
-                "TRANSPORT_INDETERMINATE",
-                "The Copilot pre-activation guard blocked browser activation",
-                { diagnosticCode, dispatchAttempted: false },
-                { cause: error },
-              );
-            }
-          }
-
-          #verifiedObservedPage(): Page {
-          '''.replace(/^          /gm, ""),
+          context_path = Path("src/browser/context-semantic-page.ts")
+          context = context_path.read_text(encoding="utf-8")
+          activation_call = "    const page = await this.#verifiedActivationPage();"
+          if context.count(activation_call) != 2:
+              raise RuntimeError("unexpected activation-call count")
+          context = context.replace(
+              activation_call,
+              "    const page = await this.#activationPageOrThrow();",
+          )
+          observed_anchor = "  #verifiedObservedPage(): Page {\n"
+          if context.count(observed_anchor) != 1:
+              raise RuntimeError("verified-observed anchor changed")
+          activation_helper = (
+              "  /**\n"
+              "   * Every failure before delegating click or Enter is conclusively\n"
+              "   * pre-dispatch. Preserve that fact for the adapter so a guarded failure\n"
+              "   * remains safely retryable instead of being treated as indeterminate.\n"
+              "   */\n"
+              "  async #activationPageOrThrow(): Promise<Page> {\n"
+              "    try {\n"
+              "      return await this.#verifiedActivationPage();\n"
+              "    } catch (error) {\n"
+              "      if (error instanceof AgentError && error.details.dispatchAttempted === false) {\n"
+              "        throw error;\n"
+              "      }\n"
+              "      const diagnosticCode =\n"
+              "        error instanceof AgentError && typeof error.details.diagnosticCode === \"string\"\n"
+              "          ? error.details.diagnosticCode\n"
+              "          : \"PRE_ACTIVATION_GUARD_FAILED\";\n"
+              "      throw new AgentError(\n"
+              "        \"TRANSPORT_INDETERMINATE\",\n"
+              "        \"The Copilot pre-activation guard blocked browser activation\",\n"
+              "        { diagnosticCode, dispatchAttempted: false },\n"
+              "        { cause: error },\n"
+              "      );\n"
+              "    }\n"
+              "  }\n\n"
+          )
+          context_path.write_text(
+              context.replace(observed_anchor, activation_helper + observed_anchor),
+              encoding="utf-8",
+              newline="\n",
           )
 
-          replace_exact(
+          adapter_old = (
+              "    record.activationAttempted = true;\n"
+              "    this.#taskConversations.set(request.taskId, conversationId);\n"
+              "    try {\n"
+              "      if (strategy === \"send-control\") {\n"
+              "        await this.#page.click(this.#config.uiContract.groups.send);\n"
+              "      } else {\n"
+              "        await this.#page.press(this.#config.uiContract.groups.composer, \"Enter\");\n"
+              "      }\n"
+              "    } catch {\n"
+              "      // Playwright can throw after dispatch. Resolve only through page evidence.\n"
+              "    }\n\n"
+              "    record.receipt = await this.#confirmSubmission(record, options.signal);\n"
+          )
+          adapter_new = (
+              "    record.activationAttempted = true;\n"
+              "    this.#taskConversations.set(request.taskId, conversationId);\n"
+              "    try {\n"
+              "      if (strategy === \"send-control\") {\n"
+              "        await this.#page.click(this.#config.uiContract.groups.send);\n"
+              "      } else {\n"
+              "        await this.#page.press(this.#config.uiContract.groups.composer, \"Enter\");\n"
+              "      }\n"
+              "    } catch (error) {\n"
+              "      const diagnosticCode = knownPreActivationDiagnostic(error);\n"
+              "      if (diagnosticCode !== undefined) {\n"
+              "        record.activationAttempted = false;\n"
+              "        if (establishedConversation === undefined) {\n"
+              "          this.#taskConversations.delete(request.taskId);\n"
+              "        }\n"
+              "        record.receipt = this.#receipt(\n"
+              "          request,\n"
+              "          \"not-submitted\",\n"
+              "          conversationId,\n"
+              "          marker,\n"
+              "          diagnosticCode,\n"
+              "        );\n"
+              "        return record.receipt;\n"
+              "      }\n"
+              "      // Playwright can throw after dispatch. Resolve only through page evidence.\n"
+              "    }\n\n"
+              "    record.receipt = await this.#confirmSubmission(record, options.signal);\n"
+          )
+          replace_once("src/browser/copilot-browser-adapter.ts", adapter_old, adapter_new)
+
+          helper_anchor = "function responseTexts(observation: CopilotPageObservation): readonly string[] {\n"
+          helper = (
+              "function knownPreActivationDiagnostic(error: unknown): string | undefined {\n"
+              "  if (!(error instanceof AgentError) || error.details.dispatchAttempted !== false) {\n"
+              "    return undefined;\n"
+              "  }\n"
+              "  const diagnosticCode = error.details.diagnosticCode;\n"
+              "  return typeof diagnosticCode === \"string\" && diagnosticCode.length > 0\n"
+              "    ? diagnosticCode\n"
+              "    : \"PRE_ACTIVATION_GUARD_FAILED\";\n"
+              "}\n\n"
+          )
+          replace_once(
               "src/browser/copilot-browser-adapter.ts",
-              '''    record.activationAttempted = true;
-              this.#taskConversations.set(request.taskId, conversationId);
-              try {
-                if (strategy === "send-control") {
-                  await this.#page.click(this.#config.uiContract.groups.send);
-                } else {
-                  await this.#page.press(this.#config.uiContract.groups.composer, "Enter");
-                }
-              } catch {
-                // Playwright can throw after dispatch. Resolve only through page evidence.
-              }
-
-              record.receipt = await this.#confirmSubmission(record, options.signal);
-          '''.replace(/^          /gm, ""),
-              '''    record.activationAttempted = true;
-              this.#taskConversations.set(request.taskId, conversationId);
-              try {
-                if (strategy === "send-control") {
-                  await this.#page.click(this.#config.uiContract.groups.send);
-                } else {
-                  await this.#page.press(this.#config.uiContract.groups.composer, "Enter");
-                }
-              } catch (error) {
-                const diagnosticCode = knownPreActivationDiagnostic(error);
-                if (diagnosticCode !== undefined) {
-                  record.activationAttempted = false;
-                  if (establishedConversation === undefined) {
-                    this.#taskConversations.delete(request.taskId);
-                  }
-                  record.receipt = this.#receipt(
-                    request,
-                    "not-submitted",
-                    conversationId,
-                    marker,
-                    diagnosticCode,
-                  );
-                  return record.receipt;
-                }
-                // Playwright can throw after dispatch. Resolve only through page evidence.
-              }
-
-              record.receipt = await this.#confirmSubmission(record, options.signal);
-          '''.replace(/^          /gm, ""),
+              helper_anchor,
+              helper + helper_anchor,
           )
 
-          replace_exact(
-              "src/browser/copilot-browser-adapter.ts",
-              '''function responseTexts(observation: CopilotPageObservation): readonly string[] {
-          '''.replace(/^          /gm, ""),
-              '''function knownPreActivationDiagnostic(error: unknown): string | undefined {
-            if (!(error instanceof AgentError) || error.details.dispatchAttempted !== false) {
-              return undefined;
-            }
-            const diagnosticCode = error.details.diagnosticCode;
-            return typeof diagnosticCode === "string" && diagnosticCode.length > 0
-              ? diagnosticCode
-              : "PRE_ACTIVATION_GUARD_FAILED";
-          }
-
-          function responseTexts(observation: CopilotPageObservation): readonly string[] {
-          '''.replace(/^          /gm, ""),
-          )
-
-          replace_exact(
+          replace_once(
               "tests/unit/browser-adapter.test.ts",
-              '''import { MutableBrowserKillSwitch } from "../../src/browser/kill-switch.js";
-          '''.replace(/^          /gm, ""),
-              '''import { MutableBrowserKillSwitch } from "../../src/browser/kill-switch.js";
-          import { AgentError } from "../../src/shared/errors.js";
-          '''.replace(/^          /gm, ""),
+              'import { MutableBrowserKillSwitch } from "../../src/browser/kill-switch.js";\n',
+              'import { MutableBrowserKillSwitch } from "../../src/browser/kill-switch.js";\n'
+              'import { AgentError } from "../../src/shared/errors.js";\n',
           )
-
-          replace_exact(
+          replace_once(
               "tests/unit/browser-adapter.test.ts",
-              '''  public activationMode: ActivationMode = "submitted";
-            public fillCalls = 0;
-            public activationCalls = 0;
-          '''.replace(/^          /gm, ""),
-              '''  public activationMode: ActivationMode = "submitted";
-            public preActivationDiagnostic: string | undefined = undefined;
-            public fillCalls = 0;
-            public activationCalls = 0;
-          '''.replace(/^          /gm, ""),
+              '  public activationMode: ActivationMode = "submitted";\n'
+              '  public fillCalls = 0;\n'
+              '  public activationCalls = 0;\n',
+              '  public activationMode: ActivationMode = "submitted";\n'
+              '  public preActivationDiagnostic: string | undefined = undefined;\n'
+              '  public fillCalls = 0;\n'
+              '  public activationCalls = 0;\n',
           )
-
-          replace_exact(
+          replace_once(
               "tests/unit/browser-adapter.test.ts",
-              '''  public async click(): Promise<void> {
-            await this.#activate();
-          }
-
-          public async press(): Promise<void> {
-            await this.#activate();
-          }
-
-          async #activate(): Promise<void> {
-          '''.replace(/^          /gm, ""),
-              '''  public async click(): Promise<void> {
-            this.#assertPreActivationGuard();
-            await this.#activate();
-          }
-
-          public async press(): Promise<void> {
-            this.#assertPreActivationGuard();
-            await this.#activate();
-          }
-
-          #assertPreActivationGuard(): void {
-            if (this.preActivationDiagnostic === undefined) return;
-            throw new AgentError(
-              "TRANSPORT_INDETERMINATE",
-              "Synthetic pre-activation guard blocked dispatch",
-              {
-                diagnosticCode: this.preActivationDiagnostic,
-                dispatchAttempted: false,
-              },
-            );
-          }
-
-          async #activate(): Promise<void> {
-          '''.replace(/^          /gm, ""),
+              '  public async click(): Promise<void> {\n'
+              '    await this.#activate();\n'
+              '  }\n\n'
+              '  public async press(): Promise<void> {\n'
+              '    await this.#activate();\n'
+              '  }\n\n'
+              '  async #activate(): Promise<void> {\n',
+              '  public async click(): Promise<void> {\n'
+              '    this.#assertPreActivationGuard();\n'
+              '    await this.#activate();\n'
+              '  }\n\n'
+              '  public async press(): Promise<void> {\n'
+              '    this.#assertPreActivationGuard();\n'
+              '    await this.#activate();\n'
+              '  }\n\n'
+              '  #assertPreActivationGuard(): void {\n'
+              '    if (this.preActivationDiagnostic === undefined) return;\n'
+              '    throw new AgentError(\n'
+              '      "TRANSPORT_INDETERMINATE",\n'
+              '      "Synthetic pre-activation guard blocked dispatch",\n'
+              '      { diagnosticCode: this.preActivationDiagnostic, dispatchAttempted: false },\n'
+              '    );\n'
+              '  }\n\n'
+              '  async #activate(): Promise<void> {\n',
           )
-
-          replace_exact(
+          test_anchor = 'test("failed activation remains indeterminate because dispatch timing cannot be proven", async () => {\n'
+          test_block = (
+              'test("pre-activation guard failures are known not-submitted and safely retryable", async () => {\n'
+              '  const { adapter, page } = makeHarness();\n'
+              '  page.preActivationDiagnostic = "COMPOSER_CONTENT_CHANGED_BEFORE_SUBMIT";\n\n'
+              '  const first = await adapter.submit(request);\n'
+              '  assert.equal(first.status, "not-submitted");\n'
+              '  assert.equal(first.diagnosticCode, "COMPOSER_CONTENT_CHANGED_BEFORE_SUBMIT");\n'
+              '  assert.equal(page.activationCalls, 0);\n\n'
+              '  page.preActivationDiagnostic = undefined;\n'
+              '  page.url = "https://copilot.example.test/chat/conversation-2";\n'
+              '  const retry = await adapter.submit(request);\n'
+              '  assert.equal(retry.status, "submitted");\n'
+              '  assert.equal(page.activationCalls, 1);\n'
+              '});\n\n'
+          )
+          replace_once(
               "tests/unit/browser-adapter.test.ts",
-              '''test("failed activation remains indeterminate because dispatch timing cannot be proven", async () => {
-          '''.replace(/^          /gm, ""),
-              '''test("pre-activation guard failures are known not-submitted and safely retryable", async () => {
-            const { adapter, page } = makeHarness();
-            page.preActivationDiagnostic = "COMPOSER_CONTENT_CHANGED_BEFORE_SUBMIT";
-
-            const first = await adapter.submit(request);
-            assert.equal(first.status, "not-submitted");
-            assert.equal(first.diagnosticCode, "COMPOSER_CONTENT_CHANGED_BEFORE_SUBMIT");
-            assert.equal(page.activationCalls, 0);
-
-            page.preActivationDiagnostic = undefined;
-            page.url = "https://copilot.example.test/chat/conversation-2";
-            const retry = await adapter.submit(request);
-            assert.equal(retry.status, "submitted");
-            assert.equal(page.activationCalls, 1);
-          });
-
-          test("failed activation remains indeterminate because dispatch timing cannot be proven", async () => {
-          '''.replace(/^          /gm, ""),
+              test_anchor,
+              test_block + test_anchor,
           )
       - run: npm ci --no-audit --no-fund
       - run: npm run check
