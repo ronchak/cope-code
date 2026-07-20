@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   harden:
-    if: github.event.head_commit.message == 'Trigger native-dialog readiness hardening'
+    if: github.event.head_commit.message == 'Trigger corrected native-dialog readiness hardening'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,48 +36,52 @@ jobs:
 
           replace_once(
               "src/browser/classifier.ts",
-              '''  if (modal) {
-            return result("blocking-modal", false, "UNEXPECTED_BLOCKING_MODAL");
-          }
-          '''.replace(/^          /gm, ""),
-              '''  if (modal) {
-            // Native JavaScript dialogs are deliberately sticky in the Playwright
-            // adapter because Cope never accepts or dismisses them. Distinguish
-            // that unrecoverable session state from an ordinary DOM dialog that
-            // the operator can close manually on the configured Copilot surface.
-            const diagnosticCode = observation.modal.enabledElements === 0
-              ? "NATIVE_BROWSER_DIALOG_DETECTED"
-              : "UNEXPECTED_BLOCKING_MODAL";
-            return result("blocking-modal", false, diagnosticCode);
-          }
-          '''.replace(/^          /gm, ""),
+              dedent("""\
+                if (modal) {
+                  return result("blocking-modal", false, "UNEXPECTED_BLOCKING_MODAL");
+                }
+              """),
+              dedent("""\
+                if (modal) {
+                  // Native JavaScript dialogs are deliberately sticky in the Playwright
+                  // adapter because Cope never accepts or dismisses them. Distinguish
+                  // that unrecoverable session state from an ordinary DOM dialog that
+                  // the operator can close manually on the configured Copilot surface.
+                  const diagnosticCode = observation.modal.enabledElements === 0
+                    ? "NATIVE_BROWSER_DIALOG_DETECTED"
+                    : "UNEXPECTED_BLOCKING_MODAL";
+                  return result("blocking-modal", false, diagnosticCode);
+                }
+              """),
           )
 
           replace_once(
               "src/browser/edge-launcher.ts",
-              '''  const state = inspection.classification.state;
-            if (!isTerminalManualReadinessState(state)) return false;
-            if (state !== "unapproved-host") return true;
-          '''.replace(/^          /gm, ""),
-              '''  const state = inspection.classification.state;
-            // DOM dialogs on the configured Copilot page can be closed by the
-            // operator. Native JavaScript dialogs are sticky by design and cannot
-            // recover inside this session, so return their diagnostic promptly.
-            if (
-              state === "blocking-modal" &&
-              inspection.classification.diagnosticCode === "NATIVE_BROWSER_DIALOG_DETECTED"
-            ) {
-              return true;
-            }
-            if (!isTerminalManualReadinessState(state)) return false;
-            if (state !== "unapproved-host") return true;
-          '''.replace(/^          /gm, ""),
+              dedent("""\
+                const state = inspection.classification.state;
+                if (!isTerminalManualReadinessState(state)) return false;
+                if (state !== "unapproved-host") return true;
+              """),
+              dedent("""\
+                const state = inspection.classification.state;
+                // DOM dialogs on the configured Copilot page can be closed by the
+                // operator. Native JavaScript dialogs are sticky by design and cannot
+                // recover inside this session, so return their diagnostic promptly.
+                if (
+                  state === "blocking-modal" &&
+                  inspection.classification.diagnosticCode === "NATIVE_BROWSER_DIALOG_DETECTED"
+                ) {
+                  return true;
+                }
+                if (!isTerminalManualReadinessState(state)) return false;
+                if (state !== "unapproved-host") return true;
+              """),
           )
 
           test_path = Path("tests/unit/native-dialog-readiness.test.ts")
           if test_path.exists():
               raise RuntimeError("native-dialog readiness test already exists")
-          test_path.write_text(dedent('''\
+          test_path.write_text(dedent("""\
           import assert from "node:assert/strict";
           import test from "node:test";
 
@@ -198,7 +202,7 @@ jobs:
               },
             };
           }
-          '''), encoding="utf-8", newline="\n")
+          """), encoding="utf-8", newline="\n")
       - run: npm ci --no-audit --no-fund
       - run: npm run check
       - name: Commit native-dialog readiness hardening
