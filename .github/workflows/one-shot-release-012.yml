@@ -1,4 +1,5 @@
 name: one-shot-cope-012-release
+# Triggered only by an explicit follow-up commit.
 
 on:
   push:
