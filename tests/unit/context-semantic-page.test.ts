@@ -151,6 +151,21 @@ test("tracked semantic page moves from Microsoft authentication to the returned 
   assert.equal(approved.defaultNavigationTimeout, config.waits.actionMs);
 });
 
+test("same-host pages outside the chat path do not inherit the long URL-only auth window", async () => {
+  const sameHost = new FakePage("https://m365.cloud.microsoft/search");
+  const context = new FakeContext([sameHost]);
+  const config = browserConfig();
+  const tracked = new ContextSemanticPage(
+    context.asContext(),
+    config,
+    sameHost.asPage(),
+    config.waits.actionMs,
+  );
+
+  assert.equal(await tracked.currentUrl(), sameHost.currentUrl);
+  assert.equal(tracked.isManualAuthenticationRedirect(), false);
+});
+
 test("multiple approved Copilot pages remain an ambiguity hard stop", () => {
   const first = new FakePage(`${entryUrl}/conversation/one`);
   const second = new FakePage(`${entryUrl}/conversation/two`);
