@@ -26,23 +26,7 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci --no-audit --no-fund
-      - if: runner.os != 'Windows'
-        run: npm run check
-      - if: runner.os == 'Windows'
-        name: Run checks and retain failure evidence
-        shell: pwsh
-        run: |
-          & npm.cmd run check *>&1 | Tee-Object -FilePath windows-check.log
-          $exitCode = $LASTEXITCODE
-          exit $exitCode
-      - if: failure() && runner.os == 'Windows'
-        name: Upload Windows check failure evidence
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-check-log
-          path: windows-check.log
-          if-no-files-found: error
-          retention-days: 1
+      - run: npm run check
       - if: runner.os == 'macOS'
         run: sh -n scripts/install-macos.sh scripts/uninstall-macos.sh
       - if: runner.os == 'macOS'
