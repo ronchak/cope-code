@@ -3,7 +3,7 @@ import path from "node:path";
 import type { ChildProcess } from "node:child_process";
 
 import { AgentError } from "../shared/errors.js";
-import { defaultProfileHome, selectEnvironment, terminatePosixProcessGroup, uniquePaths } from "./common.js";
+import { selectEnvironment, terminatePosixProcessGroup, uniquePaths } from "./common.js";
 import type { HostPlatform } from "./contracts.js";
 
 export class DarwinHostPlatform implements HostPlatform {
@@ -22,17 +22,24 @@ export class DarwinHostPlatform implements HostPlatform {
   }
 
   public stateHome(environment: NodeJS.ProcessEnv = process.env): string {
-    return path.join(environment.HOME ?? homedir(), "Library", "Application Support", "CopilotBrowserAgent");
+    return path.posix.join(
+      environment.HOME ?? homedir(),
+      "Library",
+      "Application Support",
+      "CopilotBrowserAgent",
+    );
   }
 
-  public profileHome(stateHome: string): string { return defaultProfileHome(stateHome); }
+  public profileHome(stateHome: string): string {
+    return path.posix.join(path.posix.dirname(stateHome), "CopilotBrowserAgentEdgeProfile");
+  }
 
   public edgeExecutableCandidates(environment: NodeJS.ProcessEnv = process.env): readonly string[] {
     const home = environment.HOME ?? homedir();
     return uniquePaths([
       environment.COPE_EDGE_EXECUTABLE,
       "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-      path.join(home, "Applications", "Microsoft Edge.app", "Contents", "MacOS", "Microsoft Edge"),
+      path.posix.join(home, "Applications", "Microsoft Edge.app", "Contents", "MacOS", "Microsoft Edge"),
     ]);
   }
 
