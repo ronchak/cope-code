@@ -129,7 +129,14 @@ export function classifyCopilotPage(
     return result("service-error", true, "COPILOT_SERVICE_ERROR");
   }
   if (modal) {
-    return result("blocking-modal", false, "UNEXPECTED_BLOCKING_MODAL");
+    // Native JavaScript dialogs are deliberately sticky in the Playwright
+    // adapter because Cope never accepts or dismisses them. Distinguish
+    // that unrecoverable session state from an ordinary DOM dialog that
+    // the operator can close manually on the configured Copilot surface.
+    const diagnosticCode = observation.modal.enabledElements === 0
+      ? "NATIVE_BROWSER_DIALOG_DETECTED"
+      : "UNEXPECTED_BLOCKING_MODAL";
+    return result("blocking-modal", false, diagnosticCode);
   }
 
   if (

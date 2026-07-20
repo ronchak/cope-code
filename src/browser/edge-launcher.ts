@@ -219,6 +219,15 @@ export function isTerminalEdgeReadinessInspection(
   isManualAuthenticationRedirect: boolean,
 ): boolean {
   const state = inspection.classification.state;
+  // DOM dialogs on the configured Copilot page can be closed by the
+  // operator. Native JavaScript dialogs are sticky by design and cannot
+  // recover inside this session, so return their diagnostic promptly.
+  if (
+    state === "blocking-modal" &&
+    inspection.classification.diagnosticCode === "NATIVE_BROWSER_DIALOG_DETECTED"
+  ) {
+    return true;
+  }
   if (!isTerminalManualReadinessState(state)) return false;
   if (state !== "unapproved-host") return true;
   return inspection.classification.diagnosticCode !== "HOST_NOT_APPROVED" ||
