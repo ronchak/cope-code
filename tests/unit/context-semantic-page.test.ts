@@ -66,14 +66,18 @@ test("launch creates a fresh navigation tab instead of reusing an arbitrary star
   const context = new FakeContext([startupBlank]);
   const navigationPage = new FakePage("about:blank");
   context.nextPage = navigationPage;
+  const config = browserConfig();
 
-  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+  const tracked = await openTrackedCopilotPage(context.asContext(), config);
 
   assert.equal(context.newPageCalls, 1);
   assert.equal(startupBlank.currentUrl, "about:blank");
   assert.equal(navigationPage.currentUrl, entryUrl);
+  const frontCountAfterLaunch = navigationPage.frontCount;
   assert.equal(await tracked.currentUrl(), entryUrl);
-  assert.ok(navigationPage.frontCount >= 1);
+  assert.equal(navigationPage.frontCount, frontCountAfterLaunch);
+  assert.equal(navigationPage.defaultTimeout, config.waits.actionMs);
+  assert.equal(navigationPage.defaultNavigationTimeout, config.waits.actionMs);
 });
 
 test("launch follows an approved replacement page when the original navigation tab stays blank", async () => {
@@ -86,21 +90,26 @@ test("launch follows an approved replacement page when the original navigation t
     throw new Error("net::ERR_ABORTED");
   };
   context.nextPage = navigationPage;
+  const config = browserConfig();
 
-  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+  const tracked = await openTrackedCopilotPage(context.asContext(), config);
 
   assert.equal(navigationPage.currentUrl, "about:blank");
   assert.equal(await tracked.currentUrl(), replacement.currentUrl);
   assert.ok(replacement.frontCount >= 1);
+  assert.equal(replacement.defaultTimeout, config.waits.actionMs);
+  assert.equal(replacement.defaultNavigationTimeout, config.waits.actionMs);
 });
 
 test("tracked semantic page moves from Microsoft authentication to the returned Copilot tab", async () => {
   const authentication = new FakePage(authUrl);
   const context = new FakeContext([authentication]);
+  const config = browserConfig();
   const tracked = new ContextSemanticPage(
     context.asContext(),
-    browserConfig(),
+    config,
     authentication.asPage(),
+    config.waits.actionMs,
   );
 
   assert.equal(await tracked.currentUrl(), authUrl);
@@ -112,6 +121,8 @@ test("tracked semantic page moves from Microsoft authentication to the returned 
   assert.equal(await tracked.currentUrl(), approved.currentUrl);
   assert.equal(tracked.isManualAuthenticationRedirect(), false);
   assert.ok(approved.frontCount >= 1);
+  assert.equal(approved.defaultTimeout, config.waits.actionMs);
+  assert.equal(approved.defaultNavigationTimeout, config.waits.actionMs);
 });
 
 test("multiple approved Copilot pages remain an ambiguity hard stop", () => {
