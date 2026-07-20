@@ -182,16 +182,17 @@ function identityTextMatches(snapshot: GroupSnapshot, expected: string | TextPat
 /**
  * Microsoft account controls commonly render a display name in surname-first
  * order or wrap the configured email in additional account text. Matching is
- * limited to complete email addresses or contiguous display-name token order,
- * including the common last-name-first rotation.
+ * limited to exactly one complete email address or contiguous display-name
+ * token order, including the common last-name-first rotation.
  */
 function identityStringMatches(candidate: string, expected: string): boolean {
-  const expectedComparable = expected.normalize("NFKC").trim().toLocaleLowerCase();
-  const candidateComparable = candidate.normalize("NFKC").trim().toLocaleLowerCase();
+  const expectedComparable = expected.normalize("NFKC").trim().toLowerCase();
+  const candidateComparable = candidate.normalize("NFKC").trim().toLowerCase();
   if (expectedComparable === "" || candidateComparable === "") return false;
 
   if (expectedComparable.includes("@")) {
-    return extractEmailAddresses(candidateComparable).includes(expectedComparable);
+    const addresses = extractEmailAddresses(candidateComparable);
+    return addresses.length === 1 && addresses[0] === expectedComparable;
   }
 
   const expectedTokens = identityTokens(expectedComparable);
@@ -207,14 +208,14 @@ function identityStringMatches(candidate: string, expected: string): boolean {
 function extractEmailAddresses(value: string): readonly string[] {
   return value.match(
     /[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+/giu,
-  )?.map((entry) => entry.toLocaleLowerCase()) ?? [];
+  )?.map((entry) => entry.toLowerCase()) ?? [];
 }
 
 function identityTokens(value: string): readonly string[] {
   return value
     .normalize("NFKD")
     .replace(/\p{M}/gu, "")
-    .toLocaleLowerCase()
+    .toLowerCase()
     .match(/[\p{L}\p{N}]+/gu) ?? [];
 }
 
