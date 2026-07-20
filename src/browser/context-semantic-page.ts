@@ -38,6 +38,8 @@ export class ContextSemanticPage implements SemanticPage {
   #observedUrl: string | undefined;
   #filledPage: Page | undefined;
   #filledUrl: string | undefined;
+  #filledGroup: LocatorGroup | undefined;
+  #filledValue: string | undefined;
   #postFillObservationSeen = false;
 
   public constructor(
@@ -121,12 +123,14 @@ export class ContextSemanticPage implements SemanticPage {
     }
     this.#filledPage = page;
     this.#filledUrl = expectedUrl;
+    this.#filledGroup = group;
+    this.#filledValue = value;
     this.#postFillObservationSeen = false;
   }
 
   /** Send activation requires a completed post-fill observation on the same page. */
   public async click(group: LocatorGroup): Promise<void> {
-    const page = this.#verifiedActivationPage();
+    const page = await this.#verifiedActivationPage();
     try {
       await this.#delegate(page).click(group);
     } finally {
@@ -136,7 +140,7 @@ export class ContextSemanticPage implements SemanticPage {
 
   /** Enter activation follows the same post-fill page-identity requirements. */
   public async press(group: LocatorGroup, key: "Enter"): Promise<void> {
-    const page = this.#verifiedActivationPage();
+    const page = await this.#verifiedActivationPage();
     try {
       await this.#delegate(page).press(group, key);
     } finally {
@@ -166,10 +170,12 @@ export class ContextSemanticPage implements SemanticPage {
     return this.#activePage;
   }
 
-  #verifiedActivationPage(): Page {
+  async #verifiedActivationPage(): Promise<Page> {
     if (
       this.#filledPage === undefined ||
       this.#filledUrl === undefined ||
+      this.#filledGroup === undefined ||
+      this.#filledValue === undefined ||
       !this.#postFillObservationSeen
     ) {
       throw new AgentError(
@@ -178,6 +184,27 @@ export class ContextSemanticPage implements SemanticPage {
         { diagnosticCode: "POST_FILL_OBSERVATION_REQUIRED" },
       );
     }
+
+    const page = this.#verifiedFilledPage();
+    const composer = await this.#delegate(page).snapshot(this.#filledGroup);
+    const filledValue = this.#filledValue;
+    const contentStillPresent = composer.elements.some(
+      (element) =>
+        element.visible &&
+        element.enabled &&
+        (element.value === filledValue || element.text === filledValue),
+    );
+    if (!contentStillPresent) {
+      this.#clearFilledPagePin();
+      throw new AgentError(
+        "TRANSPORT_INDETERMINATE",
+        "The Copilot composer changed after it was filled",
+        { diagnosticCode: "COMPOSER_CONTENT_CHANGED_BEFORE_SUBMIT" },
+      );
+    }
+
+    // Recheck page ownership after reading the composer so a replacement or
+    // navigation during that read cannot be followed by activation.
     return this.#verifiedFilledPage();
   }
 
@@ -222,6 +249,8 @@ export class ContextSemanticPage implements SemanticPage {
   #clearFilledPagePin(): void {
     this.#filledPage = undefined;
     this.#filledUrl = undefined;
+    this.#filledGroup = undefined;
+    this.#filledValue = undefined;
     this.#postFillObservationSeen = false;
   }
 
