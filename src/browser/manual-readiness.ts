@@ -10,9 +10,11 @@ export interface ManualReadinessDependencies {
 }
 
 /**
- * Browser pages often expose the composer before identity and shell signals
- * finish hydrating. Non-retryable classifications therefore have to remain
- * unchanged for a bounded quorum before launch treats them as final.
+ * Browser pages often expose only part of the certified surface while the app
+ * hydrates. Non-manual states therefore have to remain unchanged for a bounded
+ * quorum before launch treats them as final. Only states that genuinely require
+ * the operator to sign in, complete MFA, or grant consent may consume the full
+ * manual-readiness window.
  */
 export async function waitForStableManualReadiness(
   observe: (maxWaitMs: number, signal?: AbortSignal) => Promise<BrowserStateInspection>,
@@ -83,14 +85,18 @@ export async function waitForStableManualReadiness(
   }
 }
 
+/**
+ * Only explicit manual-authentication states remain open-ended. Every other
+ * non-ready state must either recover during its bounded hydration window or
+ * return a diagnostic instead of leaving the terminal apparently hung.
+ */
 export function isTerminalManualReadinessState(
   state: BrowserStateInspection["classification"]["state"],
 ): boolean {
-  return state === "unapproved-host" ||
-    state === "blocking-modal" ||
-    state === "identity-unverified" ||
-    state === "protection-unverified" ||
-    state === "changed-selector";
+  return state !== "ready" &&
+    state !== "sign-in-required" &&
+    state !== "mfa-required" &&
+    state !== "consent-required";
 }
 
 function terminalStabilityMs(
@@ -98,12 +104,10 @@ function terminalStabilityMs(
   waits: BrowserWaitConfig,
   maxWaitMs: number,
 ): number {
-  const hydrationSensitive = state === "identity-unverified" ||
-    state === "protection-unverified" ||
-    state === "changed-selector";
-  const desired = hydrationSensitive
-    ? Math.max(waits.minimumStableMs, waits.actionMs)
-    : waits.minimumStableMs;
+  const immediatelyUnsafe = state === "unapproved-host" || state === "blocking-modal";
+  const desired = immediatelyUnsafe
+    ? waits.minimumStableMs
+    : Math.max(waits.minimumStableMs, waits.actionMs);
   return Math.min(desired, maxWaitMs);
 }
 
