@@ -83,6 +83,32 @@ test("a persistent unsafe readiness state still fails closed after a stable quor
   assert.equal(now, waits.minimumStableMs);
 });
 
+test("an approved manual-authentication redirect can return to Copilot", async () => {
+  let now = 0;
+  let calls = 0;
+  const sequence = [
+    inspection("unapproved-host", "HOST_NOT_APPROVED"),
+    inspection("unapproved-host", "HOST_NOT_APPROVED"),
+    inspection("ready", "READY"),
+  ] as const;
+
+  const result = await waitForStableManualReadiness(
+    async () => sequence[Math.min(calls++, sequence.length - 1)]!,
+    waits,
+    waits.manualReadinessMs,
+    undefined,
+    {
+      monotonicNow: () => now,
+      sleep: async (milliseconds) => { now += milliseconds; },
+      isTerminalInspection: (candidate) => candidate.classification.state !== "unapproved-host",
+    },
+  );
+
+  assert.equal(result.classification.state, "ready");
+  assert.equal(calls, 3);
+  assert.equal(now, waits.pollMs * 2);
+});
+
 test("readiness diagnostics explain stale identity configuration without exposing identity data", () => {
   const classification: PageClassification = {
     state: "identity-unverified",
