@@ -35,6 +35,7 @@ export class ContextSemanticPage implements SemanticPage {
   readonly #delegates = new WeakMap<Page, PlaywrightSemanticPage>();
   readonly #configuredPages = new WeakSet<Page>();
   #activePage: Page;
+  #observedUrl: string | undefined;
 
   public constructor(
     context: BrowserContext,
@@ -60,6 +61,7 @@ export class ContextSemanticPage implements SemanticPage {
     );
     const changed = selected !== this.#activePage;
     this.#activePage = selected;
+    if (changed) this.#observedUrl = undefined;
     this.#configurePage(selected);
     if (force || changed) await selected.bringToFront().catch(() => undefined);
     return selected;
@@ -71,26 +73,51 @@ export class ContextSemanticPage implements SemanticPage {
   }
 
   public async currentUrl(): Promise<string> {
-    return (await this.focusActivePage()).url();
+    const page = await this.focusActivePage();
+    const currentUrl = page.url();
+    this.#observedUrl = currentUrl;
+    return currentUrl;
   }
 
   public async snapshot(group: LocatorGroup): Promise<GroupSnapshot> {
     return this.#delegate(this.#activePage).snapshot(group);
   }
 
+  /**
+   * Consequential actions stay pinned to the exact page and URL used by the
+   * immediately preceding observation. If a replacement tab appears or the
+   * observed tab navigates after verification, fail closed and let the caller
+   * re-observe rather than typing or clicking in a different conversation.
+   */
   public async fill(group: LocatorGroup, value: string): Promise<void> {
-    const page = await this.focusActivePage();
+    const page = this.#verifiedActionPage();
     await this.#delegate(page).fill(group, value);
   }
 
   public async click(group: LocatorGroup): Promise<void> {
-    const page = await this.focusActivePage();
+    const page = this.#verifiedActionPage();
     await this.#delegate(page).click(group);
   }
 
   public async press(group: LocatorGroup, key: "Enter"): Promise<void> {
-    const page = await this.focusActivePage();
+    const page = this.#verifiedActionPage();
     await this.#delegate(page).press(group, key);
+  }
+
+  #verifiedActionPage(): Page {
+    const currentUrl = this.#activePage.url();
+    if (
+      this.#activePage.isClosed() ||
+      this.#observedUrl === undefined ||
+      currentUrl !== this.#observedUrl
+    ) {
+      throw new AgentError(
+        "TRANSPORT_INDETERMINATE",
+        "The observed Copilot page changed before the browser action",
+        { diagnosticCode: "ACTIVE_PAGE_CHANGED_BEFORE_ACTION" },
+      );
+    }
+    return this.#activePage;
   }
 
   #configurePage(page: Page): void {
