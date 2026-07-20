@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   classifyCopilotPage,
   observeCopilotPage,
+  type ClassifierRequirements,
 } from "../../src/browser/classifier.js";
 import { createBaselineCopilotUiContract } from "../../src/browser/config.js";
 import type {
@@ -57,6 +58,15 @@ class LiveShapePage implements SemanticPage {
   public async press(): Promise<void> { throw new Error("not used"); }
 }
 
+function requirements(expectedIdentity: string): ClassifierRequirements {
+  return {
+    entryUrl: "https://m365.cloud.microsoft/chat",
+    approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
+    expectedIdentity,
+    requireProtectionIndicator: true,
+  };
+}
+
 test("surname-first Microsoft account text verifies the configured display name", async () => {
   const expectedIdentity = "Ronak Chakraborty";
   const contract = createBaselineCopilotUiContract(expectedIdentity);
@@ -65,11 +75,11 @@ test("surname-first Microsoft account text verifies the configured display name"
     contract,
   );
 
-  const classification = classifyCopilotPage(observation, contract, {
-    approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
-    expectedIdentity,
-    requireProtectionIndicator: true,
-  });
+  const classification = classifyCopilotPage(
+    observation,
+    contract,
+    requirements(expectedIdentity),
+  );
 
   assert.equal(classification.state, "ready");
 });
@@ -82,11 +92,11 @@ test("an email wrapped in account-button text still verifies the exact configure
     contract,
   );
 
-  const classification = classifyCopilotPage(observation, contract, {
-    approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
-    expectedIdentity,
-    requireProtectionIndicator: true,
-  });
+  const classification = classifyCopilotPage(
+    observation,
+    contract,
+    requirements(expectedIdentity),
+  );
 
   assert.equal(classification.state, "ready");
 });
@@ -99,11 +109,11 @@ test("an address that merely contains the configured email is rejected", async (
     contract,
   );
 
-  const classification = classifyCopilotPage(observation, contract, {
-    approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
-    expectedIdentity,
-    requireProtectionIndicator: true,
-  });
+  const classification = classifyCopilotPage(
+    observation,
+    contract,
+    requirements(expectedIdentity),
+  );
 
   assert.equal(classification.state, "identity-unverified");
 });
@@ -116,11 +126,11 @@ test("identity token matching does not accept a different visible account", asyn
     contract,
   );
 
-  const classification = classifyCopilotPage(observation, contract, {
-    approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
-    expectedIdentity,
-    requireProtectionIndicator: true,
-  });
+  const classification = classifyCopilotPage(
+    observation,
+    contract,
+    requirements(expectedIdentity),
+  );
 
   assert.equal(classification.state, "identity-unverified");
 });
@@ -133,11 +143,11 @@ test("a visible but disabled composer never qualifies the page as ready", async 
     contract,
   );
 
-  const classification = classifyCopilotPage(observation, contract, {
-    approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
-    expectedIdentity,
-    requireProtectionIndicator: true,
-  });
+  const classification = classifyCopilotPage(
+    observation,
+    contract,
+    requirements(expectedIdentity),
+  );
 
   assert.equal(classification.state, "changed-selector");
   assert.equal(classification.diagnosticCode, "UI_CONTRACT_QUORUM_FAILED");
