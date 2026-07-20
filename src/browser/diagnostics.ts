@@ -67,8 +67,8 @@ export function browserReadinessGuidance(
     }
     case "unapproved-host":
       return {
-        summary: "Edge remained on a host that is not approved for Copilot or manual Microsoft sign-in.",
-        next: "Run cope setup --force and confirm the Microsoft 365 Copilot Chat URL, then complete sign-in only in the visible Edge window.",
+        summary: "Edge did not return to an approved Copilot conversation before the readiness deadline.",
+        next: "If Microsoft sign-in is visible, complete it manually and wait for Copilot Chat to return. Otherwise run cope setup --force and confirm the Microsoft 365 Copilot Chat URL.",
       };
     case "blocking-modal":
       return {
