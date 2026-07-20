@@ -36,6 +36,9 @@ export class ContextSemanticPage implements SemanticPage {
   readonly #configuredPages = new WeakSet<Page>();
   #activePage: Page;
   #observedUrl: string | undefined;
+  #filledPage: Page | undefined;
+  #filledUrl: string | undefined;
+  #postFillObservationSeen = false;
 
   public constructor(
     context: BrowserContext,
@@ -73,6 +76,22 @@ export class ContextSemanticPage implements SemanticPage {
   }
 
   public async currentUrl(): Promise<string> {
+    // The first observation after composer fill is part of the same submission
+    // transaction. It must inspect the exact page that received the prompt, not
+    // silently adopt a replacement tab with the same conversation URL.
+    if (this.#filledPage !== undefined && !this.#postFillObservationSeen) {
+      const page = this.#verifiedFilledPage();
+      const currentUrl = page.url();
+      this.#activePage = page;
+      this.#observedUrl = currentUrl;
+      this.#postFillObservationSeen = true;
+      return currentUrl;
+    }
+
+    // A later observation means the prior filled draft was not activated. Drop
+    // the transaction pin so an explicit retry can inspect the current context.
+    if (this.#filledPage !== undefined) this.#clearFilledPagePin();
+
     const page = await this.focusActivePage();
     const currentUrl = page.url();
     this.#observedUrl = currentUrl;
@@ -84,28 +103,48 @@ export class ContextSemanticPage implements SemanticPage {
   }
 
   /**
-   * Consequential actions stay pinned to the exact page and URL used by the
-   * immediately preceding observation. If a replacement tab appears, a second
-   * Copilot page creates ambiguity, or the observed tab navigates after
-   * verification, fail closed and let the caller re-observe rather than typing
-   * or clicking in a different conversation.
+   * Fill is permitted only on the exact page and URL used by the trusted
+   * observation. A successful fill starts a transaction pin that remains active
+   * through the second trust observation and send activation.
    */
   public async fill(group: LocatorGroup, value: string): Promise<void> {
-    const page = this.#verifiedActionPage();
+    const page = this.#verifiedObservedPage();
+    const expectedUrl = this.#observedUrl!;
     await this.#delegate(page).fill(group, value);
+    if (page.isClosed() || page.url() !== expectedUrl) {
+      this.#clearFilledPagePin();
+      throw new AgentError(
+        "TRANSPORT_INDETERMINATE",
+        "The observed Copilot page changed while the composer was being filled",
+        { diagnosticCode: "ACTIVE_PAGE_CHANGED_DURING_FILL" },
+      );
+    }
+    this.#filledPage = page;
+    this.#filledUrl = expectedUrl;
+    this.#postFillObservationSeen = false;
   }
 
+  /** Send activation requires a completed post-fill observation on the same page. */
   public async click(group: LocatorGroup): Promise<void> {
-    const page = this.#verifiedActionPage();
-    await this.#delegate(page).click(group);
+    const page = this.#verifiedActivationPage();
+    try {
+      await this.#delegate(page).click(group);
+    } finally {
+      this.#clearFilledPagePin();
+    }
   }
 
+  /** Enter activation follows the same post-fill page-identity requirements. */
   public async press(group: LocatorGroup, key: "Enter"): Promise<void> {
-    const page = this.#verifiedActionPage();
-    await this.#delegate(page).press(group, key);
+    const page = this.#verifiedActivationPage();
+    try {
+      await this.#delegate(page).press(group, key);
+    } finally {
+      this.#clearFilledPagePin();
+    }
   }
 
-  #verifiedActionPage(): Page {
+  #verifiedObservedPage(): Page {
     const selected = selectActiveCopilotPage(
       this.#context.pages(),
       this.#config,
@@ -125,6 +164,65 @@ export class ContextSemanticPage implements SemanticPage {
       );
     }
     return this.#activePage;
+  }
+
+  #verifiedActivationPage(): Page {
+    if (
+      this.#filledPage === undefined ||
+      this.#filledUrl === undefined ||
+      !this.#postFillObservationSeen
+    ) {
+      throw new AgentError(
+        "TRANSPORT_INDETERMINATE",
+        "The filled Copilot composer was not re-verified before activation",
+        { diagnosticCode: "POST_FILL_OBSERVATION_REQUIRED" },
+      );
+    }
+    return this.#verifiedFilledPage();
+  }
+
+  #verifiedFilledPage(): Page {
+    const filledPage = this.#filledPage;
+    const filledUrl = this.#filledUrl;
+    if (filledPage === undefined || filledUrl === undefined) {
+      throw new AgentError(
+        "TRANSPORT_INDETERMINATE",
+        "The filled Copilot page transaction is unavailable",
+        { diagnosticCode: "FILLED_PAGE_TRANSACTION_MISSING" },
+      );
+    }
+
+    let selected: Page;
+    try {
+      selected = selectActiveCopilotPage(
+        this.#context.pages(),
+        this.#config,
+        filledPage,
+      );
+    } catch (error) {
+      this.#clearFilledPagePin();
+      throw error;
+    }
+
+    if (
+      selected !== filledPage ||
+      filledPage.isClosed() ||
+      filledPage.url() !== filledUrl
+    ) {
+      this.#clearFilledPagePin();
+      throw new AgentError(
+        "TRANSPORT_INDETERMINATE",
+        "The Copilot page that received the prompt changed before activation",
+        { diagnosticCode: "ACTIVE_PAGE_CHANGED_AFTER_FILL" },
+      );
+    }
+    return filledPage;
+  }
+
+  #clearFilledPagePin(): void {
+    this.#filledPage = undefined;
+    this.#filledUrl = undefined;
+    this.#postFillObservationSeen = false;
   }
 
   #configurePage(page: Page): void {
