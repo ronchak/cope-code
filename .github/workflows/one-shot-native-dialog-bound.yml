@@ -1,0 +1,212 @@
+name: one-shot-native-dialog-bound
+
+on:
+  push:
+    branches:
+      - agent/fix-visible-copilot-readiness-stall
+
+permissions:
+  contents: write
+
+jobs:
+  harden:
+    if: github.event.head_commit.message == 'Trigger native-dialog readiness hardening'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/fix-visible-copilot-readiness-stall
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Distinguish sticky native dialogs from recoverable DOM dialogs
+        shell: python
+        run: |
+          from pathlib import Path
+          from textwrap import dedent
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              file = Path(path)
+              text = file.read_text(encoding="utf-8")
+              if text.count(old) != 1:
+                  raise RuntimeError(f"{path}: expected exactly one replacement target")
+              file.write_text(text.replace(old, new), encoding="utf-8", newline="\n")
+
+          replace_once(
+              "src/browser/classifier.ts",
+              '''  if (modal) {
+            return result("blocking-modal", false, "UNEXPECTED_BLOCKING_MODAL");
+          }
+          '''.replace(/^          /gm, ""),
+              '''  if (modal) {
+            // Native JavaScript dialogs are deliberately sticky in the Playwright
+            // adapter because Cope never accepts or dismisses them. Distinguish
+            // that unrecoverable session state from an ordinary DOM dialog that
+            // the operator can close manually on the configured Copilot surface.
+            const diagnosticCode = observation.modal.enabledElements === 0
+              ? "NATIVE_BROWSER_DIALOG_DETECTED"
+              : "UNEXPECTED_BLOCKING_MODAL";
+            return result("blocking-modal", false, diagnosticCode);
+          }
+          '''.replace(/^          /gm, ""),
+          )
+
+          replace_once(
+              "src/browser/edge-launcher.ts",
+              '''  const state = inspection.classification.state;
+            if (!isTerminalManualReadinessState(state)) return false;
+            if (state !== "unapproved-host") return true;
+          '''.replace(/^          /gm, ""),
+              '''  const state = inspection.classification.state;
+            // DOM dialogs on the configured Copilot page can be closed by the
+            // operator. Native JavaScript dialogs are sticky by design and cannot
+            // recover inside this session, so return their diagnostic promptly.
+            if (
+              state === "blocking-modal" &&
+              inspection.classification.diagnosticCode === "NATIVE_BROWSER_DIALOG_DETECTED"
+            ) {
+              return true;
+            }
+            if (!isTerminalManualReadinessState(state)) return false;
+            if (state !== "unapproved-host") return true;
+          '''.replace(/^          /gm, ""),
+          )
+
+          test_path = Path("tests/unit/native-dialog-readiness.test.ts")
+          if test_path.exists():
+              raise RuntimeError("native-dialog readiness test already exists")
+          test_path.write_text(dedent('''\
+          import assert from "node:assert/strict";
+          import test from "node:test";
+
+          import {
+            classifyCopilotPage,
+            type ClassifierRequirements,
+          } from "../../src/browser/classifier.js";
+          import { createBaselineCopilotUiContract } from "../../src/browser/config.js";
+          import type {
+            CopilotPageObservation,
+            CopilotSignal,
+            GroupSnapshot,
+          } from "../../src/browser/contracts.js";
+          import {
+            isTerminalEdgeReadinessInspection,
+          } from "../../src/browser/edge-launcher.js";
+
+          const signals: readonly CopilotSignal[] = [
+            "shell",
+            "conversation",
+            "composer",
+            "send",
+            "responses",
+            "user-messages",
+            "streaming",
+            "identity",
+            "protection",
+            "signed-out",
+            "mfa",
+            "consent",
+            "throttled",
+            "service-error",
+            "modal",
+          ];
+          const identity = "Synthetic Work Account";
+          const contract = createBaselineCopilotUiContract(identity);
+          const requirements: ClassifierRequirements = {
+            entryUrl: "https://m365.cloud.microsoft/chat",
+            approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
+            expectedIdentity: identity,
+            requireProtectionIndicator: false,
+          };
+
+          test("a sticky native browser dialog returns a bounded terminal diagnostic", () => {
+            const classification = classifyCopilotPage(
+              modalObservation(false),
+              contract,
+              requirements,
+            );
+
+            assert.equal(classification.state, "blocking-modal");
+            assert.equal(classification.diagnosticCode, "NATIVE_BROWSER_DIALOG_DETECTED");
+            assert.equal(
+              isTerminalEdgeReadinessInspection(inspection(classification), false),
+              true,
+            );
+          });
+
+          test("a recoverable DOM dialog retains the operator window", () => {
+            const classification = classifyCopilotPage(
+              modalObservation(true),
+              contract,
+              requirements,
+            );
+
+            assert.equal(classification.state, "blocking-modal");
+            assert.equal(classification.diagnosticCode, "UNEXPECTED_BLOCKING_MODAL");
+            assert.equal(
+              isTerminalEdgeReadinessInspection(inspection(classification), false),
+              false,
+            );
+          });
+
+          function modalObservation(enabled: boolean): CopilotPageObservation {
+            const snapshots = Object.fromEntries(
+              signals.map((signal) => [signal, snapshot(signal, signal === "modal", enabled)]),
+            ) as Record<CopilotSignal, GroupSnapshot>;
+            return {
+              url: "https://m365.cloud.microsoft/chat/conversation/synthetic",
+              ...snapshots,
+            };
+          }
+
+          function snapshot(
+            signal: CopilotSignal,
+            visible: boolean,
+            enabled: boolean,
+          ): GroupSnapshot {
+            return {
+              signal,
+              matchedCandidates: visible ? 1 : 0,
+              visibleElements: visible ? 1 : 0,
+              enabledElements: visible && enabled ? 1 : 0,
+              elements: visible
+                ? [{
+                    visible: true,
+                    enabled,
+                    text: "",
+                    value: "",
+                    accessibleLabel: "",
+                  }]
+                : [],
+            };
+          }
+
+          function inspection(
+            classification: ReturnType<typeof classifyCopilotPage>,
+          ) {
+            return {
+              classification,
+              diagnostic: {
+                uiContractVersion: contract.version,
+                state: classification.state,
+                diagnosticCode: classification.diagnosticCode,
+                locatorQuorum: Object.fromEntries(
+                  signals.map((signal) => [signal, signal === "modal"]),
+                ) as Readonly<Record<CopilotSignal, boolean>>,
+              },
+            };
+          }
+          '''), encoding="utf-8", newline="\n")
+      - run: npm ci --no-audit --no-fund
+      - run: npm run check
+      - name: Commit native-dialog readiness hardening
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/browser/classifier.ts src/browser/edge-launcher.ts tests/unit/native-dialog-readiness.test.ts
+          git commit -m "Bound sticky native browser dialogs"
+          git pull --rebase origin agent/fix-visible-copilot-readiness-stall
+          git push origin HEAD:agent/fix-visible-copilot-readiness-stall
