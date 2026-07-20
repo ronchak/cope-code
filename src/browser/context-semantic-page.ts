@@ -146,8 +146,7 @@ export function selectActiveCopilotPage(
 /**
  * Reuse an existing configured Copilot page or a genuine Microsoft
  * authentication page. Otherwise create a fresh tab and navigate it explicitly.
- * The newly navigated tab may remain selected for a same-tab auth transition,
- * but unrelated pre-existing tabs cannot satisfy launch readiness.
+ * Unrelated pages on broadly allowlisted Office hosts never satisfy launch.
  */
 export async function openTrackedCopilotPage(
   context: BrowserContext,
@@ -185,11 +184,10 @@ export async function openTrackedCopilotPage(
     } catch (error) {
       navigationError = error;
     }
-    if (!hasAllowedPage(context, config, initial)) {
+    if (!hasAllowedPage(context, config)) {
       const replacementFound = await waitForAllowedReplacementPage(
         context,
         config,
-        initial,
         navigationDeadline,
       );
       if (!replacementFound) {
@@ -231,10 +229,10 @@ function isConfiguredCopilotUrl(value: string, entryValue: string): boolean {
 
 /**
  * A manual-authentication host is not enough by itself. Setup intentionally
- * allowlists several broad Microsoft and Office hosts for visible redirects;
- * selecting one requires a dedicated login host, an OAuth-style query, or an
- * authentication-shaped path. This excludes roots and unrelated pages such as
- * m365.cloud.microsoft/search and www.office.com/.
+ * allowlists several broad Microsoft and Office hosts for visible redirects.
+ * Dedicated login hosts are authentication surfaces by definition; other hosts
+ * require an authentication-shaped path or a coherent OAuth query. This rejects
+ * roots and unrelated pages such as m365.cloud.microsoft/search and office.com/.
  */
 export function isGenuineManualAuthenticationUrl(
   value: string,
@@ -254,21 +252,26 @@ export function isGenuineManualAuthenticationUrl(
     return false;
   }
 
-  const hostname = url.hostname.toLocaleLowerCase().replace(/\.$/u, "");
-  const path = normalizedPath(url.pathname).toLocaleLowerCase();
+  const hostname = url.hostname.toLowerCase().replace(/\.$/u, "");
+  if (DEDICATED_MICROSOFT_LOGIN_HOSTS.has(hostname)) return true;
+
+  const path = normalizedPath(url.pathname).toLowerCase();
   const authPath = /(?:^|\/)(?:auth|authorize|federation|kmsi|login|oauth2?|ppsecure|sas|signin)(?:\/|$|\.)/iu.test(path);
-  const authQuery = [
+  if (authPath) return true;
+
+  const oauthCoreCount = [
     "client_id",
     "code_challenge",
-    "login_hint",
-    "prompt",
     "redirect_uri",
     "response_type",
+  ].filter((key) => url.searchParams.has(key)).length;
+  const oauthSupportCount = [
+    "login_hint",
+    "prompt",
     "sso_reload",
     "state",
-  ].some((key) => url.searchParams.has(key));
-  const dedicatedLoginPath = DEDICATED_MICROSOFT_LOGIN_HOSTS.has(hostname) && path !== "/";
-  return authPath || authQuery || dedicatedLoginPath;
+  ].filter((key) => url.searchParams.has(key)).length;
+  return oauthCoreCount >= 2 || (oauthCoreCount >= 1 && oauthSupportCount >= 1);
 }
 
 /** At launch and in the outer retry loop, trust only genuine external auth URLs. */
@@ -280,18 +283,6 @@ function isReusableExternalAuthenticationUrl(
     !isApprovedUrl(value, config.approvedHosts);
 }
 
-function isNavigatedSameTabAuthenticationCandidate(
-  page: Page,
-  navigationPage: Page,
-  config: CopilotPageSelectionConfig,
-): boolean {
-  const value = page.url();
-  return page === navigationPage &&
-    value !== "about:blank" &&
-    isApprovedUrl(value, config.manualAuthenticationHosts ?? []) &&
-    !isConfiguredCopilotUrl(value, config.entryUrl);
-}
-
 function normalizedPath(value: string): string {
   const withoutTrailingSlash = value.replace(/\/+$/u, "");
   return withoutTrailingSlash === "" ? "/" : withoutTrailingSlash;
@@ -300,24 +291,21 @@ function normalizedPath(value: string): string {
 function hasAllowedPage(
   context: BrowserContext,
   config: EdgeLaunchConfig,
-  navigationPage: Page,
 ): boolean {
   return context.pages().some((page) =>
     !page.isClosed() && (
       isConfiguredCopilotUrl(page.url(), config.entryUrl) ||
-      isGenuineManualAuthenticationUrl(page.url(), config) ||
-      isNavigatedSameTabAuthenticationCandidate(page, navigationPage, config)
+      isGenuineManualAuthenticationUrl(page.url(), config)
     ));
 }
 
 async function waitForAllowedReplacementPage(
   context: BrowserContext,
   config: EdgeLaunchConfig,
-  navigationPage: Page,
   deadline: number,
 ): Promise<boolean> {
   for (;;) {
-    if (hasAllowedPage(context, config, navigationPage)) return true;
+    if (hasAllowedPage(context, config)) return true;
     const remaining = deadline - performance.now();
     if (remaining <= 0) return false;
     await delay(Math.min(config.waits.pollMs, remaining));
