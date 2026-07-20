@@ -7,6 +7,7 @@ import { parseCliArguments } from "./arguments.js";
 import { executeCommand } from "./commands.js";
 import { renderHumanError } from "./friendly-output.js";
 import { PromptCancelledError } from "./prompts.js";
+import { enableInteractiveSetupRerun } from "./setup-invocation.js";
 import { beginTerminalTakeover, commandUsesTerminalTakeover } from "./terminal-layout.js";
 import { WorkspaceExitRequestedError } from "./workspace.js";
 
@@ -14,7 +15,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
   const json = argv.includes("--json");
   let endTerminalTakeover = (): void => undefined;
   try {
-    const command = parseCliArguments(argv);
+    const command = enableInteractiveSetupRerun(parseCliArguments(argv));
     if (commandUsesTerminalTakeover(command.command, command.json)) {
       endTerminalTakeover = beginTerminalTakeover(stdout);
     }
