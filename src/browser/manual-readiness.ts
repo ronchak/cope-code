@@ -12,7 +12,7 @@ export interface ManualReadinessDependencies {
 /**
  * Browser pages often expose the composer before identity and shell signals
  * finish hydrating. Non-retryable classifications therefore have to remain
- * unchanged for a short, bounded quorum before launch treats them as final.
+ * unchanged for a bounded quorum before launch treats them as final.
  */
 export async function waitForStableManualReadiness(
   observe: (maxWaitMs: number, signal?: AbortSignal) => Promise<BrowserStateInspection>,
@@ -55,9 +55,14 @@ export async function waitForStableManualReadiness(
         terminalSamples = 1;
         terminalSince = observedAt;
       }
+      const requiredStableMs = terminalStabilityMs(
+        inspection.classification.state,
+        waits,
+        maxWaitMs,
+      );
       if (
         terminalSamples >= waits.stableSamples &&
-        observedAt - terminalSince >= waits.minimumStableMs
+        observedAt - terminalSince >= requiredStableMs
       ) {
         return inspection;
       }
@@ -86,6 +91,20 @@ export function isTerminalManualReadinessState(
     state === "identity-unverified" ||
     state === "protection-unverified" ||
     state === "changed-selector";
+}
+
+function terminalStabilityMs(
+  state: BrowserStateInspection["classification"]["state"],
+  waits: BrowserWaitConfig,
+  maxWaitMs: number,
+): number {
+  const hydrationSensitive = state === "identity-unverified" ||
+    state === "protection-unverified" ||
+    state === "changed-selector";
+  const desired = hydrationSensitive
+    ? Math.max(waits.minimumStableMs, waits.actionMs)
+    : waits.minimumStableMs;
+  return Math.min(desired, maxWaitMs);
 }
 
 async function sleepWithAbort(milliseconds: number, signal?: AbortSignal): Promise<void> {
