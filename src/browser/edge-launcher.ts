@@ -11,12 +11,18 @@ import type {
   TransportCallOptions,
 } from "../transport/model-transport.js";
 import { CopilotBrowserAdapter, type BrowserStateInspection } from "./copilot-browser-adapter.js";
-import { isApprovedUrl, validateEdgeLaunchConfig, type EdgeLaunchConfig } from "./config.js";
+import {
+  isApprovedUrl,
+  validateEdgeLaunchConfig,
+  type BrowserWaitConfig,
+  type EdgeLaunchConfig,
+} from "./config.js";
 import {
   assertKillSwitchEnabled,
   MutableBrowserKillSwitch,
   type BrowserKillSwitch,
 } from "./kill-switch.js";
+import { waitForStableManualReadiness } from "./manual-readiness.js";
 import { PlaywrightSemanticPage } from "./playwright-semantic-page.js";
 import { ExclusiveProfileLock, prepareDedicatedProfile } from "./profile-lock.js";
 import { CURRENT_HOST_PLATFORM, type HostPlatform } from "../platform/index.js";
@@ -38,6 +44,7 @@ export class EdgeCopilotTransport implements ModelTransport {
   readonly #adapter: CopilotBrowserAdapter;
   readonly #lock: ExclusiveProfileLock;
   readonly #killSwitch: BrowserKillSwitch;
+  readonly #readinessWaits: BrowserWaitConfig;
   #closed = false;
 
   private constructor(
@@ -45,11 +52,13 @@ export class EdgeCopilotTransport implements ModelTransport {
     adapter: CopilotBrowserAdapter,
     lock: ExclusiveProfileLock,
     killSwitch: BrowserKillSwitch,
+    readinessWaits: BrowserWaitConfig,
   ) {
     this.#context = context;
     this.#adapter = adapter;
     this.#lock = lock;
     this.#killSwitch = killSwitch;
+    this.#readinessWaits = readinessWaits;
   }
 
   public static async launch(
@@ -69,12 +78,12 @@ export class EdgeCopilotTransport implements ModelTransport {
       context = await launchDedicatedPersistentContext(
         config.profileDirectory,
         {
-        ...(config.edgeExecutable === undefined
-          ? { channel: "msedge" as const }
-          : { executablePath: config.edgeExecutable }),
-        headless: false,
-        acceptDownloads: false,
-        timeout: config.waits.actionMs,
+          ...(config.edgeExecutable === undefined
+            ? { channel: "msedge" as const }
+            : { executablePath: config.edgeExecutable }),
+          headless: false,
+          acceptDownloads: false,
+          timeout: config.waits.actionMs,
         },
         dependencies.launchPersistentContext,
       );
@@ -89,7 +98,7 @@ export class EdgeCopilotTransport implements ModelTransport {
       const adapter = new CopilotBrowserAdapter(new PlaywrightSemanticPage(page), adapterConfig, {
         killSwitch,
       });
-      return new EdgeCopilotTransport(context, adapter, lock, killSwitch);
+      return new EdgeCopilotTransport(context, adapter, lock, killSwitch, config.waits);
     } catch (error) {
       if (context !== undefined) await context.close().catch(() => undefined);
       await lock.release();
@@ -110,9 +119,12 @@ export class EdgeCopilotTransport implements ModelTransport {
     maxWaitMs?: number,
     signal?: AbortSignal,
   ): Promise<BrowserStateInspection> {
-    return maxWaitMs === undefined
-      ? this.#adapter.waitForManualReadiness(undefined, signal)
-      : this.#adapter.waitForManualReadiness(maxWaitMs, signal);
+    return waitForStableManualReadiness(
+      (sliceMs, activeSignal) => this.#adapter.waitForManualReadiness(sliceMs, activeSignal),
+      this.#readinessWaits,
+      maxWaitMs ?? this.#readinessWaits.manualReadinessMs,
+      signal,
+    );
   }
 
   public async submit(
