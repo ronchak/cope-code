@@ -193,7 +193,7 @@ test("process runner uses no shell, a controlled environment/cwd, bounded output
       executable: process.execPath,
       fixedArguments: [
         "-e",
-        "console.log(process.argv[1]); console.log(process.cwd()); console.log(process.env.CBA_TEST_SECRET ?? 'not-inherited'); console.error('password=abcdefghijklmnop')",
+        "console.log(process.argv[1]); console.log('cwd=' + process.cwd()); console.log(process.env.CBA_TEST_SECRET ?? 'not-inherited'); console.error('password=abcdefghijklmnop')",
       ],
       parameters: [{ name: "value", kind: "string", pattern: "[\\s\\S]+", maxLength: 100 }],
       maxOutputBytes: 4_096,
@@ -258,8 +258,8 @@ test("process runner uses no shell, a controlled environment/cwd, bounded output
   });
   assert.equal(outcome.outcome, "success");
   assert.equal(outcome.stdout.includes(literal), true);
-  const observedCwd = outcome.stdout.split(/\r?\n/u)[1] ?? "";
-  assert.equal(normalizePath(observedCwd), normalizePath(root));
+  const observedCwd = outputValue(outcome.stdout, "cwd");
+  assert.equal(normalizePath(observedCwd), normalizePath(boundary.root));
   assert.equal(outcome.stdout.includes("not-inherited"), true);
   assert.equal(outcome.stdout.includes("must-not-leak"), false);
   assert.equal(outcome.stderr.includes("abcdefghijklmnop"), false);
@@ -284,8 +284,15 @@ test("process runner uses no shell, a controlled environment/cwd, bounded output
   assert.match(repositoryControlled.error ?? "", /Repository-writable executables/);
 });
 
+function outputValue(output: string, key: string): string {
+  const prefix = `${key}=`;
+  const line = output.split(/\r?\n/u).find((candidate) => candidate.startsWith(prefix));
+  if (line === undefined) assert.fail(`Missing ${key} output marker`);
+  return line.slice(prefix.length);
+}
+
 function normalizePath(value: string): string {
-  const normalized = path.normalize(value.trim());
+  const normalized = path.resolve(value.trim());
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
