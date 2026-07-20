@@ -64,34 +64,67 @@ export const DEFAULT_BROWSER_WAITS: BrowserWaitConfig = Object.freeze({
 export function createBaselineCopilotUiContract(
   expectedIdentity: string | TextPattern,
 ): CopilotUiContract {
+  const flexibleIdentity = identityLocatorPattern(expectedIdentity);
   const groups: Record<CopilotSignal, LocatorGroup> = {
-    shell: group("shell", [{ kind: "role", role: "main" }], "presence"),
+    shell: group(
+      "shell",
+      [
+        { kind: "role", role: "main" },
+        { kind: "css", selector: 'main, [role="main"]' },
+      ],
+      "presence",
+    ),
     conversation: group(
       "conversation",
       [
         { kind: "role", role: "main" },
         { kind: "test-id", testId: pattern("chat|conversation") },
+        {
+          kind: "css",
+          selector: 'main, [role="main"], [data-testid*="chat" i], [data-testid*="conversation" i]',
+        },
       ],
       "presence",
     ),
     composer: group(
       "composer",
       [
-        { kind: "role", role: "textbox", name: pattern("message|ask|copilot") },
-        { kind: "placeholder", placeholder: pattern("message|ask|copilot") },
+        { kind: "role", role: "textbox", name: pattern("message|ask|copilot|prompt") },
+        { kind: "placeholder", placeholder: pattern("message|ask|copilot|prompt") },
+        { kind: "label", label: pattern("message|ask|copilot|prompt") },
+        {
+          kind: "css",
+          selector: [
+            'textarea[placeholder*="message" i]',
+            'textarea[placeholder*="ask" i]',
+            'textarea[placeholder*="copilot" i]',
+            '[contenteditable="true"][role="textbox"][aria-label*="message" i]',
+            '[contenteditable="true"][role="textbox"][aria-label*="ask" i]',
+            '[contenteditable="true"][role="textbox"][aria-label*="copilot" i]',
+          ].join(", "),
+        },
       ],
       "value-and-text",
     ),
     send: group(
       "send",
-      [{ kind: "role", role: "button", name: pattern("send|submit") }],
+      [
+        { kind: "role", role: "button", name: pattern("send|submit") },
+        {
+          kind: "css",
+          selector: 'button[aria-label*="send" i], [role="button"][aria-label*="send" i], [data-testid*="send" i]',
+        },
+      ],
       "presence",
     ),
     responses: group(
       "responses",
       [
         { kind: "test-id", testId: pattern("assistant.*message|response") },
-        { kind: "css", selector: '[data-content="ai-message"], [data-author="assistant"]' },
+        {
+          kind: "css",
+          selector: '[data-content="ai-message"], [data-author="assistant"], [data-testid*="assistant" i][data-testid*="message" i], [data-testid*="response" i]',
+        },
       ],
       "text",
       200,
@@ -100,7 +133,10 @@ export function createBaselineCopilotUiContract(
       "user-messages",
       [
         { kind: "test-id", testId: pattern("user.*message") },
-        { kind: "css", selector: '[data-content="user-message"], [data-author="user"]' },
+        {
+          kind: "css",
+          selector: '[data-content="user-message"], [data-author="user"], [data-testid*="user" i][data-testid*="message" i]',
+        },
       ],
       "text",
       200,
@@ -117,9 +153,12 @@ export function createBaselineCopilotUiContract(
       "identity",
       [
         { kind: "role", role: "button", name: expectedIdentity },
+        { kind: "role", role: "button", name: flexibleIdentity },
         { kind: "text", text: expectedIdentity },
+        { kind: "text", text: flexibleIdentity },
       ],
       "text",
+      50,
     ),
     protection: group(
       "protection",
@@ -131,7 +170,10 @@ export function createBaselineCopilotUiContract(
     ),
     "signed-out": group(
       "signed-out",
-      [{ kind: "role", role: "button", name: pattern("sign in|log in") }],
+      [
+        { kind: "role", role: "button", name: pattern("sign in|log in") },
+        { kind: "role", role: "link", name: pattern("sign in|log in") },
+      ],
       "presence",
     ),
     mfa: group(
@@ -157,7 +199,7 @@ export function createBaselineCopilotUiContract(
     modal: group("modal", [{ kind: "role", role: "dialog" }], "presence"),
   };
   return {
-    version: COPILOT_UI_CONTRACT_VERSION,
+    version: `${COPILOT_UI_CONTRACT_VERSION}:m365-2026-07`,
     certifiedSurface: "Microsoft 365 Copilot Chat web",
     submissionStrategy: "send-control",
     groups,
@@ -489,4 +531,17 @@ function group(
   maximumElements = 20,
 ): LocatorGroup {
   return { signal, candidates, minimumCandidateMatches: 1, maximumElements, capture };
+}
+
+function identityLocatorPattern(expectedIdentity: string | TextPattern): TextPattern {
+  if (typeof expectedIdentity !== "string") return expectedIdentity;
+  const comparable = expectedIdentity.normalize("NFKD").replace(/\p{M}/gu, "").trim();
+  if (comparable.includes("@")) return pattern(escapeRegExp(comparable));
+  const tokens = comparable.match(/[\p{L}\p{N}]+/gu) ?? [];
+  if (tokens.length === 0) return pattern(escapeRegExp(expectedIdentity));
+  return pattern(tokens.map((token) => `(?=.*${escapeRegExp(token)})`).join("") + ".*");
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }
