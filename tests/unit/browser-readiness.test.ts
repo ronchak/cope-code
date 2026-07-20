@@ -3,7 +3,10 @@ import test from "node:test";
 
 import type { BrowserStateInspection } from "../../src/browser/copilot-browser-adapter.js";
 import { browserReadinessGuidance } from "../../src/browser/diagnostics.js";
-import { waitForStableManualReadiness } from "../../src/browser/manual-readiness.js";
+import {
+  isTerminalManualReadinessState,
+  waitForStableManualReadiness,
+} from "../../src/browser/manual-readiness.js";
 import type { BrowserWaitConfig } from "../../src/browser/config.js";
 import type { CopilotPageState, PageClassification } from "../../src/browser/classifier.js";
 import type { CopilotSignal } from "../../src/browser/contracts.js";
@@ -128,6 +131,78 @@ test("an approved manual-authentication redirect can return to Copilot", async (
   assert.equal(result.classification.state, "ready");
   assert.equal(calls, 3);
   assert.equal(now, waits.pollMs * 2);
+});
+
+test("a transient unknown page can hydrate into the certified Copilot surface", async () => {
+  let now = 0;
+  let calls = 0;
+  const sequence = [
+    inspection("unknown", "UNKNOWN_PAGE_STATE"),
+    inspection("ready", "READY"),
+  ] as const;
+
+  const result = await waitForStableManualReadiness(
+    async () => sequence[Math.min(calls++, sequence.length - 1)]!,
+    waits,
+    waits.manualReadinessMs,
+    undefined,
+    {
+      monotonicNow: () => now,
+      sleep: async (milliseconds) => { now += milliseconds; },
+    },
+  );
+
+  assert.equal(result.classification.state, "ready");
+  assert.equal(calls, 2);
+  assert.equal(now, waits.pollMs);
+});
+
+test("a persistent unknown page returns a bounded diagnostic instead of waiting ten minutes", async () => {
+  let now = 0;
+  let calls = 0;
+  const unknown = inspection("unknown", "UNKNOWN_PAGE_STATE");
+
+  const result = await waitForStableManualReadiness(
+    async () => { calls += 1; return unknown; },
+    waits,
+    waits.manualReadinessMs,
+    undefined,
+    {
+      monotonicNow: () => now,
+      sleep: async (milliseconds) => { now += milliseconds; },
+    },
+  );
+
+  assert.equal(result.classification.state, "unknown");
+  assert.equal(calls, 5);
+  assert.equal(now, waits.actionMs);
+});
+
+test("manual sign-in states retain the long readiness window and may recover", async () => {
+  let now = 0;
+  let calls = 0;
+
+  const result = await waitForStableManualReadiness(
+    async () => {
+      calls += 1;
+      return calls < 7
+        ? inspection("sign-in-required", "MANUAL_SIGN_IN_REQUIRED")
+        : inspection("ready", "READY");
+    },
+    waits,
+    waits.manualReadinessMs,
+    undefined,
+    {
+      monotonicNow: () => now,
+      sleep: async (milliseconds) => { now += milliseconds; },
+    },
+  );
+
+  assert.equal(result.classification.state, "ready");
+  assert.equal(now, waits.pollMs * 6);
+  assert.equal(isTerminalManualReadinessState("sign-in-required"), false);
+  assert.equal(isTerminalManualReadinessState("unknown"), true);
+  assert.equal(isTerminalManualReadinessState("streaming"), true);
 });
 
 test("readiness diagnostics explain stale identity configuration without exposing identity data", () => {
