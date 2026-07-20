@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   fix:
-    if: github.event.head_commit.message == 'Trigger eager dialog listener attachment'
+    if: github.event.head_commit.message == 'Trigger corrected eager dialog listener attachment'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,6 +26,7 @@ jobs:
         run: |
           from pathlib import Path
           from textwrap import dedent
+          import re
 
           def replace_once(path: str, old: str, new: str) -> None:
               file = Path(path)
@@ -36,164 +37,124 @@ jobs:
 
           replace_once(
               "src/browser/context-semantic-page.ts",
-              dedent("""\
-                  this.#activePage = initialPage;
-                  this.#actionMs = actionMs;
-                  this.#configurePage(initialPage);
-              """),
-              dedent("""\
-                  this.#activePage = initialPage;
-                  this.#actionMs = actionMs;
-                  for (const page of context.pages()) this.#configurePage(page);
-                  this.#configurePage(initialPage);
-                  if (typeof context.on === "function") {
-                    context.on("page", (page) => {
-                      this.#configurePage(page);
-                    });
-                  }
-              """),
+              "    this.#activePage = initialPage;\n"
+              "    this.#actionMs = actionMs;\n"
+              "    this.#configurePage(initialPage);\n",
+              "    this.#activePage = initialPage;\n"
+              "    this.#actionMs = actionMs;\n"
+              "    for (const page of context.pages()) this.#configurePage(page);\n"
+              "    this.#configurePage(initialPage);\n"
+              "    if (typeof context.on === \"function\") {\n"
+              "      context.on(\"page\", (page) => {\n"
+              "        this.#configurePage(page);\n"
+              "      });\n"
+              "    }\n",
           )
 
           replace_once(
               "src/browser/context-semantic-page.ts",
-              dedent("""\
-                #configurePage(page: Page): void {
-                  if (this.#configuredPages.has(page)) return;
-                  page.setDefaultTimeout(this.#actionMs);
-                  page.setDefaultNavigationTimeout(this.#actionMs);
-                  this.#configuredPages.add(page);
-                }
-              """),
-              dedent("""\
-                #configurePage(page: Page): void {
-                  if (this.#configuredPages.has(page)) return;
-                  // Construct the delegate first so its native-dialog listener is active
-                  // before navigation, foregrounding, or the first semantic snapshot.
-                  this.#delegate(page);
-                  page.setDefaultTimeout(this.#actionMs);
-                  page.setDefaultNavigationTimeout(this.#actionMs);
-                  this.#configuredPages.add(page);
-                }
-              """),
+              "  #configurePage(page: Page): void {\n"
+              "    if (this.#configuredPages.has(page)) return;\n"
+              "    page.setDefaultTimeout(this.#actionMs);\n"
+              "    page.setDefaultNavigationTimeout(this.#actionMs);\n"
+              "    this.#configuredPages.add(page);\n"
+              "  }\n",
+              "  #configurePage(page: Page): void {\n"
+              "    if (this.#configuredPages.has(page)) return;\n"
+              "    // Construct the delegate first so its native-dialog listener is active\n"
+              "    // before navigation, foregrounding, or the first semantic snapshot.\n"
+              "    this.#delegate(page);\n"
+              "    page.setDefaultTimeout(this.#actionMs);\n"
+              "    page.setDefaultNavigationTimeout(this.#actionMs);\n"
+              "    this.#configuredPages.add(page);\n"
+              "  }\n",
           )
 
           replace_once(
               "src/browser/playwright-semantic-page.ts",
-              dedent("""\
-                  page.on("dialog", () => {
-                    this.#nativeDialogDetected = true;
-                  });
-              """),
-              dedent("""\
-                  if (typeof page.on === "function") {
-                    page.on("dialog", () => {
-                      this.#nativeDialogDetected = true;
-                    });
-                  }
-              """),
+              "    page.on(\"dialog\", () => {\n"
+              "      this.#nativeDialogDetected = true;\n"
+              "    });\n",
+              "    if (typeof page.on === \"function\") {\n"
+              "      page.on(\"dialog\", () => {\n"
+              "        this.#nativeDialogDetected = true;\n"
+              "      });\n"
+              "    }\n",
           )
 
-          replace_once(
-              "src/browser/context-semantic-page.ts",
-              dedent("""\
-                if (initial === undefined) {
-                  initial = await context.newPage();
-                  initial.setDefaultTimeout(config.waits.actionMs);
-                  initial.setDefaultNavigationTimeout(config.waits.actionMs);
-                  await initial.bringToFront().catch(() => undefined);
-                  const navigationDeadline = performance.now() + config.waits.actionMs;
-                  let navigationError: unknown;
-                  try {
-                    await initial.goto(config.entryUrl, {
-                      waitUntil: "domcontentloaded",
-                      timeout: config.waits.actionMs,
-                    });
-                  } catch (error) {
-                    navigationError = error;
-                  }
-                  if (!hasAllowedPage(context, config)) {
-                    const replacementFound = await waitForAllowedReplacementPage(
-                      context,
-                      config,
-                      navigationDeadline,
-                    );
-                    if (!replacementFound) {
-                      if (navigationError !== undefined) throw navigationError;
-                      throw new AgentError(
-                        "TRANSPORT_UNAVAILABLE",
-                        "The dedicated Edge session did not open the configured Copilot surface",
-                        {
-                          diagnosticCode: "EDGE_NAVIGATION_NO_ALLOWED_PAGE",
-                          next: "Close the dedicated Edge window, run cope setup --force, and retry.",
-                        },
-                      );
-                    }
-                  }
-                }
-
-                const tracked = new ContextSemanticPage(
-                  context,
-                  config,
-                  initial,
-                  config.waits.actionMs,
+          context_path = Path("src/browser/context-semantic-page.ts")
+          context_text = context_path.read_text(encoding="utf-8")
+          navigation_pattern = re.compile(
+              r"  if \(initial === undefined\) \{\n.*?\n"
+              r"  const tracked = new ContextSemanticPage\(\n"
+              r"    context,\n"
+              r"    config,\n"
+              r"    initial,\n"
+              r"    config\.waits\.actionMs,\n"
+              r"  \);\n"
+              r"  await tracked\.focusActivePage\(true\);\n"
+              r"  return tracked;\n",
+              re.DOTALL,
+          )
+          navigation_replacement = """  let tracked: ContextSemanticPage;
+          if (initial === undefined) {
+            initial = await context.newPage();
+            // Install the native-dialog listener before navigation can execute page
+            // script or open a replacement authentication window.
+            tracked = new ContextSemanticPage(
+              context,
+              config,
+              initial,
+              config.waits.actionMs,
+            );
+            await initial.bringToFront().catch(() => undefined);
+            const navigationDeadline = performance.now() + config.waits.actionMs;
+            let navigationError: unknown;
+            try {
+              await initial.goto(config.entryUrl, {
+                waitUntil: "domcontentloaded",
+                timeout: config.waits.actionMs,
+              });
+            } catch (error) {
+              navigationError = error;
+            }
+            if (!hasAllowedPage(context, config)) {
+              const replacementFound = await waitForAllowedReplacementPage(
+                context,
+                config,
+                navigationDeadline,
+              );
+              if (!replacementFound) {
+                if (navigationError !== undefined) throw navigationError;
+                throw new AgentError(
+                  "TRANSPORT_UNAVAILABLE",
+                  "The dedicated Edge session did not open the configured Copilot surface",
+                  {
+                    diagnosticCode: "EDGE_NAVIGATION_NO_ALLOWED_PAGE",
+                    next: "Close the dedicated Edge window, run cope setup --force, and retry.",
+                  },
                 );
-                await tracked.focusActivePage(true);
-                return tracked;
-              """),
-              dedent("""\
-                let tracked: ContextSemanticPage;
-                if (initial === undefined) {
-                  initial = await context.newPage();
-                  // Install the native-dialog listener before navigation can execute page
-                  // script or open a replacement authentication window.
-                  tracked = new ContextSemanticPage(
-                    context,
-                    config,
-                    initial,
-                    config.waits.actionMs,
-                  );
-                  await initial.bringToFront().catch(() => undefined);
-                  const navigationDeadline = performance.now() + config.waits.actionMs;
-                  let navigationError: unknown;
-                  try {
-                    await initial.goto(config.entryUrl, {
-                      waitUntil: "domcontentloaded",
-                      timeout: config.waits.actionMs,
-                    });
-                  } catch (error) {
-                    navigationError = error;
-                  }
-                  if (!hasAllowedPage(context, config)) {
-                    const replacementFound = await waitForAllowedReplacementPage(
-                      context,
-                      config,
-                      navigationDeadline,
-                    );
-                    if (!replacementFound) {
-                      if (navigationError !== undefined) throw navigationError;
-                      throw new AgentError(
-                        "TRANSPORT_UNAVAILABLE",
-                        "The dedicated Edge session did not open the configured Copilot surface",
-                        {
-                          diagnosticCode: "EDGE_NAVIGATION_NO_ALLOWED_PAGE",
-                          next: "Close the dedicated Edge window, run cope setup --force, and retry.",
-                        },
-                      );
-                    }
-                  }
-                } else {
-                  tracked = new ContextSemanticPage(
-                    context,
-                    config,
-                    initial,
-                    config.waits.actionMs,
-                  );
-                }
+              }
+            }
+          } else {
+            tracked = new ContextSemanticPage(
+              context,
+              config,
+              initial,
+              config.waits.actionMs,
+            );
+          }
 
-                await tracked.focusActivePage(true);
-                return tracked;
-              """),
+          await tracked.focusActivePage(true);
+          return tracked;
+          """
+          context_text, replacement_count = navigation_pattern.subn(
+              navigation_replacement,
+              context_text,
           )
+          if replacement_count != 1:
+              raise RuntimeError("context-semantic-page.ts: navigation block changed unexpectedly")
+          context_path.write_text(context_text, encoding="utf-8", newline="\n")
 
           test_path = Path("tests/unit/context-dialog-listener.test.ts")
           if test_path.exists():
