@@ -174,19 +174,64 @@ export function createBaselineCopilotUiContract(
     "signed-out": group(
       "signed-out",
       [
-        { kind: "role", role: "button", name: pattern("sign in|log in") },
-        { kind: "role", role: "link", name: pattern("sign in|log in") },
+        { kind: "role", role: "button", name: pattern("sign in|log in|use another account") },
+        { kind: "test-id", testId: pattern("sign.?in|login|account.?picker") },
+        {
+          kind: "css",
+          selector: [
+            'button[aria-label*="sign in" i]',
+            'button[aria-label*="log in" i]',
+            '[role="button"][aria-label*="sign in" i]',
+            '[role="button"][aria-label*="log in" i]',
+            'button[data-testid*="sign-in" i]',
+            'button[data-testid*="signin" i]',
+            '[role="button"][data-testid*="sign-in" i]',
+            '[role="button"][data-testid*="signin" i]',
+          ].join(", "),
+        },
       ],
       "presence",
     ),
     mfa: group(
       "mfa",
-      [{ kind: "text", text: pattern("approve sign.in|verification code|multi.factor") }],
+      [
+        { kind: "role", role: "textbox", name: pattern("verification code|security code|one.time code|passcode") },
+        { kind: "label", label: pattern("verification code|security code|one.time code|passcode") },
+        { kind: "placeholder", placeholder: pattern("verification code|security code|one.time code|passcode") },
+        { kind: "role", role: "status", name: pattern("approve sign.in|check your authenticator|verification required") },
+        { kind: "test-id", testId: pattern("mfa|multi.factor|verification.code|one.time.code|otp") },
+        {
+          kind: "css",
+          selector: [
+            'input[autocomplete="one-time-code"]',
+            'input[name*="otp" i]',
+            'input[name*="verification" i]',
+            'input[id*="verification" i]',
+            '[aria-label*="verification code" i]',
+            '[aria-label*="security code" i]',
+            '[data-testid*="mfa" i]',
+            '[data-testid*="otp" i]',
+          ].join(", "),
+        },
+      ],
       "presence",
     ),
     consent: group(
       "consent",
-      [{ kind: "text", text: pattern("permissions requested|consent|accept") }],
+      [
+        { kind: "role", role: "dialog", name: pattern("permissions requested|consent|review permissions|allow access") },
+        { kind: "test-id", testId: pattern("consent|permissions") },
+        {
+          kind: "css",
+          selector: [
+            'form[action*="consent" i]',
+            '[data-testid*="consent" i]',
+            '[data-testid*="permission" i]',
+            '[aria-label*="permissions requested" i]',
+            '[aria-label*="consent" i]',
+          ].join(", "),
+        },
+      ],
       "presence",
     ),
     throttled: group(
