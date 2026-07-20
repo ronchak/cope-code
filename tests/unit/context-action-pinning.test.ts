@@ -60,17 +60,47 @@ class ActionContext {
   public asContext(): BrowserContext { return this as unknown as BrowserContext; }
 }
 
-test("an unchanged observed page remains actionable", async () => {
+test("an unchanged filled page remains actionable after its second observation", async () => {
   const page = new ActionPage(`${entryUrl}/conversation/one`);
   const context = new ActionContext([page]);
   const tracked = createTracked(context, page);
 
   assert.equal(await tracked.currentUrl(), page.currentUrl);
   await tracked.fill(composerGroup, "hello");
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
   await tracked.click(sendGroup);
+
+  assert.deepEqual(page.actions, ["fill:hello", "click"]);
+});
+
+test("composer-enter activation uses the same post-fill page pin", async () => {
+  const page = new ActionPage(`${entryUrl}/conversation/one`);
+  const context = new ActionContext([page]);
+  const tracked = createTracked(context, page);
+
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  await tracked.fill(composerGroup, "hello");
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
   await tracked.press(composerGroup, "Enter");
 
-  assert.deepEqual(page.actions, ["fill:hello", "click", "press:Enter"]);
+  assert.deepEqual(page.actions, ["fill:hello", "press:Enter"]);
+});
+
+test("activation without the post-fill observation is rejected", async () => {
+  const page = new ActionPage(`${entryUrl}/conversation/one`);
+  const context = new ActionContext([page]);
+  const tracked = createTracked(context, page);
+
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  await tracked.fill(composerGroup, "hello");
+
+  await assert.rejects(
+    tracked.click(sendGroup),
+    (error: unknown) =>
+      error instanceof AgentError &&
+      error.details.diagnosticCode === "POST_FILL_OBSERVATION_REQUIRED",
+  );
+  assert.deepEqual(page.actions, ["fill:hello"]);
 });
 
 test("a replacement Copilot tab cannot receive a fill without a new observation", async () => {
@@ -100,7 +130,7 @@ test("same-tab navigation after observation blocks the consequential action", as
   page.currentUrl = `${entryUrl}/conversation/two`;
 
   await assert.rejects(
-    tracked.click(sendGroup),
+    tracked.fill(composerGroup, "must-not-disclose"),
     changedPageError,
   );
   assert.deepEqual(page.actions, []);
@@ -120,6 +150,43 @@ test("a second configured Copilot page creates a hard stop before prompt fill", 
     ambiguousPageError,
   );
   assert.deepEqual(first.actions, []);
+  assert.deepEqual(second.actions, []);
+});
+
+test("a same-URL replacement after fill aborts the second trust observation", async () => {
+  const firstUrl = `${entryUrl}/conversation/one`;
+  const first = new ActionPage(firstUrl);
+  const context = new ActionContext([first]);
+  const tracked = createTracked(context, first);
+
+  assert.equal(await tracked.currentUrl(), firstUrl);
+  await tracked.fill(composerGroup, "filled-only-on-first");
+  first.closed = true;
+  const replacement = new ActionPage(firstUrl);
+  context.pageList.push(replacement);
+
+  await assert.rejects(
+    tracked.currentUrl(),
+    (error: unknown) =>
+      error instanceof AgentError &&
+      error.details.diagnosticCode === "ACTIVE_PAGE_CHANGED_AFTER_FILL",
+  );
+  assert.deepEqual(first.actions, ["fill:filled-only-on-first"]);
+  assert.deepEqual(replacement.actions, []);
+});
+
+test("a second configured page appearing after fill aborts before activation", async () => {
+  const first = new ActionPage(`${entryUrl}/conversation/one`);
+  const context = new ActionContext([first]);
+  const tracked = createTracked(context, first);
+
+  assert.equal(await tracked.currentUrl(), first.currentUrl);
+  await tracked.fill(composerGroup, "filled-only-on-first");
+  const second = new ActionPage(`${entryUrl}/conversation/two`);
+  context.pageList.push(second);
+
+  await assert.rejects(tracked.currentUrl(), ambiguousPageError);
+  assert.deepEqual(first.actions, ["fill:filled-only-on-first"]);
   assert.deepEqual(second.actions, []);
 });
 
