@@ -106,6 +106,23 @@ test("same-tab navigation after observation blocks the consequential action", as
   assert.deepEqual(page.actions, []);
 });
 
+test("a second configured Copilot page creates a hard stop before prompt fill", async () => {
+  const first = new ActionPage(`${entryUrl}/conversation/one`);
+  const context = new ActionContext([first]);
+  const tracked = createTracked(context, first);
+
+  assert.equal(await tracked.currentUrl(), first.currentUrl);
+  const second = new ActionPage(`${entryUrl}/conversation/two`);
+  context.pageList.push(second);
+
+  await assert.rejects(
+    tracked.fill(composerGroup, "must-not-disclose"),
+    ambiguousPageError,
+  );
+  assert.deepEqual(first.actions, []);
+  assert.deepEqual(second.actions, []);
+});
+
 function createTracked(
   context: ActionContext,
   page: ActionPage,
@@ -126,4 +143,10 @@ function changedPageError(error: unknown): boolean {
   return error instanceof AgentError &&
     error.code === "TRANSPORT_INDETERMINATE" &&
     error.details.diagnosticCode === "ACTIVE_PAGE_CHANGED_BEFORE_ACTION";
+}
+
+function ambiguousPageError(error: unknown): boolean {
+  return error instanceof AgentError &&
+    error.code === "TRANSPORT_INDETERMINATE" &&
+    error.details.diagnosticCode === "AMBIGUOUS_COPILOT_PAGE";
 }
