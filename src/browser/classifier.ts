@@ -232,12 +232,14 @@ function containsTokenSequence(
 /**
  * Broad host approval is not enough once the UI contract includes semantic
  * fallbacks. Submission-capable classification is limited to the configured
- * Copilot entry path and its descendants, such as /chat/conversation/... .
+ * Copilot origin and entry path, including descendants such as
+ * /chat/conversation/... .
  */
 function isWithinConfiguredCopilotPath(value: string, entryValue: string): boolean {
   try {
     const actual = new URL(value);
     const entry = new URL(entryValue);
+    if (actual.origin !== entry.origin) return false;
     const basePath = normalizedPath(entry.pathname);
     const actualPath = normalizedPath(actual.pathname);
     return basePath === "/" || actualPath === basePath || actualPath.startsWith(`${basePath}/`);
