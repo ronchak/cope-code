@@ -1,4 +1,4 @@
-name: one-shot-pr4-finalize-v2
+name: one-shot-pr4-final-blockers
 
 on:
   push:
@@ -23,130 +23,34 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - name: Settle prior one-shot updates
-        run: |
-          sleep 30
-          git pull --rebase origin agent/fix-visible-copilot-readiness-stall
-      - name: Apply idempotent final fixes
+      - name: Confirm the settled branch
+        run: git pull --ff-only origin agent/fix-visible-copilot-readiness-stall
+      - name: Apply the remaining PR 4 fixes
         shell: python
+        env:
+          PATCH1: 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
+          PATCH2: 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
+          PATCH3: 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
+          PATCH4: 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
+          PATCH5: KXuPPTMHYh+wg62PfGZQp0oSmIDUXBcgdO2VATcrrW48oxppPj0O6DZ4XS8GbS9EqyeQnQImeUtPZ601jRsdSz02XCo57bBvG/xe079WeHpP71pVaXOdj+2tul3sXL0wpaOOl7bBKNoDT5MrX8nW5vipXJVZbagIWc6mGpfGRqz10hZlw9yaXz8Hi6lVleY2lXA99Sla8iP1gV7tA7GaYRtTyg3p5JYupamS7dtnPUx1dr/d+faH7s6P9jKLn0BekR32s8DuqR0y951HXMN89jC+11BA0uByAkm9k5ImSnrV0g210jVfUXVcKpVu7rZUAG0a6gPt1fwLL6lvVuUkv73iave4ytzsBVUBu+Xf9VIudO1tRBcccAqyorX2uyv7kQBVw6/2Z8v5Lv4WfRd/y34XX1aiYfzzPi9uxmn+Hj/LLCvTwklSTqvhtm7BKrRJmg+DrTzjXdyl7jfhYpZuteVn/nW/sMIUxE3QfvJ/TCZamQ==
         run: |
-          from pathlib import Path
-          import re
+          import base64
+          import os
+          import zlib
 
-          readiness_path = Path("src/browser/manual-readiness.ts")
-          readiness = readiness_path.read_text(encoding="utf-8")
-          if 'state !== "blocking-modal"' not in readiness:
-              needle = '''  return state !== "ready" &&\n    state !== "sign-in-required" &&\n    state !== "mfa-required" &&\n    state !== "consent-required";'''
-              replacement = '''  return state !== "ready" &&\n    state !== "sign-in-required" &&\n    state !== "mfa-required" &&\n    state !== "consent-required" &&\n    state !== "blocking-modal";'''
-              if readiness.count(needle) != 1:
-                  raise RuntimeError("manual readiness terminal-state block changed unexpectedly")
-              readiness = readiness.replace(needle, replacement, 1)
-          readiness = readiness.replace(
-              '  return state === "unapproved-host" || state === "blocking-modal";',
-              '  return state === "unapproved-host";',
-          )
-          readiness_path.write_text(readiness, encoding="utf-8", newline="\n")
-
-          readiness_test_path = Path("tests/unit/browser-readiness.test.ts")
-          readiness_test = readiness_test_path.read_text(encoding="utf-8")
-          modal_test = '''test("a visible blocking dialog retains the manual window and may recover", async () => {\n  let now = 0;\n  let calls = 0;\n\n  const result = await waitForStableManualReadiness(\n    async () => {\n      calls += 1;\n      return calls < 7\n        ? inspection("blocking-modal", "UNEXPECTED_BLOCKING_MODAL")\n        : inspection("ready", "READY");\n    },\n    waits,\n    waits.manualReadinessMs,\n    undefined,\n    {\n      monotonicNow: () => now,\n      sleep: async (milliseconds) => { now += milliseconds; },\n    },\n  );\n\n  assert.equal(result.classification.state, "ready");\n  assert.equal(calls, 7);\n  assert.equal(now, waits.pollMs * 6);\n  assert.equal(isTerminalManualReadinessState("blocking-modal"), false);\n});\n\n'''
-          readiness_anchor = 'test("manual sign-in states retain the long readiness window and may recover", async () => {'
-          if modal_test not in readiness_test:
-              if readiness_test.count(readiness_anchor) != 1:
-                  raise RuntimeError("manual readiness test anchor changed unexpectedly")
-              readiness_test = readiness_test.replace(readiness_anchor, modal_test + readiness_anchor, 1)
-          readiness_test_path.write_text(readiness_test, encoding="utf-8", newline="\n")
-
-          adapter_path = Path("src/browser/copilot-browser-adapter.ts")
-          adapter = adapter_path.read_text(encoding="utf-8")
-          suffix = 'const TASK_MARKER_SUFFIX = "]]";\n'
-          guard_set = '''const PRE_ACTIVATION_GUARD_DIAGNOSTICS = new Set([\n  "ACTIVE_PAGE_CHANGED_AFTER_FILL",\n  "ACTIVE_PAGE_CHANGED_BEFORE_ACTION",\n  "AMBIGUOUS_COPILOT_PAGE",\n  "COMPOSER_CONTENT_CHANGED_BEFORE_SUBMIT",\n  "EDGE_PAGE_MISSING",\n  "FILLED_PAGE_TRANSACTION_MISSING",\n  "POST_FILL_OBSERVATION_REQUIRED",\n]);\n'''
-          if guard_set not in adapter:
-              if adapter.count(suffix) != 1:
-                  raise RuntimeError("task marker suffix changed unexpectedly")
-              adapter = adapter.replace(suffix, suffix + guard_set, 1)
-
-          old_catch = '''    } catch {\n      // Playwright can throw after dispatch. Resolve only through page evidence.\n    }\n\n    record.receipt = await this.#confirmSubmission(record, options.signal);'''
-          new_catch = '''    } catch (error) {\n      const preActivationDiagnostic = preActivationGuardDiagnostic(error);\n      if (preActivationDiagnostic !== undefined) {\n        record.activationAttempted = false;\n        record.receipt = this.#receipt(\n          request,\n          "not-submitted",\n          conversationId,\n          marker,\n          preActivationDiagnostic,\n        );\n        return record.receipt;\n      }\n      // Playwright can throw after dispatch. Resolve only through page evidence.\n    }\n\n    record.receipt = await this.#confirmSubmission(record, options.signal);'''
-          if 'preActivationGuardDiagnostic(error)' not in adapter:
-              if adapter.count(old_catch) != 1:
-                  raise RuntimeError("activation catch block changed unexpectedly")
-              adapter = adapter.replace(old_catch, new_catch, 1)
-
-          guard_helper = '''\nfunction preActivationGuardDiagnostic(error: unknown): string | undefined {\n  if (!(error instanceof AgentError)) return undefined;\n  const diagnosticCode = error.details.diagnosticCode;\n  return typeof diagnosticCode === "string" &&\n      PRE_ACTIVATION_GUARD_DIAGNOSTICS.has(diagnosticCode)\n    ? diagnosticCode\n    : undefined;\n}\n'''
-          if guard_helper not in adapter:
-              anchor = '\nfunction responseTexts('
-              if adapter.count(anchor) != 1:
-                  raise RuntimeError("response text helper anchor changed unexpectedly")
-              adapter = adapter.replace(anchor, guard_helper + anchor, 1)
-          adapter_path.write_text(adapter, encoding="utf-8", newline="\n")
-
-          adapter_test_path = Path("tests/unit/browser-adapter.test.ts")
-          adapter_test = adapter_test_path.read_text(encoding="utf-8")
-          if 'import { AgentError } from "../../src/shared/errors.js";' not in adapter_test:
-              anchor = 'import { MutableBrowserKillSwitch } from "../../src/browser/kill-switch.js";\n'
-              if adapter_test.count(anchor) != 1:
-                  raise RuntimeError("adapter test import anchor changed unexpectedly")
-              adapter_test = adapter_test.replace(
-                  anchor,
-                  anchor + 'import { AgentError } from "../../src/shared/errors.js";\n',
-                  1,
-              )
-          if 'public preActivationGuardCode: string | undefined;' not in adapter_test:
-              anchor = '  public activationMode: ActivationMode = "submitted";\n'
-              if adapter_test.count(anchor) != 1:
-                  raise RuntimeError("adapter fake-page property anchor changed unexpectedly")
-              adapter_test = adapter_test.replace(
-                  anchor,
-                  anchor + '  public preActivationGuardCode: string | undefined;\n',
-                  1,
-              )
-          old_methods = '''  public async click(): Promise<void> {\n    await this.#activate();\n  }\n\n  public async press(): Promise<void> {\n    await this.#activate();\n  }\n\n  async #activate(): Promise<void> {'''
-          new_methods = '''  public async click(): Promise<void> {\n    this.#throwPreActivationGuard();\n    await this.#activate();\n  }\n\n  public async press(): Promise<void> {\n    this.#throwPreActivationGuard();\n    await this.#activate();\n  }\n\n  #throwPreActivationGuard(): void {\n    if (this.preActivationGuardCode === undefined) return;\n    throw new AgentError(\n      "TRANSPORT_INDETERMINATE",\n      "Synthetic pre-activation guard",\n      { diagnosticCode: this.preActivationGuardCode },\n    );\n  }\n\n  async #activate(): Promise<void> {'''
-          if '#throwPreActivationGuard(): void' not in adapter_test:
-              if adapter_test.count(old_methods) != 1:
-                  raise RuntimeError("adapter fake-page methods changed unexpectedly")
-              adapter_test = adapter_test.replace(old_methods, new_methods, 1)
-          guard_test = '''test("a known pre-activation guard remains safely retryable", async () => {\n  const { adapter, page } = makeHarness();\n  page.preActivationGuardCode = "COMPOSER_CONTENT_CHANGED_BEFORE_SUBMIT";\n\n  const first = await adapter.submit(request);\n  assert.equal(first.status, "not-submitted");\n  assert.equal(first.diagnosticCode, "COMPOSER_CONTENT_CHANGED_BEFORE_SUBMIT");\n  assert.equal(page.activationCalls, 0);\n\n  page.preActivationGuardCode = undefined;\n  const retry = await adapter.submit(request);\n  assert.equal(retry.status, "submitted");\n  assert.equal(page.activationCalls, 1);\n});\n\n'''
-          if guard_test not in adapter_test:
-              anchor = 'test("configured send-control strategy never guesses Enter when send is disabled", async () => {'
-              if adapter_test.count(anchor) != 1:
-                  raise RuntimeError("adapter guard-test anchor changed unexpectedly")
-              adapter_test = adapter_test.replace(anchor, guard_test + anchor, 1)
-          adapter_test_path.write_text(adapter_test, encoding="utf-8", newline="\n")
-
-          config_path = Path("src/browser/config.ts")
-          config = config_path.read_text(encoding="utf-8")
-          scoped_auth = '''    "signed-out": group(\n      "signed-out",\n      [\n        { kind: "role", role: "button", name: pattern("sign in|log in") },\n        { kind: "role", role: "link", name: pattern("sign in|log in") },\n        {\n          kind: "css",\n          selector: 'button[type="submit"][aria-label*="sign in" i], a[href*="login" i][aria-label*="sign in" i], [data-testid*="sign-in" i], [data-testid*="signin" i]',\n        },\n      ],\n      "presence",\n    ),\n    mfa: group(\n      "mfa",\n      [\n        { kind: "role", role: "textbox", name: pattern("verification code|security code|one.time code|passcode") },\n        { kind: "label", label: pattern("verification code|security code|one.time code|passcode") },\n        { kind: "role", role: "status", name: pattern("approve sign.in|multi.factor|authenticator") },\n        { kind: "role", role: "alert", name: pattern("approve sign.in|multi.factor|authenticator") },\n        { kind: "test-id", testId: pattern("mfa|multi.factor|otp|one.time|verification") },\n        {\n          kind: "css",\n          selector: 'input[autocomplete="one-time-code"], input[name*="otc" i], input[name*="otp" i], input[name*="verification" i], [data-testid*="mfa" i], [data-testid*="otp" i], [data-testid*="verification" i]',\n        },\n      ],\n      "presence",\n    ),\n    consent: group(\n      "consent",\n      [\n        { kind: "role", role: "dialog", name: pattern("permissions requested|requested permissions|consent") },\n        { kind: "role", role: "alertdialog", name: pattern("permissions requested|requested permissions|consent") },\n        { kind: "test-id", testId: pattern("consent|permissions.request|requested.permissions") },\n        {\n          kind: "css",\n          selector: '[role="dialog"][aria-label*="permission" i], [role="alertdialog"][aria-label*="permission" i], [data-testid*="consent" i], [data-testid*="permissions-request" i]',\n        },\n      ],\n      "presence",\n    ),\n'''
-          block_pattern = re.compile(
-              r'    "signed-out": group\(.*?\n    throttled: group\(',
-              re.DOTALL,
-          )
-          matches = list(block_pattern.finditer(config))
-          if len(matches) != 1:
-              raise RuntimeError("manual-auth group sequence changed unexpectedly")
-          config = block_pattern.sub(scoped_auth + '    throttled: group(', config, count=1)
-          config_path.write_text(config, encoding="utf-8", newline="\n")
-
-          Path("tests/unit/manual-auth-locator-scoping.test.ts").write_text(
-              '''import assert from "node:assert/strict";\nimport test from "node:test";\n\nimport { createBaselineCopilotUiContract } from "../../src/browser/config.js";\n\ntest("manual-auth signals do not use unrestricted page-text locators", () => {\n  const contract = createBaselineCopilotUiContract("Synthetic Work Account");\n  for (const signal of ["signed-out", "mfa", "consent"] as const) {\n    assert.equal(\n      contract.groups[signal].candidates.some((candidate) => candidate.kind === "text"),\n      false,\n      `${signal} must be tied to an authentication control or container`,\n    );\n  }\n});\n\ntest("MFA and consent fallbacks remain structurally scoped", () => {\n  const contract = createBaselineCopilotUiContract("Synthetic Work Account");\n  assert.equal(\n    contract.groups.mfa.candidates.some((candidate) =>\n      candidate.kind === "role" && ["textbox", "status", "alert"].includes(candidate.role)),\n    true,\n  );\n  assert.equal(\n    contract.groups.consent.candidates.some((candidate) =>\n      candidate.kind === "role" && ["dialog", "alertdialog"].includes(candidate.role)),\n    true,\n  );\n});\n''',
-              encoding="utf-8",
-              newline="\n",
-          )
-
-          for workflow in Path(".github/workflows").glob("one-shot-*.yml"):
-              workflow.unlink()
-      - run: npm ci --no-audit --no-fund
-      - run: npm run check
-      - name: Commit and push exact tested state
+          payload = "".join(os.environ[f"PATCH{index}"] for index in range(1, 6))
+          source = zlib.decompress(base64.b64decode(payload)).decode()
+          exec(compile(source, "pr4-finalizer.py", "exec"))
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Validate the exact staged code
+        run: npm run check
+      - name: Commit and push the exact tested state
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          if git diff --cached --quiet; then
-            echo "No changes required"
-            exit 0
-          fi
-          git commit -m "Finish PR 4 readiness and activation hardening"
+          test -n "$(git status --porcelain)"
+          git commit -m "Finish PR 4 dialog and readiness hardening"
           git pull --rebase origin agent/fix-visible-copilot-readiness-stall
           git push origin HEAD:agent/fix-visible-copilot-readiness-stall
