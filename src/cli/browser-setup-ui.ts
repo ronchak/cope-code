@@ -5,7 +5,7 @@ import { stdin, stdout } from "node:process";
 import type { DiscoveredBrowser } from "../browser/discovery.js";
 import { browserProductPresentation, type BrowserProduct } from "../browser/product.js";
 import { PromptCancelledError } from "./prompts.js";
-import { bold, dim, type Writable } from "./presentation.js";
+import { bold, dim, magenta, success, type Writable } from "./presentation.js";
 import { displayWidth, isPlainTerminal, terminalColumns, wrapText } from "./terminal-layout.js";
 
 export class PromptBackError extends Error {
@@ -114,43 +114,55 @@ export function renderBrowserSetupScreen(
     const presentation = browserProductPresentation(browser.product);
     const marker = options.plain === true
       ? `${index === undefined ? "" : `${String(index + 1)}. `}${selected ? "[x]" : "[ ]"}`
-      : selected ? "●" : "○";
+      : selected ? magenta("●") : dim("○");
     const version = browser.version.split(".")[0] ?? browser.version;
     addWrapped(`${marker} ${presentation.productName} ${version}`.trim());
-    addWrapped(productSupportLabel(browser.product), "    ");
+    if (browser.product === "chrome") addWrapped(dim("Cope support for Chrome is in preview."), "    ");
   };
-  const addControls = (value: string): void => {
-    for (const line of wrapText(value, Math.max(8, contentWidth - 2))) lines.push(`  ${dim(line)}`);
+  const addControls = (items: readonly string[]): void => {
+    const available = Math.max(8, contentWidth - 2);
+    const separator = "  ·  ";
+    let current = "";
+    for (const item of items) {
+      const candidate = current.length === 0 ? item : `${current}${separator}${item}`;
+      if (current.length > 0 && displayWidth(candidate) > available) {
+        lines.push(`  ${dim(current)}`);
+        current = item;
+      } else {
+        current = candidate;
+      }
+    }
+    if (current.length > 0) lines.push(`  ${dim(current)}`);
   };
 
   switch (screen.kind) {
     case "current":
-      lines.push(bold("Browser"), "");
+      lines.push(bold("Your browser"), "");
       addBrowser(screen.browser, true);
-      addWrapped(screen.browser.locationLabel, "    ");
+      addWrapped(dim(screen.browser.locationLabel), "    ");
       lines.push("");
-      addWrapped("Cope will use this browser's separate profile. Your everyday profile will not be used.");
+      addWrapped("Cope uses a separate profile, keeping your everyday browsing data untouched.");
       lines.push("");
-      addControls("Enter Continue    C Change browser    Esc Back");
+      addControls(["[Enter] Continue", "[C] Change browser", "[Esc] Back"]);
       break;
     case "single":
-      lines.push(bold("Browser"), "");
+      lines.push(bold("Browser found"), "");
       addBrowser(screen.browser, true);
-      addWrapped(screen.browser.locationLabel, "    ");
+      addWrapped(dim(screen.browser.locationLabel), "    ");
       lines.push("");
-      addWrapped("Cope will create a separate browser profile. Your everyday browser profile will not be used.");
+      addWrapped("Cope uses a separate profile, keeping your everyday browsing data untouched.");
       lines.push("");
-      addControls("Enter Continue    C Choose installation    Esc Back");
+      addControls(["[Enter] Continue", "[C] Other installation", "[Esc] Back"]);
       break;
     case "choose":
       lines.push(bold("Choose a browser"), "");
       screen.browsers.forEach((browser, index) => addBrowser(browser, index === screen.selectedIndex, index));
       lines.push("");
-      addWrapped("Cope always uses a separate browser profile.");
+      addWrapped("Your selection opens in a separate profile, away from your everyday browsing data.");
       lines.push("");
       addControls(options.plain === true
-        ? "Number Select    Enter Continue    Esc Back"
-        : "↑↓ Select    Enter Continue    Esc Back");
+        ? ["[Number] Select", "[Enter] Continue", "[Esc] Back"]
+        : ["[↑/↓] Select", "[Enter] Continue", "[Esc] Back"]);
       break;
     case "none":
       lines.push(bold("No supported browser found"), "");
@@ -160,7 +172,7 @@ export function renderBrowserSetupScreen(
       addWrapped("Install Microsoft Edge Stable or Google Chrome Stable, then choose Retry.");
       if (screen.guidance !== undefined) addWrapped(screen.guidance);
       lines.push("");
-      addControls("R Retry    A Choose installation    Esc Exit setup");
+      addControls(["[R] Retry", "[A] Other installation", "[Esc] Exit setup"]);
       break;
     case "manual-product":
       lines.push(bold("Choose the installation type"), "");
@@ -173,8 +185,8 @@ export function renderBrowserSetupScreen(
       });
       lines.push("");
       addControls(options.plain === true
-        ? "Number Select    Enter Continue    Esc Back"
-        : "↑↓ Select    Enter Continue    Esc Back");
+        ? ["[Number] Select", "[Enter] Continue", "[Esc] Back"]
+        : ["[↑/↓] Select", "[Enter] Continue", "[Esc] Back"]);
       break;
     case "confirm-change":
       lines.push(bold("Change browser?"), "");
@@ -185,7 +197,7 @@ export function renderBrowserSetupScreen(
         ? "Cope will keep this browser product's dedicated profile and reverify the selected installation."
         : "The new browser uses a different dedicated profile. Existing browser authentication is not copied.");
       lines.push("");
-      addControls("Enter Confirm change    Esc Back");
+      addControls(["[Enter] Confirm change", "[Esc] Back"]);
       break;
   }
   return `${lines.join("\n")}\n`;
@@ -250,7 +262,16 @@ export async function browserSetupPrompt(
         }
         if (transition.action !== undefined) {
           cleanup();
-          output.write("\n");
+          if (renderedLines > 0) output.write(`\x1b[${String(renderedLines)}A\r\x1b[J`);
+          const selectedBrowser = transition.action.action === "continue" || transition.action.action === "confirm-change"
+            ? transition.action.browser
+            : undefined;
+          if (selectedBrowser !== undefined) {
+            const presentation = browserProductPresentation(selectedBrowser.product);
+            const version = selectedBrowser.version.split(".")[0] ?? selectedBrowser.version;
+            success(`${presentation.productName} ${version} selected.`, output);
+            output.write("\n");
+          }
           resolve(transition.action);
           return;
         }
@@ -333,8 +354,4 @@ function plainAnswerKey(answer: string): BrowserSetupKey | undefined {
   if (answer === "r") return "retry";
   if (answer === "a") return "advanced";
   return undefined;
-}
-
-function productSupportLabel(product: BrowserProduct): string {
-  return product === "edge" ? "Established compatibility target" : "Chrome preview candidate / offline evidence only";
 }

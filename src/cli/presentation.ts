@@ -9,6 +9,7 @@ import {
   terminalColumns,
   truncateEnd,
   truncateMiddle,
+  wrapText,
 } from "./terminal-layout.js";
 
 export interface Writable {
@@ -51,9 +52,43 @@ export interface ChatContext {
   readonly demo?: boolean;
 }
 
+export interface SetupHeroOptions {
+  readonly columns?: number;
+}
+
 export function banner(version: string, output: Writable): void {
   output.write(`\n${bold(magenta("COPE"))} ${dim(`v${version}`)}\n`);
   output.write(`${dim("Copilot coding, without the copy and paste loop")}\n\n`);
+}
+
+export function setupHero(output: Writable, options: SetupHeroOptions = {}): void {
+  const width = Math.max(24, Math.min(options.columns ?? terminalColumns(), 72));
+  const characters = frameCharacters();
+  const innerWidth = width - 4;
+  const title = ` ${bold(magenta("COPE CODE"))} `;
+  const topFill = Math.max(0, width - displayWidth(title) - 3);
+  const line = (value = ""): void => framedLine(value, innerWidth, characters, output);
+  const wrapped = (value: string, decorate: (line: string) => string = (line) => line): void => {
+    for (const wrappedLine of wrapText(value, innerWidth)) line(decorate(wrappedLine));
+  };
+
+  output.write(`\n${characters.topLeft}${characters.horizontal}${title}${repeatToWidth(characters.horizontal, topFill)}${characters.topRight}\n`);
+  line();
+  line(bold("Welcome to Cope Code"));
+  wrapped("A quick setup, then you're ready to build.", dim);
+  line();
+
+  if (width >= 48) {
+    line(`${magenta("●")} ${bold("Browser")}  ${dim("──")}  ${dim("○ Account")}  ${dim("──")}  ${dim("○ Ready")}`);
+  } else {
+    line(`${magenta("●")} ${bold("Step 1 of 3 · Browser")}`);
+    line(dim("Next: account, then ready"));
+  }
+  line();
+  line(`${dim("Created by")} ${bold("Ronak Chakraborty")}`);
+  wrapped("Your password stays in the browser.", dim);
+  line();
+  output.write(`${characters.bottomLeft}${repeatToWidth(characters.horizontal, width - 2)}${characters.bottomRight}\n\n`);
 }
 
 export function startupPanel(options: StartupPanelOptions, output: Writable): void {

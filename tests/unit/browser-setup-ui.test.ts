@@ -88,7 +88,7 @@ test("browser setup remains readable at 54 columns and after resize without expo
     assert.match(rendered, /Microsoft Edge Stable/u);
     assert.match(rendered, /Google Chrome Stable/u);
     assert.match(rendered, /● Google Chrome/u);
-    assert.match(rendered, /Enter Continue/u);
+    assert.match(rendered, /\[Enter\] Continue/u);
     assert.doesNotMatch(rendered, /\/Applications|\\Program Files|browser_executable/u);
   }
 });
@@ -105,9 +105,9 @@ test("plain and no-color setup uses numbered options and explicit selection mark
     assert.doesNotMatch(rendered, /\x1b\[/u);
     assert.match(rendered, /1\. \[x\] Microsoft Edge/u);
     assert.match(rendered, /2\. \[ \] Google Chrome/u);
-    assert.match(rendered, /Established compatibility target/u);
-    assert.match(rendered, /preview candidate \/ offline evidence\s+only/u);
-    assert.match(rendered, /Number Select/u);
+    assert.doesNotMatch(rendered, /Established compatibility target/u);
+    assert.match(rendered, /support for Chrome is in preview/u);
+    assert.match(rendered, /\[Number\] Select/u);
   } finally {
     if (prior === undefined) delete process.env.NO_COLOR;
     else process.env.NO_COLOR = prior;
@@ -158,6 +158,7 @@ test("active raw prompt clears from a known viewport origin after resize", async
   assert.equal(action.action, "continue");
   if (action.action === "continue") assert.equal(action.browser.product, "chrome");
   assert.match(rendered, /\x1b\[2J\x1b\[H/u);
+  assert.match(rendered, /Google Chrome Stable 149 selected/u);
   assert.equal(raw, false);
   } finally {
     if (priorTerm === undefined) delete process.env.TERM;

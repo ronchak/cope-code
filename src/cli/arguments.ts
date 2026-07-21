@@ -37,6 +37,7 @@ export type CliCommand =
       readonly browserExecutable?: string;
     } & CommonOptions)
   | ({ readonly command: "doctor"; readonly repository: string } & CommonOptions)
+  | ({ readonly command: "update" } & CommonOptions)
   | ({ readonly command: "sessions"; readonly repository?: string; readonly all: boolean } & CommonOptions)
   | ({ readonly command: "init"; readonly repository: string; readonly force: boolean; readonly quick: boolean } & CommonOptions)
   | ({
@@ -80,6 +81,7 @@ const EXPLICIT_COMMANDS = new Set([
   "export-review",
   "setup",
   "doctor",
+  "update",
   "sessions",
   "help",
   "version",
@@ -172,6 +174,9 @@ export function parseCliArguments(argv: readonly string[]): CliCommand {
       assertNoUnknown(args);
       return { command, repository, ...common };
     }
+    case "update":
+      assertNoUnknown(args);
+      return { command, ...common };
     case "sessions": {
       const repository = takeOptionAny(args, ["--repo", "-C"]);
       const all = takeFlag(args, "--all");
