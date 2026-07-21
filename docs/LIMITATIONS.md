@@ -2,7 +2,7 @@
 
 ## Current disposition
 
-The repository contains an offline-testable runtime and a visible Edge/Copilot adapter design. It is not, by itself, authorization or evidence for a production/live real-repository deployment. The supplied environment data lacks the exact tenant URL, identity, protection indicator, UI selector certification, license/terms decision, repository eligibility, profile approval, and target-machine live results.
+The repository contains an offline-testable runtime and a shared visible Edge/Chrome Copilot adapter design. Edge remains the established compatibility target; Chrome is a **preview candidate / offline evidence only**. Neither label is, by itself, authorization or evidence for a production/live real-repository deployment. The supplied environment data lacks the exact tenant URL, identity, protection indicator, UI selector certification, license/terms decision, repository eligibility, profile approval, and complete target-machine live results.
 
 No live tuple is certified by this source tree. Windows x64 remains the primary blocking candidate. The two exact Mac candidates are experimental home-test preview lanes only: MacBook Air `Mac14,2`/M2/macOS `26.4.1`, and MacBook Pro `MacBookPro16,3`/Intel/macOS `15.7.7`. Hosted/offline success is not a live claim. See [MACOS-TARGET.md](MACOS-TARGET.md) and use the [live-pilot acceptance matrix](LIVE-PILOT-ACCEPTANCE.md) on each exact machine.
 
@@ -20,10 +20,13 @@ No live tuple is certified by this source tree. Windows x64 remains the primary 
 - The adapter supports one task conversation and one active Copilot page/profile at a time.
 - It cannot always determine whether a browser activation reached the service. Ambiguity pauses instead of risking a duplicate.
 - Conversation reconstruction is limited to persisted task/outbox/response facts; it cannot recreate hidden service state.
-- No guarantee is made for all future Edge or Copilot versions, tenants, licenses, languages, accessibility layouts, experiments, or Conditional Access flows.
+- No guarantee is made for all future Edge, Chrome, or Copilot versions, tenants, licenses, languages, accessibility layouts, experiments, or Conditional Access flows. Chromium similarity does not transfer live certification between products.
 
 ## Authentication and browser
 
+- Cope recognizes Microsoft Edge and Google Chrome only through Stable bundle identities/installation locations. Known Beta/Dev/Canary/SxS locations, portable/lookalike paths, Brave, Arc, Chromium, embedded runtimes, and other derivatives are rejected even if they can launch a Chromium page.
+- Identity verification proves that the approved Stable location/bundle plus platform product metadata/signature, canonical path/stat identity, version, and SHA-256 matched the requested product during configuration/launch. On Windows, this is not independent release-channel attestation and cannot defeat a privileged replacement by another vendor-signed binary. Exact binary/channel approval remains a certification responsibility; future binaries, endpoint integrity, tenant eligibility, UI compatibility, and live certification are not proved.
+- Cope uses a separate product-marked persistent profile. Edge and Chrome never share it, and neither ordinary profile is eligible. Profile checks are application controls, not a sandbox against a malicious browser or privileged endpoint attacker.
 - Sign-in, MFA, consent, reauthentication, bot controls, and security interstitials are manual.
 - The profile contains credential-equivalent authentication state and is not encrypted or lifecycle-managed by this application.
 - The baseline UI contract is not tenant-certified. Visible identity text can be ambiguous unless the deployment selects a unique approved signal.
@@ -81,7 +84,7 @@ No live tuple is certified by this source tree. Windows x64 remains the primary 
 ## CLI and operations
 
 - The initial CLI is local and single-user; there is no daemon, remote control plane, multi-agent coordination, or GUI.
-- `run` defaults to live Edge transport and edit mode; offline fixture/replay and inspect mode must be selected explicitly. Missing live configuration still fails closed.
+- `run` defaults to the configured live visible-browser transport and edit mode; offline fixture/replay and inspect mode must be selected explicitly. Missing live configuration still fails closed. The persisted value `edge` remains an internal live-transport compatibility discriminator, not a browser-product selection.
 - The built-in initial approval view emits the complete versioned `cba-effective-grant/1` envelope. Preapproval is safe only as a controlled acknowledgement of that exact previously reviewed envelope; it does not alter policy.
 - `status` is an integrity-checked view of persisted session/grant/disclosure/handoff facts, not a fresh Git observation. A fresh consistency-checked final status/diff exists only in the immediate successful `run`/`resume` completion handoff; use trusted Git tooling for later repository truth.
 - One active session is permitted per canonical repository.

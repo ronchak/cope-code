@@ -1,4 +1,4 @@
-import { stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 
 import type { AutonomyMode } from "../session/types.js";
@@ -30,6 +30,8 @@ import { executeSessionsCommand, listSessions, mostRecentResumableSession } from
 import { resolveWorkspace, syncWorkspaceCopy } from "./workspace.js";
 import type { HostPlatform } from "../platform/index.js";
 import { preparePrivateStateHome } from "../platform/private-storage.js";
+import { browserProductPresentation } from "../browser/index.js";
+import { parseBrowserConfig } from "../config/loader.js";
 
 export interface CliIo {
   readonly stdout: Writable;
@@ -49,7 +51,7 @@ export async function executeInteractiveCommand(
   if (command.transport !== "edge") {
     throw new AgentError(
       "CONFIG_INVALID",
-      "The guided interface currently uses the live Edge transport",
+      "The guided interface currently uses the live browser transport",
       { next: "Use cope run with --transport fixture or --transport replay for offline automation." },
     );
   }
@@ -91,11 +93,12 @@ export async function executeInteractiveCommand(
         ? { preferredProfile: "inspect" as const }
         : {}),
   });
+  let transportLabel = await configuredBrowserLabel(paths.browser);
 
   if (interactive) {
-    startupPanel({ version, repositoryRoot, mode, transport: "visible Edge" }, io.stdout);
+    startupPanel({ version, repositoryRoot, mode, transport: transportLabel }, io.stdout);
   } else {
-    showReady(repositoryRoot, mode, io.stdout);
+    showReady(repositoryRoot, mode, transportLabel, io.stdout);
   }
   if (interactive && workspace.copiedFromFile !== undefined) {
     info("This standalone file is running in a safe Git workspace.", io.stdout);
@@ -116,7 +119,7 @@ export async function executeInteractiveCommand(
   }
 
   while (true) {
-    const input = await chatPrompt({ repositoryRoot, mode, transport: "visible Edge" });
+    const input = await chatPrompt({ repositoryRoot, mode, transport: transportLabel });
     if (!input.startsWith("/")) {
       const code = await runObjective(input, repositoryRoot, mode, command, io, execute);
       if (code === 0) workspace = await syncWorkspaceCopy(workspace, { interactive: true, output: io.stdout });
@@ -170,7 +173,7 @@ export async function executeInteractiveCommand(
           output: io.stdout,
           ...(mode === "inspect" ? { preferredProfile: "inspect" as const } : {}),
         });
-        showReady(repositoryRoot, mode, io.stdout);
+        showReady(repositoryRoot, mode, transportLabel, io.stdout);
         break;
       }
       case "/sync":
@@ -183,6 +186,7 @@ export async function executeInteractiveCommand(
           json: false,
           ...(command.stateHome === undefined ? {} : { stateHome: command.stateHome }),
         }, io, host);
+        transportLabel = await configuredBrowserLabel(paths.browser);
         break;
       case "/config":
         section("Configuration", io.stdout);
@@ -306,8 +310,17 @@ async function selectMode(current: AutonomyMode): Promise<AutonomyMode> {
   });
 }
 
-function showReady(repositoryRoot: string, mode: AutonomyMode, output: Writable): void {
-  readySummary({ repositoryRoot, mode, transport: "visible Edge" }, output);
+function showReady(repositoryRoot: string, mode: AutonomyMode, transport: string, output: Writable): void {
+  readySummary({ repositoryRoot, mode, transport }, output);
+}
+
+export async function configuredBrowserLabel(filename: string): Promise<string> {
+  try {
+    const parsed = parseBrowserConfig(JSON.parse(await readFile(filename, "utf8")) as unknown);
+    return `visible ${browserProductPresentation(parsed.config.product).shortName}`;
+  } catch {
+    return "visible browser";
+  }
 }
 
 function showSlashHelp(output: Writable): void {
@@ -317,7 +330,7 @@ function showSlashHelp(output: Writable): void {
   commandHint("/sessions", "Show recent work for this project", output);
   commandHint("/repo PATH", "Open another project or standalone file", output);
   commandHint("/sync", "Copy verified standalone-file changes back to the original", output);
-  commandHint("/doctor", "Check Node, Git, Edge, and configuration", output);
+  commandHint("/doctor", "Check Node, Git, browser, and configuration", output);
   commandHint("/config", "Show configuration locations", output);
   commandHint("/setup", "Redo machine onboarding", output);
   commandHint("/exit", "Close Cope", output);

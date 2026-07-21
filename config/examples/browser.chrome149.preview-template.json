@@ -1,0 +1,35 @@
+{
+  "schema_version": "cba-browser-config/2",
+  "product": "chrome",
+  "browser_contract_version": "cope-visible-browser/v1",
+  "entry_url": "https://copilot.example.invalid/chat",
+  "approved_hosts": [
+    {
+      "hostname": "copilot.example.invalid",
+      "allow_subdomains": false
+    }
+  ],
+  "manual_authentication_hosts": [
+    {
+      "hostname": "login.example.invalid",
+      "allow_subdomains": false
+    }
+  ],
+  "expected_identity": "REPLACE_WITH_APPROVED_WORK_ACCOUNT_DISPLAY_STRING",
+  "require_protection_indicator": true,
+  "profile_directory": "C:\\Users\\REPLACE_WITH_WINDOWS_USER\\AppData\\Local\\CopilotBrowserAgentChromeProfile",
+  "browser_executable": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+  "browser_version": "REPLACE_WITH_EXACT_APPROVED_CHROME_VERSION",
+  "browser_executable_sha256": "REPLACE_WITH_LOWERCASE_SHA256_OF_APPROVED_CHROME_EXECUTABLE",
+  "max_message_chars": 200000,
+  "max_response_chars": 1000000,
+  "waits": {
+    "actionMs": 15000,
+    "submissionConfirmationMs": 12000,
+    "responseMs": 180000,
+    "manualReadinessMs": 600000,
+    "pollMs": 250,
+    "stableSamples": 3,
+    "minimumStableMs": 750
+  }
+}

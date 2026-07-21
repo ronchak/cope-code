@@ -29,6 +29,8 @@ test("macOS packaging wrappers are syntactically valid and preserve the user-lev
   assert.match(installer, /npm pack --json --ignore-scripts --pack-destination/u);
   assert.match(installer, /npm install --global --prefix "\$prefix"/u);
   assert.match(installer, /"\$prefix\/bin\/cope"/u);
+  assert.match(installer, /--no-path-update/u);
+  assert.match(installer, /Added by the Cope installer/u);
   assert.match(installer, /expected_version=.*package\.json/u);
   assert.match(installer, /"\$installed_version" = "\$expected_version"/u);
   assert.match(installer, /installed_version=\$\("\$cope_command" --version\)/u);
@@ -41,7 +43,8 @@ test("macOS packaging wrappers are syntactically valid and preserve the user-lev
   assert.match(uninstaller, /--remove-state/u);
   assert.match(uninstaller, /--remove-profile/u);
   assert.match(uninstaller, /--require-existing --validate-tree/u);
-  assert.match(uninstaller, /State and Edge profile were retained/u);
+  assert.match(uninstaller, /State and dedicated browser profiles were retained/u);
+  assert.match(uninstaller, /CopilotBrowserAgentChromeProfile/u);
   assert.doesNotMatch(uninstaller, /(?:^|\n)\s*sudo\b/u);
   assert.doesNotMatch(uninstaller, /Microsoft Edge(?! profile)/iu);
 });
@@ -171,10 +174,28 @@ esac
   const firstLog = await readFile(log, "utf8");
   assert.ok(firstLog.indexOf("version\n") < firstLog.indexOf("setup\n"), "version verification must precede setup");
   assert.equal((await execFileAsync(path.join(prefix, "bin", "cope"), ["--version"], { env: environment })).stdout.trim(), packageJson.version);
+  await assert.rejects(lstat(path.join(home, ".zprofile")), { code: "ENOENT" });
 
   await execFileAsync("/bin/sh", [uninstallPath], { env: environment });
   await assert.rejects(lstat(path.join(prefix, "bin", "cope")), { code: "ENOENT" });
   await execFileAsync("/bin/sh", [installPath, "--skip-build", "--skip-setup"], { env: environment });
   assert.equal((await execFileAsync(path.join(prefix, "bin", "cope"), ["--version"], { env: environment })).stdout.trim(), packageJson.version);
   await execFileAsync("/bin/sh", [uninstallPath], { env: environment });
+
+  const defaultEnvironment: NodeJS.ProcessEnv = { ...environment };
+  delete defaultEnvironment.COPE_INSTALL_PREFIX;
+  const defaultPrefix = path.join(home, ".local");
+  await execFileAsync("/bin/sh", [installPath, "--skip-build", "--skip-setup"], { env: defaultEnvironment });
+  await execFileAsync("/bin/sh", [installPath, "--skip-build", "--skip-setup"], { env: defaultEnvironment });
+  const profile = await readFile(path.join(home, ".zprofile"), "utf8");
+  assert.equal(profile.match(/export PATH="\$HOME\/\.local\/bin:\$PATH"/gu)?.length, 1);
+  assert.equal((await execFileAsync(path.join(defaultPrefix, "bin", "cope"), ["--version"], { env: defaultEnvironment })).stdout.trim(), packageJson.version);
+  await execFileAsync("/bin/sh", [uninstallPath], { env: defaultEnvironment });
+});
+
+test("build output keeps the linked-development CLI executable", {
+  skip: process.platform === "win32",
+}, async () => {
+  const cli = await lstat(path.resolve("dist/src/cli/main.js"));
+  assert.equal(cli.mode & 0o111, 0o111);
 });

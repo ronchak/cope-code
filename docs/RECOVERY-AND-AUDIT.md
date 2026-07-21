@@ -27,7 +27,7 @@ The Windows default state root is `%LOCALAPPDATA%\CopilotBrowserAgent`. The expe
 
 Exact filenames beyond the public CLI contract are implementation details; use CLI status/verify/rollback rather than editing records. State and recovery roots must remain outside repositories.
 
-Every row requires an explicit handling decision; “no raw file bodies” does not mean public. Verified completion clears the transient `artifacts` directory—including outbox, response, and decision files—unless `retain_source_artifacts_on_completion` is true. Pause, failure, interruption, and some recovery states can retain those files. Checkpoints, `fingerprint.key`, completion handoff, ledgers, audit, and review exports are outside that cleanup switch and remain subject to their own approved retention/deletion procedures. The Edge profile is credential-equivalent and requires the strongest handling.
+Every row requires an explicit handling decision; “no raw file bodies” does not mean public. Verified completion clears the transient `artifacts` directory—including outbox, response, and decision files—unless `retain_source_artifacts_on_completion` is true. Pause, failure, interruption, and some recovery states can retain those files. Checkpoints, `fingerprint.key`, completion handoff, ledgers, audit, and review exports are outside that cleanup switch and remain subject to their own approved retention/deletion procedures. Each product-specific dedicated browser profile is credential-equivalent and requires the strongest handling.
 
 ## Commit points
 
@@ -145,12 +145,20 @@ Define separate periods for:
 - the per-session fingerprint key;
 - completion handoffs;
 - exported review packages and any external signatures/receipts;
-- Edge profile/authentication state; and
+- dedicated Edge and Chrome profile/authentication state; and
 - redacted support diagnostics.
 
 Use the shortest period compatible with recovery, incident handling, and records obligations. This code uses restrictive creation modes and best-effort deletion, but does not provide cryptographic secure erase, BitLocker management, enterprise backup exclusion, or eDiscovery integration. SSD/file-system deletion semantics require the organization's endpoint policy.
 
-Never include state directories, checkpoints, Edge profiles, or raw diagnostics in Git, support tickets, chat, email, or test fixtures.
+Never include state directories, checkpoints, dedicated browser profiles, or raw diagnostics in Git, support tickets, chat, email, or test fixtures.
+
+## Browser configuration and product recovery
+
+The persisted runtime-manifest value `edge` identifies the legacy live visible-browser transport for compatibility; the browser configuration hash pins the actual Edge/Chrome choice. Recovery never infers a product switch from that manifest value. A resumed live session requires the same exact browser configuration bytes/hash and therefore the same product, executable identity evidence, profile, host, and UI contract.
+
+`cba-browser-config/1` is interpreted only as legacy Edge. A valid legacy file and its authenticated profile remain usable without a rewrite. A deliberate product change writes version 2 only after explicit confirmation and visible manual readiness, under an exclusive configuration lock and compare-and-swap transaction. Setup refuses the change while a resumable live-browser session exists. Concurrent edits, corrupt session manifests, product/executable mismatch, stale identity/version/hash, wrong-product profile markers, and tampering fail closed with recovery guidance; Cope does not guess, merge, or fall back to another browser.
+
+After an interrupted setup, inspect `cope doctor --json`, the browser config hash, executable identity evidence, and dedicated-profile marker before retrying. Do not delete or repoint an authenticated profile to force recovery. If a browser update changes its version/hash, rerun guided setup and the applicable product/tuple certification gates. If profile material may have been exposed, stop live use and follow the identity-provider session-revocation and credential incident plan.
 
 ## Incident procedure
 

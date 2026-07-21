@@ -29,6 +29,21 @@ test("CLI rejects missing transport inputs and unknown options", () => {
   assert.throws(() => parseCliArguments(["run", "Fix", "--mode", "unrestricted"]), /Invalid mode/);
 });
 
+test("setup accepts optional browser automation choices and rejects unsupported products", () => {
+  const chrome = parseCliArguments([
+    "setup",
+    "--browser",
+    "chrome",
+    "--browser-executable",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  ]);
+  assert.equal(chrome.command, "setup");
+  if (chrome.command !== "setup") return;
+  assert.equal(chrome.browser, "chrome");
+  assert.equal(chrome.browserExecutable, "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+  assert.throws(() => parseCliArguments(["setup", "--browser", "brave"]), /edge or chrome/iu);
+});
+
 test("CLI parses pause and pins explicit resume transport sources", () => {
   const pause = parseCliArguments(["pause", "session_12345678", "--reason", "operator break"]);
   assert.deepEqual(pause, {

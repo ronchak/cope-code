@@ -1,4 +1,4 @@
-import { access, lstat, readFile } from "node:fs/promises";
+import { lstat, readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { parseBrowserConfig, parseRepositoryConfig } from "../config/loader.js";
@@ -18,19 +18,32 @@ import {
   type HostPlatform,
 } from "../platform/index.js";
 import { verifyDedicatedProfileRoot, verifyPrivateStateHome } from "../platform/private-storage.js";
+import {
+  browserProductPresentation,
+  resolveSafeBrowserProfileDirectory,
+  verifyDedicatedProfileMarker,
+  verifyManualBrowserExecutable,
+  type BrowserIdentityVerifier,
+} from "../browser/index.js";
 
 interface Check {
   readonly name: string;
   readonly ok: boolean;
   readonly detail: string;
+  readonly summary?: string;
+  readonly evidence?: unknown;
   readonly required: boolean;
+}
+
+export interface DoctorDependencies extends DoctorProbeDependencies {
+  readonly browserIdentityVerifier?: BrowserIdentityVerifier;
 }
 
 export async function executeDoctorCommand(
   command: Extract<CliCommand, { readonly command: "doctor" }>,
   io: { readonly stdout: Writable; readonly stderr: Writable },
   host: HostPlatform,
-  dependencies: DoctorProbeDependencies = {},
+  dependencies: DoctorDependencies = {},
 ): Promise<number> {
   const checks: Check[] = [];
   const probeRunner = dependencies.runProbe ?? runHostProbe;
@@ -64,7 +77,14 @@ export async function executeDoctorCommand(
     } else {
       host.assertNonPrivileged();
     }
-    checks.push({ name: "Host session", ok: true, detail: `${host.platform}/${host.architecture}; standard user and GUI verified`, required: true });
+    checks.push({
+      name: "Host session",
+      ok: true,
+      detail: host.liveBrowserSupported
+        ? `${host.platform}/${host.architecture}; standard user and GUI verified`
+        : `${host.platform}/${host.architecture}; standard user verified; live browser unsupported`,
+      required: true,
+    });
   } catch (error) {
     const remediation = host.platform === "darwin"
       ? " Log in to Aqua as the intended console user and run Cope without sudo."
@@ -94,28 +114,81 @@ export async function executeDoctorCommand(
     ok: machine.valid,
     detail: machine.valid
       ? paths.browser
-      : `${machine.problems.join(" ")} Install Microsoft Edge Stable, then run cope setup.`,
+      : `${machine.problems.join(" ")} Install Microsoft Edge Stable or Google Chrome Stable, then run cope setup.`,
+    summary: machine.valid ? "configured" : "missing or invalid; run cope setup",
     required: true,
   });
 
   if (machine.valid) {
     try {
       const parsed = parseBrowserConfig(JSON.parse(await readFile(paths.browser, "utf8")) as unknown);
-      await access(parsed.config.edgeExecutable);
-      checks.push({ name: "Microsoft Edge", ok: true, detail: parsed.config.edgeExecutable, required: true });
+      const verified = await verifyManualBrowserExecutable(
+        parsed.config.product,
+        parsed.config.browserExecutable,
+        {
+          host,
+          ...(dependencies.browserIdentityVerifier === undefined
+            ? {}
+            : { identityVerifier: dependencies.browserIdentityVerifier }),
+        },
+      );
+      if (
+        parsed.config.browserVersion !== undefined && parsed.config.browserVersion !== verified.version ||
+        parsed.config.browserExecutableSha256 !== undefined &&
+          parsed.config.browserExecutableSha256 !== verified.executableSha256
+      ) throw new Error("Configured browser version or executable digest changed after setup");
+      const presentation = browserProductPresentation(parsed.config.product);
+      const support = parsed.config.product === "chrome"
+        ? "Chrome preview candidate / offline evidence only"
+        : "Established compatibility target / live evidence pending";
+      checks.push({
+        name: "Selected browser",
+        ok: true,
+        detail: `${presentation.productName} ${verified.version}; ${support}; ${verified.executablePath}`,
+        summary: `${presentation.productName} ${verified.version.split(".")[0] ?? verified.version} — ${support}`,
+        evidence: {
+          product: verified.product,
+          version: verified.version,
+          executable_path: verified.executablePath,
+          executable_sha256: verified.executableSha256,
+          identity: verified.evidence,
+          support_track: presentation.supportTrack,
+          certification_status: presentation.certificationStatus,
+        },
+        required: true,
+      });
       try {
-        await lstat(parsed.config.profileDirectory);
-        await verifyDedicatedProfileRoot(parsed.config.profileDirectory, host);
-        checks.push({ name: "Edge profile privacy", ok: true, detail: parsed.config.profileDirectory, required: true });
+        const profileDirectory = await resolveSafeBrowserProfileDirectory(parsed.config.profileDirectory, {
+          stateHome: paths.stateHome,
+          ordinaryProfileRoots: (["edge", "chrome"] as const).flatMap((product) =>
+            host.ordinaryBrowserProfileRoots(product, process.env)),
+        });
+        await lstat(profileDirectory);
+        await verifyDedicatedProfileRoot(profileDirectory, host);
+        await verifyDedicatedProfileMarker(profileDirectory, parsed.config.product);
+        checks.push({
+          name: "Browser profile privacy",
+          ok: true,
+          detail: `${profileDirectory}; private ownership and ${parsed.config.product} product marker verified`,
+          summary: `private, dedicated, and ${parsed.config.product}-bound`,
+          evidence: { profile_path: profileDirectory, product: parsed.config.product, privacy_status: "verified" },
+          required: true,
+        });
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-          checks.push({ name: "Edge profile privacy", ok: true, detail: `${parsed.config.profileDirectory} (created privately on first launch)`, required: true });
+          checks.push({
+            name: "Browser profile privacy",
+            ok: true,
+            detail: `${parsed.config.profileDirectory} (will be created privately on first launch)`,
+            summary: "dedicated profile not created yet",
+            required: true,
+          });
         } else {
-          checks.push({ name: "Edge profile privacy", ok: false, detail: errorMessage(error), required: true });
+          checks.push({ name: "Browser profile privacy", ok: false, detail: errorMessage(error), required: true });
         }
       }
     } catch (error) {
-      checks.push({ name: "Microsoft Edge", ok: false, detail: errorMessage(error), required: true });
+      checks.push({ name: "Selected browser", ok: false, detail: errorMessage(error), required: true });
     }
   }
 
@@ -145,8 +218,9 @@ export async function executeDoctorCommand(
   } else {
     section("Cope doctor", io.stdout);
     for (const check of checks) {
-      if (check.ok) success(`${check.name}: ${check.detail}`, io.stdout);
-      else warning(`${check.name}: ${check.detail}`, io.stdout);
+      const detail = check.summary ?? check.detail;
+      if (check.ok) success(`${check.name}: ${detail}`, io.stdout);
+      else warning(`${check.name}: ${detail}`, io.stdout);
     }
     io.stdout.write("\n");
     if (ok) success("Cope is ready to launch.", io.stdout);

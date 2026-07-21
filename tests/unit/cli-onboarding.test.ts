@@ -1,10 +1,23 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { writeRepositoryConfiguration } from "../../src/cli/onboarding.js";
+import {
+  configurationPaths,
+  configureMachine,
+  writeRepositoryConfiguration,
+} from "../../src/cli/onboarding.js";
+import type {
+  BrowserLaunchConfig,
+  BrowserProduct,
+  DiscoveredBrowser,
+  EdgeCopilotTransport,
+} from "../../src/browser/index.js";
+import { UnsupportedHostPlatform } from "../../src/platform/index.js";
+import { AgentError } from "../../src/shared/errors.js";
+import { PromptCancelledError } from "../../src/cli/prompts.js";
 
 test("guided project setup detects useful package scripts and chooses one completion check", async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), "cope-onboarding-"));
@@ -67,4 +80,473 @@ test("placeholder npm tests are ignored and inspect setup stays read-only", asyn
   assert.deepEqual(config.grant_defaults.writable_paths, []);
   assert.deepEqual(config.commands, []);
   assert.deepEqual(config.completion.required_command_ids, []);
+});
+
+const browserDigest = "a".repeat(64);
+
+function discoveredBrowser(product: BrowserProduct, executablePath = `/verified/${product}`): DiscoveredBrowser {
+  return {
+    product,
+    executablePath,
+    version: "149.0.1.2",
+    executableSha256: browserDigest,
+    size: 42,
+    modifiedMs: 1,
+    evidence: {
+      platform: "darwin",
+      productName: product === "edge" ? "Microsoft Edge Stable" : "Google Chrome Stable",
+      publisher: product === "edge" ? "UBF8T346G9" : "EQHXZ8M8AV",
+      identifier: product === "edge" ? "com.microsoft.edgemac" : "com.google.Chrome",
+      signatureStatus: "valid",
+    },
+    source: "automatic",
+    locationLabel: "Found in Applications",
+  };
+}
+
+function readyTransport(observed: BrowserLaunchConfig[]): EdgeCopilotTransport {
+  return {
+    waitForManualReadiness: async () => ({ classification: { state: "ready" } }),
+    inspectState: async () => ({ classification: { state: "ready" } }),
+    close: async () => undefined,
+  } as unknown as EdgeCopilotTransport;
+}
+
+test("guided machine setup preselects the only detected browser and commits only after readiness", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-machine-one-browser-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const stateHome = path.join(root, "state");
+  await mkdir(stateHome);
+  const host = new UnsupportedHostPlatform("linux", "x64");
+  const paths = configurationPaths(stateHome, host);
+  const chrome = discoveredBrowser("chrome");
+  const launched: BrowserLaunchConfig[] = [];
+  const result = await configureMachine({
+    paths,
+    force: false,
+    interactive: true,
+    output: { write: () => undefined },
+    host,
+    entryUrl: "https://m365.cloud.microsoft/chat",
+  }, {
+    discoverBrowsers: async () => [chrome],
+    promptBrowser: async (screen) => {
+      assert.equal(screen.kind, "single");
+      return { action: "continue", browser: chrome };
+    },
+    promptText: async (label) => label.includes("account") ? "person@example.com" : "",
+    promptConfirm: async () => false,
+    verifyManualBrowser: async (product, executablePath) => ({
+      ...discoveredBrowser(product, executablePath),
+      source: "manual",
+    }),
+    launchBrowser: async (config) => {
+      launched.push(config);
+      return readyTransport(launched);
+    },
+  });
+  assert.equal(result.browserProduct, "chrome");
+  assert.equal(result.edgeExecutable, undefined);
+  assert.equal(launched.length, 1);
+  assert.equal(launched[0]?.product, "chrome");
+  const persisted = JSON.parse(await readFile(paths.browser, "utf8")) as Record<string, unknown>;
+  assert.equal(persisted.schema_version, "cba-browser-config/2");
+  assert.equal(persisted.product, "chrome");
+  assert.equal(persisted.browser_executable, chrome.executablePath);
+  assert.equal(path.basename(String(persisted.profile_directory)), "CopilotBrowserAgentChromeProfile");
+  assert.ok(await readFile(paths.organizationPolicy, "utf8"));
+});
+
+test("two-browser setup defaults to Edge and explicit automation can choose Chrome without UI", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-machine-two-browser-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const host = new UnsupportedHostPlatform("linux", "x64");
+  const edge = discoveredBrowser("edge");
+  const chrome = discoveredBrowser("chrome");
+  const interactiveHome = path.join(root, "interactive");
+  await mkdir(interactiveHome);
+  let selectedIndex = -1;
+  await configureMachine({
+    paths: configurationPaths(interactiveHome, host),
+    force: false,
+    interactive: true,
+    output: { write: () => undefined },
+    host,
+    identity: "person@example.com",
+    entryUrl: "https://m365.cloud.microsoft/chat",
+    requireProtectionIndicator: false,
+  }, {
+    discoverBrowsers: async () => [edge, chrome],
+    promptBrowser: async (screen) => {
+      assert.equal(screen.kind, "choose");
+      if (screen.kind !== "choose") throw new Error("wrong screen");
+      selectedIndex = screen.selectedIndex;
+      return { action: "continue", browser: screen.browsers[screen.selectedIndex]! };
+    },
+    promptConfirm: async () => false,
+    verifyManualBrowser: async (product, executablePath) => ({ ...discoveredBrowser(product, executablePath), source: "manual" }),
+    launchBrowser: async () => readyTransport([]),
+  });
+  assert.equal(selectedIndex, 0);
+
+  const managedHome = path.join(root, "managed");
+  await mkdir(managedHome);
+  let promptCalled = false;
+  const result = await configureMachine({
+    paths: configurationPaths(managedHome, host),
+    force: false,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+    browser: "chrome",
+    identity: "person@example.com",
+  }, {
+    discoverBrowsers: async () => [edge, chrome],
+    promptBrowser: async () => { promptCalled = true; throw new Error("unexpected prompt"); },
+    verifyManualBrowser: async (product, executablePath) => ({ ...discoveredBrowser(product, executablePath), source: "manual" }),
+    launchBrowser: async () => readyTransport([]),
+  });
+  assert.equal(promptCalled, false);
+  assert.equal(result.browserProduct, "chrome");
+});
+
+test("Retry redetects browsers and changing Edge to Chrome requires confirmation and a separate profile", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-machine-retry-change-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const host = new UnsupportedHostPlatform("linux", "x64");
+  const edge = discoveredBrowser("edge");
+  const chrome = discoveredBrowser("chrome");
+
+  const retryHome = path.join(root, "retry");
+  await mkdir(retryHome);
+  let discoveryCount = 0;
+  const retryScreens: string[] = [];
+  const retryResult = await configureMachine({
+    paths: configurationPaths(retryHome, host),
+    force: false,
+    interactive: true,
+    output: { write: () => undefined },
+    host,
+    identity: "person@example.com",
+    entryUrl: "https://m365.cloud.microsoft/chat",
+    requireProtectionIndicator: false,
+  }, {
+    discoverBrowsers: async () => ++discoveryCount === 1 ? [] : [chrome],
+    promptBrowser: async (screen) => {
+      retryScreens.push(screen.kind);
+      if (screen.kind === "none") return { action: "retry" };
+      if (screen.kind === "single") return { action: "continue", browser: screen.browser };
+      throw new Error(`unexpected screen ${screen.kind}`);
+    },
+    verifyManualBrowser: async (product, executablePath) => ({ ...discoveredBrowser(product, executablePath), source: "manual" }),
+    launchBrowser: async () => readyTransport([]),
+  });
+  assert.equal(retryResult.browserProduct, "chrome");
+  assert.deepEqual(retryScreens, ["none", "single"]);
+
+  const changeHome = path.join(root, "change");
+  await mkdir(changeHome);
+  const changePaths = configurationPaths(changeHome, host);
+  const common = {
+    verifyManualBrowser: async (product: BrowserProduct, executablePath: string) => ({
+      ...discoveredBrowser(product, executablePath),
+      source: "manual" as const,
+    }),
+    launchBrowser: async () => readyTransport([]),
+  };
+  await configureMachine({
+    paths: changePaths,
+    force: false,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+    browser: "edge",
+    identity: "person@example.com",
+  }, { ...common, discoverBrowsers: async () => [edge] });
+  const changeScreens: string[] = [];
+  const changed = await configureMachine({
+    paths: changePaths,
+    force: false,
+    interactive: true,
+    output: { write: () => undefined },
+    host,
+  }, {
+    ...common,
+    discoverBrowsers: async () => [edge, chrome],
+    promptBrowser: async (screen) => {
+      changeScreens.push(screen.kind);
+      if (screen.kind === "current") return { action: "change" };
+      if (screen.kind === "choose") return { action: "continue", browser: chrome };
+      if (screen.kind === "confirm-change") return { action: "confirm-change", browser: chrome };
+      throw new Error(`unexpected screen ${screen.kind}`);
+    },
+  });
+  assert.equal(changed.browserProduct, "chrome");
+  assert.deepEqual(changeScreens, ["current", "choose", "confirm-change"]);
+  const persisted = JSON.parse(await readFile(changePaths.browser, "utf8")) as Record<string, unknown>;
+  assert.equal(persisted.product, "chrome");
+  assert.notEqual(persisted.profile_directory, changePaths.profileDirectories.edge);
+  assert.equal(path.basename(String(persisted.profile_directory)), "CopilotBrowserAgentChromeProfile");
+});
+
+test("existing browser setup remains selected and is not silently rewritten", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-machine-existing-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const stateHome = path.join(root, "state");
+  await mkdir(stateHome);
+  const host = new UnsupportedHostPlatform("linux", "x64");
+  const paths = configurationPaths(stateHome, host);
+  const edge = discoveredBrowser("edge");
+  const launched: BrowserLaunchConfig[] = [];
+  const dependencies = {
+    discoverBrowsers: async () => [] as readonly DiscoveredBrowser[],
+    promptBrowser: async (screen: Parameters<NonNullable<import("../../src/cli/onboarding.js").MachineSetupDependencies["promptBrowser"]>>[0]) => {
+      assert.equal(screen.kind, "current");
+      return { action: "continue", browser: edge } as const;
+    },
+    verifyManualBrowser: async (product: BrowserProduct, executablePath: string) => ({
+      ...discoveredBrowser(product, executablePath),
+      source: "manual" as const,
+    }),
+    launchBrowser: async (config: BrowserLaunchConfig) => {
+      launched.push(config);
+      return readyTransport(launched);
+    },
+  };
+  await configureMachine({
+    paths,
+    force: false,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+    browser: "edge",
+    identity: "person@example.com",
+  }, {
+    ...dependencies,
+    discoverBrowsers: async () => [edge],
+  });
+  const managed = JSON.parse(await readFile(paths.browser, "utf8")) as {
+    approved_hosts: Array<{ hostname: string; allow_subdomains: boolean }>;
+    manual_authentication_hosts: Array<{ hostname: string; allow_subdomains: boolean }>;
+  } & Record<string, unknown>;
+  managed.approved_hosts = [
+    { hostname: "m365.cloud.microsoft", allow_subdomains: false },
+    { hostname: "tenant.example", allow_subdomains: false },
+  ];
+  managed.manual_authentication_hosts = [
+    { hostname: "login.microsoftonline.com", allow_subdomains: false },
+  ];
+  await writeFile(paths.browser, `${JSON.stringify(managed)}\n`, "utf8");
+  const before = await readFile(paths.browser);
+  const result = await configureMachine({
+    paths,
+    force: false,
+    interactive: true,
+    output: { write: () => undefined },
+    host,
+  }, dependencies);
+  assert.equal(result.browserProduct, "edge");
+  assert.deepEqual(await readFile(paths.browser), before);
+  assert.deepEqual(launched.at(-1)?.approvedHosts, [
+    { hostname: "m365.cloud.microsoft", allowSubdomains: false },
+    { hostname: "tenant.example", allowSubdomains: false },
+  ]);
+  assert.deepEqual(launched.at(-1)?.manualAuthenticationHosts, [
+    { hostname: "login.microsoftonline.com", allowSubdomains: false },
+  ]);
+});
+
+test("existing Chrome and strict legacy Edge remain selected without silent migration", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-machine-existing-products-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const host = new UnsupportedHostPlatform("linux", "x64");
+  for (const product of ["chrome", "edge"] as const) {
+    const stateHome = path.join(root, product);
+    await mkdir(stateHome);
+    const paths = configurationPaths(stateHome, host);
+    const selected = discoveredBrowser(product);
+    const common = {
+      discoverBrowsers: async () => [selected],
+      verifyManualBrowser: async (verifiedProduct: BrowserProduct, executablePath: string) => ({
+        ...discoveredBrowser(verifiedProduct, executablePath),
+        source: "manual" as const,
+      }),
+      launchBrowser: async () => readyTransport([]),
+    };
+    await configureMachine({
+      paths,
+      force: false,
+      interactive: false,
+      output: { write: () => undefined },
+      host,
+      browser: product,
+      identity: "person@example.com",
+    }, common);
+    if (product === "edge") {
+      const current = JSON.parse(await readFile(paths.browser, "utf8")) as Record<string, unknown>;
+      const executable = current.browser_executable;
+      delete current.product;
+      delete current.browser_contract_version;
+      delete current.browser_executable;
+      delete current.browser_version;
+      delete current.browser_executable_sha256;
+      current.schema_version = "cba-browser-config/1";
+      current.edge_executable = executable;
+      await writeFile(paths.browser, `${JSON.stringify(current, null, 2)}\n`, "utf8");
+    }
+    const before = await readFile(paths.browser);
+    let currentProduct: BrowserProduct | undefined;
+    const result = await configureMachine({
+      paths,
+      force: false,
+      interactive: true,
+      output: { write: () => undefined },
+      host,
+    }, {
+      ...common,
+      promptBrowser: async (screen) => {
+        assert.equal(screen.kind, "current");
+        if (screen.kind !== "current") throw new Error("wrong screen");
+        currentProduct = screen.browser.product;
+        return { action: "continue", browser: screen.browser };
+      },
+    });
+    assert.equal(result.browserProduct, product);
+    assert.equal(currentProduct, product);
+    assert.deepEqual(await readFile(paths.browser), before);
+    const persisted = JSON.parse(before.toString("utf8")) as Record<string, unknown>;
+    assert.equal(persisted.schema_version, product === "edge" ? "cba-browser-config/1" : "cba-browser-config/2");
+  }
+});
+
+test("no-browser setup offers manual installation selection and never saves before readiness", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-machine-manual-browser-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const stateHome = path.join(root, "state");
+  await mkdir(stateHome);
+  const host = new UnsupportedHostPlatform("linux", "x64");
+  const paths = configurationPaths(stateHome, host);
+  const screens: string[] = [];
+  let closed = false;
+  await assert.rejects(configureMachine({
+    paths,
+    force: false,
+    interactive: true,
+    output: { write: () => undefined },
+    host,
+    identity: "person@example.com",
+    entryUrl: "https://m365.cloud.microsoft/chat",
+    requireProtectionIndicator: false,
+  }, {
+    discoverBrowsers: async () => [],
+    promptBrowser: async (screen) => {
+      screens.push(screen.kind);
+      if (screen.kind === "none") return { action: "advanced" };
+      if (screen.kind === "manual-product") return { action: "manual-product", product: "chrome" };
+      throw new Error(`unexpected screen ${screen.kind}`);
+    },
+    promptText: async () => "/managed/Google Chrome",
+    verifyManualBrowser: async (product, executablePath) => ({
+      ...discoveredBrowser(product, executablePath),
+      source: "manual",
+    }),
+    launchBrowser: async () => ({
+      waitForManualReadiness: async () => ({ classification: { state: "signed-out" } }),
+      close: async () => { closed = true; },
+    } as unknown as EdgeCopilotTransport),
+  }), (error: unknown) => error instanceof Error && /did not reach/iu.test(error.message));
+  assert.deepEqual(screens, ["none", "manual-product"]);
+  assert.equal(closed, true);
+  await assert.rejects(readFile(paths.browser), { code: "ENOENT" });
+  await assert.rejects(readFile(paths.organizationPolicy), { code: "ENOENT" });
+});
+
+test("corrupt policy and mismatched existing browser configuration fail with recovery actions", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-machine-corrupt-recovery-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const host = new UnsupportedHostPlatform("linux", "x64");
+  const policyHome = path.join(root, "policy");
+  await mkdir(path.join(policyHome, "config"), { recursive: true });
+  const policyPaths = configurationPaths(policyHome, host);
+  await writeFile(policyPaths.organizationPolicy, "{not-json\n", "utf8");
+  await assert.rejects(configureMachine({
+    paths: policyPaths,
+    force: true,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+    browser: "edge",
+    identity: "person@example.com",
+  }), (error: unknown) => error instanceof AgentError &&
+    typeof error.details.next === "string" && /policy/iu.test(error.details.next));
+
+  const browserHome = path.join(root, "browser");
+  await mkdir(browserHome);
+  const browserPaths = configurationPaths(browserHome, host);
+  const edge = discoveredBrowser("edge");
+  await configureMachine({
+    paths: browserPaths,
+    force: false,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+    browser: "edge",
+    identity: "person@example.com",
+  }, {
+    discoverBrowsers: async () => [edge],
+    verifyManualBrowser: async (product, executablePath) => ({ ...discoveredBrowser(product, executablePath), source: "manual" }),
+    launchBrowser: async () => readyTransport([]),
+  });
+  await assert.rejects(configureMachine({
+    paths: browserPaths,
+    force: true,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+    browser: "edge",
+    identity: "person@example.com",
+  }, {
+    verifyManualBrowser: async () => {
+      throw new AgentError("CONFIG_INVALID", "product mismatch", {
+        diagnosticCode: "BROWSER_EXECUTABLE_PRODUCT_MISMATCH",
+      });
+    },
+  }), (error: unknown) => error instanceof AgentError &&
+    typeof error.details.next === "string" && /browser configuration/iu.test(error.details.next));
+});
+
+test("Ctrl+C during manual browser readiness cancels cleanly before persistence", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-machine-readiness-cancel-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const stateHome = path.join(root, "state");
+  await mkdir(stateHome);
+  const host = new UnsupportedHostPlatform("linux", "x64");
+  const paths = configurationPaths(stateHome, host);
+  const chrome = discoveredBrowser("chrome");
+  const priorSigintListeners = process.listenerCount("SIGINT");
+  let closed = false;
+  await assert.rejects(configureMachine({
+    paths,
+    force: false,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+    browser: "chrome",
+    identity: "person@example.com",
+  }, {
+    discoverBrowsers: async () => [chrome],
+    verifyManualBrowser: async (product, executablePath) => ({ ...discoveredBrowser(product, executablePath), source: "manual" }),
+    launchBrowser: async () => ({
+      waitForManualReadiness: async (_maxWaitMs?: number, signal?: AbortSignal) => {
+        process.emit("SIGINT", "SIGINT");
+        assert.equal(signal?.aborted, true);
+        return { classification: { state: "signed-out" } };
+      },
+      close: async () => { closed = true; },
+    } as unknown as EdgeCopilotTransport),
+  }), PromptCancelledError);
+  assert.equal(closed, true);
+  assert.equal(process.listenerCount("SIGINT"), priorSigintListeners);
+  await assert.rejects(readFile(paths.browser), { code: "ENOENT" });
+  await assert.rejects(readFile(paths.organizationPolicy), { code: "ENOENT" });
 });

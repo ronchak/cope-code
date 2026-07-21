@@ -7,10 +7,11 @@ Extract the release and run `install.cmd`. The installer leaves a durable global
 Open a new PowerShell window:
 
 ```powershell
+cope setup
 cope
 ```
 
-The first launch guides machine setup, project selection, repository policy creation, task permissions, and manual Edge authentication.
+`cope setup` guides Edge/Chrome selection when needed, product-specific profile creation, machine policy, and manual authentication in the visible selected browser. Then `cope` guides project selection, repository policy creation, and task permissions. Edge is the established compatibility target; Chrome remains a preview candidate/offline evidence only.
 
 ## The three normal launch patterns
 
@@ -48,4 +49,4 @@ Use `cope -c` to continue the latest resumable session for the selected project.
 cope doctor
 ```
 
-This checks Node, Git, Edge, machine policy, browser configuration, the selected Git repository, and project configuration. Human-readable output is the default. `--json` remains available for scripts.
+This checks Node, Git, the selected browser product/version/identity, machine policy, browser configuration, the selected Git repository, and project configuration. Human-readable output is concise; `--json` adds executable/profile paths and identity evidence for scripts and advanced diagnosis.

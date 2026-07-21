@@ -115,7 +115,7 @@ function validateRuntimeManifest(value: unknown): asserts value is SessionRuntim
     throw new AgentError("RECOVERY_REQUIRED", "Session runtime manifest failed validation", { unknown });
   }
   if (item.transport === "edge" && item.source_file !== undefined) {
-    throw new AgentError("RECOVERY_REQUIRED", "Edge sessions cannot have an offline source file");
+    throw new AgentError("RECOVERY_REQUIRED", "Live browser sessions cannot have an offline source file");
   }
   if (item.transport !== "edge" && item.source_file === undefined) {
     throw new AgentError("RECOVERY_REQUIRED", "Offline sessions require a pinned source file");

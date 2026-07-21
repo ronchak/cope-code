@@ -1,5 +1,7 @@
 {
-  "schema_version": "cba-browser-config/1",
+  "schema_version": "cba-browser-config/2",
+  "product": "edge",
+  "browser_contract_version": "cope-visible-browser/v1",
   "entry_url": "https://copilot.example.invalid/chat",
   "approved_hosts": [
     {
@@ -16,7 +18,9 @@
   "expected_identity": "REPLACE_WITH_APPROVED_WORK_ACCOUNT_DISPLAY_STRING",
   "require_protection_indicator": true,
   "profile_directory": "C:\\Users\\REPLACE_WITH_WINDOWS_USER\\AppData\\Local\\CopilotBrowserAgentEdgeProfile",
-  "edge_executable": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+  "browser_executable": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+  "browser_version": "149.0.4022.98",
+  "browser_executable_sha256": "REPLACE_WITH_LOWERCASE_SHA256_OF_APPROVED_EDGE_EXECUTABLE",
   "max_message_chars": 200000,
   "max_response_chars": 1000000,
   "waits": {

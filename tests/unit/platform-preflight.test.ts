@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -69,6 +69,45 @@ test("Darwin GUI eligibility is revalidated at machine preflight after an earlie
       error instanceof AgentError && error.details.diagnosticCode === "DARWIN_GUI_SESSION_UNAVAILABLE",
   );
   assert.equal(checks, 2);
+});
+
+test("live preflight reports a selected Chrome product, executable, and version without Edge wording", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-preflight-chrome-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  initializeGitRepository(root);
+  const executable = path.join(root, "Google Chrome");
+  await writeFile(executable, "chrome fixture\n", "utf8");
+  const base = new DarwinHostPlatform("arm64", () => 501);
+  const host = new Proxy(base, {
+    get(target, property, receiver) {
+      if (property === "verifyEligibility") {
+        return async () => ({ standardUserVerified: true, guiSessionVerified: true });
+      }
+      return Reflect.get(target, property, receiver) as unknown;
+    },
+  });
+  const result = await runMachinePreflight({
+    repositoryRoot: root,
+    liveBrowser: true,
+    host,
+    gitExecutable: DEFAULT_GIT_EXECUTABLE,
+    browserProduct: "chrome",
+    browserExecutable: executable,
+    browserVersion: "149.0.1.2",
+    runProbe: async (command, args) => {
+      if (command === DEFAULT_GIT_EXECUTABLE && args[0] === "--version") {
+        return { exitCode: 0, stdout: "git version 2.50.0\n", stderr: "" };
+      }
+      if (command === DEFAULT_GIT_EXECUTABLE && args.includes("--show-toplevel")) {
+        return { exitCode: 0, stdout: `${root}\n`, stderr: "" };
+      }
+      throw new Error(`unexpected probe: ${command} ${args.join(" ")}`);
+    },
+  });
+  assert.equal(result.browserProduct, "chrome");
+  assert.equal(result.browserExecutable, executable);
+  assert.equal(result.browserVersion, "149.0.1.2");
+  assert.equal(result.edgeExecutable, undefined);
 });
 
 function initializeGitRepository(root: string): void {

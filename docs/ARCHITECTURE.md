@@ -2,7 +2,7 @@
 
 ## Host portability boundary
 
-One host adapter is selected at startup and injected through preflight, state/path resolution, onboarding, runtime composition, and process execution. Windows retains its `%LOCALAPPDATA%`, integrity-label, Edge/Git discovery, and `taskkill.exe` behavior. Darwin adds exact-tuple preview eligibility, Aqua verification, private Application Support storage, actual-volume case/Unicode identity, and a parent-death POSIX process-group supervisor. The browser adapter, `ModelTransport`, protocol, agent loop, policy meanings, and visible/headful/manual-authentication constraints are shared and unchanged. See [MACOS-TARGET.md](MACOS-TARGET.md); this boundary is implementation evidence, not live certification.
+One host adapter is selected at startup and injected through preflight, state/path resolution, onboarding, runtime composition, and process execution. Windows retains its `%LOCALAPPDATA%`, integrity-label, frozen Edge discovery order, Git discovery, and `taskkill.exe` behavior while adding deterministic Chrome Stable candidates. Darwin adds exact-tuple preview eligibility, Aqua verification, private Application Support storage, deterministic Edge/Chrome candidates, actual-volume case/Unicode identity, and a parent-death POSIX process-group supervisor. The browser adapter, `ModelTransport`, protocol, agent loop, policy meanings, and visible/headful/manual-authentication constraints are shared and unchanged. See [MACOS-TARGET.md](MACOS-TARGET.md); this boundary is implementation evidence, not live certification.
 
 ## Governing invariant
 
@@ -20,7 +20,7 @@ That boundary makes the browser replaceable and keeps the local runtime testable
 | Policy (`src/policy`) | organization/repository/session precedence, allow/ask/deny, budget and capability decisions | executing a denied action, modifying its own inputs |
 | Repository/security/tools (`src/repository`, `src/security`, `src/tools`) | path boundary, bounded reads/search, Git inspection, content controls, atomic changes, checkpoints, command catalog/process limits | browser selectors, model reasoning, arbitrary shell |
 | Transport (`src/transport`) | submit/resolve/receive correlation and exactly-once status contract; offline fixture/replay implementations | repository or policy knowledge |
-| Browser adapter (`src/browser`) | visible Edge lifecycle, dedicated profile, host/identity/protection assertions, semantic locators, submission/response association, page-state classification | local tools, policy decisions, source mutation |
+| Browser adapter (`src/browser`) | Edge/Chrome product model, deterministic discovery and identity evidence, visible lifecycle, product-specific dedicated profile, host/account/protection assertions, semantic locators, submission/response association, page-state classification | local tools, policy decisions, source mutation |
 | Session/audit (`src/session`, `src/audit`) | durable local truth, workspace lock, operation journal, artifacts, integrity records | treating the chat transcript as authoritative state |
 
 Dependency direction is inward through contracts:
@@ -32,12 +32,12 @@ CLI
 AgentRuntime --> ProtocolAdapter
  |      |-----> RuntimePolicy --> PolicyEngine
  |      |-----> ToolExecutor --> repository/security/process services
- |      |-----> ModelTransport <---- fixture | replay | Edge adapter
+ |      |-----> ModelTransport <---- fixture | replay | browser adapter
  |      `-----> SessionStore / OperationJournal / AuditLog
  `------------> UserInteraction
 ```
 
-The tool layer cannot import Copilot DOM assumptions. The browser adapter cannot read or modify a repository. A future supported model transport can replace Edge without changing policy or tools.
+The tool layer cannot import Copilot DOM assumptions. The browser adapter cannot read or modify a repository. Selecting Edge or Chrome changes local launch/configuration state only; it does not change the model-transport contract, policy, tools, correlation, classifier, or agent loop.
 
 ## Authoritative control flow
 
@@ -105,7 +105,7 @@ The operation journal stores request integrity and lifecycle state. Completed op
 
 `apply_patch` is one multi-file transaction. Paths and exact current-byte SHA-256 values are checked, a checkpoint is created outside the repository, all changes are staged and installed, and the post-change inventory is verified. Failure invokes restoration. If restoration itself cannot be proven, the session stops in recovery-required state.
 
-Checkpoint-backed diffs remain inside the same repository boundary. `checkpoint` scope compares current bytes with one verified before-image; `session` scope receives a narrow mutation/checkpoint inventory from authoritative session state and selects the earliest before-image for each agent-mutated path. The repository diff inspector owns byte comparison, bounds, and concrete-path filtering. Tool orchestration supplies scope only; transports and the Edge adapter have no checkpoint or filesystem knowledge.
+Checkpoint-backed diffs remain inside the same repository boundary. `checkpoint` scope compares current bytes with one verified before-image; `session` scope receives a narrow mutation/checkpoint inventory from authoritative session state and selects the earliest before-image for each agent-mutated path. The repository diff inspector owns byte comparison, bounds, and concrete-path filtering. Tool orchestration supplies scope only; transports and the browser adapter have no checkpoint or filesystem knowledge.
 
 ## Trust boundaries
 
@@ -114,9 +114,9 @@ Checkpoint-backed diffs remain inside the same repository boundary. `checkpoint`
 3. Repository/process output to disclosure guard.
 4. Copilot output to strict protocol parser.
 5. Harness to child process.
-6. Harness to visible Edge automation.
-7. Dedicated Edge profile to authentication state.
-8. Edge to the approved Microsoft 365 host.
+6. Harness to visible selected-browser automation.
+7. Product-specific dedicated browser profile to authentication state.
+8. Selected Edge or Chrome process to the approved Microsoft 365 host.
 9. Session process to local audit and recovery storage.
 
 Every value crossing these boundaries is untrusted until the receiving layer validates it. Source comments, documentation, test fixtures, filenames, diffs, and command output cannot alter protocol or authority.
@@ -133,7 +133,7 @@ Operational records are separated by sensitivity and recovery purpose:
 - the completion handoff is a bounded, secret-redacted, integrity-protected durable model claim plus verifier facts. It can still contain task prose and repository paths, is retained separately from transient artifacts, and is not a source-free review package.
 - `review-package.json` is an optional source-free derivative containing hashes, counts, timestamps, budgets, validation/mutation metadata, and redaction findings. Its SHA-256 body digest detects change relative to the package; it is not a signature, trusted timestamp, or external attestation.
 
-Edge profile storage remains outside both repository and agent-state roots and is credential-equivalent. All of these records require explicit ACL, encryption, retention, backup, incident-preservation, and deletion decisions; POSIX-style creation modes do not provision Windows ACLs.
+Dedicated Edge and Chrome profile storage remains outside both repository and agent-state roots and is credential-equivalent. The products never share a profile. All of these records require explicit ACL, encryption, retention, backup, incident-preservation, and deletion decisions; POSIX-style creation modes do not provision Windows ACLs.
 
 The audit and disclosure ledgers are SHA-256 hash chains. This detects modification or truncation relative to the available chain; it is not a signature, trusted timestamp, or substitute for approved host storage and access controls.
 
@@ -159,4 +159,12 @@ The final report distinguishes all working-tree changes, agent-recorded changed 
 - Never add a raw shell, arbitrary path, generic browser-control, credential, or policy-modification tool to `cba/1`.
 - A wire semantic change requires a new protocol version; a compatible UI selector update requires a new certified UI contract suffix.
 - Configuration must fail closed on unknown schema versions and fields at every validated nesting level, including command, browser-host, UI-contract, signal-group, locator, and text-pattern objects.
-- Keep tests capable of executing the complete loop without network, Edge, or Copilot.
+- Keep tests capable of executing the complete loop without network, an installed browser, or Copilot.
+
+## Browser product boundary
+
+`BrowserProduct` is exactly `edge | chrome`. A browser launch configuration records the product, canonical verified executable, version/hash identity evidence, product-specific profile directory, independent browser/UI contract version, approved entry point, and host/UI checks. Existing strict `cba-browser-config/1` Edge documents are interpreted as Edge in memory; they are not silently rewritten, switched to Chrome, or detached from their authenticated Edge profile. New browser-aware documents use `cba-browser-config/2`.
+
+Discovery is bounded to deterministic platform candidates and an explicit advanced path. Identity verification then fails closed unless platform metadata proves the requested product: bundle identifier, signing team and code-signature validity on macOS; product/company/original-filename metadata and Authenticode signer on Windows. The verified file version, canonical path, stat identity, and SHA-256 are pinned and rechecked at launch. This proves that the selected file matched the expected signed browser product at those checks. It does not certify a tenant, Conditional Access flow, Copilot UI contract, future browser update, endpoint integrity, or release tuple.
+
+Playwright launches only that verified executable in a visible persistent context, with downloads disabled and no channel fallback or browser download. Edge and Chrome share the Copilot-page adapter because no product-specific page behavior has been demonstrated. Chrome remains a preview candidate until its independent live gates pass.

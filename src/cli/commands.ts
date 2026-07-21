@@ -11,7 +11,7 @@ import {
 import path from "node:path";
 
 import { AuditLog } from "../audit/audit-log.js";
-import { launchEdgeCopilotTransport } from "../browser/index.js";
+import { browserProductPresentation, launchBrowserCopilotTransport } from "../browser/index.js";
 import { loadRuntimeConfiguration } from "../config/loader.js";
 import type { LoadedRuntimeConfiguration } from "../config/types.js";
 import type { RuntimeProgressEvent } from "../orchestrator/agent-runtime.js";
@@ -77,6 +77,7 @@ import {
 } from "./session-files.js";
 import { TerminalUserInteraction } from "./terminal-user.js";
 import { executeDoctorCommand } from "./doctor.js";
+import { pinBrowserConfigurationForSession } from "./setup-transaction.js";
 import { executeDemoCommand } from "./demo.js";
 import { renderHumanResult } from "./friendly-output.js";
 import { executeInteractiveCommand } from "./interactive.js";
@@ -210,7 +211,11 @@ async function runNewSession(
   await runMachinePreflight({
     repositoryRoot: boundary.root,
     liveBrowser: command.transport === "edge",
-    ...(configuration.browser === undefined ? {} : { edgeExecutable: configuration.browser.edgeExecutable }),
+    ...(configuration.browser === undefined ? {} : {
+      browserProduct: configuration.browser.product,
+      browserExecutable: configuration.browser.browserExecutable,
+      ...(configuration.browser.browserVersion === undefined ? {} : { browserVersion: configuration.browser.browserVersion }),
+    }),
     host,
     gitExecutable,
   });
@@ -321,8 +326,31 @@ async function runNewSession(
     });
     await moveState(state, "preflight", store, audit);
     await writeSessionGrant(sessionDirectory, grant);
-    const runtimeManifest = createRuntimeManifest(command.transport, source, configuration, now);
-    await writeRuntimeManifest(sessionDirectory, runtimeManifest);
+    if (command.transport === "edge") {
+      const expectedBrowserHash = configuration.hashes.browser;
+      if (expectedBrowserHash === undefined) {
+        throw new AgentError("CONFIG_INVALID", "Live browser configuration hash is unavailable");
+      }
+      await pinBrowserConfigurationForSession({
+        stateHome,
+        expectedBrowserHash,
+        loadCurrent: async () => loadRuntimeConfiguration({
+          repositoryRoot: boundary.root,
+          stateHome,
+          requireBrowser: true,
+          host,
+        }),
+        writeManifest: async (pinnedConfiguration) => {
+          await writeRuntimeManifest(
+            sessionDirectory,
+            createRuntimeManifest(command.transport, source, pinnedConfiguration, now),
+          );
+        },
+      });
+    } else {
+      const runtimeManifest = createRuntimeManifest(command.transport, source, configuration, now);
+      await writeRuntimeManifest(sessionDirectory, runtimeManifest);
+    }
     await moveState(state, "grant_pending", store, audit);
 
     const user = terminalUser(command.json, io);
@@ -444,7 +472,11 @@ async function resumeSession(
   await runMachinePreflight({
     repositoryRoot: boundary.root,
     liveBrowser: selection === "edge",
-    ...(configuration.browser === undefined ? {} : { edgeExecutable: configuration.browser.edgeExecutable }),
+    ...(configuration.browser === undefined ? {} : {
+      browserProduct: configuration.browser.product,
+      browserExecutable: configuration.browser.browserExecutable,
+      ...(configuration.browser.browserVersion === undefined ? {} : { browserVersion: configuration.browser.browserVersion }),
+    }),
     host,
     gitExecutable: resolveDefaultGitExecutable(host),
   });
@@ -871,8 +903,9 @@ async function prepareTransport(
     if (configuration.browser === undefined) {
       throw new AgentError("CONFIG_INVALID", "Browser configuration was not loaded");
     }
-    io.stdout.write("Opening the dedicated visible Edge session. Complete any sign-in, MFA, or consent in the browser.\n");
-    const transport = await launchEdgeCopilotTransport(configuration.browser, { host });
+    const browserName = browserProductPresentation(configuration.browser.product).productName;
+    io.stdout.write(`Opening the dedicated visible ${browserName} session. Complete any sign-in, MFA, or consent in the browser.\n`);
+    const transport = await launchBrowserCopilotTransport(configuration.browser, { host });
     control.bindTransport(transport);
     const readiness = await transport.waitForManualReadiness(configuration.browser.waits.manualReadinessMs);
     if (readiness.classification.state !== "ready") {
@@ -1323,6 +1356,7 @@ Normal use rarely needs these. Run cope by itself for the guided interface.
   cope rollback <session-id> [--checkpoint ID] [--force]
   cope verify-audit <session-id>
   cope export-review <session-id> [--output FILE]
+  cope setup [--browser edge|chrome] [--browser-executable PATH]
 
 Common options: --state-home PATH, --json
 Compatibility alias: copilot-agent
@@ -1333,7 +1367,7 @@ A guided terminal coding harness for Microsoft 365 Copilot
 
 Start
   cope                         Open Cope in the current project
-  cope demo                    Preview the terminal interface without Edge or setup
+  cope demo                    Preview the terminal interface without a browser or setup
   cope "fix the failing tests" Run a task directly
   cope PATH                    Open a folder or standalone file
   cope -c                      Continue the latest session
@@ -1341,8 +1375,8 @@ Start
 Useful controls
   cope --inspect               Start read-only
   cope --auto                  Use the configured project policy with fewer prompts
-  cope setup                   Run or redo one-time Edge setup
-  cope doctor                  Check Node, Git, Edge, and configuration
+  cope setup                   Run or change guided browser setup
+  cope doctor                  Check Node, Git, browser, and configuration
   cope sessions                Show recent work
 
 Inside Cope
@@ -1356,7 +1390,7 @@ function humanProgressState(state: string): string {
   switch (state) {
     case "preflight": return "Checking project and machine readiness";
     case "grant_pending": return "Reviewing task permissions";
-    case "transport_starting": return "Opening the dedicated Edge session";
+    case "transport_starting": return "Opening the dedicated browser session";
     case "initializing_model": return "Connecting to Copilot";
     case "awaiting_model": return "Waiting for Copilot";
     case "executing_tools": return "Working in the project";

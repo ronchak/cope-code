@@ -1,4 +1,5 @@
 import type { ChildProcess } from "node:child_process";
+import type { BrowserProduct } from "../browser/product.js";
 
 export interface ProbeResult {
   readonly exitCode: number | null;
@@ -29,7 +30,10 @@ export interface HostPlatform {
   readonly nullDevice: string;
 
   stateHome(environment?: NodeJS.ProcessEnv): string;
-  profileHome(stateHome: string): string;
+  profileHome(stateHome: string, product?: BrowserProduct): string;
+  browserExecutableCandidates(product: BrowserProduct, environment?: NodeJS.ProcessEnv): readonly string[];
+  ordinaryBrowserProfileRoots(product: BrowserProduct, environment?: NodeJS.ProcessEnv): readonly string[];
+  /** Compatibility surface whose ordering is frozen for existing Windows Edge users. */
   edgeExecutableCandidates(environment?: NodeJS.ProcessEnv): readonly string[];
   gitExecutableCandidates(environment?: NodeJS.ProcessEnv): readonly string[];
   probeEnvironment(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv;

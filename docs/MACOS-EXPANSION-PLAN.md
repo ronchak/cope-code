@@ -2,6 +2,8 @@
 
 Status: finalized and implemented through the offline Phase 5 gate; owner-machine Phase 6 approval/certification remains pending. Code completion does not certify any live tuple.
 
+> Historical scope note (2026-07-19): this plan records the original Edge-only macOS expansion and its frozen evidence. The browser-product expansion in `ARCHITECTURE.md`, `MACOS-TARGET.md`, and `LIVE-PILOT-ACCEPTANCE.md` supersedes its “never discover Chrome” implementation constraint. Edge evidence in this historical plan does not certify Chrome; Chrome remains a preview candidate/offline-evidence-only lane with separate gates.
+
 Governing documents: `PROTOCOL.md` and `THREAT-MODEL.md` take precedence, followed by the MAC-### requirements in the macOS expansion PRD. The Windows target remains the blocking release target. macOS remains an exact-tuple experimental home-test preview.
 
 ## Skeptical review of the draft plan
@@ -176,7 +178,7 @@ Outcome: reversible user-level macOS packaging plus accurate preview documentati
 
 Implementation:
 
-- Add `scripts/install-macos.sh`: Darwin/non-root check; Node >=24 and npm >=11; `npm ci`; build; `npm pack`; no browser download. Install with `npm install --global --prefix` into the deterministic user-owned prefix `${COPE_INSTALL_PREFIX:-$HOME/.local}`. Validate the resolved prefix and existing ancestors are local, non-links, owned by the current UID, and writable; create new prefix directories as the user. Verify the exact `$prefix/bin/cope --version`, and print PATH guidance for that exact bin directory. Optional setup runs only after verification.
+- Add `scripts/install-macos.sh`: Darwin/non-root check; Node >=24 and npm >=11; `npm ci`; build; `npm pack`; no browser download. Install with `npm install --global --prefix` into the deterministic user-owned prefix `${COPE_INSTALL_PREFIX:-$HOME/.local}`. Validate the resolved prefix and existing ancestors are local, non-links, owned by the current UID, and writable; create new prefix directories as the user. Verify the exact `$prefix/bin/cope --version`; for the default prefix, safely configure `~/.zprofile` when PATH needs it, with an explicit `--no-path-update` opt-out. Custom prefixes receive exact manual guidance. Optional setup runs only after verification. The build lifecycle must restore executable mode on the generated CLI so a development link cannot be broken by a rebuild.
 - Add `scripts/uninstall-macos.sh`: require Darwin and non-root execution, validate the same deterministic prefix, and run `npm uninstall --global --prefix`; retain state/profile by default; remove only the exact Darwin state/profile roots with explicit separate flags after non-link/ownership validation. No step uses `sudo` or the machine npm prefix.
 - Keep every existing Windows installer/wrapper byte-identical.
 - Add GitHub Actions offline lanes for Windows x64, Darwin arm64, and Darwin x64. As of this plan, the current official hosted labels are `windows-2025`, `macos-26`, and `macos-15-intel`; workflow comments must state that hosted lanes are not owner-tuple certification.

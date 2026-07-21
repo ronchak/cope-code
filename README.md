@@ -1,6 +1,6 @@
 # Cope
 
-Cope turns Microsoft 365 Copilot Chat into a local coding agent through a visible Microsoft Edge session. The normal interface is intentionally small. Install it once, run `cope`, choose a project, and describe the task in plain English.
+Cope turns Microsoft 365 Copilot Chat into a local coding agent through a visible Microsoft Edge Stable or Google Chrome Stable session. Edge remains the established compatibility target. Chrome is a **preview candidate / offline evidence only** until its separate live acceptance gates pass. The normal interface is intentionally small: install it once, run `cope setup`, then run `cope`, choose a project, and describe the task in plain English.
 
 The deterministic harness remains responsible for repository boundaries, permissions, local tools, checkpoints, validation, recovery, and audit records. Copilot supplies the coding judgment through its normal browser UI. Cope does not use private Copilot endpoints, token extraction, network interception, or automated sign-in.
 
@@ -12,7 +12,7 @@ Extract the release zip, then double-click:
 install.cmd
 ```
 
-The installer performs a locked dependency install, builds the TypeScript release, creates a packed npm artifact, installs the global `cope` command, and offers to run one-time Edge onboarding. The packed install is deliberate. Moving or deleting the extracted release folder later will not break the global command.
+The installer performs a locked dependency install, builds the TypeScript release, creates a packed npm artifact, installs the global `cope` command, and offers to run guided browser setup. It is browser-neutral: it neither chooses nor downloads a browser. The packed install is deliberate. Moving or deleting the extracted release folder later will not break the global command.
 
 Open a new PowerShell window after installation and run:
 
@@ -20,19 +20,23 @@ Open a new PowerShell window after installation and run:
 cope
 ```
 
-Requirements are Node.js 24 or newer, npm, Git, Windows 11, and Microsoft Edge. Cope refuses elevated execution for live sessions.
+Requirements are Node.js 24 or newer, npm, Git, Windows 11, and Microsoft Edge Stable or Google Chrome Stable. Cope refuses elevated execution for live sessions.
 
 ## Install on macOS (experimental preview candidate)
 
-macOS operation is an uncertified, exact-tuple home-test preview—not production parity or a generic support claim. From a reviewed checkout, with Node 24+, npm 11+, Git, and Edge Stable already installed:
+macOS operation is an uncertified, exact-tuple home-test preview—not production parity or a generic support claim. From a reviewed checkout, with Node 24+, npm 11+, Git, and Edge Stable or Chrome Stable already installed:
 
 ```sh
 ./scripts/install-macos.sh --skip-setup
-export PATH="$HOME/.local/bin:$PATH"
+```
+
+The installer verifies the installed command and, when using the default `~/.local` prefix, safely adds it to `~/.zprofile` if it is not already on `PATH`. Open a new Terminal window, then run:
+
+```sh
 cope setup
 ```
 
-The installer is user-level, validates `${COPE_INSTALL_PREFIX:-$HOME/.local}`, packs a durable artifact, uses no `sudo`, and downloads no browser. Sign-in, MFA, and consent stay manual. Live Edge additionally requires a logged-in Aqua session; root and logged-out/headless operation fail closed. See [the exact candidate tuples and gates](docs/MACOS-TARGET.md).
+The installer is user-level, validates `${COPE_INSTALL_PREFIX:-$HOME/.local}`, packs a durable artifact instead of linking to the checkout, uses no `sudo`, and downloads no browser. Use `--no-path-update` if shell startup files must remain untouched. Browser choice, the dedicated profile, sign-in, MFA, and consent belong to `cope setup`; authentication remains manual. A live browser additionally requires a logged-in Aqua session; root and logged-out/headless operation fail closed. See [the exact candidate tuples and gates](docs/MACOS-TARGET.md).
 
 ## Everyday use
 
@@ -86,7 +90,7 @@ Cope offers a recommended clean-project copy beside the file, creates a baseline
 
 Running `cope` opens the guided terminal interface. It remembers the last project and mode, avoids silently turning a home folder into a repository, detects missing configuration, and guides first-time setup.
 
-Preview the terminal interface on any development machine without Edge setup:
+Preview the terminal interface on any development machine without browser setup:
 
 ```text
 cope demo
@@ -109,7 +113,7 @@ Describe a task directly at the prompt. The small in-session command set is:
 /sessions   Show recent work
 /repo PATH  Open another project or file
 /sync       Copy an approved standalone-file result back
-/doctor     Check Node, Git, Edge, and configuration
+/doctor     Check Node, Git, browser, and configuration
 /config     Show configuration locations
 /setup      Redo machine onboarding
 /exit       Close Cope
@@ -123,7 +127,9 @@ cope help advanced
 
 ## First-run onboarding
 
-`cope setup` creates local machine policy, browser configuration, and a dedicated Edge profile. It asks for the account name or email visibly shown in Microsoft 365 Copilot and uses `https://m365.cloud.microsoft/chat` by default. Authentication, MFA, and consent remain manual in the visible browser.
+`cope setup` detects installed Edge Stable and Chrome Stable copies, verifies their product identity, and guides the choice only when a meaningful choice exists. One detected browser is preselected; two produce an arrow-key selector that defaults to an existing choice or otherwise Edge; none produces retry and manual-installation actions. Existing valid configurations remain selected and are not silently changed. Plain terminals receive a numbered fallback.
+
+Setup creates local machine policy, browser configuration, and a product-specific dedicated profile, then visibly launches the selected browser for manual sign-in readiness. It asks for the account name or email visibly shown in Microsoft 365 Copilot and uses `https://m365.cloud.microsoft/chat` by default. Credentials, MFA, CAPTCHA, consent, and ordinary-profile import are never automated. For managed automation only, `cope setup --browser edge|chrome` and `--browser-executable <path>` are available; normal users do not need them.
 
 Per-project setup is guided automatically. Cope detects useful package scripts such as `test`, `check`, `build`, `typecheck`, and `lint`, then creates `.cba\repository.json`. Inspect mode starts read-only. Edit mode allows project changes subject to the layered policy and task grant.
 
@@ -152,11 +158,12 @@ The two previous Windows preflight failures were caused by tests invoking bare `
 Machine policy   %LOCALAPPDATA%\CopilotBrowserAgent\config\organization-policy.json
 Browser config   %LOCALAPPDATA%\CopilotBrowserAgent\config\browser.json
 Edge profile     %LOCALAPPDATA%\CopilotBrowserAgentEdgeProfile
+Chrome profile   %LOCALAPPDATA%\CopilotBrowserAgentChromeProfile
 Project config   <project>\.cba\repository.json
 Session state    %LOCALAPPDATA%\CopilotBrowserAgent
 ```
 
-The browser adapter verifies the approved host, conversation, visible identity, optional protection indicator, composer, and UI contract before submitting a prompt. UI changes can still require browser-contract adjustments. Cope fails closed with diagnostics rather than sending content from an unverified page.
+The browser adapter verifies the selected executable's Edge/Chrome identity and recorded hash, dedicated-profile product marker, approved host, conversation, visible identity, optional protection indicator, composer, and UI contract before submitting a prompt. Edge and Chrome never share a dedicated profile, and Cope rejects overlap with either ordinary browser profile. UI changes can still require browser-contract adjustments. Cope fails closed with diagnostics rather than sending content from an unverified page.
 
 ## Technical documentation
 

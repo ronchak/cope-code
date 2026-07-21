@@ -4,14 +4,16 @@ import path from "node:path";
 
 import { AgentError } from "../shared/errors.js";
 import { newId } from "../shared/crypto.js";
-import { validateEdgeProfileDirectoryPath } from "./config.js";
+import { validateBrowserProfileDirectoryPath } from "./config.js";
 import { detectFilesystemIdentity, type FilesystemIdentity } from "../shared/filesystem-identity.js";
 import { CURRENT_HOST_PLATFORM, type HostPlatform } from "../platform/index.js";
 import { prepareDedicatedProfileRoot } from "../platform/private-storage.js";
+import type { BrowserProduct } from "./product.js";
 
 const LOCK_FILE = ".copilot-agent-profile.lock";
 const PROFILE_MARKER = ".copilot-agent-profile-v1.json";
-const PROFILE_MARKER_KIND = "copilot-agent-dedicated-edge-profile/v1";
+const PROFILE_MARKER_KIND = "copilot-agent-dedicated-browser-profile/v1";
+const LEGACY_EDGE_PROFILE_MARKER_KIND = "copilot-agent-dedicated-edge-profile/v1";
 
 interface LockMetadata {
   readonly version: 1;
@@ -20,45 +22,52 @@ interface LockMetadata {
   readonly createdAt: string;
 }
 
-export interface EdgeProfilePathBoundaries {
-  readonly repositoryRoot: string;
+export interface BrowserProfilePathBoundaries {
+  readonly repositoryRoot?: string;
   readonly stateHome: string;
   readonly ordinaryProfileRoots?: readonly string[];
 }
+
+/** @deprecated Compatibility alias for existing imports. */
+export type EdgeProfilePathBoundaries = BrowserProfilePathBoundaries;
 
 /**
  * Resolves an existing profile or its deepest existing ancestor before
  * checking both directions of overlap with protected local roots. The result
  * is safe to persist in runtime configuration and use for launch.
  */
-export async function resolveSafeEdgeProfileDirectory(
+export async function resolveSafeBrowserProfileDirectory(
   configuredPath: string,
-  boundaries: EdgeProfilePathBoundaries,
+  boundaries: BrowserProfilePathBoundaries,
   identityDetector: (anchor: string) => Promise<FilesystemIdentity> = detectFilesystemIdentity,
 ): Promise<string> {
   try {
-    validateEdgeProfileDirectoryPath(configuredPath);
+    validateBrowserProfileDirectoryPath(configuredPath);
     const [profile, repositoryRoot, stateHome] = await Promise.all([
       canonicalizeProspectiveDirectory(configuredPath),
-      canonicalizeExistingDirectory(boundaries.repositoryRoot, "repository root"),
+      boundaries.repositoryRoot === undefined
+        ? Promise.resolve(undefined)
+        : canonicalizeExistingDirectory(boundaries.repositoryRoot, "repository root"),
       canonicalizeExistingDirectory(boundaries.stateHome, "state root"),
     ]);
     // A local-looking junction may resolve to a share or device namespace.
-    validateEdgeProfileDirectoryPath(profile.path);
+    validateBrowserProfileDirectoryPath(profile.path);
     const [profileIdentity, repositoryIdentity, stateIdentity] = await Promise.all([
       identityDetector(profile.existingAncestor),
-      identityDetector(repositoryRoot),
+      repositoryRoot === undefined ? Promise.resolve(undefined) : identityDetector(repositoryRoot),
       identityDetector(stateHome),
     ]);
 
     for (const [name, protectedRoot, protectedIdentity] of [
-      ["repository", repositoryRoot, repositoryIdentity],
+      ...(repositoryRoot === undefined || repositoryIdentity === undefined
+        ? []
+        : [["repository", repositoryRoot, repositoryIdentity] as const]),
       ["state", stateHome, stateIdentity],
     ] as const) {
       if (pathsOverlap(profile.path, profileIdentity, protectedRoot, protectedIdentity)) {
         throw new AgentError(
           "CONFIG_INVALID",
-          `Dedicated Edge profile directory must not overlap the ${name} root`,
+          `Dedicated browser profile directory must not overlap the ${name} root`,
           { diagnosticCode: "EDGE_PROFILE_PATH_OVERLAP", boundary: name },
         );
       }
@@ -69,8 +78,8 @@ export async function resolveSafeEdgeProfileDirectory(
       if (pathsOverlap(profile.path, profileIdentity, protectedProfile.path, protectedIdentity)) {
         throw new AgentError(
           "CONFIG_INVALID",
-          "Dedicated Edge profile directory must not overlap an ordinary Microsoft Edge profile",
-          { diagnosticCode: "EDGE_PROFILE_PATH_OVERLAP", boundary: "ordinary-edge-profile" },
+          "Dedicated browser profile directory must not overlap an ordinary browser profile",
+          { diagnosticCode: "EDGE_PROFILE_PATH_OVERLAP", boundary: "ordinary-browser-profile" },
         );
       }
     }
@@ -79,11 +88,20 @@ export async function resolveSafeEdgeProfileDirectory(
     if (error instanceof AgentError) throw error;
     throw new AgentError(
       "CONFIG_INVALID",
-      `Dedicated Edge profile path is unsafe: ${error instanceof Error ? error.message : String(error)}`,
+      `Dedicated browser profile path is unsafe: ${error instanceof Error ? error.message : String(error)}`,
       { diagnosticCode: "EDGE_PROFILE_PATH_UNSAFE" },
       { cause: error },
     );
   }
+}
+
+/** @deprecated Compatibility alias for existing imports. */
+export async function resolveSafeEdgeProfileDirectory(
+  configuredPath: string,
+  boundaries: EdgeProfilePathBoundaries,
+  identityDetector: (anchor: string) => Promise<FilesystemIdentity> = detectFilesystemIdentity,
+): Promise<string> {
+  return resolveSafeBrowserProfileDirectory(configuredPath, boundaries, identityDetector);
 }
 
 export class ExclusiveProfileLock {
@@ -129,14 +147,14 @@ export class ExclusiveProfileLock {
         if (owner === undefined) {
           throw new AgentError(
             "TRANSPORT_UNAVAILABLE",
-            "The dedicated Edge profile lock cannot be verified",
+            "The dedicated browser profile lock cannot be verified",
             { diagnosticCode: "EDGE_PROFILE_LOCK_UNREADABLE" },
           );
         }
         if (isProcessAlive(owner.pid)) {
           throw new AgentError(
             "TRANSPORT_UNAVAILABLE",
-            "The dedicated Edge profile is already in use",
+            "The dedicated browser profile is already in use",
             { diagnosticCode: "EDGE_PROFILE_LOCKED" },
           );
         }
@@ -147,7 +165,7 @@ export class ExclusiveProfileLock {
         });
       }
     }
-    throw new AgentError("TRANSPORT_UNAVAILABLE", "Could not acquire the Edge profile lock", {
+    throw new AgentError("TRANSPORT_UNAVAILABLE", "Could not acquire the browser profile lock", {
       diagnosticCode: "EDGE_PROFILE_LOCK_RACE",
     });
   }
@@ -164,16 +182,22 @@ export class ExclusiveProfileLock {
 }
 
 /** Refuses to attach automation to an existing, unmarked everyday profile. */
-export async function prepareDedicatedProfile(profileDirectory: string): Promise<void> {
+export async function prepareDedicatedProfile(
+  profileDirectory: string,
+  product: BrowserProduct = "edge",
+): Promise<void> {
   await assertDirectoryIsNotLink(profileDirectory);
   const markerPath = path.join(profileDirectory, PROFILE_MARKER);
   const entries = await readdir(profileDirectory);
   const hasMarker = entries.includes(PROFILE_MARKER);
   if (hasMarker) {
     const marker = await readProfileMarker(markerPath);
-    if (marker !== PROFILE_MARKER_KIND) {
-      throw new AgentError("CONFIG_INVALID", "Dedicated Edge profile marker is invalid", {
+    const matches = marker?.kind === PROFILE_MARKER_KIND && marker.product === product;
+    const legacyEdgeMatches = product === "edge" && marker?.kind === LEGACY_EDGE_PROFILE_MARKER_KIND;
+    if (!matches && !legacyEdgeMatches) {
+      throw new AgentError("CONFIG_INVALID", "Dedicated browser profile marker is invalid or belongs to another product", {
         diagnosticCode: "EDGE_PROFILE_MARKER_INVALID",
+        expectedProduct: product,
       });
     }
     return;
@@ -183,15 +207,32 @@ export async function prepareDedicatedProfile(profileDirectory: string): Promise
   if (foreignEntries.length > 0) {
     throw new AgentError(
       "CONFIG_INVALID",
-      "Refusing to use a non-empty, unmarked Edge profile directory",
+      "Refusing to use a non-empty, unmarked browser profile directory",
       { diagnosticCode: "EDGE_PROFILE_NOT_DEDICATED", entryCount: foreignEntries.length },
     );
   }
   await writeFile(
     markerPath,
-    `${JSON.stringify({ kind: PROFILE_MARKER_KIND, createdAt: new Date().toISOString() })}\n`,
+    `${JSON.stringify({ kind: PROFILE_MARKER_KIND, product, createdAt: new Date().toISOString() })}\n`,
     { encoding: "utf8", mode: 0o600, flag: "wx" },
   );
+}
+
+/** Read-only profile product check for doctor and diagnostics. */
+export async function verifyDedicatedProfileMarker(
+  profileDirectory: string,
+  product: BrowserProduct,
+): Promise<void> {
+  await assertDirectoryIsNotLink(profileDirectory);
+  const marker = await readProfileMarker(path.join(profileDirectory, PROFILE_MARKER));
+  const matches = marker?.kind === PROFILE_MARKER_KIND && marker.product === product;
+  const legacyEdgeMatches = product === "edge" && marker?.kind === LEGACY_EDGE_PROFILE_MARKER_KIND;
+  if (!matches && !legacyEdgeMatches) {
+    throw new AgentError("CONFIG_INVALID", "Dedicated browser profile marker is invalid or belongs to another product", {
+      diagnosticCode: "EDGE_PROFILE_MARKER_INVALID",
+      expectedProduct: product,
+    });
+  }
 }
 
 async function canonicalizeProspectiveDirectory(candidate: string): Promise<{
@@ -252,23 +293,47 @@ function isSameOrWithin(root: string, candidate: string, identity: FilesystemIde
 async function assertDirectoryIsNotLink(profileDirectory: string): Promise<void> {
   const metadata = await lstat(profileDirectory);
   if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
-    throw new AgentError("CONFIG_INVALID", "Dedicated Edge profile path must be a real directory", {
+    throw new AgentError("CONFIG_INVALID", "Dedicated browser profile path must be a real directory", {
       diagnosticCode: "EDGE_PROFILE_PATH_UNSAFE",
     });
   }
 }
 
-async function readProfileMarker(path: string): Promise<string | undefined> {
+async function readProfileMarker(markerPath: string): Promise<{
+  readonly kind: string;
+  readonly product?: BrowserProduct;
+} | undefined> {
   try {
-    const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
-    if (parsed !== null && typeof parsed === "object" && "kind" in parsed) {
-      const kind = (parsed as { kind?: unknown }).kind;
-      return typeof kind === "string" ? kind : undefined;
+    const markerState = await lstat(markerPath);
+    if (!markerState.isFile() || markerState.isSymbolicLink()) return undefined;
+    const parsed: unknown = JSON.parse(await readFile(markerPath, "utf8"));
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const marker = parsed as Readonly<Record<string, unknown>>;
+    const createdAt = marker.createdAt;
+    if (typeof createdAt !== "string" || !validMarkerTimestamp(createdAt)) return undefined;
+    if (marker.kind === LEGACY_EDGE_PROFILE_MARKER_KIND) {
+      if (!exactMarkerKeys(marker, ["kind", "createdAt"])) return undefined;
+      return { kind: LEGACY_EDGE_PROFILE_MARKER_KIND };
+    }
+    if (marker.kind === PROFILE_MARKER_KIND) {
+      if (!exactMarkerKeys(marker, ["kind", "product", "createdAt"])) return undefined;
+      if (marker.product !== "edge" && marker.product !== "chrome") return undefined;
+      return { kind: PROFILE_MARKER_KIND, product: marker.product };
     }
     return undefined;
   } catch {
     return undefined;
   }
+}
+
+function exactMarkerKeys(marker: Readonly<Record<string, unknown>>, expected: readonly string[]): boolean {
+  const keys = Object.keys(marker).sort();
+  return keys.length === expected.length && [...expected].sort().every((key, index) => keys[index] === key);
+}
+
+function validMarkerTimestamp(value: string): boolean {
+  const parsed = new Date(value);
+  return !Number.isNaN(parsed.valueOf()) && parsed.toISOString() === value;
 }
 
 async function readLockMetadata(path: string): Promise<LockMetadata | undefined> {
