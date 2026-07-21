@@ -38,6 +38,19 @@ test("Windows host preserves state, Edge, Git, and probe-environment order", () 
     "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
     "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
   ]);
+  assert.deepEqual(host.browserExecutableCandidates("edge", environment), [
+    "E:\\Edge\\msedge.exe",
+    "D:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+    "D:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+    "C:\\Users\\preview\\AppData\\Local\\Microsoft\\Edge\\Application\\msedge.exe",
+    "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+    "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+  ]);
+  assert.equal(host.profileHome(host.stateHome(environment), "edge"), "C:\\Users\\preview\\AppData\\Local\\CopilotBrowserAgentEdgeProfile");
+  assert.equal(host.profileHome(host.stateHome(environment), "chrome"), "C:\\Users\\preview\\AppData\\Local\\CopilotBrowserAgentChromeProfile");
+  assert.deepEqual(host.ordinaryBrowserProfileRoots("chrome", environment), [
+    "C:\\Users\\preview\\AppData\\Local\\Google\\Chrome\\User Data",
+  ]);
   assert.deepEqual(host.gitExecutableCandidates(environment), [
     "C:\\Users\\preview\\AppData\\Local\\Programs\\Git\\cmd\\git.exe",
     "D:\\Program Files\\Git\\cmd\\git.exe",
@@ -96,6 +109,14 @@ test("Darwin host uses tuple-scoped paths, rejects root, and verifies Aqua owner
     "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
     "/Users/preview/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
   ]);
+  assert.deepEqual(host.browserExecutableCandidates("chrome", { HOME: "/Users/preview" }), [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Users/preview/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  ]);
+  assert.equal(
+    host.profileHome(host.stateHome({ HOME: "/Users/preview" }), "chrome"),
+    "/Users/preview/Library/Application Support/CopilotBrowserAgentChromeProfile",
+  );
   assert.equal(host.nullDevice, "/dev/null");
   const calls: string[] = [];
   const probe: ProbeRunner = async (executable) => {

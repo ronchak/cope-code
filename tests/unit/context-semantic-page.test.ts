@@ -249,6 +249,9 @@ function browserConfig(
 ): EdgeLaunchConfig {
   const expectedIdentity = "Ronak Chakraborty";
   return {
+    product: "edge",
+    browserContractVersion: "cope-visible-browser/v1",
+    browserExecutable: path.resolve("synthetic-edge-executable"),
     entryUrl,
     approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
     manualAuthenticationHosts: [

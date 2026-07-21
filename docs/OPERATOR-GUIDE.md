@@ -4,7 +4,7 @@
 
 Do not use a real repository until the [live-pilot acceptance matrix](LIVE-PILOT-ACCEPTANCE.md) has an accountable approval.
 
-The supplied machine map is not a certified compatibility tuple. In particular, it reports Git `2.55.0.windows.3` but names conflicting executable locations and records a failed `where.exe` lookup. Resolve and hash the exact Edge, Node, npm, and Git executables on the managed Windows target before treating the checklist below as satisfied.
+The supplied historical Windows/Edge machine map is not a certified compatibility tuple. In particular, it reports Git `2.55.0.windows.3` but names conflicting executable locations and records a failed `where.exe` lookup. Resolve and hash the exact Edge, Node, npm, and Git executables on that managed Windows target before treating its checklist as satisfied. A proposed Chrome tuple requires a separate record and cannot inherit this Edge evidence.
 
 Confirm:
 
@@ -14,10 +14,10 @@ Confirm:
 - pre-existing working-tree changes are understood and backed up;
 - the exact Copilot URL, work identity, protection indicator, and UI contract are certified;
 - the dedicated profile is local/nonshared, outside repository and state roots, protected by approved ACLs, and certified;
-- Edge, Node, npm, Git, Windows, and dependency versions are within the recorded compatibility tuple;
+- the selected Edge/Chrome product, Node, npm, Git, OS/architecture, and dependency versions are within that product's recorded compatibility tuple;
 - the session is running as a standard user;
 - checkpoints and state storage have sufficient local space and approved ACL/retention;
-- no other process is using the dedicated Edge profile or repository workspace; and
+- no other process is using the selected product's dedicated browser profile or repository workspace; and
 - the operator knows the emergency stop and manual fallback procedures.
 
 Use a synthetic repository first after any upgrade or configuration change.
@@ -52,9 +52,9 @@ Record the session ID. The CLI acquires one canonical-workspace lock, records Gi
 
 For offline operation use `--transport fixture --fixture <file>` or `--transport replay --transcript <file>`. Offline source files are canonicalized and hash-pinned in the runtime manifest; replacing a source file is not a valid resume strategy.
 
-## Visible Edge readiness
+## Visible browser readiness
 
-Edge opens headfully with the dedicated profile. Complete sign-in, MFA, Conditional Access, consent, and reauthentication manually. The agent never clicks or types into those controls.
+The selected browser opens headfully with its product-specific dedicated profile. Complete sign-in, MFA, Conditional Access, consent, and reauthentication manually. The agent never clicks or types into those controls.
 
 Before a submission, the adapter must classify the page `ready`, which requires:
 
@@ -115,7 +115,7 @@ To make the session terminal, use explicit abort:
 cope abort <session-id> --reason "operator stop"
 ```
 
-Abort uses the same active-owner control channel and cannot be downgraded by a later pause request. An inactive nonterminal session is moved directly to `aborted`; an existing terminal state is not altered. If the process is unresponsive and the request is not acknowledged, follow the incident procedure: isolate the endpoint if necessary, terminate the known agent/child/agent-owned Edge processes through approved endpoint tooling, preserve non-source evidence, and reconcile repository/session state before any resume.
+Abort uses the same active-owner control channel and cannot be downgraded by a later pause request. An inactive nonterminal session is moved directly to `aborted`; an existing terminal state is not altered. If the process is unresponsive and the request is not acknowledged, follow the incident procedure: isolate the endpoint if necessary, terminate the known agent/child/agent-owned browser processes through approved endpoint tooling, preserve non-source evidence, and reconcile repository/session state before any resume.
 
 Never delete a lock merely because work appears slow. Stale local locks are removed only after the owner PID is proven dead; a corrupt or remote-host lock requires investigation.
 
@@ -156,7 +156,7 @@ Resume is safe only when:
 - the existing session's 32-byte fingerprint key exists and is well formed; missing or malformed durable key state fails closed instead of silently generating a replacement;
 - repository root, branch, fingerprint, and pre-existing state are reconciled;
 - no other session owns the workspace;
-- the same Edge task conversation can be proven, or an approved recovery path is used;
+- the same selected-browser task conversation can be proven, or an approved recovery path is used;
 - pending read-only operations are safe to retry; and
 - every pending mutation is proven completed/not executed or is rolled back/reconciled manually.
 
@@ -183,7 +183,7 @@ Rollback requires exclusive workspace ownership, reloads the current non-browser
 
 | State | Operator response |
 | --- | --- |
-| Signed out / MFA / consent | Complete manually in visible Edge, then allow bounded readiness polling |
+| Signed out / MFA / consent | Complete manually in the visible selected browser, then allow bounded readiness polling |
 | Wrong or unverifiable identity | Stop; do not edit selectors mid-session |
 | Protection indicator absent | Stop; confirm tenant/license/surface with service owner |
 | Unapproved host | Stop unless it is an explicitly configured manual-auth redirect during readiness |

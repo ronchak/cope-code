@@ -1,35 +1,49 @@
 #!/usr/bin/env node
 
 import { stderr, stdout } from "node:process";
+import { realpathSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { AgentError, errorMessage } from "../shared/errors.js";
 import { parseCliArguments } from "./arguments.js";
 import { executeCommand } from "./commands.js";
 import { renderHumanError } from "./friendly-output.js";
 import { PromptCancelledError } from "./prompts.js";
-import { enableInteractiveSetupRerun } from "./setup-invocation.js";
 import { beginTerminalTakeover, commandUsesTerminalTakeover } from "./terminal-layout.js";
 import { WorkspaceExitRequestedError } from "./workspace.js";
 
-export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<number> {
+export interface MainDependencies {
+  readonly stdout?: typeof stdout;
+  readonly stderr?: typeof stderr;
+  readonly executeCommand?: typeof executeCommand;
+}
+
+export async function main(
+  argv: readonly string[] = process.argv.slice(2),
+  dependencies: MainDependencies = {},
+): Promise<number> {
+  const output = dependencies.stdout ?? stdout;
+  const errorOutput = dependencies.stderr ?? stderr;
+  const execute = dependencies.executeCommand ?? executeCommand;
   const json = argv.includes("--json");
   let endTerminalTakeover = (): void => undefined;
   try {
-    const command = enableInteractiveSetupRerun(parseCliArguments(argv));
+    const command = parseCliArguments(argv);
     if (commandUsesTerminalTakeover(command.command, command.json)) {
-      endTerminalTakeover = beginTerminalTakeover(stdout);
+      endTerminalTakeover = beginTerminalTakeover(output);
     }
-    return await executeCommand(command, { stdout, stderr });
+    return await execute(command, { stdout: output, stderr: errorOutput });
   } catch (error) {
     if (error instanceof WorkspaceExitRequestedError) {
-      if (!json) stdout.write("\nClosed.\n");
+      if (!json) output.write("\nClosed.\n");
       return 0;
     }
     if (error instanceof PromptCancelledError) {
       if (json) {
-        stdout.write(`${JSON.stringify({ ok: false, code: "CANCELLED", message: "Cancelled by user" })}\n`);
+        output.write(`${JSON.stringify({ ok: false, code: "CANCELLED", message: "Cancelled by user" })}\n`);
       } else {
-        stderr.write("\nCancelled.\n");
+        errorOutput.write("\nCancelled.\n");
       }
       return 130;
     }
@@ -44,11 +58,11 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     };
 
     if (json) {
-      stdout.write(`${JSON.stringify(body)}\n`);
+      output.write(`${JSON.stringify(body)}\n`);
     } else {
-      stderr.write(renderHumanError(error));
+      errorOutput.write(renderHumanError(error));
       if (process.env.COPE_DEBUG === "1" && error instanceof Error && error.stack !== undefined) {
-        stderr.write(`\n${error.stack}\n`);
+        errorOutput.write(`\n${error.stack}\n`);
       }
     }
     return 1;
@@ -57,4 +71,15 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
   }
 }
 
-process.exitCode = await main();
+if (isDirectInvocation()) process.exitCode = await main();
+
+function isDirectInvocation(): boolean {
+  const invoked = process.argv[1];
+  if (invoked === undefined) return false;
+  const modulePath = fileURLToPath(import.meta.url);
+  try {
+    return realpathSync(invoked) === realpathSync(modulePath);
+  } catch {
+    return path.resolve(invoked) === path.resolve(modulePath);
+  }
+}

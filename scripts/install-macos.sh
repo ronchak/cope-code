@@ -3,23 +3,41 @@ set -eu
 
 skip_build=0
 skip_setup=0
+update_path=1
 for argument in "$@"; do
   case "$argument" in
     --skip-build) skip_build=1 ;;
     --skip-setup) skip_setup=1 ;;
+    --no-path-update) update_path=0 ;;
+    --help)
+      printf 'Usage: %s [--skip-build] [--skip-setup] [--no-path-update]\n' "$0"
+      exit 0
+      ;;
     *) printf 'Unknown option: %s\n' "$argument" >&2; exit 64 ;;
   esac
 done
 
 [ "$(uname -s)" = "Darwin" ] || { printf 'Cope macOS preview installation requires Darwin.\n' >&2; exit 1; }
 [ "$(id -u)" -ne 0 ] || { printf 'Cope refuses root installation. Do not use sudo.\n' >&2; exit 1; }
-command -v node >/dev/null 2>&1 || { printf 'Node.js 24+ is required.\n' >&2; exit 1; }
-command -v npm >/dev/null 2>&1 || { printf 'npm 11+ is required.\n' >&2; exit 1; }
+command -v node >/dev/null 2>&1 || {
+  printf 'Node.js 24+ was not found. Install it with your approved package manager, reopen Terminal, and rerun this installer.\n' >&2
+  exit 1
+}
+command -v npm >/dev/null 2>&1 || {
+  printf 'npm 11+ was not found. Install the npm bundled with Node.js 24+, reopen Terminal, and rerun this installer.\n' >&2
+  exit 1
+}
 
 node_major=$(node -p 'Number(process.versions.node.split(".")[0])')
 npm_major=$(npm --version | awk -F. '{print $1}')
-[ "$node_major" -ge 24 ] || { printf 'Node.js 24+ is required; found %s.\n' "$(node --version)" >&2; exit 1; }
-[ "$npm_major" -ge 11 ] || { printf 'npm 11+ is required; found %s.\n' "$(npm --version)" >&2; exit 1; }
+[ "$node_major" -ge 24 ] || {
+  printf 'Node.js 24+ is required; found %s. Upgrade Node.js, reopen Terminal, and rerun this installer.\n' "$(node --version)" >&2
+  exit 1
+}
+[ "$npm_major" -ge 11 ] || {
+  printf 'npm 11+ is required; found %s. Upgrade npm for this Node.js installation and rerun this installer.\n' "$(npm --version)" >&2
+  exit 1
+}
 
 script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 project_root=$(dirname -- "$script_directory")
@@ -49,10 +67,50 @@ cope_command="$prefix/bin/cope"
 installed_version=$("$cope_command" --version)
 [ "$installed_version" = "$expected_version" ] || { printf 'Installed version check failed: expected %s, found %s\n' "$expected_version" "$installed_version" >&2; exit 1; }
 
+configure_default_path() {
+  bin_directory=$1
+  case ":${PATH}:" in
+    *":${bin_directory}:"*)
+      printf 'Cope command directory is already on PATH: %s\n' "$bin_directory"
+      return
+      ;;
+  esac
+
+  home_real=$(CDPATH= cd -- "$HOME" && pwd -P)
+  if [ "$prefix" != "$home_real/.local" ]; then
+    printf 'Custom install prefix detected; PATH was not changed automatically.\n'
+    printf 'Run Cope by its exact path or add this directory to PATH: %s\n' "$bin_directory"
+    return
+  fi
+
+  profile="$HOME/.zprofile"
+  if [ -L "$profile" ] || { [ -e "$profile" ] && { [ ! -f "$profile" ] || [ ! -O "$profile" ]; }; }; then
+    printf 'PATH was not changed because %s is linked, non-regular, or not user-owned.\n' "$profile" >&2
+    printf 'Add this directory to PATH manually: %s\n' "$bin_directory" >&2
+    return
+  fi
+
+  path_line='export PATH="$HOME/.local/bin:$PATH"'
+  if [ ! -e "$profile" ]; then
+    umask 077
+    : > "$profile"
+  fi
+  if ! /usr/bin/grep -Fqx "$path_line" "$profile"; then
+    printf '\n# Added by the Cope installer\n%s\n' "$path_line" >> "$profile"
+  fi
+  printf 'Configured %s for future Terminal sessions.\n' "$profile"
+  printf 'Open a new Terminal window before running cope, or run: export PATH="$HOME/.local/bin:$PATH"\n'
+}
+
+if [ "$update_path" -eq 1 ]; then
+  configure_default_path "$prefix/bin"
+else
+  printf 'PATH update skipped. Add this directory to PATH if needed: %s/bin\n' "$prefix"
+fi
+
 printf 'Cope %s installed for the current user.\n' "$installed_version"
-printf 'Add this exact directory to PATH if needed: %s/bin\n' "$prefix"
 printf 'This is an uncertified macOS preview; live use still requires the exact-tuple acceptance gates.\n'
 if [ "$skip_setup" -eq 0 ]; then
-  printf 'Starting manual Edge onboarding. Sign-in and MFA remain user-controlled.\n'
+  printf 'Starting guided browser setup. Sign-in and MFA remain user-controlled.\n'
   "$cope_command" setup
 fi

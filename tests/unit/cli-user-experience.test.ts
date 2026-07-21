@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { executeCommand } from "../../src/cli/commands.js";
+import { configuredBrowserLabel, interactiveSetupCommand } from "../../src/cli/interactive.js";
 import { chatFooter, renderUserMessage, startupPanel } from "../../src/cli/presentation.js";
 import { chatPromptStartRow, inputViewport } from "../../src/cli/prompts.js";
 import {
@@ -21,6 +22,35 @@ class MemoryOutput {
   public value = "";
   public write(chunk: string): void { this.value += chunk; }
 }
+
+test("interactive transport label follows the configured Chrome product", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-interactive-browser-label-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const browserFile = path.join(root, "browser.json");
+  await writeFile(browserFile, JSON.stringify({
+    schema_version: "cba-browser-config/2",
+    product: "chrome",
+    browser_contract_version: "cope-visible-browser/v1",
+    entry_url: "https://m365.cloud.microsoft/chat",
+    approved_hosts: [{ hostname: "m365.cloud.microsoft", allow_subdomains: false }],
+    expected_identity: "person@example.com",
+    require_protection_indicator: false,
+    profile_directory: path.join(root, "profile"),
+    browser_executable: path.join(root, "Google Chrome"),
+    browser_version: "149.0.1.2",
+    browser_executable_sha256: "a".repeat(64),
+  }), "utf8");
+  assert.equal(await configuredBrowserLabel(browserFile), "visible Chrome");
+});
+
+test("the in-session setup command preserves valid configuration by default", () => {
+  assert.deepEqual(interactiveSetupCommand("/managed/state"), {
+    command: "setup",
+    force: false,
+    json: false,
+    stateHome: "/managed/state",
+  });
+});
 
 test("package and installer expose a durable global cope command", async () => {
   const packageJson = JSON.parse(await readFile(path.resolve("package.json"), "utf8")) as {

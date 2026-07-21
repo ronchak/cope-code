@@ -37,6 +37,33 @@ export function padDisplay(value: string, width: number): string {
   return `${fitted}${" ".repeat(Math.max(0, width - displayWidth(fitted)))}`;
 }
 
+export function wrapText(value: string, width: number): readonly string[] {
+  if (width <= 0) return [""];
+  const paragraphs = value.split(/\r?\n/u);
+  return paragraphs.flatMap((paragraph) => {
+    if (paragraph.length === 0) return [""];
+    const words = paragraph.split(/\s+/u);
+    const lines: string[] = [];
+    let line = "";
+    for (const word of words) {
+      const pieces = displayWidth(word) <= width
+        ? [word]
+        : splitToWidth(word, width);
+      for (const piece of pieces) {
+        const candidate = line.length === 0 ? piece : `${line} ${piece}`;
+        if (displayWidth(candidate) <= width) {
+          line = candidate;
+        } else {
+          if (line.length > 0) lines.push(line);
+          line = piece;
+        }
+      }
+    }
+    if (line.length > 0) lines.push(line);
+    return lines.length === 0 ? [""] : lines;
+  });
+}
+
 export function terminalColumns(fallback = 80): number {
   const columns = process.stdout.columns;
   return Number.isSafeInteger(columns) && columns !== undefined && columns > 0 ? columns : fallback;
@@ -106,6 +133,18 @@ function takeWidth(value: string, width: number): string {
     used += next;
   }
   return result;
+}
+
+function splitToWidth(value: string, width: number): readonly string[] {
+  const pieces: string[] = [];
+  let rest = value;
+  while (rest.length > 0) {
+    const piece = takeWidth(rest, width);
+    if (piece.length === 0) break;
+    pieces.push(piece);
+    rest = graphemes(rest).slice(graphemes(piece).length).join("");
+  }
+  return pieces;
 }
 
 function takeWidthFromEnd(value: string, width: number): string {

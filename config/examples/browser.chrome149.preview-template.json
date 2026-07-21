@@ -1,6 +1,6 @@
 {
   "schema_version": "cba-browser-config/2",
-  "product": "edge",
+  "product": "chrome",
   "browser_contract_version": "cope-visible-browser/v1",
   "entry_url": "https://copilot.example.invalid/chat",
   "approved_hosts": [
@@ -17,10 +17,10 @@
   ],
   "expected_identity": "REPLACE_WITH_APPROVED_WORK_ACCOUNT_DISPLAY_STRING",
   "require_protection_indicator": true,
-  "profile_directory": "C:\\Users\\REPLACE_WITH_WINDOWS_USER\\AppData\\Local\\CopilotBrowserAgentEdgeProfile",
-  "browser_executable": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-  "browser_version": "149.0.4022.98",
-  "browser_executable_sha256": "REPLACE_WITH_LOWERCASE_SHA256_OF_APPROVED_EDGE_EXECUTABLE",
+  "profile_directory": "C:\\Users\\REPLACE_WITH_WINDOWS_USER\\AppData\\Local\\CopilotBrowserAgentChromeProfile",
+  "browser_executable": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+  "browser_version": "REPLACE_WITH_EXACT_APPROVED_CHROME_VERSION",
+  "browser_executable_sha256": "REPLACE_WITH_LOWERCASE_SHA256_OF_APPROVED_CHROME_EXECUTABLE",
   "max_message_chars": 200000,
   "max_response_chars": 1000000,
   "waits": {
@@ -33,7 +33,7 @@
     "minimumStableMs": 750
   },
   "ui_contract": {
-    "version": "copilot-ui/v1:uncertified-edge149-template",
+    "version": "copilot-ui/v1:uncertified-chrome149-template",
     "certifiedSurface": "UNDEPLOYABLE TEMPLATE — replace with the exact certified tenant surface",
     "submissionStrategy": "send-control",
     "groups": {

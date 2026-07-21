@@ -59,6 +59,9 @@ test("a replacement Copilot tab arriving just after navigation abort is still ad
 function browserConfig(): EdgeLaunchConfig {
   const expectedIdentity = "Ronak Chakraborty";
   return {
+    product: "edge",
+    browserContractVersion: "cope-visible-browser/v1",
+    browserExecutable: path.resolve("synthetic-edge-executable"),
     entryUrl: "https://m365.cloud.microsoft/chat",
     approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
     manualAuthenticationHosts: [{ hostname: "login.microsoftonline.com" }],

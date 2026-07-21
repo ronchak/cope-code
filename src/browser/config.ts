@@ -10,6 +10,11 @@ import {
   type SemanticLocator,
   type TextPattern,
 } from "./contracts.js";
+import {
+  BROWSER_CONTRACT_VERSION,
+  isBrowserProduct,
+  type BrowserProduct,
+} from "./product.js";
 
 export interface ApprovedHost {
   readonly hostname: string;
@@ -40,12 +45,20 @@ export interface CopilotBrowserAdapterConfig {
   readonly waits: BrowserWaitConfig;
 }
 
-export interface EdgeLaunchConfig extends CopilotBrowserAdapterConfig {
-  /** Dedicated directory. Existing unmarked browser profiles are refused. */
+export interface BrowserLaunchConfig extends CopilotBrowserAdapterConfig {
+  readonly product: BrowserProduct;
+  readonly browserContractVersion: typeof BROWSER_CONTRACT_VERSION;
+  /** Dedicated product-bound directory. Existing unmarked browser profiles are refused. */
   readonly profileDirectory: string;
-  /** Explicit system Edge binary selected by deployment configuration. */
-  readonly edgeExecutable?: string;
+  /** Explicit verified stable-browser binary selected by deployment configuration. */
+  readonly browserExecutable: string;
+  /** Recorded setup evidence. Legacy Edge v1 files acquire these in memory at load. */
+  readonly browserVersion?: string;
+  readonly browserExecutableSha256?: string;
 }
+
+/** @deprecated Compatibility alias for existing imports. */
+export type EdgeLaunchConfig = BrowserLaunchConfig;
 
 export const DEFAULT_BROWSER_WAITS: BrowserWaitConfig = Object.freeze({
   actionMs: 15_000,
@@ -318,7 +331,7 @@ function validateBrowserConfigContents(config: CopilotBrowserAdapterConfig): voi
   validateUiContract(config.uiContract);
 }
 
-export function validateEdgeLaunchConfig(config: EdgeLaunchConfig): void {
+export function validateBrowserLaunchConfig(config: BrowserLaunchConfig): void {
   assertExactKeys(config, [
     "entryUrl",
     "approvedHosts",
@@ -329,14 +342,36 @@ export function validateEdgeLaunchConfig(config: EdgeLaunchConfig): void {
     "maxMessageChars",
     "maxResponseChars",
     "waits",
+    "product",
+    "browserContractVersion",
     "profileDirectory",
-    "edgeExecutable",
-  ], "Edge launch configuration");
+    "browserExecutable",
+    "browserVersion",
+    "browserExecutableSha256",
+  ], "browser launch configuration");
   validateBrowserConfigContents(config);
-  validateEdgeProfileDirectoryPath(config.profileDirectory);
-  if (config.edgeExecutable !== undefined && !isAbsolute(config.edgeExecutable)) {
-    throw new TypeError("edgeExecutable must be an absolute system Edge path");
+  if (!isBrowserProduct(config.product)) throw new TypeError("product must be edge or chrome");
+  if (config.browserContractVersion !== BROWSER_CONTRACT_VERSION) {
+    throw new TypeError(`Unsupported browser contract version: ${config.browserContractVersion}`);
   }
+  validateBrowserProfileDirectoryPath(config.profileDirectory);
+  if (!isAbsolute(config.browserExecutable)) {
+    throw new TypeError("browserExecutable must be an absolute stable-browser path");
+  }
+  if (config.browserVersion !== undefined && !/^\d+(?:\.\d+){1,3}$/u.test(config.browserVersion)) {
+    throw new TypeError("browserVersion is invalid");
+  }
+  if (
+    config.browserExecutableSha256 !== undefined &&
+    !/^[a-f0-9]{64}$/u.test(config.browserExecutableSha256)
+  ) {
+    throw new TypeError("browserExecutableSha256 is invalid");
+  }
+}
+
+/** @deprecated Compatibility alias for existing imports. */
+export function validateEdgeLaunchConfig(config: EdgeLaunchConfig): void {
+  validateBrowserLaunchConfig(config);
 }
 
 /**
@@ -344,7 +379,7 @@ export function validateEdgeLaunchConfig(config: EdgeLaunchConfig): void {
  * canonical/prospective containment check is performed while loading live
  * configuration, once the repository and state roots are known.
  */
-export function validateEdgeProfileDirectoryPath(profileDirectory: string): void {
+export function validateBrowserProfileDirectoryPath(profileDirectory: string): void {
   if (profileDirectory.includes("\0")) {
     throw new TypeError("profileDirectory must not contain NUL characters");
   }
@@ -361,6 +396,11 @@ export function validateEdgeProfileDirectoryPath(profileDirectory: string): void
   if (resolve(profileDirectory) === resolve(profileDirectory, "..")) {
     throw new TypeError("profileDirectory is not a usable dedicated path");
   }
+}
+
+/** @deprecated Compatibility alias for existing imports. */
+export function validateEdgeProfileDirectoryPath(profileDirectory: string): void {
+  validateBrowserProfileDirectoryPath(profileDirectory);
 }
 
 export function isApprovedUrl(url: URL | string, hosts: readonly ApprovedHost[]): boolean {

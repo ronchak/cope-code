@@ -1,4 +1,5 @@
 import { access } from "node:fs/promises";
+import type { BrowserProduct } from "../browser/index.js";
 import { AgentError } from "../shared/errors.js";
 import { DEFAULT_GIT_EXECUTABLE, RepositoryBoundary } from "../repository/boundary.js";
 import {
@@ -12,6 +13,10 @@ import {
 export interface MachinePreflightOptions {
   readonly repositoryRoot: string;
   readonly liveBrowser: boolean;
+  readonly browserProduct?: BrowserProduct;
+  readonly browserExecutable?: string;
+  readonly browserVersion?: string;
+  /** @deprecated Edge-only compatibility input. */
   readonly edgeExecutable?: string;
   readonly gitExecutable?: string;
   readonly minimumNodeMajor?: number;
@@ -24,6 +29,10 @@ export interface MachinePreflightResult {
   readonly nodeVersion: string;
   readonly gitVersion: string;
   readonly repositoryTopLevel: string;
+  readonly browserProduct?: BrowserProduct;
+  readonly browserExecutable?: string;
+  readonly browserVersion?: string;
+  /** @deprecated Edge-only compatibility output. */
   readonly edgeExecutable?: string;
   readonly standardUserVerified: boolean;
   readonly guiSessionVerified: boolean;
@@ -83,12 +92,15 @@ export async function runMachinePreflight(options: MachinePreflightOptions): Pro
   await boundary.assertNoNestedGitBoundaries({ gitExecutable });
 
   if (options.liveBrowser) {
-    if (!options.edgeExecutable) {
-      throw new AgentError("CONFIG_INVALID", "Live Edge transport requires an explicit Edge executable path");
+    const browserExecutable = options.browserExecutable ?? options.edgeExecutable;
+    const browserProduct = options.browserProduct ?? "edge";
+    if (!browserExecutable) {
+      throw new AgentError("CONFIG_INVALID", "Live browser transport requires an explicit verified browser executable path");
     }
-    await access(options.edgeExecutable).catch(() => {
-      throw new AgentError("CONFIG_INVALID", "Configured Microsoft Edge executable is unavailable", {
-        edgeExecutable: options.edgeExecutable,
+    await access(browserExecutable).catch(() => {
+      throw new AgentError("CONFIG_INVALID", "The selected browser executable is unavailable", {
+        product: browserProduct,
+        browserExecutable,
       });
     });
   } else {
@@ -100,6 +112,9 @@ export async function runMachinePreflight(options: MachinePreflightOptions): Pro
     nodeVersion: process.versions.node,
     gitVersion: version.stdout.trim(),
     repositoryTopLevel: topLevel.stdout.trim(),
+    ...(options.browserProduct === undefined ? {} : { browserProduct: options.browserProduct }),
+    ...(options.browserExecutable === undefined ? {} : { browserExecutable: options.browserExecutable }),
+    ...(options.browserVersion === undefined ? {} : { browserVersion: options.browserVersion }),
     ...(options.edgeExecutable === undefined ? {} : { edgeExecutable: options.edgeExecutable }),
     standardUserVerified: early.eligibility.standardUserVerified,
     guiSessionVerified: early.eligibility.guiSessionVerified,
@@ -110,7 +125,7 @@ export async function runMachinePreflight(options: MachinePreflightOptions): Pro
 export function offlineTransportWarnings(host: HostPlatform): readonly string[] {
   return host.platform === "win32"
     ? []
-    : ["Live Edge checks were skipped because an offline transport was selected."];
+    : ["Live browser checks were skipped because an offline transport was selected."];
 }
 
 function bounded(value: string): string {

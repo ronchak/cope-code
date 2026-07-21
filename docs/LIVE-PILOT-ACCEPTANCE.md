@@ -2,7 +2,7 @@
 
 ## Current decision: NO-GO for real repository content
 
-As of 2026-07-18, the supplied machine map and project inputs do not include the tenant-specific Copilot URL, organizational identity, protection indicator, UI certification evidence, applicable-terms approval, repository/data-owner approval, or an approved live run on any exact tuple. The macOS implementation is an experimental home-test preview candidate with offline evidence only; it is not certified.
+As of 2026-07-19, the supplied machine map and project inputs do not include the tenant-specific Copilot URL, organizational identity, protection indicator, UI certification evidence, applicable-terms approval, repository/data-owner approval, or an approved live run on any exact tuple. Edge remains the established compatibility target with live evidence pending. Chrome is a **preview candidate / offline evidence only** and has no transferred certification from Edge. The macOS implementation is also an experimental home-test preview candidate with offline evidence only; it is not certified.
 
 Offline implementation and tests are prerequisites, not substitutes for these gates. Change the decision only through the accountable governance/release process and attach evidence; do not edit a local copy merely to make the CLI run.
 
@@ -24,8 +24,10 @@ Any `FAIL` or `PENDING` P0 row is a no-go.
 | Release/source revision | immutable commit/build identifier | PENDING |
 | Package lock digest and dependency inventory/SBOM | approved artifact references | PENDING |
 | Windows/Edge/Node/npm/Git tuple | exact versions and executable hashes/paths | candidate Windows/Edge/Node/npm values known; Git `2.55.0.windows.3` reported with conflicting Program Files/per-user paths and failed `where.exe`; exact path and all hashes PENDING |
+| Windows/Chrome/Node/npm/Git tuple | exact OS/architecture, Chrome version/signature/path/hash, Node/npm/Git versions/paths/hashes | PENDING; no live Chrome tuple may be inferred from the Edge row |
 | macOS arm64 preview tuple | MacBook Air `Mac14,2`, macOS `26.4.1` (`25E253`), Edge/Node/npm/Git paths/hashes | machine/OS/APFS inventory known; Node/npm upgrade, Edge installation, hashes, and owner-approved live evidence PENDING |
 | macOS x64 preview tuple | MacBook Pro `MacBookPro16,3`, macOS `15.7.7` (`24G720`), Edge/Node/npm/Git paths/hashes and Aqua/SSH envelope | machine/OS/APFS/Aqua inventory known; Edge, hashes, SSH launch evidence, and owner-approved live evidence PENDING |
+| macOS Chrome preview tuple(s) | exact machine/OS/architecture/Chrome/Node/npm/Git and Aqua envelope | PENDING separately for every proposed Chrome tuple |
 | Copilot product/license/tenant surface | exact approved work experience | PENDING |
 | Copilot entry/final/redirect hosts | exact HTTPS URLs/hostnames | PENDING; examples are not certification |
 | Identity/protection contract | unique signals and evidence | PENDING |
@@ -62,6 +64,10 @@ Any `FAIL` or `PENDING` P0 row is a no-go.
 | OFF-11 | P0 | Audit/disclosure/artifact/decision/fingerprint-key/completion-handoff/checkpoint/review-package corruption and partial records fail closed; review export remains source-free and its digest is not represented as a signature. | integrity/export tests | PENDING review |
 | OFF-12 | P1 | Dependency vulnerability/provenance review, SBOM, signing, reproducible packaging, and update rollback meet release policy. | release-security evidence | PENDING |
 | OFF-13 | P0 | Explicitly granted `sideEffects: true` validation runs in `edit`/`auto`; every command is bracketed by nested-Git and Git-visible/nonignored, protected, and Git-control integrity checks; `sideEffects: false` also detects bounded ordinary-ignored drift; disallowed or unverifiable drift is recovery-required and cannot satisfy validation. | command-boundary implementation and adversarial tests for tracked, policy-hidden, protected, control, nested, ignored, and bounds cases | PENDING review |
+| OFF-14 | P0 | Deterministic Edge-only, Chrome-only, both, neither, current-config, automation, and manual-path selection pass; mismatch, derivative, missing, inaccessible, and stale identity evidence fail closed. | discovery/setup/config tests | PENDING immutable review |
+| OFF-15 | P0 | Wide, 54-column, resized, raw arrow/Enter/Escape/Ctrl+C, plain numbered, redirected, and no-color setup cases remain legible and cancellation exits 130 without partial persistence. | terminal/setup tests | PENDING immutable review |
+| OFF-16 | P0 | Edge/Chrome dedicated profiles remain separate; both ordinary roots, cross-product reuse, marker tampering, non-empty unmarked roots, links/devices/ownership/lock races are rejected. | profile/transaction tests | PENDING immutable review |
+| OFF-17 | P0 | Legacy Edge configuration and profile remain unchanged unless explicitly rewritten; frozen Windows wrappers/discovery order, fixture/replay transport, and `cba/1` semantics remain unchanged. | migration/frozen-byte/protocol tests and diff review | PENDING immutable review |
 
 ## Target workstation gates
 
@@ -70,7 +76,7 @@ Any `FAIL` or `PENDING` P0 row is a no-go.
 | WIN-01 | P0 | Windows 11 Enterprise build 22631 candidate has adequate CPU/RAM/disk; previously failed inventory probes are resolved. | refreshed sanitized inventory | PENDING |
 | WIN-02 | P0 | Standard-user preflight passes and elevated high/system tokens are refused. | target test record | PENDING |
 | WIN-03 | P0 | Exact Edge 149, Node 24, npm 11, and Git executables are available and approved; conflicting Git discovery is resolved. | executable path/hash/version record | PENDING |
-| WIN-04 | P0 | Dedicated profile location is empty/marked, user-only, outside repository and state roots, local/nonshared, and exclusive-lock behavior passes. Canonical parent-junction containment is tested. | ACL/path/profile test | PENDING |
+| WIN-04 | P0 | Product-specific dedicated profile locations are empty/marked, user-only, mutually separate, outside repository/state and ordinary Edge/Chrome roots, local/nonshared, and exclusive-lock behavior passes. Cross-product markers and canonical parent-junction containment are tested. | ACL/path/profile test | PENDING |
 | WIN-05 | P0 | Endpoint protection, application control, proxy/egress, filesystem/resource containment, encryption, and logging posture is acceptable; the approved executable/transitive-script trusted-computing-base risk and inability to comprehensively prevent/observe external writes are explicitly accepted or mitigated; stopped service indicators are explained. | endpoint/security owner sign-off and reviewed command/script inventory | PENDING |
 | WIN-06 | P0 | State/checkpoint/artifact/profile deletion and incident preservation procedures work on target storage. | operations exercise | PENDING |
 | WIN-07 | P1 | Install, update, rollback, uninstall, and decommission work without global Playwright/browser download or admin rights. | packaging exercise | PENDING |
@@ -106,6 +112,23 @@ These rows are non-blocking for the Windows artifact, but every P0 row blocks th
 | MAC-I-03 | same x64 tuple | P0 | Same zero ordinary-profile access observer gate and process-tree crash/cancel corpus pass. | PENDING |
 | MAC-WIN-01 | shared artifact / Windows primary | P0 | Frozen Windows characterization remains green and the predeclared A/B local-operation thresholds (≤5% median, ≤10% p95 regression) pass on the exact Windows candidate. | PENDING |
 
+## Chrome preview candidate gates
+
+These gates are additive. Every row must pass independently for each exact OS/architecture/Chrome/Node/npm/Git tuple before removing **Chrome preview candidate / offline evidence only**. Passing Edge gates, sharing Chromium internals, or passing offline Chrome tests does not satisfy them. Chrome acceptance must not weaken any Windows or Edge release gate.
+
+| ID | P | Gate and threshold | Required evidence | Status |
+| --- | --- | --- | --- | --- |
+| CHR-01 | P0 | Exact OS/build/architecture, Chrome Stable version, Node, npm, Git, release revision and dependency lock are recorded with canonical executable paths and SHA-256 values. | immutable tuple record | PENDING |
+| CHR-02 | P0 | Chrome identity evidence matches expected application metadata and signer/publisher, rejects Edge and unsupported Chromium derivatives, and survives a configure-to-launch stat/version/hash recheck. | target positive/negative identity record | PENDING |
+| CHR-03 | P0 | Browser-neutral installer and clean `cope setup` detect/select Chrome without a download; manual-path and managed flag flows work; uninstall/reinstall preserve or deliberately remove state as documented. | clean packaging/setup/decommission exercise | PENDING |
+| CHR-04 | P0 | User manually completes Microsoft 365 sign-in, MFA, consent, reauthentication and tenant Conditional Access; Cope does not automate or capture authentication material. | observed synthetic live exercise | PENDING |
+| CHR-05 | P0 | The configured Copilot page passes exact host, visible identity, protection, composer, state-classifier and `copilot-ui/v1:<cert-id>` checks on this Chrome tuple, including negative signed-out/MFA/consent/modal/throttle/changed-selector cases. | certified fixture plus live UI record | PENDING |
+| CHR-06 | P0 | Chrome uses a Chrome-marked dedicated profile and refuses Edge/cross-product profiles. Owner-approved observation shows zero Cope/launched-Chrome process-tree reads or writes beneath the ordinary Chrome root for the complete setup/session/crash exercise. | profile evidence and source-free observer record | PENDING |
+| CHR-07 | P0 | Three consecutive synthetic sessions pass submission marker/baseline correlation, stable response capture, sustained `cba/1` adherence, and wrong/old/partial response rejection. | live run and correlation evidence | PENDING |
+| CHR-08 | P0 | Ctrl+C, kill switch, timeout, browser crash and parent crash terminate the full process tree; before/after-send recovery never duplicates a submission and indeterminate delivery pauses. | controlled fault-injection record | PENDING |
+| CHR-09 | P0 | Windows Edge discovery order and wrappers remain byte-identical, existing Edge configuration/authentication remains selected, Edge live behavior has no regression, and the shared artifact meets the Windows A/B thresholds. | frozen-surface diff, Edge rerun and performance evidence | PENDING |
+| CHR-10 | P0 | Support status remains visible as Chrome preview/offline-only in setup, doctor, docs and release notes until CHR-01–09 plus all shared P0 gates are approved. | product/release review | PENDING |
+
 ## Disposable edit/auto gates
 
 | ID | P | Gate and threshold | Required evidence | Status |
@@ -129,8 +152,8 @@ Complete only after every P0 row is `PASS` or approved `N/A`:
 | Repository/data owner |  |  |  |
 | Security |  |  |  |
 | Privacy/records |  |  |  |
-| M365/Edge service owner |  |  |  |
+| M365/browser service owner |  |  |  |
 | Operations/support |  |  |  |
 | Release decision (`GO`/`NO-GO`) |  |  |  |
 
-Approval applies only to the recorded candidate tuple, repositories/classifications, users/devices, policies, and validity period. Edge/Copilot UI, identity/protection behavior, dependency, policy, or platform changes trigger recertification.
+Approval applies only to the recorded candidate tuple, browser product, repositories/classifications, users/devices, policies, and validity period. Edge/Chrome/Copilot UI, identity/protection behavior, dependency, policy, or platform changes trigger product-specific recertification.

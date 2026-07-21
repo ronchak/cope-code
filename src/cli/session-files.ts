@@ -16,6 +16,7 @@ export interface SessionRuntimeManifest {
   readonly source_file?: string;
   readonly source_sha256?: string;
   readonly browser_config_sha256?: string;
+  readonly browser_identity_sha256?: string;
   readonly created_at: string;
 }
 
@@ -89,6 +90,21 @@ export async function sourceFileIdentity(filename: string): Promise<{
   }
 }
 
+export function assertBrowserRuntimeManifestMatches(
+  manifest: SessionRuntimeManifest,
+  hashes: { readonly browser?: string; readonly browserIdentity?: string },
+): void {
+  if (manifest.browser_config_sha256 !== hashes.browser) {
+    throw new AgentError("RECOVERY_REQUIRED", "Browser configuration changed during the session");
+  }
+  if (
+    manifest.browser_identity_sha256 !== undefined &&
+    manifest.browser_identity_sha256 !== hashes.browserIdentity
+  ) {
+    throw new AgentError("RECOVERY_REQUIRED", "Verified browser identity changed during the session");
+  }
+}
+
 function validateRuntimeManifest(value: unknown): asserts value is SessionRuntimeManifest {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new AgentError("RECOVERY_REQUIRED", "Session runtime manifest must be an object");
@@ -100,6 +116,7 @@ function validateRuntimeManifest(value: unknown): asserts value is SessionRuntim
     "source_file",
     "source_sha256",
     "browser_config_sha256",
+    "browser_identity_sha256",
     "created_at",
   ].includes(key));
   if (
@@ -110,12 +127,15 @@ function validateRuntimeManifest(value: unknown): asserts value is SessionRuntim
     (item.source_file === undefined) !== (item.source_sha256 === undefined) ||
     (item.source_file !== undefined && typeof item.source_file !== "string") ||
     (item.source_sha256 !== undefined && !/^[a-f0-9]{64}$/u.test(item.source_sha256)) ||
-    (item.browser_config_sha256 !== undefined && !/^[a-f0-9]{64}$/u.test(item.browser_config_sha256))
+    (item.browser_config_sha256 !== undefined && !/^[a-f0-9]{64}$/u.test(item.browser_config_sha256)) ||
+    (item.browser_identity_sha256 !== undefined && !/^[a-f0-9]{64}$/u.test(item.browser_identity_sha256)) ||
+    (item.browser_identity_sha256 !== undefined &&
+      (item.browser_config_sha256 === undefined || item.transport !== "edge"))
   ) {
     throw new AgentError("RECOVERY_REQUIRED", "Session runtime manifest failed validation", { unknown });
   }
   if (item.transport === "edge" && item.source_file !== undefined) {
-    throw new AgentError("RECOVERY_REQUIRED", "Edge sessions cannot have an offline source file");
+    throw new AgentError("RECOVERY_REQUIRED", "Live browser sessions cannot have an offline source file");
   }
   if (item.transport !== "edge" && item.source_file === undefined) {
     throw new AgentError("RECOVERY_REQUIRED", "Offline sessions require a pinned source file");

@@ -106,7 +106,7 @@ Legend:
 
 | Req | Evidence | Disposition / remaining gate |
 | --- | --- | --- |
-| FR-070 | `EdgeCopilotTransport`, persistent headful `playwright-core` context | Target/Live: not run on mapped Windows/Edge. |
+| FR-070 | `BrowserCopilotTransport` compatibility abstraction, persistent headful `playwright-core` context, explicit verified executable | Automated Edge/Chrome launch composition; target/live tuples pending. |
 | FR-071 | manual readiness classifier; browser-adapter test | Live: verify exact auth/CA flows without automation. |
 | FR-072 | exact host, identity, protection checks before composer/send | Live-blocked: tenant URL/identity/protection contract missing. |
 | FR-073 | fail-closed page classifications | Automated synthetic; live negative cases pending. |
@@ -116,6 +116,16 @@ Legend:
 | FR-077 | classifier corpus for sign-in/MFA/consent/throttle/error/modal/selectors | Automated synthetic; tenant fixture certification pending. |
 | FR-078 | minimal source-free diagnostics | Automated; approved support retention/redaction process is governance work. |
 | FR-079 | `src/browser` behind `ModelTransport`, independent UI contract version | Automated architectural boundary; import/maintenance review remains. |
+| FR-097 | `BrowserProduct`, deterministic Darwin/Windows candidates, product identity verification; `browser-discovery`/platform tests | Automated offline for Edge-only, Chrome-only, both/neither, manual/override, mismatch, derivatives, missing/inaccessible; exact target metadata/signature evidence pending. |
+| FR-098 | strict v1 Edge compatibility parser and v2 browser schema; config/profile/setup tests | Automated migration and exact-byte preservation; existing live Edge authentication no-regression remains target evidence. |
+| FR-099 | product-specific profile roots/markers, both ordinary-root overlap checks, ownership/link/device/lock controls; profile tests | Automated adversarial coverage; target observer must prove zero ordinary-profile access. |
+| FR-100 | guided `cope setup`, browser selector, retry/advanced/change confirmation; setup/UI tests | Automated current/one/two/none/automation/manual cases. |
+| FR-101 | responsive raw-terminal renderer and plain numbered fallback; terminal tests | Automated wide, 54-column, resize, arrow/Enter/Escape/Ctrl+C 130, redirected and no-color cases; terminal/screen-reader UAT pending. |
+| FR-102 | readiness-before-persistence transaction, config CAS lock, resumable-session guard, cancellation cleanup; setup-transaction tests | Automated fault/race cases; live auth/CA readiness pending. |
+| FR-103 | launcher identity/version/hash recheck, canonical executable/profile, no channel fallback/download; Chrome launcher tests | Automated composition; exact browser process-tree/live evidence pending. |
+| FR-104 | browser-aware doctor/preflight/interactive labels and JSON identity/profile evidence; doctor/preflight tests | Automated concise/path-hidden human output and Chrome preview label; target output UAT pending. |
+| FR-105 | unchanged `cba/1`, fixture/replay and persisted `edge` live-transport discriminator; protocol/runtime tests and frozen-surface review | Automated semantic compatibility; release review remains. |
+| FR-106 | browser-neutral installers, Edge-order/frozen Windows wrapper tests, packed executable checks | Automated packaging surfaces; clean target install/setup and uninstall/reinstall evidence pending. |
 
 ## Agent loop and completion
 
@@ -150,11 +160,11 @@ Legend:
 | Reliability | explicit state machine, intent/journal/artifact ordering, fault-specific tests | systematic crash injection at every commit point and live browser recovery |
 | Maintainability | separated modules, central contracts/versions, fixture/replay transport | architecture dependency enforcement and UI-owner recertification process |
 | Performance | bounded reads/output/context and state-based waits | measured large-repository and live-turn thresholds on target |
-| Usability/accessibility | non-color CLI structures, explicit pause/status controls, and specific policy reasons | operator UAT and accessible terminal review |
+| Usability/accessibility | non-color CLI structures, responsive browser selection, plain numbered fallback, explicit pause/status controls, and specific policy reasons | operator UAT, screen-reader review, and target terminal matrix |
 | Privacy/governance | minimized local metadata, no added telemetry, explicit classification | written terms/data-owner/privacy/records decisions |
 
 ## Known release-blocking gaps
 
-Irrespective of automated tests, real-repository pilot remains blocked until governance approval, exact Copilot tenant/URL/identity/protection certification, dedicated profile approval, Windows target execution, live exactly-once and response-completion evidence, endpoint storage/network/resource decisions, approved executable/transitive-script review and external-write risk disposition, release provenance/signing/SBOM, and operations/incident ownership are complete.
+Irrespective of automated tests, real-repository pilot remains blocked until governance approval, exact Copilot tenant/URL/identity/protection certification, dedicated profile approval, Windows target execution, live exactly-once and response-completion evidence, endpoint storage/network/resource decisions, approved executable/transitive-script review and external-write risk disposition, release provenance/signing/SBOM, and operations/incident ownership are complete. Chrome additionally remains **preview candidate / offline evidence only** until its exact product/OS/architecture/Node/npm/Git tuple passes CHR-01 through CHR-10 in the live matrix; Edge evidence does not transfer.
 
 The partial FR-064, FR-087, and FR-094 items require an explicit product decision or implementation before claiming full PRD conformance. The deterministic offline autonomous-loop path supports granted side-effecting validation without accepting tracked/nonignored, protected, control, or nested-repository drift; it is not live certification. A future versioned write-scope/checkpoint contract is still required before intentionally source-mutating child commands can be supported.
