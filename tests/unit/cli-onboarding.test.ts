@@ -364,7 +364,7 @@ test("existing browser setup remains selected and is not silently rewritten", as
   ]);
 });
 
-test("forced setup replaces only an invalid pinned UI contract", async (context) => {
+test("forced setup replaces only a stale pinned UI contract", async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), "cope-machine-stale-contract-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
   const stateHome = path.join(root, "state");
@@ -440,6 +440,26 @@ test("forced setup replaces only an invalid pinned UI contract", async (context)
   );
   assert.equal(await readFile(paths.browser, "utf8"), invalidBytes);
 
+  for (const unrecoverable of [
+    "null\n",
+    "[]\n",
+    "{broken json\n",
+    `${JSON.stringify({ unexpected_top_level: true })}\n`,
+  ]) {
+    await writeFile(paths.browser, unrecoverable, "utf8");
+    await assert.rejects(
+      configureMachine({
+        paths,
+        force: true,
+        interactive: false,
+        output: { write: () => undefined },
+        host,
+      }, dependencies),
+      /was not replaced/u,
+    );
+    assert.equal(await readFile(paths.browser, "utf8"), unrecoverable);
+  }
+
   await writeFile(paths.browser, staleBytes, "utf8");
   launched.length = 0;
   await configureMachine({
@@ -458,6 +478,75 @@ test("forced setup replaces only an invalid pinned UI contract", async (context)
   const recovered = JSON.parse(await readFile(paths.browser, "utf8")) as Record<string, unknown>;
   assert.equal(Object.hasOwn(recovered, "ui_contract"), false);
   assert.doesNotThrow(() => parseBrowserConfig(recovered));
+
+  const validButStaleContract = structuredClone(
+    createBaselineCopilotUiContract("person@example.com"),
+  ) as unknown as Record<string, unknown>;
+  validButStaleContract.version = `${String(validButStaleContract.version)}:synthetically-stale`;
+  const validPinned = { ...recovered, ui_contract: validButStaleContract };
+  assert.doesNotThrow(() => parseBrowserConfig(validPinned));
+  const validPinnedBytes = `${JSON.stringify(validPinned)}\n`;
+  await writeFile(paths.browser, validPinnedBytes, "utf8");
+  await configureMachine({
+    paths,
+    force: false,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+  }, dependencies);
+  assert.equal(await readFile(paths.browser, "utf8"), validPinnedBytes);
+
+  await assert.rejects(
+    configureMachine({
+      paths,
+      force: true,
+      interactive: false,
+      output: { write: () => undefined },
+      host,
+    }, {
+      ...dependencies,
+      launchBrowser: async (config) => {
+        assert.notEqual(config.uiContract.version, validButStaleContract.version);
+        return {
+          waitForManualReadiness: async () => ({
+            classification: {
+              state: "changed-selector" as const,
+              diagnosticCode: "UI_CONTRACT_QUORUM_FAILED",
+            },
+          }),
+          inspectState: async () => ({
+            classification: {
+              state: "changed-selector" as const,
+              diagnosticCode: "UI_CONTRACT_QUORUM_FAILED",
+            },
+          }),
+          close: async () => undefined,
+        } as unknown as EdgeCopilotTransport;
+      },
+    }),
+    (error: unknown) =>
+      error instanceof AgentError &&
+      error.code === "TRANSPORT_UNAVAILABLE",
+  );
+  assert.equal(await readFile(paths.browser, "utf8"), validPinnedBytes);
+
+  launched.length = 0;
+  await configureMachine({
+    paths,
+    force: true,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+  }, dependencies);
+  assert.equal(launched.length, 1);
+  assert.notEqual(
+    launched[0]?.uiContract.version,
+    validButStaleContract.version,
+  );
+  const resetValidPinned = JSON.parse(
+    await readFile(paths.browser, "utf8"),
+  ) as Record<string, unknown>;
+  assert.equal(Object.hasOwn(resetValidPinned, "ui_contract"), false);
 
   await writeFile(paths.browser, staleBytes, "utf8");
   const externalChange = "external browser config change\n";

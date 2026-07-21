@@ -611,28 +611,25 @@ function parseExistingBrowserConfigForSetup(
   raw: unknown,
   force: boolean,
 ): ReturnType<typeof parseBrowserConfig> {
-  try {
+  if (
+    !force ||
+    raw === null ||
+    typeof raw !== "object" ||
+    Array.isArray(raw) ||
+    !Object.hasOwn(raw, "ui_contract")
+  ) {
     return parseBrowserConfig(raw);
-  } catch (error) {
-    if (
-      !force ||
-      raw === null ||
-      typeof raw !== "object" ||
-      Array.isArray(raw) ||
-      !Object.hasOwn(raw, "ui_contract")
-    ) {
-      throw error;
-    }
-
-    // Forced setup is the explicit recovery path for stale pinned selectors.
-    // Remove only that untrusted extension, then re-run the complete strict
-    // parser so every host, path, browser-evidence, and schema invariant still
-    // has to pass. The returned file also omits the stale contract, ensuring
-    // readiness and persistence both use the safe built-in baseline.
-    const withoutUiContract = { ...(raw as Readonly<Record<string, unknown>>) };
-    delete withoutUiContract.ui_contract;
-    return parseBrowserConfig(withoutUiContract);
   }
+
+  // Forced setup is the explicit recovery path for stale pinned selectors,
+  // including contracts that remain structurally valid but no longer match the
+  // live UI. Remove only that untrusted extension, then run the complete strict
+  // parser so every host, path, browser-evidence, and schema invariant still
+  // has to pass. The returned file also omits the stale contract, ensuring
+  // readiness and persistence both use the safe built-in baseline.
+  const withoutUiContract = { ...(raw as Readonly<Record<string, unknown>>) };
+  delete withoutUiContract.ui_contract;
+  return parseBrowserConfig(withoutUiContract);
 }
 
 async function selectBrowserForSetup(input: {
