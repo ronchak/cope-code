@@ -210,6 +210,32 @@ test("a persistent unknown page returns a bounded diagnostic instead of waiting 
   assert.equal(now, waits.actionMs);
 });
 
+test("a visible blocking dialog retains the manual window and may recover", async () => {
+  let now = 0;
+  let calls = 0;
+
+  const result = await waitForStableManualReadiness(
+    async () => {
+      calls += 1;
+      return calls < 7
+        ? inspection("blocking-modal", "UNEXPECTED_BLOCKING_MODAL")
+        : inspection("ready", "READY");
+    },
+    waits,
+    waits.manualReadinessMs,
+    undefined,
+    {
+      monotonicNow: () => now,
+      sleep: async (milliseconds) => { now += milliseconds; },
+    },
+  );
+
+  assert.equal(result.classification.state, "ready");
+  assert.equal(calls, 7);
+  assert.equal(now, waits.pollMs * 6);
+  assert.equal(isTerminalManualReadinessState("blocking-modal"), false);
+});
+
 test("manual sign-in states retain the long readiness window and may recover", async () => {
   let now = 0;
   let calls = 0;
@@ -233,6 +259,7 @@ test("manual sign-in states retain the long readiness window and may recover", a
   assert.equal(result.classification.state, "ready");
   assert.equal(now, waits.pollMs * 6);
   assert.equal(isTerminalManualReadinessState("sign-in-required"), false);
+  assert.equal(isTerminalManualReadinessState("blocking-modal"), false);
   assert.equal(isTerminalManualReadinessState("unknown"), true);
   assert.equal(isTerminalManualReadinessState("streaming"), true);
 });
