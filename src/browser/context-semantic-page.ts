@@ -60,6 +60,7 @@ export class ContextSemanticPage implements SemanticPage {
   #filledValue: string | undefined;
   #postFillObservationSeen = false;
   #authenticationPage: Page | undefined;
+  #operationTermination: Promise<void> | undefined;
 
   public constructor(
     context: BrowserContext,
@@ -487,28 +488,53 @@ export class ContextSemanticPage implements SemanticPage {
   #delegate(page: Page): PlaywrightSemanticPage {
     const existing = this.#delegates.get(page);
     if (existing !== undefined) return existing;
-    const created = new PlaywrightSemanticPage(page, () => {
-      this.#nativeDialogEpoch += 1;
-      // A dialog on any page can race a queued action on another target. Abort
-      // the entire dedicated browser process first: target/context close
-      // commands do not preempt an evaluate already queued on another page.
-      if (this.#browser !== null && typeof this.#browser.close === "function") {
-        void this.#browser.close().catch(() => undefined);
-        return true;
-      }
-      if (typeof this.#activePage.close === "function") {
-        void this.#activePage.close({ runBeforeUnload: false }).catch(() => undefined);
-      }
-      if (typeof this.#context.close === "function") {
-        void this.#context.close().catch(() => undefined);
-      }
-      // Without an owning Browser, also let the delegate close the page that
-      // raised the dialog. Mock/embedded contexts may not implement a context
-      // close that actually tears down every target.
-      return false;
-    });
+    const created = new PlaywrightSemanticPage(
+      page,
+      () => {
+        this.#nativeDialogEpoch += 1;
+        // A dialog on any page can race a queued action on another target. Abort
+        // the entire dedicated browser process first: target/context close
+        // commands do not preempt an evaluate already queued on another page.
+        if (this.#browser !== null && typeof this.#browser.close === "function") {
+          void this.#browser.close().catch(() => undefined);
+          return true;
+        }
+        if (typeof this.#activePage.close === "function") {
+          void this.#activePage.close({ runBeforeUnload: false }).catch(() => undefined);
+        }
+        if (typeof this.#context.close === "function") {
+          void this.#context.close().catch(() => undefined);
+        }
+        // Without an owning Browser, also let the delegate close the page that
+        // raised the dialog. Mock/embedded contexts may not implement a context
+        // close that actually tears down every target.
+        return false;
+      },
+      this.#actionMs,
+      () => this.#terminateTimedOutOperation(page),
+    );
     this.#delegates.set(page, created);
     return created;
+  }
+
+  #terminateTimedOutOperation(page: Page): Promise<void> {
+    // observeCopilotPage launches all signal snapshots concurrently. Cache one
+    // teardown so simultaneous deadlines cannot race repeated Browser.close()
+    // calls or let one delegate return before the shared owner is gone.
+    this.#operationTermination ??= (async () => {
+      // Default Playwright timeouts do not cover locator.count() or
+      // ElementHandle.evaluate(). Terminate the captured process owner so a
+      // timed-out renderer call cannot later disclose or activate anything.
+      if (this.#browser !== null && typeof this.#browser.close === "function") {
+        await this.#browser.close();
+        return;
+      }
+      await Promise.all([
+        page.close({ runBeforeUnload: false }).catch(() => undefined),
+        this.#context.close().catch(() => undefined),
+      ]);
+    })();
+    return this.#operationTermination;
   }
 }
 

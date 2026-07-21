@@ -9,6 +9,7 @@ import { chromium } from "playwright-core";
 
 import { ContextSemanticPage } from "../../src/browser/context-semantic-page.js";
 import { PlaywrightSemanticPage } from "../../src/browser/playwright-semantic-page.js";
+import { AgentError } from "../../src/shared/errors.js";
 import type { LocatorGroup } from "../../src/browser/contracts.js";
 
 const composerGroup: LocatorGroup = {
@@ -195,5 +196,113 @@ test("a background-page dialog aborts queued actions on the active Chromium targ
     const modal = await tracked.snapshot(modalGroup);
     assert.equal(modal.matchedCandidates, 1);
     assert.equal(modal.enabledElements, 0);
+  }
+});
+
+test("renderer stalls terminate bounded snapshots, fills, and clicks in persistent Chromium", {
+  skip: !existsSync(chromiumExecutable),
+}, async () => {
+  for (const operation of ["snapshot", "fill", "click"] as const) {
+    const profile = await mkdtemp(join(tmpdir(), `cope-operation-timeout-${operation}-`));
+    const context = await chromium.launchPersistentContext(profile, {
+      headless: true,
+      executablePath: chromiumExecutable,
+    });
+    try {
+      const browser = context.browser();
+      assert.notEqual(browser, null, "persistent Chromium context must expose its process owner");
+      await context.route("**/*", async (route) => {
+        await route.fulfill({
+          contentType: "text/html",
+          body: `
+            <textarea style="width:200px;height:40px"></textarea>
+            <button style="width:100px;height:40px">Send</button>
+            <script>
+              if (${JSON.stringify(operation)} === "fill") {
+                document.querySelector("textarea").addEventListener("input", () => {
+                  while (true) { /* renderer intentionally blocked */ }
+                });
+              }
+              if (${JSON.stringify(operation)} === "click") {
+                document.querySelector("button").addEventListener("click", () => {
+                  while (true) { /* renderer intentionally blocked */ }
+                });
+              }
+            </script>
+          `,
+        });
+      });
+      const page = await context.newPage();
+      const chatUrl = `https://m365.cloud.microsoft/chat/conversation/timeout-${operation}`;
+      await page.goto(chatUrl);
+      const tracked = new ContextSemanticPage(context, {
+        entryUrl: "https://m365.cloud.microsoft/chat",
+        approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
+      }, page, 100);
+      assert.equal(await tracked.currentUrl(), chatUrl);
+
+      if (operation === "click") {
+        await tracked.fill(composerGroup, "prepared draft", () => {});
+        assert.equal(await tracked.currentUrl(), chatUrl);
+      }
+      if (operation === "snapshot") {
+        let rendererBlocked: (() => void) | undefined;
+        const blocked = new Promise<void>((resolve) => { rendererBlocked = resolve; });
+        await page.exposeFunction("rendererBlocked", () => rendererBlocked?.());
+        const blocker = page.evaluate(() => {
+          void (window as unknown as { rendererBlocked: () => Promise<void> }).rendererBlocked();
+          while (true) { /* renderer intentionally blocked */ }
+        });
+        void blocker.catch(() => undefined);
+        await blocked;
+      }
+
+      const disconnected = new Promise<void>((resolve) => {
+        browser!.once("disconnected", () => resolve());
+      });
+      const startedAt = performance.now();
+      let observedError: unknown;
+      // Keep the regression itself bounded if the production timeout barrier
+      // is accidentally removed: force process teardown, then fail below on
+      // the missing BROWSER_OPERATION_TIMEOUT diagnostic.
+      const watchdog = setTimeout(() => {
+        void browser!.close().catch(() => undefined);
+      }, 2_000);
+      try {
+        if (operation === "snapshot") {
+          await tracked.snapshot(composerGroup);
+        } else if (operation === "fill") {
+          await tracked.fill(composerGroup, "bounded disclosure", () => {});
+        } else {
+          await tracked.click(sendGroup, () => {});
+        }
+      } catch (error) {
+        observedError = error;
+      } finally {
+        clearTimeout(watchdog);
+      }
+      const elapsedMs = performance.now() - startedAt;
+
+      assert.equal(observedError instanceof AgentError, true);
+      assert.equal(
+        (observedError as AgentError).details.diagnosticCode,
+        "BROWSER_OPERATION_TIMEOUT",
+      );
+      assert.equal(
+        (observedError as AgentError).details.dispatchAttempted,
+        operation !== "snapshot",
+      );
+      assert.ok(elapsedMs < 2_000, `${operation} exceeded its bounded teardown window`);
+      await disconnected;
+      assert.equal(browser!.isConnected(), false);
+    } finally {
+      await context.close().catch(() => undefined);
+      await rm(profile, {
+        recursive: true,
+        force: true,
+        maxRetries: 10,
+        retryDelay: 100,
+      });
+    }
   }
 });

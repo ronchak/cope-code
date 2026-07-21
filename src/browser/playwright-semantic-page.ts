@@ -15,11 +15,24 @@ import {
 /** The only module that translates the UI contract into Playwright locators. */
 export class PlaywrightSemanticPage implements SemanticPage {
   readonly #page: Page;
+  readonly #actionMs: number;
+  readonly #onOperationTimeout: (() => Promise<void>) | undefined;
+  #operationTermination: Promise<void> | undefined;
   #nativeDialogDetected = false;
   #nativeDialogEpoch = 0;
 
-  public constructor(page: Page, onNativeDialog?: () => boolean | void) {
+  public constructor(
+    page: Page,
+    onNativeDialog?: () => boolean | void,
+    actionMs = 15_000,
+    onOperationTimeout?: () => Promise<void>,
+  ) {
+    if (!Number.isSafeInteger(actionMs) || actionMs <= 0) {
+      throw new TypeError("Playwright operation timeout must be a positive integer");
+    }
     this.#page = page;
+    this.#actionMs = actionMs;
+    this.#onOperationTimeout = onOperationTimeout;
     // Do not accept, dismiss, inspect, or automate unknown browser dialogs.
     // Leaving the dialog visible blocks consequential actions and the sticky
     // signal makes the adapter fail closed until the session is restarted.
@@ -48,44 +61,46 @@ export class PlaywrightSemanticPage implements SemanticPage {
   }
 
   public async snapshot(group: LocatorGroup): Promise<GroupSnapshot> {
-    if (this.#nativeDialogDetected) {
-      const elements: readonly ElementSnapshot[] =
-        group.signal === "modal"
-          ? [{ visible: true, enabled: false, text: "", value: "", accessibleLabel: "" }]
-          : [];
+    return this.#runBounded(async () => {
+      if (this.#nativeDialogDetected) {
+        const elements: readonly ElementSnapshot[] =
+          group.signal === "modal"
+            ? [{ visible: true, enabled: false, text: "", value: "", accessibleLabel: "" }]
+            : [];
+        return {
+          signal: group.signal,
+          matchedCandidates: group.signal === "modal" ? group.minimumCandidateMatches : 0,
+          visibleElements: elements.length,
+          enabledElements: 0,
+          elements,
+        };
+      }
+      const candidateSnapshots = await Promise.all(
+        group.candidates.map(async (candidate) => this.#snapshotCandidate(candidate, group)),
+      );
+      const matched = candidateSnapshots.filter((entry) => entry.length > 0);
+      const richest = matched.reduce<readonly ElementSnapshot[]>(
+        (best, current) => (current.length > best.length ? current : best),
+        [],
+      );
+      const firstActionable = matched.find((entry) =>
+        entry.some((element) => element.visible && element.enabled));
+      // Composer and send snapshots must expose the same first actionable
+      // candidate that fill/click will use. Other content-bearing groups
+      // retain the richest successful candidate to avoid duplicate text capture.
+      const elements =
+        (group.signal === "composer" || group.signal === "send") && firstActionable !== undefined
+          ? firstActionable
+          : richest;
+      const allElements = matched.flat();
       return {
         signal: group.signal,
-        matchedCandidates: group.signal === "modal" ? group.minimumCandidateMatches : 0,
-        visibleElements: elements.length,
-        enabledElements: 0,
+        matchedCandidates: matched.length,
+        visibleElements: allElements.filter((element) => element.visible).length,
+        enabledElements: allElements.filter((element) => element.visible && element.enabled).length,
         elements,
       };
-    }
-    const candidateSnapshots = await Promise.all(
-      group.candidates.map(async (candidate) => this.#snapshotCandidate(candidate, group)),
-    );
-    const matched = candidateSnapshots.filter((entry) => entry.length > 0);
-    const richest = matched.reduce<readonly ElementSnapshot[]>(
-      (best, current) => (current.length > best.length ? current : best),
-      [],
-    );
-    const firstActionable = matched.find((entry) =>
-      entry.some((element) => element.visible && element.enabled));
-    // Composer and send snapshots must expose the same first actionable
-    // candidate that fill/click will use. Other content-bearing groups
-    // retain the richest successful candidate to avoid duplicate text capture.
-    const elements =
-      (group.signal === "composer" || group.signal === "send") && firstActionable !== undefined
-        ? firstActionable
-        : richest;
-    const allElements = matched.flat();
-    return {
-      signal: group.signal,
-      matchedCandidates: matched.length,
-      visibleElements: allElements.filter((element) => element.visible).length,
-      enabledElements: allElements.filter((element) => element.visible && element.enabled).length,
-      elements,
-    };
+    }, () => false);
   }
 
   public async fill(
@@ -93,12 +108,19 @@ export class PlaywrightSemanticPage implements SemanticPage {
     value: string,
     guard: SemanticActionGuard,
   ): Promise<void> {
-    this.#assertNoNativeDialog();
-    const element = await this.#firstActionableOrThrow(group);
-    this.#assertNoNativeDialog();
-    guard();
-    this.#assertNoNativeDialog();
-    await element.evaluate((node, nextValue) => {
+    let dispatchAttempted = false;
+    await this.#runBounded(async (assertWithinDeadline) => {
+      this.#assertNoNativeDialog();
+      const element = await this.#firstActionableOrThrow(group);
+      this.#assertNoNativeDialog();
+      guard();
+      this.#assertNoNativeDialog();
+      // A timeout can fire while locator discovery is resolving during owner
+      // teardown. Check the sticky deadline synchronously at the last possible
+      // boundary so no late evaluate can follow a timed-out discovery.
+      assertWithinDeadline();
+      dispatchAttempted = true;
+      await element.evaluate((node, nextValue) => {
       if (!(node instanceof HTMLElement) || !node.isConnected) {
         throw new Error("The bound composer element is no longer connected");
       }
@@ -181,17 +203,22 @@ export class PlaywrightSemanticPage implements SemanticPage {
           })
         : new Event("input", { bubbles: true });
       node.dispatchEvent(inputEvent);
-    }, value);
-    this.#assertNoNativeDialog(true);
+      }, value);
+      this.#assertNoNativeDialog(true);
+    }, () => dispatchAttempted);
   }
 
   public async click(group: LocatorGroup, guard: SemanticActionGuard): Promise<void> {
-    this.#assertNoNativeDialog();
-    const element = await this.#firstActionableOrThrow(group);
-    this.#assertNoNativeDialog();
-    guard();
-    this.#assertNoNativeDialog();
-    const dispatchStatus = await element.evaluate((node): "pre-dispatch" | "dispatched" => {
+    let dispatchAttempted = false;
+    await this.#runBounded(async (assertWithinDeadline) => {
+      this.#assertNoNativeDialog();
+      const element = await this.#firstActionableOrThrow(group);
+      this.#assertNoNativeDialog();
+      guard();
+      this.#assertNoNativeDialog();
+      assertWithinDeadline();
+      dispatchAttempted = true;
+      const dispatchStatus = await element.evaluate((node): "pre-dispatch" | "dispatched" => {
       if (!(node instanceof HTMLElement) || !node.isConnected) {
         return "pre-dispatch";
       }
@@ -286,18 +313,99 @@ export class PlaywrightSemanticPage implements SemanticPage {
       // boundary cannot prove whether page code observed a dispatch.
       node.click();
       return "dispatched";
+      });
+      this.#assertNoNativeDialog(true);
+      if (dispatchStatus === "pre-dispatch") {
+        throw new AgentError(
+          "TRANSPORT_INDETERMINATE",
+          "The bound send element changed before browser dispatch",
+          {
+            diagnosticCode: "ACTIONABLE_ELEMENT_CHANGED_BEFORE_DISPATCH",
+            dispatchAttempted: false,
+          },
+        );
+      }
+    }, () => dispatchAttempted);
+  }
+
+  async #runBounded<T>(
+    operation: (assertWithinDeadline: () => void) => Promise<T>,
+    dispatchAttempted: () => boolean,
+  ): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    let termination: Promise<void> | undefined;
+    const timeoutError = (cause?: unknown) => new AgentError(
+      "TRANSPORT_INDETERMINATE",
+      "The browser operation exceeded its configured action timeout",
+      {
+        diagnosticCode: "BROWSER_OPERATION_TIMEOUT",
+        dispatchAttempted: dispatchAttempted(),
+      },
+      cause === undefined ? undefined : { cause },
+    );
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        // Set this before starting teardown. If the renderer operation settles
+        // during termination, it must not win the race and report success.
+        timedOut = true;
+        termination = this.#terminateTimedOutOperation();
+        void termination.then(
+          () => reject(timeoutError()),
+          (error) => reject(timeoutError(error)),
+        );
+      }, this.#actionMs);
     });
-    this.#assertNoNativeDialog(true);
-    if (dispatchStatus === "pre-dispatch") {
-      throw new AgentError(
-        "TRANSPORT_INDETERMINATE",
-        "The bound send element changed before browser dispatch",
-        {
-          diagnosticCode: "ACTIONABLE_ELEMENT_CHANGED_BEFORE_DISPATCH",
-          dispatchAttempted: false,
-        },
-      );
+    const assertWithinDeadline = () => {
+      if (timedOut) throw timeoutError();
+    };
+
+    try {
+      const result = await Promise.race([operation(assertWithinDeadline), timeout]);
+      if (timedOut) {
+        await termination;
+        throw timeoutError();
+      }
+      return result;
+    } catch (error) {
+      if (!timedOut) throw error;
+      try {
+        await termination;
+      } catch (terminationError) {
+        throw timeoutError(terminationError);
+      }
+      if (
+        error instanceof AgentError &&
+        error.details.diagnosticCode === "BROWSER_OPERATION_TIMEOUT"
+      ) {
+        throw error;
+      }
+      throw timeoutError(error);
+    } finally {
+      if (!timedOut && timer !== undefined) clearTimeout(timer);
     }
+  }
+
+  #terminateTimedOutOperation(): Promise<void> {
+    this.#operationTermination ??= this.#performTimedOutTermination();
+    return this.#operationTermination;
+  }
+
+  async #performTimedOutTermination(): Promise<void> {
+    if (this.#onOperationTimeout !== undefined) {
+      await this.#onOperationTimeout();
+      return;
+    }
+    const context = this.#page.context();
+    const browser = context.browser();
+    if (browser !== null) {
+      await browser.close();
+      return;
+    }
+    await Promise.all([
+      this.#page.close({ runBeforeUnload: false }).catch(() => undefined),
+      context.close().catch(() => undefined),
+    ]);
   }
 
   async #snapshotCandidate(
