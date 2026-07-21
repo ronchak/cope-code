@@ -34,6 +34,8 @@ export class ContextSemanticPage implements SemanticPage {
   readonly #actionMs: number;
   readonly #delegates = new WeakMap<Page, PlaywrightSemanticPage>();
   readonly #configuredPages = new WeakSet<Page>();
+  readonly #navigationEpochs = new WeakMap<Page, number>();
+  readonly #staleAuthenticationPages = new WeakSet<Page>();
   #activePage: Page;
   #observedUrl: string | undefined;
   #filledPage: Page | undefined;
@@ -41,6 +43,10 @@ export class ContextSemanticPage implements SemanticPage {
   #filledGroup: LocatorGroup | undefined;
   #filledValue: string | undefined;
   #postFillObservationSeen = false;
+  #authenticationPage: Page | undefined;
+  #configuredPageBeforeAuthentication: Page | undefined;
+  #configuredUrlBeforeAuthentication: string | undefined;
+  #configuredEpochBeforeAuthentication = 0;
 
   public constructor(
     context: BrowserContext,
@@ -65,11 +71,29 @@ export class ContextSemanticPage implements SemanticPage {
   }
 
   public async focusActivePage(force = false): Promise<Page> {
-    const selected = selectActiveCopilotPage(
-      this.#context.pages(),
+    const pages = this.#context.pages();
+    const returnedConfiguredPage = this.#returnedConfiguredPage(pages);
+    if (returnedConfiguredPage !== undefined) {
+      this.#markCurrentAuthenticationPagesStale(pages);
+    }
+
+    const selectablePages = returnedConfiguredPage === undefined
+      ? pages.filter((page) =>
+        !this.#staleAuthenticationPages.has(page) ||
+        !isGenuineManualAuthenticationUrl(page.url(), this.#config))
+      : pages;
+    const selected = returnedConfiguredPage ?? selectActiveCopilotPage(
+      selectablePages,
       this.#config,
       this.#activePage,
     );
+
+    if (isGenuineManualAuthenticationUrl(selected.url(), this.#config)) {
+      this.#trackAuthenticationSelection(pages, selected);
+    } else if (isConfiguredCopilotUrl(selected.url(), this.#config.entryUrl)) {
+      this.#clearAuthenticationTracking();
+    }
+
     const changed = selected !== this.#activePage;
     this.#activePage = selected;
     if (changed) this.#observedUrl = undefined;
@@ -277,6 +301,59 @@ export class ContextSemanticPage implements SemanticPage {
     return filledPage;
   }
 
+  #returnedConfiguredPage(pages: readonly Page[]): Page | undefined {
+    const authenticationPage = this.#authenticationPage;
+    if (authenticationPage === undefined) return undefined;
+
+    const configuredPage = uniqueConfiguredCopilotPage(pages, this.#config.entryUrl);
+    if (configuredPage === undefined) return undefined;
+    if (authenticationPage.isClosed() || !pages.includes(authenticationPage)) {
+      return configuredPage;
+    }
+
+    const priorConfiguredPage = this.#configuredPageBeforeAuthentication;
+    if (priorConfiguredPage === undefined || configuredPage !== priorConfiguredPage) {
+      return configuredPage;
+    }
+    if (configuredPage.url() !== this.#configuredUrlBeforeAuthentication) {
+      return configuredPage;
+    }
+    const currentEpoch = this.#navigationEpochs.get(configuredPage) ?? 0;
+    return currentEpoch > this.#configuredEpochBeforeAuthentication
+      ? configuredPage
+      : undefined;
+  }
+
+  #trackAuthenticationSelection(pages: readonly Page[], selected: Page): void {
+    if (this.#authenticationPage !== undefined) {
+      this.#authenticationPage = selected;
+      return;
+    }
+    const configuredPage = uniqueConfiguredCopilotPage(pages, this.#config.entryUrl);
+    this.#authenticationPage = selected;
+    this.#configuredPageBeforeAuthentication = configuredPage;
+    this.#configuredUrlBeforeAuthentication = configuredPage?.url();
+    this.#configuredEpochBeforeAuthentication = configuredPage === undefined
+      ? 0
+      : this.#navigationEpochs.get(configuredPage) ?? 0;
+  }
+
+  #markCurrentAuthenticationPagesStale(pages: readonly Page[]): void {
+    for (const page of pages) {
+      if (!page.isClosed() && isGenuineManualAuthenticationUrl(page.url(), this.#config)) {
+        this.#staleAuthenticationPages.add(page);
+      }
+    }
+    this.#clearAuthenticationTracking();
+  }
+
+  #clearAuthenticationTracking(): void {
+    this.#authenticationPage = undefined;
+    this.#configuredPageBeforeAuthentication = undefined;
+    this.#configuredUrlBeforeAuthentication = undefined;
+    this.#configuredEpochBeforeAuthentication = 0;
+  }
+
   #clearFilledPagePin(): void {
     this.#filledPage = undefined;
     this.#filledUrl = undefined;
@@ -290,6 +367,15 @@ export class ContextSemanticPage implements SemanticPage {
     // Construct the delegate first so its native-dialog listener is active
     // before navigation, foregrounding, or the first semantic snapshot.
     this.#delegate(page);
+    this.#navigationEpochs.set(page, 0);
+    page.on("framenavigated", (frame) => {
+      const mainFrame = typeof page.mainFrame === "function" ? page.mainFrame() : undefined;
+      if (mainFrame !== undefined && frame !== mainFrame) return;
+      this.#navigationEpochs.set(page, (this.#navigationEpochs.get(page) ?? 0) + 1);
+      // A popup that navigates again is no longer the stale auth surface that
+      // was left behind by the prior completed handoff.
+      this.#staleAuthenticationPages.delete(page);
+    });
     page.setDefaultTimeout(this.#actionMs);
     page.setDefaultNavigationTimeout(this.#actionMs);
     this.#configuredPages.add(page);
@@ -304,11 +390,25 @@ export class ContextSemanticPage implements SemanticPage {
   }
 }
 
+function uniqueConfiguredCopilotPage(
+  pages: readonly Page[],
+  entryUrl: string,
+): Page | undefined {
+  const configured = pages.filter((page) =>
+    !page.isClosed() && isConfiguredCopilotUrl(page.url(), entryUrl));
+  if (configured.length > 1) {
+    throw new AgentError("TRANSPORT_INDETERMINATE", "Multiple approved Copilot pages are open", {
+      diagnosticCode: "AMBIGUOUS_COPILOT_PAGE",
+      pageCount: configured.length,
+    });
+  }
+  return configured[0];
+}
+
 /**
- * Prefer the unique configured Copilot page, not merely any page on the same
- * approved host. While authentication is in progress, select only a URL with a
- * genuine Microsoft authentication shape so unrelated M365 and Office tabs
- * cannot displace the tracked navigation page.
+ * Prefer the newest eligible configured Copilot or genuine Microsoft
+ * authentication page. ContextSemanticPage adds stateful handoff tracking so a
+ * returned configured chat can subsequently outrank a stale auth popup.
  */
 export function selectActiveCopilotPage(
   pages: readonly Page[],
@@ -316,18 +416,9 @@ export function selectActiveCopilotPage(
   preferred?: Page,
 ): Page {
   const openPages = pages.filter((page) => !page.isClosed());
-  const configured = openPages.filter((page) =>
-    isConfiguredCopilotUrl(page.url(), config.entryUrl));
-  if (configured.length > 1) {
-    throw new AgentError("TRANSPORT_INDETERMINATE", "Multiple approved Copilot pages are open", {
-      diagnosticCode: "AMBIGUOUS_COPILOT_PAGE",
-      pageCount: configured.length,
-    });
-  }
-
+  const configuredPage = uniqueConfiguredCopilotPage(openPages, config.entryUrl);
   const authentication = openPages.filter((page) =>
     isGenuineManualAuthenticationUrl(page.url(), config));
-  const configuredPage = configured[0];
   const newestEligible = openPages.findLast((page) =>
     page === configuredPage || authentication.includes(page));
   if (newestEligible !== undefined) return newestEligible;
@@ -397,12 +488,12 @@ export async function openTrackedCopilotPage(
       if (!replacementFound) {
         if (navigationError !== undefined) throw navigationError;
         throw new AgentError(
-"TRANSPORT_UNAVAILABLE",
-"The dedicated Edge session did not open the configured Copilot surface",
-{
-  diagnosticCode: "EDGE_NAVIGATION_NO_ALLOWED_PAGE",
-  next: "Close the dedicated Edge window, run cope setup --force, and retry.",
-},
+          "TRANSPORT_UNAVAILABLE",
+          "The dedicated Edge session did not open the configured Copilot surface",
+          {
+            diagnosticCode: "EDGE_NAVIGATION_NO_ALLOWED_PAGE",
+            next: "Close the dedicated Edge window, run cope setup --force, and retry.",
+          },
         );
       }
     }
@@ -418,6 +509,7 @@ export async function openTrackedCopilotPage(
   await tracked.focusActivePage(true);
   return tracked;
 }
+
 function isConfiguredCopilotUrl(value: string, entryValue: string): boolean {
   try {
     const actual = new URL(value);
