@@ -56,7 +56,7 @@ export interface CopilotUiContract {
   readonly version: string;
   readonly certifiedSurface: string;
   /** Explicitly certified submission behavior; the adapter never guesses. */
-  readonly submissionStrategy: "send-control" | "composer-enter";
+  readonly submissionStrategy: "send-control";
   readonly groups: Readonly<Record<CopilotSignal, LocatorGroup>>;
 }
 
@@ -86,7 +86,6 @@ export interface SemanticPage {
   snapshot(group: LocatorGroup): Promise<GroupSnapshot>;
   fill(group: LocatorGroup, value: string, guard: SemanticActionGuard): Promise<void>;
   click(group: LocatorGroup, guard: SemanticActionGuard): Promise<void>;
-  press(group: LocatorGroup, key: "Enter", guard: SemanticActionGuard): Promise<void>;
 }
 
 export type CopilotPageObservation = Readonly<Record<CopilotSignal, GroupSnapshot>> & {

@@ -292,36 +292,25 @@ export class CopilotBrowserAdapter implements ModelTransport {
       return record.receipt;
     }
 
-    const strategy = this.#config.uiContract.submissionStrategy;
-    if (strategy === "send-control") {
-      const send = second.observation.send;
-      if (
-        !groupMatches(send, this.#config.uiContract.groups.send.minimumCandidateMatches) ||
-        send.enabledElements === 0
-      ) {
-        record.activationAttempted = false;
-        record.receipt = this.#receipt(
-          request,
-          "not-submitted",
-          conversationId,
-          marker,
-          "SEND_CONTROL_NOT_ACTIONABLE",
-        );
-        return record.receipt;
-      }
+    const send = second.observation.send;
+    if (
+      !groupMatches(send, this.#config.uiContract.groups.send.minimumCandidateMatches) ||
+      send.enabledElements === 0
+    ) {
+      record.activationAttempted = false;
+      record.receipt = this.#receipt(
+        request,
+        "not-submitted",
+        conversationId,
+        marker,
+        "SEND_CONTROL_NOT_ACTIONABLE",
+      );
+      return record.receipt;
     }
     record.activationAttempted = true;
     this.#taskConversations.set(request.taskId, conversationId);
     try {
-      if (strategy === "send-control") {
-        await this.#page.click(this.#config.uiContract.groups.send, actionGuard);
-      } else {
-        await this.#page.press(
-          this.#config.uiContract.groups.composer,
-          "Enter",
-          actionGuard,
-        );
-      }
+      await this.#page.click(this.#config.uiContract.groups.send, actionGuard);
     } catch (error) {
       const diagnosticCode = knownPreActivationDiagnostic(error);
       if (diagnosticCode !== undefined) {

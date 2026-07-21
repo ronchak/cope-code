@@ -221,29 +221,6 @@ export class ContextSemanticPage implements SemanticPage {
     }
   }
 
-  /** Enter activation follows the same post-fill page-identity requirements. */
-  public async press(
-    group: LocatorGroup,
-    key: "Enter",
-    guard: SemanticActionGuard,
-  ): Promise<void> {
-    const page = await this.#activationPageOrThrow();
-    const dispatchGuard = this.#composeDispatchGuard(guard, () => {
-      if (this.#verifiedFilledPage() !== page) {
-        throw new AgentError(
-          "TRANSPORT_INDETERMINATE",
-          "The filled Copilot page changed before activation dispatch",
-          { diagnosticCode: "ACTIVE_PAGE_CHANGED_AFTER_FILL" },
-        );
-      }
-    });
-    try {
-      await this.#delegate(page).press(group, key, dispatchGuard);
-    } finally {
-      this.#clearFilledPagePin();
-    }
-  }
-
   /**
    * Every failure before delegating click or Enter is conclusively
    * pre-dispatch. Preserve that fact for the adapter so a guarded failure

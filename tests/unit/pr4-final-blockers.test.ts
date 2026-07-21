@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { BrowserContext, Frame, Locator, Page } from "playwright-core";
+import type { BrowserContext, ElementHandle, Frame, Locator, Page } from "playwright-core";
 
 import {
   CopilotBrowserAdapter,
@@ -536,7 +536,14 @@ class CandidateItem {
     return name === "aria-label" ? "Message" : null;
   }
   public async inputValue(): Promise<string> { return this.currentValue; }
-  public async fill(value: string): Promise<void> {
+  public async elementHandle(): Promise<ElementHandle> {
+    return this as unknown as ElementHandle;
+  }
+  public async evaluate(
+    _callback: (...args: readonly unknown[]) => unknown,
+    value?: string,
+  ): Promise<void> {
+    if (value === undefined) throw new TypeError("Synthetic fill value is required");
     this.onFill?.();
     this.filledValue = value;
   }

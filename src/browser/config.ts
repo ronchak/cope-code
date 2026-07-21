@@ -499,11 +499,8 @@ function validateUiContract(contract: CopilotUiContract): void {
   ) {
     throw new TypeError("UI contract certified surface is invalid");
   }
-  if (
-    contract.submissionStrategy !== "send-control" &&
-    contract.submissionStrategy !== "composer-enter"
-  ) {
-    throw new TypeError("UI contract submission strategy is invalid");
+  if (contract.submissionStrategy !== "send-control") {
+    throw new TypeError("Only the send-control UI submission strategy is supported");
   }
   const expectedSignals: readonly CopilotSignal[] = [
     "shell",

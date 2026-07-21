@@ -290,6 +290,14 @@ test("browser configuration and UI contracts reject unknown nested fields", () =
     () => validateBrowserConfig({ ...base, uiContract } as never),
     /unknown fields/u,
   );
+  const unsafeEnterContract = structuredClone(base.uiContract) as unknown as {
+    submissionStrategy: string;
+  };
+  unsafeEnterContract.submissionStrategy = "composer-enter";
+  assert.throws(
+    () => validateBrowserConfig({ ...base, uiContract: unsafeEnterContract } as never),
+    /only the send-control/ui,
+  );
 });
 
 test("conversation identity distinguishes query state without retaining raw URL data", () => {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { BrowserContext, Frame, Locator, Page } from "playwright-core";
+import type { BrowserContext, ElementHandle, Frame, Locator, Page } from "playwright-core";
 
 import { ContextSemanticPage } from "../../src/browser/context-semantic-page.js";
 import type { LocatorGroup } from "../../src/browser/contracts.js";
@@ -27,11 +27,14 @@ const sendGroup: LocatorGroup = {
 const allowAction = () => {};
 
 class ActionLocator {
-  public constructor(private readonly page: ActionPage) {}
+  public constructor(
+    private readonly page: ActionPage,
+    private readonly selector: string,
+  ) {}
 
   public async count(): Promise<number> {
     this.page.locatorProbeHook?.();
-    return 1;
+    return this.selector === "#send" && !this.page.sendAvailable ? 0 : 1;
   }
   public nth(_index: number): Locator { return this as unknown as Locator; }
   public async isVisible(): Promise<boolean> { return true; }
@@ -39,19 +42,48 @@ class ActionLocator {
   public async innerText(): Promise<string> { return this.page.composer; }
   public async inputValue(): Promise<string> { return this.page.composer; }
   public async getAttribute(_name: string): Promise<string | null> { return null; }
-  public async fill(value: string): Promise<void> {
-    this.page.composer = value;
-    this.page.actions.push(`fill:${value}`);
+  public async elementHandle(): Promise<ElementHandle> {
+    return new BoundActionElement(this.page, this.page.documentEpoch) as unknown as ElementHandle;
   }
-  public async click(): Promise<void> { this.page.actions.push("click"); }
-  public async press(key: string): Promise<void> { this.page.actions.push(`press:${key}`); }
+}
+
+class BoundActionElement {
+  public constructor(
+    private readonly page: ActionPage,
+    private readonly documentEpoch: number,
+  ) {}
+
+  public async isVisible(): Promise<boolean> { return true; }
+  public async isEnabled(): Promise<boolean> { return true; }
+  public async evaluate(
+    _callback: (...args: readonly unknown[]) => unknown,
+    value?: string,
+  ): Promise<void> {
+    this.#beforeDispatch();
+    if (value === undefined) {
+      this.page.actions.push("click");
+    } else {
+      this.page.composer = value;
+      this.page.actions.push(`fill:${value}`);
+    }
+  }
+
+  #beforeDispatch(): void {
+    this.page.boundActionHook?.();
+    if (this.page.documentEpoch !== this.documentEpoch) {
+      throw new Error("Bound element detached before dispatch");
+    }
+  }
 }
 
 class ActionPage {
   public closed = false;
   public composer = "";
+  public documentEpoch = 0;
+  public sendAvailable = true;
   public readonly actions: string[] = [];
   public locatorProbeHook: (() => void) | undefined = undefined;
+  public boundActionHook: (() => void) | undefined = undefined;
   readonly #navigationListeners: Array<(frame: Frame) => void> = [];
 
   public constructor(public currentUrl: string) {}
@@ -69,11 +101,12 @@ class ActionPage {
   }
   public mainFrame(): Frame { return this as unknown as Frame; }
   public navigateSameUrl(): void {
+    this.documentEpoch += 1;
     const frame = this.mainFrame();
     for (const listener of this.#navigationListeners) listener(frame);
   }
   public locator(_selector: string): Locator {
-    return new ActionLocator(this) as unknown as Locator;
+    return new ActionLocator(this, _selector) as unknown as Locator;
   }
   public asPage(): Page { return this as unknown as Page; }
 }
@@ -95,19 +128,6 @@ test("an unchanged filled page remains actionable after its second observation",
   await tracked.click(sendGroup, allowAction);
 
   assert.deepEqual(page.actions, ["fill:hello", "click"]);
-});
-
-test("composer-enter activation uses the same post-fill page pin", async () => {
-  const page = new ActionPage(`${entryUrl}/conversation/one`);
-  const context = new ActionContext([page]);
-  const tracked = createTracked(context, page);
-
-  assert.equal(await tracked.currentUrl(), page.currentUrl);
-  await tracked.fill(composerGroup, "hello", allowAction);
-  assert.equal(await tracked.currentUrl(), page.currentUrl);
-  await tracked.press(composerGroup, "Enter", allowAction);
-
-  assert.deepEqual(page.actions, ["fill:hello", "press:Enter"]);
 });
 
 test("cancellation during locator discovery prevents composer fill dispatch", async () => {
@@ -258,6 +278,24 @@ test("same-URL navigation during fill locator discovery blocks dispatch", async 
   assert.deepEqual(page.actions, []);
 });
 
+test("same-URL navigation during bound fill cannot retarget the new document", async () => {
+  const page = new ActionPage(`${entryUrl}/conversation/one`);
+  const context = new ActionContext([page]);
+  const tracked = createTracked(context, page);
+
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  page.boundActionHook = () => {
+    page.boundActionHook = undefined;
+    page.navigateSameUrl();
+  };
+
+  await assert.rejects(
+    tracked.fill(composerGroup, "must-not-disclose", allowAction),
+    /bound element detached before dispatch/iu,
+  );
+  assert.deepEqual(page.actions, []);
+});
+
 test("same-URL navigation after fill blocks activation even if the draft survives", async () => {
   const page = new ActionPage(`${entryUrl}/conversation/one`);
   const context = new ActionContext([page]);
@@ -301,7 +339,7 @@ test("same-URL navigation during click locator discovery blocks dispatch", async
   assert.deepEqual(page.actions, ["fill:restored draft"]);
 });
 
-test("same-URL navigation during Enter locator discovery blocks dispatch", async () => {
+test("same-URL navigation during bound click cannot retarget the new document", async () => {
   const page = new ActionPage(`${entryUrl}/conversation/one`);
   const context = new ActionContext([page]);
   const tracked = createTracked(context, page);
@@ -309,20 +347,36 @@ test("same-URL navigation during Enter locator discovery blocks dispatch", async
   assert.equal(await tracked.currentUrl(), page.currentUrl);
   await tracked.fill(composerGroup, "restored draft", allowAction);
   assert.equal(await tracked.currentUrl(), page.currentUrl);
-  let locatorProbes = 0;
-  page.locatorProbeHook = () => {
-    locatorProbes += 1;
-    if (locatorProbes === 2) page.navigateSameUrl();
+  page.boundActionHook = () => {
+    page.boundActionHook = undefined;
+    page.navigateSameUrl();
   };
 
   await assert.rejects(
-    tracked.press(composerGroup, "Enter", allowAction),
-    (error: unknown) =>
-      error instanceof AgentError &&
-      error.details.diagnosticCode === "ACTIVE_PAGE_CHANGED_AFTER_FILL" &&
-      error.details.dispatchAttempted === false,
+    tracked.click(sendGroup, allowAction),
+    /bound element detached before dispatch/iu,
   );
   assert.deepEqual(page.actions, ["fill:restored draft"]);
+});
+
+test("a vanished send control is classified as conclusively pre-dispatch", async () => {
+  const page = new ActionPage(`${entryUrl}/conversation/one`);
+  const context = new ActionContext([page]);
+  const tracked = createTracked(context, page);
+
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  await tracked.fill(composerGroup, "safe retry draft", allowAction);
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  page.sendAvailable = false;
+
+  await assert.rejects(
+    tracked.click(sendGroup, allowAction),
+    (error: unknown) =>
+      error instanceof AgentError &&
+      error.details.diagnosticCode === "ACTIONABLE_LOCATOR_NOT_FOUND" &&
+      error.details.dispatchAttempted === false,
+  );
+  assert.deepEqual(page.actions, ["fill:safe retry draft"]);
 });
 
 test("a second configured Copilot page creates a hard stop before prompt fill", async () => {
