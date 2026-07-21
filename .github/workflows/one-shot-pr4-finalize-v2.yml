@@ -1,0 +1,152 @@
+name: one-shot-pr4-finalize-v2
+
+on:
+  push:
+    branches:
+      - agent/fix-visible-copilot-readiness-stall
+    paths:
+      - .github/workflows/one-shot-pr4-finalize-v2.yml
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/fix-visible-copilot-readiness-stall
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Settle prior one-shot updates
+        run: |
+          sleep 30
+          git pull --rebase origin agent/fix-visible-copilot-readiness-stall
+      - name: Apply idempotent final fixes
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          readiness_path = Path("src/browser/manual-readiness.ts")
+          readiness = readiness_path.read_text(encoding="utf-8")
+          if 'state !== "blocking-modal"' not in readiness:
+              needle = '''  return state !== "ready" &&\n    state !== "sign-in-required" &&\n    state !== "mfa-required" &&\n    state !== "consent-required";'''
+              replacement = '''  return state !== "ready" &&\n    state !== "sign-in-required" &&\n    state !== "mfa-required" &&\n    state !== "consent-required" &&\n    state !== "blocking-modal";'''
+              if readiness.count(needle) != 1:
+                  raise RuntimeError("manual readiness terminal-state block changed unexpectedly")
+              readiness = readiness.replace(needle, replacement, 1)
+          readiness = readiness.replace(
+              '  return state === "unapproved-host" || state === "blocking-modal";',
+              '  return state === "unapproved-host";',
+          )
+          readiness_path.write_text(readiness, encoding="utf-8", newline="\n")
+
+          readiness_test_path = Path("tests/unit/browser-readiness.test.ts")
+          readiness_test = readiness_test_path.read_text(encoding="utf-8")
+          modal_test = '''test("a visible blocking dialog retains the manual window and may recover", async () => {\n  let now = 0;\n  let calls = 0;\n\n  const result = await waitForStableManualReadiness(\n    async () => {\n      calls += 1;\n      return calls < 7\n        ? inspection("blocking-modal", "UNEXPECTED_BLOCKING_MODAL")\n        : inspection("ready", "READY");\n    },\n    waits,\n    waits.manualReadinessMs,\n    undefined,\n    {\n      monotonicNow: () => now,\n      sleep: async (milliseconds) => { now += milliseconds; },\n    },\n  );\n\n  assert.equal(result.classification.state, "ready");\n  assert.equal(calls, 7);\n  assert.equal(now, waits.pollMs * 6);\n  assert.equal(isTerminalManualReadinessState("blocking-modal"), false);\n});\n\n'''
+          readiness_anchor = 'test("manual sign-in states retain the long readiness window and may recover", async () => {'
+          if modal_test not in readiness_test:
+              if readiness_test.count(readiness_anchor) != 1:
+                  raise RuntimeError("manual readiness test anchor changed unexpectedly")
+              readiness_test = readiness_test.replace(readiness_anchor, modal_test + readiness_anchor, 1)
+          readiness_test_path.write_text(readiness_test, encoding="utf-8", newline="\n")
+
+          adapter_path = Path("src/browser/copilot-browser-adapter.ts")
+          adapter = adapter_path.read_text(encoding="utf-8")
+          suffix = 'const TASK_MARKER_SUFFIX = "]]";\n'
+          guard_set = '''const PRE_ACTIVATION_GUARD_DIAGNOSTICS = new Set([\n  "ACTIVE_PAGE_CHANGED_AFTER_FILL",\n  "ACTIVE_PAGE_CHANGED_BEFORE_ACTION",\n  "AMBIGUOUS_COPILOT_PAGE",\n  "COMPOSER_CONTENT_CHANGED_BEFORE_SUBMIT",\n  "EDGE_PAGE_MISSING",\n  "FILLED_PAGE_TRANSACTION_MISSING",\n  "POST_FILL_OBSERVATION_REQUIRED",\n]);\n'''
+          if guard_set not in adapter:
+              if adapter.count(suffix) != 1:
+                  raise RuntimeError("task marker suffix changed unexpectedly")
+              adapter = adapter.replace(suffix, suffix + guard_set, 1)
+
+          old_catch = '''    } catch {\n      // Playwright can throw after dispatch. Resolve only through page evidence.\n    }\n\n    record.receipt = await this.#confirmSubmission(record, options.signal);'''
+          new_catch = '''    } catch (error) {\n      const preActivationDiagnostic = preActivationGuardDiagnostic(error);\n      if (preActivationDiagnostic !== undefined) {\n        record.activationAttempted = false;\n        record.receipt = this.#receipt(\n          request,\n          "not-submitted",\n          conversationId,\n          marker,\n          preActivationDiagnostic,\n        );\n        return record.receipt;\n      }\n      // Playwright can throw after dispatch. Resolve only through page evidence.\n    }\n\n    record.receipt = await this.#confirmSubmission(record, options.signal);'''
+          if 'preActivationGuardDiagnostic(error)' not in adapter:
+              if adapter.count(old_catch) != 1:
+                  raise RuntimeError("activation catch block changed unexpectedly")
+              adapter = adapter.replace(old_catch, new_catch, 1)
+
+          guard_helper = '''\nfunction preActivationGuardDiagnostic(error: unknown): string | undefined {\n  if (!(error instanceof AgentError)) return undefined;\n  const diagnosticCode = error.details.diagnosticCode;\n  return typeof diagnosticCode === "string" &&\n      PRE_ACTIVATION_GUARD_DIAGNOSTICS.has(diagnosticCode)\n    ? diagnosticCode\n    : undefined;\n}\n'''
+          if guard_helper not in adapter:
+              anchor = '\nfunction responseTexts('
+              if adapter.count(anchor) != 1:
+                  raise RuntimeError("response text helper anchor changed unexpectedly")
+              adapter = adapter.replace(anchor, guard_helper + anchor, 1)
+          adapter_path.write_text(adapter, encoding="utf-8", newline="\n")
+
+          adapter_test_path = Path("tests/unit/browser-adapter.test.ts")
+          adapter_test = adapter_test_path.read_text(encoding="utf-8")
+          if 'import { AgentError } from "../../src/shared/errors.js";' not in adapter_test:
+              anchor = 'import { MutableBrowserKillSwitch } from "../../src/browser/kill-switch.js";\n'
+              if adapter_test.count(anchor) != 1:
+                  raise RuntimeError("adapter test import anchor changed unexpectedly")
+              adapter_test = adapter_test.replace(
+                  anchor,
+                  anchor + 'import { AgentError } from "../../src/shared/errors.js";\n',
+                  1,
+              )
+          if 'public preActivationGuardCode: string | undefined;' not in adapter_test:
+              anchor = '  public activationMode: ActivationMode = "submitted";\n'
+              if adapter_test.count(anchor) != 1:
+                  raise RuntimeError("adapter fake-page property anchor changed unexpectedly")
+              adapter_test = adapter_test.replace(
+                  anchor,
+                  anchor + '  public preActivationGuardCode: string | undefined;\n',
+                  1,
+              )
+          old_methods = '''  public async click(): Promise<void> {\n    await this.#activate();\n  }\n\n  public async press(): Promise<void> {\n    await this.#activate();\n  }\n\n  async #activate(): Promise<void> {'''
+          new_methods = '''  public async click(): Promise<void> {\n    this.#throwPreActivationGuard();\n    await this.#activate();\n  }\n\n  public async press(): Promise<void> {\n    this.#throwPreActivationGuard();\n    await this.#activate();\n  }\n\n  #throwPreActivationGuard(): void {\n    if (this.preActivationGuardCode === undefined) return;\n    throw new AgentError(\n      "TRANSPORT_INDETERMINATE",\n      "Synthetic pre-activation guard",\n      { diagnosticCode: this.preActivationGuardCode },\n    );\n  }\n\n  async #activate(): Promise<void> {'''
+          if '#throwPreActivationGuard(): void' not in adapter_test:
+              if adapter_test.count(old_methods) != 1:
+                  raise RuntimeError("adapter fake-page methods changed unexpectedly")
+              adapter_test = adapter_test.replace(old_methods, new_methods, 1)
+          guard_test = '''test("a known pre-activation guard remains safely retryable", async () => {\n  const { adapter, page } = makeHarness();\n  page.preActivationGuardCode = "COMPOSER_CONTENT_CHANGED_BEFORE_SUBMIT";\n\n  const first = await adapter.submit(request);\n  assert.equal(first.status, "not-submitted");\n  assert.equal(first.diagnosticCode, "COMPOSER_CONTENT_CHANGED_BEFORE_SUBMIT");\n  assert.equal(page.activationCalls, 0);\n\n  page.preActivationGuardCode = undefined;\n  const retry = await adapter.submit(request);\n  assert.equal(retry.status, "submitted");\n  assert.equal(page.activationCalls, 1);\n});\n\n'''
+          if guard_test not in adapter_test:
+              anchor = 'test("configured send-control strategy never guesses Enter when send is disabled", async () => {'
+              if adapter_test.count(anchor) != 1:
+                  raise RuntimeError("adapter guard-test anchor changed unexpectedly")
+              adapter_test = adapter_test.replace(anchor, guard_test + anchor, 1)
+          adapter_test_path.write_text(adapter_test, encoding="utf-8", newline="\n")
+
+          config_path = Path("src/browser/config.ts")
+          config = config_path.read_text(encoding="utf-8")
+          scoped_auth = '''    "signed-out": group(\n      "signed-out",\n      [\n        { kind: "role", role: "button", name: pattern("sign in|log in") },\n        { kind: "role", role: "link", name: pattern("sign in|log in") },\n        {\n          kind: "css",\n          selector: 'button[type="submit"][aria-label*="sign in" i], a[href*="login" i][aria-label*="sign in" i], [data-testid*="sign-in" i], [data-testid*="signin" i]',\n        },\n      ],\n      "presence",\n    ),\n    mfa: group(\n      "mfa",\n      [\n        { kind: "role", role: "textbox", name: pattern("verification code|security code|one.time code|passcode") },\n        { kind: "label", label: pattern("verification code|security code|one.time code|passcode") },\n        { kind: "role", role: "status", name: pattern("approve sign.in|multi.factor|authenticator") },\n        { kind: "role", role: "alert", name: pattern("approve sign.in|multi.factor|authenticator") },\n        { kind: "test-id", testId: pattern("mfa|multi.factor|otp|one.time|verification") },\n        {\n          kind: "css",\n          selector: 'input[autocomplete="one-time-code"], input[name*="otc" i], input[name*="otp" i], input[name*="verification" i], [data-testid*="mfa" i], [data-testid*="otp" i], [data-testid*="verification" i]',\n        },\n      ],\n      "presence",\n    ),\n    consent: group(\n      "consent",\n      [\n        { kind: "role", role: "dialog", name: pattern("permissions requested|requested permissions|consent") },\n        { kind: "role", role: "alertdialog", name: pattern("permissions requested|requested permissions|consent") },\n        { kind: "test-id", testId: pattern("consent|permissions.request|requested.permissions") },\n        {\n          kind: "css",\n          selector: '[role="dialog"][aria-label*="permission" i], [role="alertdialog"][aria-label*="permission" i], [data-testid*="consent" i], [data-testid*="permissions-request" i]',\n        },\n      ],\n      "presence",\n    ),\n'''
+          block_pattern = re.compile(
+              r'    "signed-out": group\(.*?\n    throttled: group\(',
+              re.DOTALL,
+          )
+          matches = list(block_pattern.finditer(config))
+          if len(matches) != 1:
+              raise RuntimeError("manual-auth group sequence changed unexpectedly")
+          config = block_pattern.sub(scoped_auth + '    throttled: group(', config, count=1)
+          config_path.write_text(config, encoding="utf-8", newline="\n")
+
+          Path("tests/unit/manual-auth-locator-scoping.test.ts").write_text(
+              '''import assert from "node:assert/strict";\nimport test from "node:test";\n\nimport { createBaselineCopilotUiContract } from "../../src/browser/config.js";\n\ntest("manual-auth signals do not use unrestricted page-text locators", () => {\n  const contract = createBaselineCopilotUiContract("Synthetic Work Account");\n  for (const signal of ["signed-out", "mfa", "consent"] as const) {\n    assert.equal(\n      contract.groups[signal].candidates.some((candidate) => candidate.kind === "text"),\n      false,\n      `${signal} must be tied to an authentication control or container`,\n    );\n  }\n});\n\ntest("MFA and consent fallbacks remain structurally scoped", () => {\n  const contract = createBaselineCopilotUiContract("Synthetic Work Account");\n  assert.equal(\n    contract.groups.mfa.candidates.some((candidate) =>\n      candidate.kind === "role" && ["textbox", "status", "alert"].includes(candidate.role)),\n    true,\n  );\n  assert.equal(\n    contract.groups.consent.candidates.some((candidate) =>\n      candidate.kind === "role" && ["dialog", "alertdialog"].includes(candidate.role)),\n    true,\n  );\n});\n''',
+              encoding="utf-8",
+              newline="\n",
+          )
+
+          for workflow in Path(".github/workflows").glob("one-shot-*.yml"):
+              workflow.unlink()
+      - run: npm ci --no-audit --no-fund
+      - run: npm run check
+      - name: Commit and push exact tested state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes required"
+            exit 0
+          fi
+          git commit -m "Finish PR 4 readiness and activation hardening"
+          git pull --rebase origin agent/fix-visible-copilot-readiness-stall
+          git push origin HEAD:agent/fix-visible-copilot-readiness-stall
