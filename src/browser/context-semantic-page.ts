@@ -1,6 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 
-import type { BrowserContext, Page } from "playwright-core";
+import type { Browser, BrowserContext, Page } from "playwright-core";
 
 import { AgentError } from "../shared/errors.js";
 import {
@@ -41,6 +41,7 @@ const DEDICATED_MICROSOFT_LOGIN_HOSTS = new Set([
  */
 export class ContextSemanticPage implements SemanticPage {
   readonly #context: BrowserContext;
+  readonly #browser: Browser | null;
   readonly #config: CopilotPageSelectionConfig;
   readonly #actionMs: number;
   readonly #delegates = new WeakMap<Page, PlaywrightSemanticPage>();
@@ -70,6 +71,9 @@ export class ContextSemanticPage implements SemanticPage {
       throw new TypeError("Context page action timeout must be a positive integer");
     }
     this.#context = context;
+    // Capture the owner once. The production persistent-context launcher
+    // verifies that this is non-null before any page can become actionable.
+    this.#browser = typeof context.browser === "function" ? context.browser() : null;
     this.#config = config;
     this.#activePage = initialPage;
     this.#actionMs = actionMs;
@@ -488,11 +492,8 @@ export class ContextSemanticPage implements SemanticPage {
       // A dialog on any page can race a queued action on another target. Abort
       // the entire dedicated browser process first: target/context close
       // commands do not preempt an evaluate already queued on another page.
-      const browser = typeof this.#context.browser === "function"
-        ? this.#context.browser()
-        : null;
-      if (browser !== null && typeof browser.close === "function") {
-        void browser.close().catch(() => undefined);
+      if (this.#browser !== null && typeof this.#browser.close === "function") {
+        void this.#browser.close().catch(() => undefined);
         return true;
       }
       if (typeof this.#activePage.close === "function") {

@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import { chromium } from "playwright-core";
@@ -76,9 +79,30 @@ test("a background-page dialog aborts queued actions on the active Chromium targ
   skip: !existsSync(chromiumExecutable),
 }, async (t) => {
   for (const action of ["fill", "click"] as const) {
-    const browser = await chromium.launch({ headless: true, executablePath: chromiumExecutable });
-    t.after(async () => browser.close().catch(() => undefined));
-    const context = await browser.newContext();
+    const profile = await mkdtemp(join(tmpdir(), "cope-dialog-race-"));
+    const context = await chromium.launchPersistentContext(profile, {
+      headless: true,
+      executablePath: chromiumExecutable,
+    }).catch(async (error: unknown) => {
+      await rm(profile, {
+        recursive: true,
+        force: true,
+        maxRetries: 10,
+        retryDelay: 100,
+      });
+      throw error;
+    });
+    t.after(async () => {
+      await context.close().catch(() => undefined);
+      await rm(profile, {
+        recursive: true,
+        force: true,
+        maxRetries: 10,
+        retryDelay: 100,
+      });
+    });
+    const browser = context.browser();
+    assert.notEqual(browser, null, "persistent Chromium context must expose its process owner");
     await context.route("**/*", async (route) => {
       const chat = route.request().url().includes("m365.cloud.microsoft");
       await route.fulfill({
@@ -156,7 +180,7 @@ test("a background-page dialog aborts queued actions on the active Chromium targ
     }, action);
     void actionPromise.catch(() => undefined);
     const browserDisconnected = new Promise<void>((resolve) => {
-      browser.once("disconnected", () => resolve());
+      browser!.once("disconnected", () => resolve());
     });
     const dialogPromise = background.evaluate(() => alert("background dialog"));
     void dialogPromise.catch(() => undefined);
@@ -165,7 +189,7 @@ test("a background-page dialog aborts queued actions on the active Chromium targ
     await browserDisconnected;
     assert.equal(dialogSeen, true);
     assert.equal(chat.isClosed(), true);
-    assert.equal(browser.isConnected(), false);
+    assert.equal(browser!.isConnected(), false);
     assert.deepEqual(observedActions, [], `${action} must not outlive a background dialog`);
     assert.equal(await tracked.currentUrl(), chatUrl);
     const modal = await tracked.snapshot(modalGroup);

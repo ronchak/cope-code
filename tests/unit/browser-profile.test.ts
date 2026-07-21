@@ -425,7 +425,9 @@ test("live configuration binds launch to the canonical verified executable and r
 test("persistent Edge launch receives only the dedicated profile as its user-data directory", async () => {
   const dedicated = "/private/dedicated-cope-edge-profile";
   const calls: Array<{ readonly userDataDirectory: string; readonly options: Readonly<Record<string, unknown>> }> = [];
-  const returnedContext = {} as BrowserContext;
+  const returnedContext = {
+    browser: () => ({ close: async () => undefined }),
+  } as unknown as BrowserContext;
   const observed = await launchDedicatedPersistentContext(
     dedicated,
     { headless: false, acceptDownloads: false },
@@ -437,6 +439,26 @@ test("persistent Edge launch receives only the dedicated profile as its user-dat
   assert.equal(observed, returnedContext);
   assert.deepEqual(calls.map((call) => call.userDataDirectory), [dedicated]);
   assert.equal("userDataDir" in (calls[0]?.options ?? {}), false);
+});
+
+test("persistent browser launch rejects a missing process owner", async () => {
+  let closed = false;
+  const returnedContext = {
+    browser: () => null,
+    close: async () => { closed = true; },
+  } as unknown as BrowserContext;
+
+  await assert.rejects(
+    launchDedicatedPersistentContext(
+      "/private/dedicated-cope-edge-profile",
+      { headless: false },
+      async () => returnedContext,
+    ),
+    (error: unknown) =>
+      error instanceof AgentError &&
+      error.details.diagnosticCode === "BROWSER_PROCESS_OWNER_UNAVAILABLE",
+  );
+  assert.equal(closed, true);
 });
 
 test("dedicated profile lock is exclusive and recoverable after release", async () => {

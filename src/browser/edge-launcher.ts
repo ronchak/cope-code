@@ -269,7 +269,20 @@ export async function launchDedicatedPersistentContext(
   options: Parameters<PersistentContextLauncher>[1],
   launcher: PersistentContextLauncher = chromium.launchPersistentContext.bind(chromium),
 ): Promise<BrowserContext> {
-  return await launcher(profileDirectory, options);
+  const context = await launcher(profileDirectory, options);
+  const browser = typeof context.browser === "function" ? context.browser() : null;
+  if (browser === null) {
+    await context.close().catch(() => undefined);
+    throw new AgentError(
+      "TRANSPORT_UNAVAILABLE",
+      "The dedicated browser process owner is unavailable",
+      {
+        diagnosticCode: "BROWSER_PROCESS_OWNER_UNAVAILABLE",
+        next: "Close the dedicated browser window, run cope setup --force, and retry.",
+      },
+    );
+  }
+  return context;
 }
 
 export async function launchEdgeCopilotTransport(

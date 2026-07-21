@@ -389,6 +389,7 @@ test("Chrome launch uses exactly the verified executable and Chrome-dedicated pe
   };
   const browserContext = {
     pages: () => [page],
+    browser: () => ({ close: async () => undefined }),
     close: async () => undefined,
   };
   const transport = await BrowserCopilotTransport.launch({
