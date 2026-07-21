@@ -92,6 +92,7 @@ class ActionPage {
   public locatorProbeHook: (() => void) | undefined = undefined;
   public boundActionHook: (() => void) | undefined = undefined;
   readonly #navigationListeners: Array<(frame: Frame) => void> = [];
+  readonly #dialogListeners: Array<() => void> = [];
 
   public constructor(public currentUrl: string) {}
 
@@ -104,6 +105,7 @@ class ActionPage {
     if (event === "framenavigated") {
       this.#navigationListeners.push(listener as (frame: Frame) => void);
     }
+    if (event === "dialog") this.#dialogListeners.push(listener as () => void);
     return this;
   }
   public mainFrame(): Frame { return this as unknown as Frame; }
@@ -111,6 +113,9 @@ class ActionPage {
     this.documentEpoch += 1;
     const frame = this.mainFrame();
     for (const listener of this.#navigationListeners) listener(frame);
+  }
+  public emitDialog(): void {
+    for (const listener of this.#dialogListeners) listener();
   }
   public locator(_selector: string): Locator {
     return new ActionLocator(this, _selector) as unknown as Locator;
@@ -154,6 +159,43 @@ test("cancellation during locator discovery prevents composer fill dispatch", as
     (error: unknown) =>
       error instanceof AgentError &&
       error.details.diagnosticCode === "PRE_ACTIVATION_GUARD_FAILED" &&
+      error.details.dispatchAttempted === false,
+  );
+  assert.deepEqual(page.actions, []);
+});
+
+test("a native dialog after observation revokes composer disclosure", async () => {
+  const page = new ActionPage(`${entryUrl}/conversation/one`);
+  const context = new ActionContext([page]);
+  const tracked = createTracked(context, page);
+
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  page.emitDialog();
+
+  await assert.rejects(
+    tracked.fill(composerGroup, "must-not-disclose", allowAction),
+    (error: unknown) =>
+      error instanceof AgentError &&
+      error.details.dispatchAttempted === false,
+  );
+  assert.deepEqual(page.actions, []);
+});
+
+test("a native dialog during locator discovery revokes composer disclosure", async () => {
+  const page = new ActionPage(`${entryUrl}/conversation/one`);
+  const context = new ActionContext([page]);
+  const tracked = createTracked(context, page);
+
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  page.locatorProbeHook = () => {
+    page.locatorProbeHook = undefined;
+    page.emitDialog();
+  };
+
+  await assert.rejects(
+    tracked.fill(composerGroup, "must-not-disclose", allowAction),
+    (error: unknown) =>
+      error instanceof AgentError &&
       error.details.dispatchAttempted === false,
   );
   assert.deepEqual(page.actions, []);
@@ -320,6 +362,48 @@ test("same-URL navigation after fill blocks activation even if the draft survive
       error.details.diagnosticCode === "ACTIVE_PAGE_CHANGED_AFTER_FILL",
   );
   assert.deepEqual(page.actions, ["fill:restored draft"]);
+});
+
+test("a native dialog after fill revokes the second observation", async () => {
+  const page = new ActionPage(`${entryUrl}/conversation/one`);
+  const context = new ActionContext([page]);
+  const tracked = createTracked(context, page);
+
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  await tracked.fill(composerGroup, "filled but never sent", allowAction);
+  page.emitDialog();
+
+  await assert.rejects(
+    tracked.currentUrl(),
+    (error: unknown) =>
+      error instanceof AgentError &&
+      error.details.diagnosticCode === "ACTIVE_PAGE_CHANGED_AFTER_FILL",
+  );
+  assert.deepEqual(page.actions, ["fill:filled but never sent"]);
+});
+
+test("a native dialog during send discovery revokes activation", async () => {
+  const page = new ActionPage(`${entryUrl}/conversation/one`);
+  const context = new ActionContext([page]);
+  const tracked = createTracked(context, page);
+
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  await tracked.fill(composerGroup, "filled but never sent", allowAction);
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  let locatorProbes = 0;
+  page.locatorProbeHook = () => {
+    locatorProbes += 1;
+    if (locatorProbes !== 2) return;
+    page.emitDialog();
+  };
+
+  await assert.rejects(
+    tracked.click(sendGroup, allowAction),
+    (error: unknown) =>
+      error instanceof AgentError &&
+      error.details.dispatchAttempted === false,
+  );
+  assert.deepEqual(page.actions, ["fill:filled but never sent"]);
 });
 
 test("same-URL navigation during click locator discovery blocks dispatch", async () => {

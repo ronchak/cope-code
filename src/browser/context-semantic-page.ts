@@ -49,9 +49,11 @@ export class ContextSemanticPage implements SemanticPage {
   #activePage: Page;
   #observedUrl: string | undefined;
   #observedEpoch: number | undefined;
+  #observedDialogEpoch: number | undefined;
   #filledPage: Page | undefined;
   #filledUrl: string | undefined;
   #filledEpoch: number | undefined;
+  #filledDialogEpoch: number | undefined;
   #filledGroup: LocatorGroup | undefined;
   #filledValue: string | undefined;
   #postFillObservationSeen = false;
@@ -106,6 +108,7 @@ export class ContextSemanticPage implements SemanticPage {
     if (changed) {
       this.#observedUrl = undefined;
       this.#observedEpoch = undefined;
+      this.#observedDialogEpoch = undefined;
     }
     this.#configurePage(selected);
     if (force || changed) await selected.bringToFront().catch(() => undefined);
@@ -127,6 +130,7 @@ export class ContextSemanticPage implements SemanticPage {
       this.#activePage = page;
       this.#observedUrl = currentUrl;
       this.#observedEpoch = this.#navigationEpochs.get(page) ?? 0;
+      this.#observedDialogEpoch = this.#delegate(page).nativeDialogEpoch();
       this.#postFillObservationSeen = true;
       return currentUrl;
     }
@@ -139,6 +143,7 @@ export class ContextSemanticPage implements SemanticPage {
     const currentUrl = page.url();
     this.#observedUrl = currentUrl;
     this.#observedEpoch = this.#navigationEpochs.get(page) ?? 0;
+    this.#observedDialogEpoch = this.#delegate(page).nativeDialogEpoch();
     return currentUrl;
   }
 
@@ -159,6 +164,7 @@ export class ContextSemanticPage implements SemanticPage {
     const page = this.#verifiedObservedPage();
     const expectedUrl = this.#observedUrl!;
     const expectedEpoch = this.#observedEpoch!;
+    const expectedDialogEpoch = this.#observedDialogEpoch!;
     const dispatchGuard = this.#composeDispatchGuard(guard, () => {
       if (this.#verifiedObservedPage() !== page) {
         throw new AgentError(
@@ -172,7 +178,8 @@ export class ContextSemanticPage implements SemanticPage {
     if (
       page.isClosed() ||
       page.url() !== expectedUrl ||
-      (this.#navigationEpochs.get(page) ?? 0) !== expectedEpoch
+      (this.#navigationEpochs.get(page) ?? 0) !== expectedEpoch ||
+      this.#delegate(page).nativeDialogEpoch() !== expectedDialogEpoch
     ) {
       this.#clearFilledPagePin();
       throw new AgentError(
@@ -184,6 +191,7 @@ export class ContextSemanticPage implements SemanticPage {
     this.#filledPage = page;
     this.#filledUrl = expectedUrl;
     this.#filledEpoch = expectedEpoch;
+    this.#filledDialogEpoch = expectedDialogEpoch;
     this.#filledGroup = group;
     this.#filledValue = value;
     this.#postFillObservationSeen = false;
@@ -203,6 +211,7 @@ export class ContextSemanticPage implements SemanticPage {
     });
     try {
       await this.#delegate(page).click(group, dispatchGuard);
+      this.#verifiedFilledPage();
     } finally {
       this.#clearFilledPagePin();
     }
@@ -270,13 +279,19 @@ export class ContextSemanticPage implements SemanticPage {
       this.#activePage.isClosed() ||
       this.#observedUrl === undefined ||
       this.#observedEpoch === undefined ||
+      this.#observedDialogEpoch === undefined ||
+      this.#observedDialogEpoch !== 0 ||
       currentUrl !== this.#observedUrl ||
-      (this.#navigationEpochs.get(this.#activePage) ?? 0) !== this.#observedEpoch
+      (this.#navigationEpochs.get(this.#activePage) ?? 0) !== this.#observedEpoch ||
+      this.#delegate(this.#activePage).nativeDialogEpoch() !== this.#observedDialogEpoch
     ) {
       throw new AgentError(
         "TRANSPORT_INDETERMINATE",
         "The observed Copilot page changed before the browser action",
-        { diagnosticCode: "ACTIVE_PAGE_CHANGED_BEFORE_ACTION" },
+        {
+          diagnosticCode: "ACTIVE_PAGE_CHANGED_BEFORE_ACTION",
+          dispatchAttempted: false,
+        },
       );
     }
     return this.#activePage;
@@ -324,10 +339,12 @@ export class ContextSemanticPage implements SemanticPage {
     const filledPage = this.#filledPage;
     const filledUrl = this.#filledUrl;
     const filledEpoch = this.#filledEpoch;
+    const filledDialogEpoch = this.#filledDialogEpoch;
     if (
       filledPage === undefined ||
       filledUrl === undefined ||
-      filledEpoch === undefined
+      filledEpoch === undefined ||
+      filledDialogEpoch === undefined
     ) {
       throw new AgentError(
         "TRANSPORT_INDETERMINATE",
@@ -350,8 +367,10 @@ export class ContextSemanticPage implements SemanticPage {
     if (
       selected !== filledPage ||
       filledPage.isClosed() ||
+      filledDialogEpoch !== 0 ||
       filledPage.url() !== filledUrl ||
-      (this.#navigationEpochs.get(filledPage) ?? 0) !== filledEpoch
+      (this.#navigationEpochs.get(filledPage) ?? 0) !== filledEpoch ||
+      this.#delegate(filledPage).nativeDialogEpoch() !== filledDialogEpoch
     ) {
       this.#clearFilledPagePin();
       throw new AgentError(
@@ -427,6 +446,7 @@ export class ContextSemanticPage implements SemanticPage {
     this.#filledPage = undefined;
     this.#filledUrl = undefined;
     this.#filledEpoch = undefined;
+    this.#filledDialogEpoch = undefined;
     this.#filledGroup = undefined;
     this.#filledValue = undefined;
     this.#postFillObservationSeen = false;

@@ -72,6 +72,35 @@ export const DEFAULT_BROWSER_WAITS: BrowserWaitConfig = Object.freeze({
 
 const PROTECTION_ACCESSIBLE_NAME_PATTERN =
   "^(?:enterprise data protection|commercial data protection)$";
+const ASSISTANT_MESSAGE_SELECTORS = [
+  '[data-content="ai-message"]',
+  '[data-author="assistant"]',
+  '[data-testid*="assistant" i][data-testid*="message" i]',
+  '[data-testid*="response" i][data-testid*="message" i]',
+] as const;
+const USER_MESSAGE_SELECTORS = [
+  '[data-content="user-message"]',
+  '[data-author="user"]',
+  '[data-testid*="user" i][data-testid*="message" i]',
+] as const;
+const IDENTITY_CONTROL_SELECTORS = [
+  'button[id*="mectrl" i]',
+  '[role="button"][id*="mectrl" i]',
+  'button[id*="mecontrol" i]',
+  '[role="button"][id*="mecontrol" i]',
+  'button[class*="mectrl" i]',
+  '[role="button"][class*="mectrl" i]',
+  'button[class*="me-control" i]',
+  '[role="button"][class*="me-control" i]',
+  'button[data-testid*="account-control" i]',
+  '[role="button"][data-testid*="account-control" i]',
+  'button[data-testid*="account-menu" i]',
+  '[role="button"][data-testid*="account-menu" i]',
+  'button[data-testid*="profile" i]',
+  '[role="button"][data-testid*="profile" i]',
+  'button[data-testid*="persona" i]',
+  '[role="button"][data-testid*="persona" i]',
+] as const;
 
 /**
  * A conservative baseline. Deployments should certify and pin a replacement
@@ -135,10 +164,9 @@ export function createBaselineCopilotUiContract(
     responses: group(
       "responses",
       [
-        { kind: "test-id", testId: pattern("assistant.*message|ai.*message|response.*message|message.*response") },
         {
           kind: "css",
-          selector: '[data-content="ai-message"], [data-author="assistant"], [data-testid*="assistant" i][data-testid*="message" i], [data-testid*="response" i][data-testid*="message" i]',
+          selector: ASSISTANT_MESSAGE_SELECTORS.join(", "),
         },
       ],
       "text",
@@ -147,10 +175,9 @@ export function createBaselineCopilotUiContract(
     "user-messages": group(
       "user-messages",
       [
-        { kind: "test-id", testId: pattern("user.*message") },
         {
           kind: "css",
-          selector: '[data-content="user-message"], [data-author="user"], [data-testid*="user" i][data-testid*="message" i]',
+          selector: USER_MESSAGE_SELECTORS.join(", "),
         },
       ],
       "text",
@@ -169,24 +196,7 @@ export function createBaselineCopilotUiContract(
       [
         {
           kind: "css",
-          selector: [
-            'button[id*="mectrl" i]',
-            '[role="button"][id*="mectrl" i]',
-            'button[id*="mecontrol" i]',
-            '[role="button"][id*="mecontrol" i]',
-            'button[class*="mectrl" i]',
-            '[role="button"][class*="mectrl" i]',
-            'button[class*="me-control" i]',
-            '[role="button"][class*="me-control" i]',
-            'button[data-testid*="account-control" i]',
-            '[role="button"][data-testid*="account-control" i]',
-            'button[data-testid*="account-menu" i]',
-            '[role="button"][data-testid*="account-menu" i]',
-            'button[data-testid*="profile" i]',
-            '[role="button"][data-testid*="profile" i]',
-            'button[data-testid*="persona" i]',
-            '[role="button"][data-testid*="persona" i]',
-          ].join(", "),
+          selector: IDENTITY_CONTROL_SELECTORS.join(", "),
         },
       ],
       "text",
@@ -542,7 +552,8 @@ function validateUiContract(contract: CopilotUiContract): void {
       groupValue.minimumCandidateMatches < 1 ||
       groupValue.minimumCandidateMatches > groupValue.candidates.length ||
       !Number.isSafeInteger(groupValue.maximumElements) ||
-      groupValue.maximumElements < 1
+      groupValue.maximumElements < 1 ||
+      groupValue.maximumElements > 500
     ) {
       throw new TypeError(`Invalid locator group: ${signal}`);
     }
@@ -551,7 +562,50 @@ function validateUiContract(contract: CopilotUiContract): void {
     }
     for (const candidate of groupValue.candidates) validateLocator(candidate);
     if (signal === "protection") validateProtectionLocators(groupValue.candidates);
+    if (signal === "identity") {
+      validateImmutableOwnedLocatorGroup(groupValue, canonicalIdentityGroup());
+    }
+    if (signal === "responses") {
+      validateImmutableOwnedLocatorGroup(groupValue, canonicalResponsesGroup());
+    }
+    if (signal === "user-messages") {
+      validateImmutableOwnedLocatorGroup(groupValue, canonicalUserMessagesGroup());
+    }
   }
+}
+
+function validateImmutableOwnedLocatorGroup(
+  groupValue: LocatorGroup,
+  canonical: LocatorGroup,
+): void {
+  const candidate = groupValue.candidates[0];
+  const canonicalCandidate = canonical.candidates[0];
+  if (
+    groupValue.signal !== canonical.signal ||
+    groupValue.minimumCandidateMatches !== canonical.minimumCandidateMatches ||
+    groupValue.maximumElements !== canonical.maximumElements ||
+    groupValue.capture !== canonical.capture ||
+    groupValue.candidates.length !== 1 ||
+    candidate?.kind !== "css" ||
+    canonicalCandidate?.kind !== "css" ||
+    candidate.selector !== canonicalCandidate.selector
+  ) {
+    throw new TypeError(
+      `${canonical.signal} locator group is an immutable ownership boundary`,
+    );
+  }
+}
+
+function canonicalIdentityGroup(): LocatorGroup {
+  return group("identity", [{ kind: "css", selector: IDENTITY_CONTROL_SELECTORS.join(", ") }], "text", 50);
+}
+
+function canonicalResponsesGroup(): LocatorGroup {
+  return group("responses", [{ kind: "css", selector: ASSISTANT_MESSAGE_SELECTORS.join(", ") }], "text", 200);
+}
+
+function canonicalUserMessagesGroup(): LocatorGroup {
+  return group("user-messages", [{ kind: "css", selector: USER_MESSAGE_SELECTORS.join(", ") }], "text", 200);
 }
 
 function validateProtectionLocators(candidates: readonly SemanticLocator[]): void {

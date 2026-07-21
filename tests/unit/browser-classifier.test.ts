@@ -322,6 +322,57 @@ test("browser configuration and UI contracts reject unknown nested fields", () =
       /protection/iu,
     );
   }
+
+  const ownershipMutations: ReadonlyArray<{
+    readonly signal: "identity" | "responses" | "user-messages";
+    readonly mutate: (group: {
+      candidates: Array<Record<string, unknown>>;
+      minimumCandidateMatches: number;
+      maximumElements: number;
+      capture: string;
+    }) => void;
+  }> = [
+    { signal: "identity", mutate: (group) => { group.candidates = [{ kind: "text", text: ".*" }]; } },
+    { signal: "identity", mutate: (group) => { group.candidates = [{ kind: "role", role: "button" }]; } },
+    { signal: "identity", mutate: (group) => { group.candidates = [{ kind: "css", selector: "button [data-testid*=profile]" }]; } },
+    { signal: "responses", mutate: (group) => { group.candidates = [{ kind: "text", text: "marker" }]; } },
+    { signal: "responses", mutate: (group) => { group.candidates = [{ kind: "test-id", testId: { source: "response", flags: "iu" } }]; } },
+    { signal: "responses", mutate: (group) => { group.candidates = [{ kind: "css", selector: "main, [data-author=assistant]" }]; } },
+    { signal: "user-messages", mutate: (group) => { group.candidates = [{ kind: "label", label: ".*" }]; } },
+    { signal: "user-messages", mutate: (group) => { group.candidates = [{ kind: "css", selector: "[data-author=assistant]" }]; } },
+    { signal: "user-messages", mutate: (group) => { group.capture = "presence"; } },
+    { signal: "responses", mutate: (group) => { group.minimumCandidateMatches = 2; } },
+    { signal: "responses", mutate: (group) => { group.maximumElements = 201; } },
+    { signal: "identity", mutate: (group) => { group.candidates.push(structuredClone(group.candidates[0]!)); } },
+  ];
+  for (const { signal, mutate } of ownershipMutations) {
+    const unsafeContract = structuredClone(base.uiContract) as unknown as {
+      version: string;
+      groups: Record<string, {
+        candidates: Array<Record<string, unknown>>;
+        minimumCandidateMatches: number;
+        maximumElements: number;
+        capture: string;
+      }>;
+    };
+    unsafeContract.version = `${unsafeContract.version}:synthetic-certified-suffix`;
+    const ownedGroup = unsafeContract.groups[signal];
+    assert.ok(ownedGroup);
+    mutate(ownedGroup);
+    assert.throws(
+      () => validateBrowserConfig({ ...base, uiContract: unsafeContract } as never),
+      /locator group|immutable ownership boundary/iu,
+    );
+  }
+
+  const excessiveSnapshotContract = structuredClone(base.uiContract) as unknown as {
+    groups: Record<string, { maximumElements: number }>;
+  };
+  excessiveSnapshotContract.groups.shell!.maximumElements = 501;
+  assert.throws(
+    () => validateBrowserConfig({ ...base, uiContract: excessiveSnapshotContract } as never),
+    /invalid locator group/iu,
+  );
 });
 
 test("conversation identity distinguishes query state without retaining raw URL data", () => {

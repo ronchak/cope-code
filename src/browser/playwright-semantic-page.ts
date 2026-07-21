@@ -27,6 +27,12 @@ export class PlaywrightSemanticPage implements SemanticPage {
       page.on("dialog", () => {
         this.#nativeDialogDetected = true;
         this.#nativeDialogEpoch += 1;
+        // A native dialog can queue an already-authorized evaluate call behind
+        // the browser modal. Tear down the target immediately so dismissing the
+        // dialog cannot release a stale fill or click into the page.
+        if (typeof page.close === "function") {
+          void page.close({ runBeforeUnload: false }).catch(() => undefined);
+        }
       });
     }
   }
@@ -86,8 +92,11 @@ export class PlaywrightSemanticPage implements SemanticPage {
     value: string,
     guard: SemanticActionGuard,
   ): Promise<void> {
+    this.#assertNoNativeDialog();
     const element = await this.#firstActionableOrThrow(group);
+    this.#assertNoNativeDialog();
     guard();
+    this.#assertNoNativeDialog();
     await element.evaluate((node, nextValue) => {
       if (!(node instanceof HTMLElement) || !node.isConnected) {
         throw new Error("The bound composer element is no longer connected");
@@ -172,11 +181,15 @@ export class PlaywrightSemanticPage implements SemanticPage {
         : new Event("input", { bubbles: true });
       node.dispatchEvent(inputEvent);
     }, value);
+    this.#assertNoNativeDialog(true);
   }
 
   public async click(group: LocatorGroup, guard: SemanticActionGuard): Promise<void> {
+    this.#assertNoNativeDialog();
     const element = await this.#firstActionableOrThrow(group);
+    this.#assertNoNativeDialog();
     guard();
+    this.#assertNoNativeDialog();
     const dispatchStatus = await element.evaluate((node): "pre-dispatch" | "dispatched" => {
       if (!(node instanceof HTMLElement) || !node.isConnected) {
         return "pre-dispatch";
@@ -273,6 +286,7 @@ export class PlaywrightSemanticPage implements SemanticPage {
       node.click();
       return "dispatched";
     });
+    this.#assertNoNativeDialog(true);
     if (dispatchStatus === "pre-dispatch") {
       throw new AgentError(
         "TRANSPORT_INDETERMINATE",
@@ -324,6 +338,7 @@ export class PlaywrightSemanticPage implements SemanticPage {
     try {
       return await this.#firstActionable(group);
     } catch (error) {
+      if (error instanceof AgentError) throw error;
       throw new AgentError(
         "TRANSPORT_INDETERMINATE",
         "No actionable element remained at the browser dispatch boundary",
@@ -336,32 +351,52 @@ export class PlaywrightSemanticPage implements SemanticPage {
     }
   }
 
+  #assertNoNativeDialog(dispatchAttempted = false): void {
+    if (!this.#nativeDialogDetected) return;
+    throw new AgentError(
+      "TRANSPORT_INDETERMINATE",
+      "A native browser dialog revoked the trusted browser action",
+      {
+        diagnosticCode: "NATIVE_BROWSER_DIALOG_DETECTED",
+        dispatchAttempted,
+      },
+    );
+  }
+
   async #firstActionable(group: LocatorGroup): Promise<ElementHandle> {
     for (const candidate of group.candidates) {
       try {
+        this.#assertNoNativeDialog();
         const locator = this.#locator(candidate);
-        const count = Math.min(await locator.count(), group.maximumElements);
+        const locatorCount = await locator.count();
+        this.#assertNoNativeDialog();
+        const count = Math.min(locatorCount, group.maximumElements);
         for (let index = 0; index < count; index += 1) {
           const item = locator.nth(index);
           // Bind the concrete DOM node before actionability checks. A Locator
           // may re-resolve into a new document during Playwright auto-wait;
           // an ElementHandle instead fails if navigation detaches this node.
           const element = await item.elementHandle();
-          if (
-            element !== null &&
-            (await safeBoolean(() => element.isVisible())) &&
-            (await safeBoolean(() => element.isEnabled())) &&
-            (
-              group.signal !== "composer" ||
-              (await safeBoolean(async () =>
-                await element.isEditable() &&
-                (await element.getAttribute("aria-readonly"))?.trim().toLowerCase() !== "true"))
-            )
-          ) {
-            return element;
+          this.#assertNoNativeDialog();
+          if (element === null) continue;
+          const visible = await safeBoolean(() => element.isVisible());
+          this.#assertNoNativeDialog();
+          if (!visible) continue;
+          const enabled = await safeBoolean(() => element.isEnabled());
+          this.#assertNoNativeDialog();
+          if (!enabled) continue;
+          if (group.signal === "composer") {
+            const editable = await safeBoolean(() => element.isEditable());
+            this.#assertNoNativeDialog();
+            if (!editable) continue;
+            const readonly = await element.getAttribute("aria-readonly").catch(() => undefined);
+            this.#assertNoNativeDialog();
+            if (readonly?.trim().toLowerCase() === "true") continue;
           }
+          return element;
         }
-      } catch {
+      } catch (error) {
+        if (error instanceof AgentError) throw error;
         // Try the next independently configured semantic locator.
       }
     }

@@ -174,7 +174,7 @@ test("adapter submits once, confirms its task marker, and captures a stable resp
   const { adapter, page } = makeHarness();
   const receipt = await adapter.submit(request);
   assert.equal(receipt.status, "submitted");
-  assert.match(receipt.transportMarker ?? "", /^\[\[COPILOT_AGENT_TASK_V1:/u);
+  assert.match(receipt.transportMarker ?? "", /^\[\[COPILOT_AGENT_TASK_V2:/u);
   assert.equal(page.activationCalls, 1);
   assert.equal(page.userMessages.length, 1);
 
@@ -213,6 +213,101 @@ test("fresh adapter recovers the response baseline from the persisted task marke
   assert.equal(response.status, "completed");
   if (response.status === "completed") assert.equal(response.content, "completed response envelope");
   assert.equal(page.activationCalls, 1, "recovery must not activate the composer again");
+});
+
+test("response correlation rejects baseline mutation instead of accepting same-count text drift", async () => {
+  const { adapter, page } = makeHarness();
+  assert.equal((await adapter.submit(request)).status, "submitted");
+  page.responses.splice(0, page.responses.length, "mutated prior response");
+
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "indeterminate");
+  if (response.status === "indeterminate") {
+    assert.equal(response.diagnosticCode, "RESPONSE_BASELINE_CHANGED");
+  }
+});
+
+test("response correlation rejects more than one appended assistant envelope", async () => {
+  const { adapter, page } = makeHarness();
+  assert.equal((await adapter.submit(request)).status, "submitted");
+  page.responses.push("unrelated second assistant envelope");
+
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "indeterminate");
+  if (response.status === "indeterminate") {
+    assert.equal(response.diagnosticCode, "RESPONSE_SEQUENCE_AMBIGUOUS");
+  }
+});
+
+test("duplicate task markers are ambiguous and never confirm a response", async () => {
+  const { adapter, page } = makeHarness();
+  const receipt = await adapter.submit(request);
+  assert.equal(receipt.status, "submitted");
+  page.userMessages.push(receipt.transportMarker ?? "missing marker");
+
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "indeterminate");
+  if (response.status === "indeterminate") {
+    assert.equal(response.diagnosticCode, "TASK_MARKER_AMBIGUOUS");
+  }
+});
+
+test("legacy markers can prove submission but cannot recover a response baseline", async () => {
+  const page = new DynamicFakePage();
+  const encoded = Buffer.from(JSON.stringify([
+    request.taskId,
+    request.turnId,
+    request.submissionId,
+  ]), "utf8").toString("base64url");
+  page.userMessages.push(`legacy [[COPILOT_AGENT_TASK_V1:${encoded}]]`);
+  const { adapter } = makeHarness(page);
+
+  const resolved = await adapter.resolveSubmission(request);
+  assert.equal(resolved.status, "submitted");
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "indeterminate");
+  if (response.status === "indeterminate") {
+    assert.equal(response.diagnosticCode, "RESPONSE_BASELINE_UNKNOWN");
+  }
+  assert.equal(page.activationCalls, 0);
+});
+
+test("new submissions reject both legacy and current reserved marker prefixes", async () => {
+  for (const prefix of [
+    "[[COPILOT_AGENT_TASK_V1:",
+    "[[COPILOT_AGENT_TASK_V2:",
+  ]) {
+    const { adapter, page } = makeHarness();
+    await assert.rejects(
+      adapter.submit({ ...request, content: `ordinary text ${prefix}injected]]` }),
+      (error: unknown) => error instanceof AgentError && error.code === "PROTOCOL_INVALID",
+    );
+    assert.equal(page.fillCalls, 0);
+    assert.equal(page.activationCalls, 0);
+  }
+});
+
+test("malformed correlation-matching legacy and current markers are ambiguous", async () => {
+  for (const [version, trailingFields] of [
+    ["V1", ["malformed-extra-field"]],
+    ["V2", []],
+    ["V2", ["malformed-extra-field"]],
+  ] as const) {
+    const page = new DynamicFakePage();
+    const encoded = Buffer.from(JSON.stringify([
+      request.taskId,
+      request.turnId,
+      request.submissionId,
+      ...trailingFields,
+    ]), "utf8").toString("base64url");
+    page.userMessages.push(`[[COPILOT_AGENT_TASK_${version}:${encoded}]]`);
+    const { adapter } = makeHarness(page);
+
+    const resolved = await adapter.resolveSubmission(request);
+    assert.equal(resolved.status, "indeterminate");
+    assert.equal(resolved.diagnosticCode, "TASK_MARKER_AMBIGUOUS");
+    assert.equal(page.activationCalls, 0);
+  }
 });
 
 test("response completion waits for streaming to end as well as stable content", async () => {
