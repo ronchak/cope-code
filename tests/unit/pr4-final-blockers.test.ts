@@ -285,6 +285,47 @@ test("a newer auth popup recaptures the chat baseline for its own episode", asyn
   assert.equal(await tracked.currentUrl(), authenticationB.currentUrl);
 });
 
+test("a retired auth popup with a new native dialog is reselected before disclosure", async () => {
+  const chat = new NavigationPage("https://m365.cloud.microsoft/chat/conversation/synthetic");
+  const authentication = new NavigationPage(
+    "https://login.microsoftonline.com/common/oauth2/authorize?client_id=synthetic",
+  );
+  const context = new NavigationContext([chat, authentication]);
+  const selectionConfig = trackedPageConfig();
+  const tracked = new ContextSemanticPage(
+    context.asContext(),
+    selectionConfig,
+    chat.asPage(),
+    1_000,
+  );
+
+  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+  chat.composerEnabled = true;
+  assert.equal(await tracked.currentUrl(), chat.currentUrl);
+
+  authentication.emitDialog();
+  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+
+  const adapter = new CopilotBrowserAdapter(tracked, {
+    ...selectionConfig,
+    expectedIdentity: "Synthetic Work Account",
+    requireProtectionIndicator: false,
+    maxMessageChars: 10_000,
+    maxResponseChars: 10_000,
+    waits,
+  });
+  const receipt = await adapter.submit({
+    taskId: "late-dialog-task",
+    turnId: "late-dialog-turn",
+    submissionId: "late-dialog-submission",
+    content: "This prompt must not be disclosed.",
+  });
+
+  assert.equal(receipt.status, "not-submitted");
+  assert.equal(receipt.diagnosticCode, "NATIVE_BROWSER_DIALOG_DETECTED");
+  assert.equal(chat.composerFillCalls, 0);
+});
+
 test("baseline identity evidence is limited to explicit account and profile controls", () => {
   const identity = createBaselineCopilotUiContract("Ronak Chakraborty").groups.identity;
 
@@ -401,6 +442,7 @@ function groupSnapshot(
 class NavigationPage {
   public closed = false;
   public composerEnabled = false;
+  public composerFillCalls = 0;
   public onComposerProbe: (() => void) | undefined;
   readonly #listeners = new Map<string, Array<(...args: unknown[]) => void>>();
   readonly #mainFrame = {} as Frame;
@@ -440,7 +482,12 @@ class NavigationPage {
   }
   #composerLocator(): Locator {
     return new CandidateCollection(
-      new CandidateItem(this.composerEnabled, "", () => this.onComposerProbe?.()),
+      new CandidateItem(
+        this.composerEnabled,
+        "",
+        () => this.onComposerProbe?.(),
+        () => { this.composerFillCalls += 1; },
+      ),
     ) as unknown as Locator;
   }
   #emptyLocator(): Locator {
@@ -476,6 +523,7 @@ class CandidateItem {
     private readonly enabled: boolean,
     private readonly currentValue: string,
     private readonly onEnabledProbe?: () => void,
+    private readonly onFill?: () => void,
   ) {}
 
   public async isVisible(): Promise<boolean> { return true; }
@@ -488,7 +536,10 @@ class CandidateItem {
     return name === "aria-label" ? "Message" : null;
   }
   public async inputValue(): Promise<string> { return this.currentValue; }
-  public async fill(value: string): Promise<void> { this.filledValue = value; }
+  public async fill(value: string): Promise<void> {
+    this.onFill?.();
+    this.filledValue = value;
+  }
 }
 
 class CandidateCollection {

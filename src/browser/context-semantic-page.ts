@@ -53,7 +53,7 @@ export class ContextSemanticPage implements SemanticPage {
   readonly #delegates = new WeakMap<Page, PlaywrightSemanticPage>();
   readonly #configuredPages = new WeakSet<Page>();
   readonly #navigationEpochs = new WeakMap<Page, number>();
-  readonly #staleAuthenticationPages = new WeakSet<Page>();
+  readonly #staleAuthenticationPages = new WeakMap<Page, AuthenticationPageStamp>();
   #activePage: Page;
   #observedUrl: string | undefined;
   #filledPage: Page | undefined;
@@ -321,7 +321,7 @@ export class ContextSemanticPage implements SemanticPage {
     preferred: Page = this.#activePage,
   ): Page {
     const selectablePages = pages.filter((page) =>
-      !this.#staleAuthenticationPages.has(page) ||
+      !this.#isStaleAuthenticationPage(page) ||
       !isGenuineManualAuthenticationUrl(page.url(), this.#config)
     );
     return selectActiveCopilotPage(selectablePages, this.#config, preferred);
@@ -510,7 +510,7 @@ export class ContextSemanticPage implements SemanticPage {
     return pages
       .filter((page) =>
         !page.isClosed() &&
-        !this.#staleAuthenticationPages.has(page) &&
+        !this.#isStaleAuthenticationPage(page) &&
         isGenuineManualAuthenticationUrl(page.url(), this.#config))
       .map((page) => ({
         page,
@@ -540,10 +540,21 @@ export class ContextSemanticPage implements SemanticPage {
   #markConfirmedAuthenticationPagesStale(
     authenticationPages: readonly AuthenticationPageStamp[],
   ): void {
-    for (const { page } of authenticationPages) {
-      this.#staleAuthenticationPages.add(page);
+    for (const stamp of authenticationPages) {
+      this.#staleAuthenticationPages.set(stamp.page, stamp);
     }
     this.#clearAuthenticationTracking();
+  }
+
+  #isStaleAuthenticationPage(page: Page): boolean {
+    const stamp = this.#staleAuthenticationPages.get(page);
+    if (stamp === undefined) return false;
+    const unchanged = !page.isClosed() &&
+      page.url() === stamp.url &&
+      (this.#navigationEpochs.get(page) ?? 0) === stamp.navigationEpoch &&
+      this.#delegate(page).nativeDialogEpoch() === stamp.dialogEpoch;
+    if (!unchanged) this.#staleAuthenticationPages.delete(page);
+    return unchanged;
   }
 
   #clearAuthenticationTracking(): void {
