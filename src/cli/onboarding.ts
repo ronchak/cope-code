@@ -103,9 +103,9 @@ export async function executeSetupCommand(
   host: HostPlatform = CURRENT_HOST_PLATFORM,
   dependencies: MachineSetupDependencies = {},
 ): Promise<number> {
-  // Setup visibly launches the selected browser, so standard-user and GUI
-  // eligibility are prerequisites just as they are for a live task.
-  await runHostEligibilityPreflight({ liveBrowser: true, host });
+  // Refuse an ineligible/elevated host before state preparation. The GUI-only
+  // portion is deferred until configureMachine knows a browser must open.
+  await runHostEligibilityPreflight({ liveBrowser: false, host });
   const paths = configurationPaths(command.stateHome, host);
   await preparePrivateStateHome(paths.stateHome, host);
   // A redirected or low-capability output still gets the plain numbered setup
@@ -303,6 +303,10 @@ export async function configureMachine(options: {
     return setupSummary(options.paths, current.config);
   }
 
+  // Eligibility includes the live GUI session, so defer it until after the
+  // read-only idempotent path has decided no browser needs to open.
+  await runHostEligibilityPreflight({ liveBrowser: true, host: options.host });
+
   const selected = await selectBrowserForSetup({
     options,
     ...(current === undefined ? {} : { current }),
@@ -323,12 +327,15 @@ export async function configureMachine(options: {
   const currentIdentity = typeof current?.config.expectedIdentity === "string"
     ? current.config.expectedIdentity
     : undefined;
-  const identity = options.identity ?? currentIdentity ?? (options.interactive
-    ? await promptText("Work account name or email shown in Copilot")
-    : undefined);
+  const identity = options.identity ?? (options.interactive
+    ? await promptText("Work account name or email shown in Copilot", {
+        ...(currentIdentity === undefined ? {} : { defaultValue: currentIdentity }),
+      })
+    : currentIdentity);
   if (identity === undefined || identity.trim().length === 0) {
     throw new AgentError("CONFIG_INVALID", "Setup requires the visible work-account name or email", { next: "Use cope setup --identity you@example.com" });
   }
+  const identityChanged = current === undefined || identity.trim() !== current.config.expectedIdentity;
   const entryText = options.entryUrl ?? current?.config.entryUrl ?? (options.interactive
     ? await promptText("Microsoft 365 Copilot Chat URL", { defaultValue: DEFAULT_COPILOT_ENTRY_URL })
     : DEFAULT_COPILOT_ENTRY_URL);
@@ -387,6 +394,7 @@ export async function configureMachine(options: {
     ...(currentFile?.ui_contract === undefined ? {} : { ui_contract: currentFile.ui_contract }),
   };
   const shouldWriteBrowser = current === undefined || current.evidenceChanged || options.force || materialBrowserChange ||
+    identityChanged ||
     options.identity !== undefined || options.entryUrl !== undefined ||
     options.requireProtectionIndicator !== undefined;
   // When nothing is being persisted, validate exactly what will remain on

@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   configurationPaths,
   configureMachine,
+  executeSetupCommand,
   writeRepositoryConfiguration,
 } from "../../src/cli/onboarding.js";
 import type {
@@ -111,6 +112,9 @@ function readyTransport(observed: BrowserLaunchConfig[]): EdgeCopilotTransport {
     close: async () => undefined,
   } as unknown as EdgeCopilotTransport;
 }
+
+const acceptPromptDefault: NonNullable<import("../../src/cli/onboarding.js").MachineSetupDependencies["promptText"]> =
+  async (_label, options) => options?.defaultValue ?? "person@example.com";
 
 test("guided machine setup preselects the only detected browser and commits only after readiness", async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), "cope-machine-one-browser-"));
@@ -253,6 +257,7 @@ test("Retry redetects browsers and changing Edge to Chrome requires confirmation
       source: "manual" as const,
     }),
     launchBrowser: async () => readyTransport([]),
+    promptText: acceptPromptDefault,
   };
   await configureMachine({
     paths: changePaths,
@@ -312,6 +317,7 @@ test("existing browser setup remains selected and is not silently rewritten", as
       launched.push(config);
       return readyTransport(launched);
     },
+    promptText: acceptPromptDefault,
   };
   await configureMachine({
     paths,
@@ -356,6 +362,115 @@ test("existing browser setup remains selected and is not silently rewritten", as
   ]);
 });
 
+test("noninteractive idempotent setup does not require a live GUI session", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-machine-idempotent-headless-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const stateHome = path.join(root, "state");
+  const host = createStandardUserHost();
+  const edge = discoveredBrowser("edge");
+  const dependencies = {
+    discoverBrowsers: async () => [edge],
+    verifyManualBrowser: async (product: BrowserProduct, executablePath: string) => ({
+      ...discoveredBrowser(product, executablePath),
+      source: "manual" as const,
+    }),
+    launchBrowser: async () => readyTransport([]),
+  };
+  const output = { write: () => undefined };
+
+  await executeSetupCommand({
+    command: "setup",
+    force: false,
+    json: true,
+    stateHome,
+    browser: "edge",
+    identity: "person@example.com",
+  }, { stdout: output, stderr: output }, host, dependencies);
+
+  const eligibilityChecks: boolean[] = [];
+  const headlessHost = new Proxy(host, {
+    get(target, property) {
+      if (property === "verifyEligibility") {
+        return async (options: { readonly liveBrowser: boolean }) => {
+          eligibilityChecks.push(options.liveBrowser);
+          if (options.liveBrowser) throw new Error("live GUI preflight must be deferred");
+          return { standardUserVerified: true, guiSessionVerified: false };
+        };
+      }
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  await executeSetupCommand({
+    command: "setup",
+    force: false,
+    json: true,
+    stateHome,
+  }, { stdout: output, stderr: output }, headlessHost, {
+    ...dependencies,
+    discoverBrowsers: async () => { throw new Error("idempotent setup must not discover"); },
+    launchBrowser: async () => { throw new Error("idempotent setup must not launch"); },
+  });
+  assert.deepEqual(eligibilityChecks, [false]);
+});
+
+test("interactive setup prompts with the current identity and persists a correction", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-machine-identity-correction-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const stateHome = path.join(root, "state");
+  await mkdir(stateHome);
+  const host = createStandardUserHost();
+  const paths = configurationPaths(stateHome, host);
+  const edge = discoveredBrowser("edge");
+  const launched: BrowserLaunchConfig[] = [];
+  const common = {
+    discoverBrowsers: async () => [edge],
+    verifyManualBrowser: async (product: BrowserProduct, executablePath: string) => ({
+      ...discoveredBrowser(product, executablePath),
+      source: "manual" as const,
+    }),
+    launchBrowser: async (config: BrowserLaunchConfig) => {
+      launched.push(config);
+      return readyTransport(launched);
+    },
+  };
+  await configureMachine({
+    paths,
+    force: false,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+    browser: "edge",
+    identity: "old-account@example.com",
+  }, common);
+
+  let defaultIdentity: string | undefined;
+  await configureMachine({
+    paths,
+    force: false,
+    interactive: true,
+    output: { write: () => undefined },
+    host,
+  }, {
+    ...common,
+    promptBrowser: async (screen) => {
+      assert.equal(screen.kind, "current");
+      if (screen.kind !== "current") throw new Error("wrong screen");
+      return { action: "continue", browser: screen.browser };
+    },
+    promptText: async (label, options) => {
+      assert.match(label, /account/iu);
+      defaultIdentity = options?.defaultValue;
+      return "new-account@example.com";
+    },
+  });
+
+  const persisted = JSON.parse(await readFile(paths.browser, "utf8")) as Record<string, unknown>;
+  assert.equal(defaultIdentity, "old-account@example.com");
+  assert.equal(persisted.expected_identity, "new-account@example.com");
+  assert.equal(launched.at(-1)?.expectedIdentity, "new-account@example.com");
+});
+
 test("guided setup verifies and persists a stable browser update before live use resumes", async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), "cope-machine-browser-update-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
@@ -377,6 +492,7 @@ test("guided setup verifies and persists a stable browser update before live use
       launched.push(config);
       return readyTransport(launched);
     },
+    promptText: acceptPromptDefault,
   };
 
   await configureMachine({
@@ -474,6 +590,7 @@ test("existing Chrome and strict legacy Edge remain selected without silent migr
         source: "manual" as const,
       }),
       launchBrowser: async () => readyTransport([]),
+      promptText: acceptPromptDefault,
     };
     await configureMachine({
       paths,
