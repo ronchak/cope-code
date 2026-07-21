@@ -39,6 +39,7 @@ class ActionLocator {
   public nth(_index: number): Locator { return this as unknown as Locator; }
   public async isVisible(): Promise<boolean> { return true; }
   public async isEnabled(): Promise<boolean> { return true; }
+  public async isEditable(): Promise<boolean> { return true; }
   public async innerText(): Promise<string> { return this.page.composer; }
   public async inputValue(): Promise<string> { return this.page.composer; }
   public async getAttribute(_name: string): Promise<string | null> { return null; }
@@ -55,6 +56,8 @@ class BoundActionElement {
 
   public async isVisible(): Promise<boolean> { return true; }
   public async isEnabled(): Promise<boolean> { return true; }
+  public async isEditable(): Promise<boolean> { return true; }
+  public async getAttribute(_name: string): Promise<string | null> { return null; }
   public async evaluate(
     _callback: (...args: readonly unknown[]) => unknown,
     value?: string,

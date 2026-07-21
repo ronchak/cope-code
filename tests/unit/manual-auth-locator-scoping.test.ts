@@ -12,6 +12,7 @@ class ProbeLocator {
   public nth(_index: number): Locator { return this as unknown as Locator; }
   public async isVisible(): Promise<boolean> { return this.visible; }
   public async isEnabled(): Promise<boolean> { return this.visible; }
+  public async isEditable(): Promise<boolean> { return this.visible; }
   public async innerText(): Promise<string> {
     return "Please accept the consent request and enter a verification code to sign in.";
   }

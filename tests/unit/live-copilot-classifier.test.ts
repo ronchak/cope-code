@@ -280,7 +280,7 @@ test("the baseline contract carries the current M365 locator revision and semant
   );
   assert.equal(
     contract.groups.protection.candidates.some((candidate) => candidate.kind === "test-id"),
-    true,
+    false,
   );
   assert.equal(
     contract.groups.protection.candidates.some((candidate) =>
@@ -289,6 +289,16 @@ test("the baseline contract carries the current M365 locator revision and semant
   );
   assert.equal(
     contract.groups.protection.candidates.some((candidate) => candidate.kind === "css"),
-    true,
+    false,
   );
+  for (const candidate of contract.groups.protection.candidates) {
+    if (candidate.kind === "role") {
+      assert.equal(typeof candidate.name, "object");
+      if (typeof candidate.name !== "object" || candidate.name === undefined) continue;
+      const matcher = new RegExp(candidate.name.source, candidate.name.flags);
+      assert.equal(matcher.test("Enterprise data protection"), true);
+      assert.equal(matcher.test("Not protected"), false);
+      assert.equal(matcher.test("Enterprise data protection disabled"), false);
+    }
+  }
 });

@@ -115,7 +115,7 @@ test("a native dialog on an external Microsoft auth host is bounded before host 
   assert.equal(classification.diagnosticCode, "NATIVE_BROWSER_DIALOG_DETECTED");
 });
 
-test("a returned chat remains selected while the completed auth popup stays open", async () => {
+test("an open authentication popup retains ownership until it closes", async () => {
   const chat = new NavigationPage("https://m365.cloud.microsoft/chat/conversation/synthetic");
   const authentication = new NavigationPage(
     "https://login.microsoftonline.com/common/oauth2/authorize?client_id=synthetic",
@@ -127,6 +127,7 @@ test("a returned chat remains selected while the completed auth popup stays open
       entryUrl: "https://m365.cloud.microsoft/chat",
       approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
       manualAuthenticationHosts: [{ hostname: "login.microsoftonline.com" }],
+      uiContract: createBaselineCopilotUiContract("Synthetic Work Account"),
     },
     chat.asPage(),
     1_000,
@@ -134,12 +135,13 @@ test("a returned chat remains selected while the completed auth popup stays open
 
   assert.equal(await tracked.currentUrl(), authentication.currentUrl);
   chat.navigate(chat.currentUrl);
+  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+
+  authentication.closed = true;
   assert.equal(await tracked.currentUrl(), chat.currentUrl);
-  assert.equal(await tracked.currentUrl(), chat.currentUrl);
-  assert.equal(authentication.closed, false);
 });
 
-test("an in-place hydrated chat displaces a completed auth popup without navigation", async () => {
+test("in-place chat hydration cannot displace an open authentication popup", async () => {
   const chat = new NavigationPage("https://m365.cloud.microsoft/chat/conversation/synthetic");
   const authentication = new NavigationPage(
     "https://login.microsoftonline.com/common/oauth2/authorize?client_id=synthetic",
@@ -162,9 +164,10 @@ test("an in-place hydrated chat displaces a completed auth popup without navigat
   assert.equal(await tracked.currentUrl(), authentication.currentUrl);
 
   chat.composerEnabled = true;
+  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+
+  authentication.closed = true;
   assert.equal(await tracked.currentUrl(), chat.currentUrl);
-  assert.equal(await tracked.currentUrl(), chat.currentUrl);
-  assert.equal(authentication.closed, false);
 });
 
 test("an already-actionable chat cannot displace a newer active auth popup", async () => {
@@ -205,7 +208,7 @@ test("a sticky native dialog prevents retiring the auth popup", async () => {
   assert.equal(await tracked.currentUrl(), authentication.currentUrl);
 });
 
-test("auth navigation during the composer probe prevents a stale handoff", async () => {
+test("navigation within an open authentication popup retains ownership", async () => {
   const chat = new NavigationPage("https://m365.cloud.microsoft/chat/conversation/synthetic");
   const authentication = new NavigationPage(
     "https://login.microsoftonline.com/common/oauth2/authorize?client_id=synthetic",
@@ -220,18 +223,15 @@ test("auth navigation during the composer probe prevents a stale handoff", async
 
   assert.equal(await tracked.currentUrl(), authentication.currentUrl);
   chat.composerEnabled = true;
-  chat.onComposerProbe = () => {
-    chat.onComposerProbe = undefined;
-    authentication.navigate(
-      "https://login.microsoftonline.com/common/oauth2/authorize?client_id=synthetic&step=mfa",
-    );
-  };
+  authentication.navigate(
+    "https://login.microsoftonline.com/common/oauth2/authorize?client_id=synthetic&step=mfa",
+  );
 
   assert.equal(await tracked.currentUrl(), authentication.currentUrl);
   assert.match(authentication.currentUrl, /step=mfa/u);
 });
 
-test("a new auth popup on the post-confirm refresh is never swept stale", async () => {
+test("a newer authentication popup supersedes the existing authentication page", async () => {
   const chat = new NavigationPage("https://m365.cloud.microsoft/chat/conversation/synthetic");
   const authenticationA = new NavigationPage(
     "https://login.microsoftonline.com/common/oauth2/authorize?client_id=synthetic&popup=a",
@@ -249,11 +249,7 @@ test("a new auth popup on the post-confirm refresh is never swept stale", async 
 
   assert.equal(await tracked.currentUrl(), authenticationA.currentUrl);
   chat.composerEnabled = true;
-  let pageReads = 0;
-  context.onPages = () => {
-    pageReads += 1;
-    if (pageReads === 3) context.pageList.push(authenticationB);
-  };
+  context.pageList.push(authenticationB);
 
   assert.equal(await tracked.currentUrl(), authenticationB.currentUrl);
   assert.equal(await tracked.currentUrl(), authenticationB.currentUrl);
@@ -285,7 +281,7 @@ test("a newer auth popup recaptures the chat baseline for its own episode", asyn
   assert.equal(await tracked.currentUrl(), authenticationB.currentUrl);
 });
 
-test("a retired auth popup with a new native dialog is reselected before disclosure", async () => {
+test("an open auth popup with a native dialog blocks disclosure", async () => {
   const chat = new NavigationPage("https://m365.cloud.microsoft/chat/conversation/synthetic");
   const authentication = new NavigationPage(
     "https://login.microsoftonline.com/common/oauth2/authorize?client_id=synthetic",
@@ -301,8 +297,6 @@ test("a retired auth popup with a new native dialog is reselected before disclos
 
   assert.equal(await tracked.currentUrl(), authentication.currentUrl);
   chat.composerEnabled = true;
-  assert.equal(await tracked.currentUrl(), chat.currentUrl);
-
   authentication.emitDialog();
   assert.equal(await tracked.currentUrl(), authentication.currentUrl);
 
@@ -323,6 +317,26 @@ test("a retired auth popup with a new native dialog is reselected before disclos
 
   assert.equal(receipt.status, "not-submitted");
   assert.equal(receipt.diagnosticCode, "NATIVE_BROWSER_DIALOG_DETECTED");
+  assert.equal(chat.composerFillCalls, 0);
+});
+
+test("DOM-only auth controls cannot yield ownership while their popup stays open", async () => {
+  const chat = new NavigationPage("https://m365.cloud.microsoft/chat/conversation/synthetic");
+  const authentication = new NavigationPage(
+    "https://login.microsoftonline.com/common/oauth2/authorize?client_id=synthetic",
+  );
+  const context = new NavigationContext([chat, authentication]);
+  const tracked = new ContextSemanticPage(
+    context.asContext(),
+    trackedPageConfig(),
+    chat.asPage(),
+    1_000,
+  );
+
+  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+  chat.composerEnabled = true;
+  authentication.authenticationControlVisible = true;
+  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
   assert.equal(chat.composerFillCalls, 0);
 });
 
@@ -375,6 +389,36 @@ test("composer actionability follows the same later candidate that fill will use
   await semantic.fill(group, "new prompt", () => {});
   assert.equal(disabled.filledValue, undefined);
   assert.equal(enabled.filledValue, "new prompt");
+});
+
+test("aria-readonly composer candidates never count as ready action surfaces", async () => {
+  const readonlyRole = new CandidateItem(true, "locked draft", undefined, undefined, true, true);
+  const readonlyPlaceholder = new CandidateItem(
+    true,
+    "locked draft",
+    undefined,
+    undefined,
+    true,
+    true,
+  );
+  const semantic = new PlaywrightSemanticPage(
+    new CandidatePage(readonlyRole, readonlyPlaceholder).asPage(),
+  );
+  const group: LocatorGroup = {
+    signal: "composer",
+    candidates: [
+      { kind: "role", role: "textbox", name: "Message" },
+      { kind: "placeholder", placeholder: "Message" },
+    ],
+    minimumCandidateMatches: 1,
+    maximumElements: 5,
+    capture: "value-and-text",
+  };
+
+  const snapshot = await semantic.snapshot(group);
+  assert.equal(snapshot.matchedCandidates, 2);
+  assert.equal(snapshot.visibleElements, 2);
+  assert.equal(snapshot.enabledElements, 0);
 });
 
 test("a recoverable popup blocks submission without any browser action", async () => {
@@ -442,8 +486,8 @@ function groupSnapshot(
 class NavigationPage {
   public closed = false;
   public composerEnabled = false;
+  public authenticationControlVisible = false;
   public composerFillCalls = 0;
-  public onComposerProbe: (() => void) | undefined;
   readonly #listeners = new Map<string, Array<(...args: unknown[]) => void>>();
   readonly #mainFrame = {} as Frame;
 
@@ -456,11 +500,30 @@ class NavigationPage {
   public async bringToFront(): Promise<void> {}
   public mainFrame(): Frame { return this.#mainFrame; }
   public getByRole(role: string): Locator {
+    if (this.#isAuthenticationPage()) {
+      return (role === "button" || role === "textbox") && this.authenticationControlVisible
+        ? this.#authenticationLocator()
+        : this.#emptyLocator();
+    }
     return role === "textbox" ? this.#composerLocator() : this.#emptyLocator();
   }
-  public getByPlaceholder(): Locator { return this.#composerLocator(); }
-  public getByLabel(): Locator { return this.#composerLocator(); }
+  public getByPlaceholder(): Locator {
+    return this.#isAuthenticationPage()
+      ? this.#authenticationLocator()
+      : this.#composerLocator();
+  }
+  public getByLabel(): Locator {
+    return this.#isAuthenticationPage()
+      ? this.#authenticationLocator()
+      : this.#composerLocator();
+  }
+  public getByTestId(): Locator {
+    return this.#isAuthenticationPage()
+      ? this.#authenticationLocator()
+      : this.#emptyLocator();
+  }
   public locator(selector: string): Locator {
+    if (this.#isAuthenticationPage()) return this.#authenticationLocator();
     return /textarea|contenteditable/iu.test(selector)
       ? this.#composerLocator()
       : this.#emptyLocator();
@@ -485,10 +548,18 @@ class NavigationPage {
       new CandidateItem(
         this.composerEnabled,
         "",
-        () => this.onComposerProbe?.(),
+        undefined,
         () => { this.composerFillCalls += 1; },
       ),
     ) as unknown as Locator;
+  }
+  #authenticationLocator(): Locator {
+    return this.authenticationControlVisible
+      ? new CandidateCollection(new CandidateItem(true, "")) as unknown as Locator
+      : this.#emptyLocator();
+  }
+  #isAuthenticationPage(): boolean {
+    return this.currentUrl.startsWith("https://login.microsoftonline.com/");
   }
   #emptyLocator(): Locator {
     return new CandidateCollection() as unknown as Locator;
@@ -499,14 +570,12 @@ class NavigationPage {
 class NavigationContext {
   readonly #listeners: Array<(page: Page) => void> = [];
   public readonly pageList: NavigationPage[];
-  public onPages: (() => void) | undefined;
 
   public constructor(pages: readonly NavigationPage[]) {
     this.pageList = [...pages];
   }
 
   public pages(): Page[] {
-    this.onPages?.();
     return this.pageList.map((page) => page.asPage());
   }
   public on(event: string, listener: (page: Page) => void): this {
@@ -524,6 +593,8 @@ class CandidateItem {
     private readonly currentValue: string,
     private readonly onEnabledProbe?: () => void,
     private readonly onFill?: () => void,
+    private readonly editable = enabled,
+    private readonly ariaReadonly = false,
   ) {}
 
   public async isVisible(): Promise<boolean> { return true; }
@@ -531,9 +602,12 @@ class CandidateItem {
     this.onEnabledProbe?.();
     return this.enabled;
   }
+  public async isEditable(): Promise<boolean> { return this.editable; }
   public async innerText(): Promise<string> { return "Message"; }
   public async getAttribute(name: string): Promise<string | null> {
-    return name === "aria-label" ? "Message" : null;
+    if (name === "aria-label") return "Message";
+    if (name === "aria-readonly") return this.ariaReadonly ? "true" : null;
+    return null;
   }
   public async inputValue(): Promise<string> { return this.currentValue; }
   public async elementHandle(): Promise<ElementHandle> {

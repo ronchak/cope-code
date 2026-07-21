@@ -82,7 +82,7 @@ test("a newer authentication popup takes precedence over an older configured cha
   assert.equal(selected, authentication.asPage());
 });
 
-test("a newer configured chat takes precedence after authentication returns", () => {
+test("an open authentication page outranks a newer replacement chat", () => {
   const authentication = new UrlPage(
     "https://login.microsoftonline.com/common/oauth2/authorize?step=signin",
   );
@@ -94,7 +94,7 @@ test("a newer configured chat takes precedence after authentication returns", ()
     authentication.asPage(),
   );
 
-  assert.equal(selected, chat.asPage());
+  assert.equal(selected, authentication.asPage());
 });
 
 test("broad Office and M365 allowlist entries are not reusable authentication pages by host alone", () => {

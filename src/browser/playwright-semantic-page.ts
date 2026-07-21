@@ -297,7 +297,12 @@ export class PlaywrightSemanticPage implements SemanticPage {
         const item = locator.nth(index);
         const visible = await safeBoolean(() => item.isVisible());
         if (!visible) continue;
-        const enabled = await safeBoolean(() => item.isEnabled());
+        const enabled = await safeBoolean(async () => {
+          if (!await item.isEnabled()) return false;
+          if (group.signal !== "composer") return true;
+          if (!await item.isEditable()) return false;
+          return (await item.getAttribute("aria-readonly"))?.trim().toLowerCase() !== "true";
+        });
         const captureText = group.capture !== "presence";
         const text = captureText ? await safeString(() => item.innerText()) : "";
         const accessibleLabel = captureText
@@ -345,7 +350,13 @@ export class PlaywrightSemanticPage implements SemanticPage {
           if (
             element !== null &&
             (await safeBoolean(() => element.isVisible())) &&
-            (await safeBoolean(() => element.isEnabled()))
+            (await safeBoolean(() => element.isEnabled())) &&
+            (
+              group.signal !== "composer" ||
+              (await safeBoolean(async () =>
+                await element.isEditable() &&
+                (await element.getAttribute("aria-readonly"))?.trim().toLowerCase() !== "true"))
+            )
           ) {
             return element;
           }

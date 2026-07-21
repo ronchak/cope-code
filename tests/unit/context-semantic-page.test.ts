@@ -163,7 +163,7 @@ test("launch reuses a pre-existing external Microsoft authentication page", asyn
   assert.equal(authentication.defaultNavigationTimeout, config.waits.actionMs);
 });
 
-test("tracked semantic page moves from Microsoft authentication to the returned Copilot tab", async () => {
+test("tracked semantic page moves to the returned Copilot tab after auth closes", async () => {
   const authentication = new FakePage(authUrl);
   const context = new FakeContext([authentication]);
   const config = browserConfig();
@@ -180,6 +180,8 @@ test("tracked semantic page moves from Microsoft authentication to the returned 
   const approved = new FakePage(`${entryUrl}/conversation/returned`);
   context.pageList.push(approved);
 
+  assert.equal(await tracked.currentUrl(), authUrl);
+  authentication.closed = true;
   assert.equal(await tracked.currentUrl(), approved.currentUrl);
   assert.equal(tracked.isManualAuthenticationRedirect(), false);
   assert.ok(approved.frontCount >= 1);

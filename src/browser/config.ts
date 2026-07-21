@@ -192,12 +192,15 @@ export function createBaselineCopilotUiContract(
     protection: group(
       "protection",
       [
-        { kind: "role", role: "status", name: pattern("enterprise data protection|commercial data protection|protected") },
-        { kind: "role", role: "img", name: pattern("enterprise data protection|commercial data protection|protected") },
-        { kind: "test-id", testId: pattern("protection|commercial-data-protection") },
         {
-          kind: "css",
-          selector: '[aria-label*="enterprise data protection" i], [aria-label*="commercial data protection" i], [title*="enterprise data protection" i], [title*="commercial data protection" i], [data-testid*="protection" i], [data-testid*="commercial-data-protection" i]',
+          kind: "role",
+          role: "status",
+          name: pattern("^(?:enterprise data protection|commercial data protection)$"),
+        },
+        {
+          kind: "role",
+          role: "img",
+          name: pattern("^(?:enterprise data protection|commercial data protection)$"),
         },
       ],
       "text",
