@@ -31,5 +31,265 @@
     "pollMs": 250,
     "stableSamples": 3,
     "minimumStableMs": 750
+  },
+  "ui_contract": {
+    "version": "copilot-ui/v1:uncertified-chrome149-template",
+    "certifiedSurface": "UNDEPLOYABLE TEMPLATE — replace with the exact certified tenant surface",
+    "submissionStrategy": "send-control",
+    "groups": {
+      "shell": {
+        "signal": "shell",
+        "candidates": [
+          {
+            "kind": "role",
+            "role": "main"
+          }
+        ],
+        "minimumCandidateMatches": 1,
+        "maximumElements": 20,
+        "capture": "presence"
+      },
+      "conversation": {
+        "signal": "conversation",
+        "candidates": [
+          {
+            "kind": "role",
+            "role": "main"
+          },
+          {
+            "kind": "test-id",
+            "testId": {
+              "source": "chat|conversation",
+              "flags": "iu"
+            }
+          }
+        ],
+        "minimumCandidateMatches": 1,
+        "maximumElements": 20,
+        "capture": "presence"
+      },
+      "composer": {
+        "signal": "composer",
+        "candidates": [
+          {
+            "kind": "role",
+            "role": "textbox",
+            "name": {
+              "source": "message|ask|copilot",
+              "flags": "iu"
+            }
+          },
+          {
+            "kind": "placeholder",
+            "placeholder": {
+              "source": "message|ask|copilot",
+              "flags": "iu"
+            }
+          }
+        ],
+        "minimumCandidateMatches": 1,
+        "maximumElements": 20,
+        "capture": "value-and-text"
+      },
+      "send": {
+        "signal": "send",
+        "candidates": [
+          {
+            "kind": "role",
+            "role": "button",
+            "name": {
+              "source": "send|submit",
+              "flags": "iu"
+            }
+          }
+        ],
+        "minimumCandidateMatches": 1,
+        "maximumElements": 20,
+        "capture": "presence"
+      },
+      "responses": {
+        "signal": "responses",
+        "candidates": [
+          {
+            "kind": "test-id",
+            "testId": {
+              "source": "assistant.*message|response",
+              "flags": "iu"
+            }
+          },
+          {
+            "kind": "css",
+            "selector": "[data-content=\"ai-message\"], [data-author=\"assistant\"]"
+          }
+        ],
+        "minimumCandidateMatches": 1,
+        "maximumElements": 200,
+        "capture": "text"
+      },
+      "user-messages": {
+        "signal": "user-messages",
+        "candidates": [
+          {
+            "kind": "test-id",
+            "testId": {
+              "source": "user.*message",
+              "flags": "iu"
+            }
+          },
+          {
+            "kind": "css",
+            "selector": "[data-content=\"user-message\"], [data-author=\"user\"]"
+          }
+        ],
+        "minimumCandidateMatches": 1,
+        "maximumElements": 200,
+        "capture": "text"
+      },
+      "streaming": {
+        "signal": "streaming",
+        "candidates": [
+          {
+            "kind": "role",
+            "role": "progressbar"
+          },
+          {
+            "kind": "css",
+            "selector": "[aria-busy=\"true\"]"
+          }
+        ],
+        "minimumCandidateMatches": 1,
+        "maximumElements": 20,
+        "capture": "presence"
+      },
+      "identity": {
+        "signal": "identity",
+        "candidates": [
+          {
+            "kind": "role",
+            "role": "button",
+            "name": "REPLACE_WITH_APPROVED_WORK_ACCOUNT_DISPLAY_STRING",
+            "exact": true
+          },
+          {
+            "kind": "text",
+            "text": "REPLACE_WITH_APPROVED_WORK_ACCOUNT_DISPLAY_STRING",
+            "exact": true
+          }
+        ],
+        "minimumCandidateMatches": 1,
+        "maximumElements": 20,
+        "capture": "text"
+      },
+      "protection": {
+        "signal": "protection",
+        "candidates": [
+          {
+            "kind": "text",
+            "text": {
+              "source": "enterprise data protection|protected",
+              "flags": "iu"
+            }
+          },
+          {
+            "kind": "test-id",
+            "testId": {
+              "source": "protection|commercial-data-protection",
+              "flags": "iu"
+            }
+          }
+        ],
+        "minimumCandidateMatches": 1,
+        "maximumElements": 20,
+        "capture": "text"
+      },
+      "signed-out": {
+        "signal": "signed-out",
+        "candidates": [
+          {
+            "kind": "role",
+            "role": "button",
+            "name": {
+              "source": "sign in|log in",
+              "flags": "iu"
+            }
+          }
+        ],
+        "minimumCandidateMatches": 1,
+        "maximumElements": 20,
+        "capture": "presence"
+      },
+      "mfa": {
+        "signal": "mfa",
+        "candidates": [
+          {
+            "kind": "text",
+            "text": {
+              "source": "approve sign.in|verification code|multi.factor",
+              "flags": "iu"
+            }
+          }
+        ],
+        "minimumCandidateMatches": 1,
+        "maximumElements": 20,
+        "capture": "presence"
+      },
+      "consent": {
+        "signal": "consent",
+        "candidates": [
+          {
+            "kind": "text",
+            "text": {
+              "source": "permissions requested|consent|accept",
+              "flags": "iu"
+            }
+          }
+        ],
+        "minimumCandidateMatches": 1,
+        "maximumElements": 20,
+        "capture": "presence"
+      },
+      "throttled": {
+        "signal": "throttled",
+        "candidates": [
+          {
+            "kind": "text",
+            "text": {
+              "source": "too many requests|try again later|rate limit",
+              "flags": "iu"
+            }
+          }
+        ],
+        "minimumCandidateMatches": 1,
+        "maximumElements": 20,
+        "capture": "presence"
+      },
+      "service-error": {
+        "signal": "service-error",
+        "candidates": [
+          {
+            "kind": "text",
+            "text": {
+              "source": "something went wrong|service unavailable|couldn't respond",
+              "flags": "iu"
+            }
+          }
+        ],
+        "minimumCandidateMatches": 1,
+        "maximumElements": 20,
+        "capture": "presence"
+      },
+      "modal": {
+        "signal": "modal",
+        "candidates": [
+          {
+            "kind": "role",
+            "role": "dialog"
+          }
+        ],
+        "minimumCandidateMatches": 1,
+        "maximumElements": 20,
+        "capture": "presence"
+      }
+    }
   }
 }

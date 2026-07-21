@@ -20,6 +20,7 @@ import {
 import { verifyDedicatedProfileRoot, verifyPrivateStateHome } from "../platform/private-storage.js";
 import {
   browserProductPresentation,
+  otherDedicatedBrowserProfileRoots,
   resolveSafeBrowserProfileDirectory,
   verifyDedicatedProfileMarker,
   verifyManualBrowserExecutable,
@@ -136,7 +137,9 @@ export async function executeDoctorCommand(
         parsed.config.browserVersion !== undefined && parsed.config.browserVersion !== verified.version ||
         parsed.config.browserExecutableSha256 !== undefined &&
           parsed.config.browserExecutableSha256 !== verified.executableSha256
-      ) throw new Error("Configured browser version or executable digest changed after setup");
+      ) {
+        throw new Error("Configured browser version or executable digest changed after setup; run cope setup to verify the update");
+      }
       const presentation = browserProductPresentation(parsed.config.product);
       const support = parsed.config.product === "chrome"
         ? "Chrome preview candidate / offline evidence only"
@@ -162,6 +165,11 @@ export async function executeDoctorCommand(
           stateHome: paths.stateHome,
           ordinaryProfileRoots: (["edge", "chrome"] as const).flatMap((product) =>
             host.ordinaryBrowserProfileRoots(product, process.env)),
+          dedicatedProfileRoots: otherDedicatedBrowserProfileRoots(
+            host,
+            paths.stateHome,
+            parsed.config.product,
+          ),
         });
         await lstat(profileDirectory);
         await verifyDedicatedProfileRoot(profileDirectory, host);

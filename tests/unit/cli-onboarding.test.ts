@@ -356,6 +356,108 @@ test("existing browser setup remains selected and is not silently rewritten", as
   ]);
 });
 
+test("guided setup verifies and persists a stable browser update before live use resumes", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-machine-browser-update-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const stateHome = path.join(root, "state");
+  await mkdir(stateHome);
+  const host = createStandardUserHost();
+  const paths = configurationPaths(stateHome, host);
+  let observed = discoveredBrowser("edge");
+  const launched: BrowserLaunchConfig[] = [];
+  const dependencies = {
+    discoverBrowsers: async () => [observed],
+    verifyManualBrowser: async () => ({ ...observed, source: "manual" as const }),
+    promptBrowser: async (screen: Parameters<NonNullable<import("../../src/cli/onboarding.js").MachineSetupDependencies["promptBrowser"]>>[0]) => {
+      assert.equal(screen.kind, "current");
+      assert.equal(screen.kind === "current" ? screen.browser.version : undefined, "150.0.2.3");
+      return { action: "continue", browser: observed } as const;
+    },
+    launchBrowser: async (config: BrowserLaunchConfig) => {
+      launched.push(config);
+      return readyTransport(launched);
+    },
+  };
+
+  await configureMachine({
+    paths,
+    force: false,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+    browser: "edge",
+    identity: "person@example.com",
+  }, dependencies);
+  const original = JSON.parse(await readFile(paths.browser, "utf8")) as Record<string, unknown>;
+
+  observed = {
+    ...observed,
+    version: "150.0.2.3",
+    executableSha256: "b".repeat(64),
+  };
+  await configureMachine({
+    paths,
+    force: false,
+    interactive: true,
+    output: { write: () => undefined },
+    host,
+  }, dependencies);
+
+  const updated = JSON.parse(await readFile(paths.browser, "utf8")) as Record<string, unknown>;
+  assert.equal(updated.browser_version, "150.0.2.3");
+  assert.equal(updated.browser_executable_sha256, "b".repeat(64));
+  assert.equal(updated.profile_directory, original.profile_directory);
+  assert.equal(launched.at(-1)?.browserVersion, "150.0.2.3");
+  assert.equal(launched.at(-1)?.browserExecutableSha256, "b".repeat(64));
+});
+
+test("same-product setup preserves a verified manual executable without discovery", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-machine-manual-browser-rerun-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const stateHome = path.join(root, "state");
+  await mkdir(stateHome);
+  const host = createStandardUserHost();
+  const paths = configurationPaths(stateHome, host);
+  const manualExecutable = "/managed/Google Chrome";
+  const launched: BrowserLaunchConfig[] = [];
+  const verifyManualBrowser = async (product: BrowserProduct, executablePath: string) => ({
+    ...discoveredBrowser(product, executablePath),
+    source: "manual" as const,
+  });
+  const launchBrowser = async (config: BrowserLaunchConfig) => {
+    launched.push(config);
+    return readyTransport(launched);
+  };
+
+  await configureMachine({
+    paths,
+    force: false,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+    browser: "chrome",
+    browserExecutable: manualExecutable,
+    identity: "person@example.com",
+  }, { verifyManualBrowser, launchBrowser });
+  const before = await readFile(paths.browser);
+
+  await configureMachine({
+    paths,
+    force: false,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+    browser: "chrome",
+  }, {
+    discoverBrowsers: async () => { throw new Error("same-product setup must not rediscover"); },
+    verifyManualBrowser,
+    launchBrowser,
+  });
+
+  assert.deepEqual(await readFile(paths.browser), before);
+  assert.equal(launched.at(-1)?.browserExecutable, manualExecutable);
+});
+
 test("existing Chrome and strict legacy Edge remain selected without silent migration", async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), "cope-machine-existing-products-"));
   context.after(async () => rm(root, { recursive: true, force: true }));

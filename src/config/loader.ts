@@ -5,6 +5,7 @@ import {
   DEFAULT_BROWSER_WAITS,
   createBaselineCopilotUiContract,
   isBrowserProduct,
+  otherDedicatedBrowserProfileRoots,
   resolveSafeBrowserProfileDirectory,
   validateBrowserLaunchConfig,
   verifyBrowserExecutable,
@@ -57,6 +58,7 @@ export async function loadRuntimeConfiguration(
 
   let browser: (BrowserLaunchConfig & { readonly browserExecutable: string }) | undefined;
   let browserHash: string | undefined;
+  let browserIdentityHash: string | undefined;
   if (options.requireBrowser) {
     const browserRaw = await readJson(browserFile, "browser configuration");
     const parsed = parseBrowserConfig(browserRaw);
@@ -98,9 +100,20 @@ export async function loadRuntimeConfiguration(
         repositoryRoot: options.repositoryRoot,
         stateHome: options.stateHome,
         ordinaryProfileRoots,
+        dedicatedProfileRoots: otherDedicatedBrowserProfileRoots(
+          host,
+          options.stateHome,
+          parsed.config.product,
+        ),
       }),
     };
     browserHash = sha256(stableJson(browserRaw));
+    browserIdentityHash = sha256(stableJson({
+      product: verified.product,
+      executable_path: verified.executablePath,
+      version: verified.version,
+      executable_sha256: verified.executableSha256,
+    }));
   }
 
   return {
@@ -111,6 +124,7 @@ export async function loadRuntimeConfiguration(
       organization: sha256(stableJson(organizationRaw)),
       repository: sha256(stableJson(repositoryRaw)),
       ...(browserHash === undefined ? {} : { browser: browserHash }),
+      ...(browserIdentityHash === undefined ? {} : { browserIdentity: browserIdentityHash }),
     },
     files: {
       organization: await canonicalOrResolved(organizationFile),

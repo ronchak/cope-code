@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -34,6 +34,21 @@ test("profile configuration rejects UNC, device, and shared path forms", () => {
       /UNC, device, and shared paths are not allowed/u,
       candidate,
     );
+  }
+});
+
+test("shipped browser templates make their product-specific uncertified UI contracts explicit", async () => {
+  for (const [filename, product] of [
+    ["config/examples/browser.edge149.uncertified-template.json", "edge"],
+    ["config/examples/browser.chrome149.preview-template.json", "chrome"],
+  ] as const) {
+    const template = JSON.parse(await readFile(filename, "utf8")) as {
+      product?: string;
+      ui_contract?: { version?: string; certifiedSurface?: string };
+    };
+    assert.equal(template.product, product);
+    assert.match(template.ui_contract?.version ?? "", new RegExp(`uncertified-${product}149-template`, "u"));
+    assert.match(template.ui_contract?.certifiedSurface ?? "", /UNDEPLOYABLE TEMPLATE/u);
   }
 });
 
@@ -130,6 +145,42 @@ test("profile resolver refuses the ordinary Google Chrome profile tree", async (
   );
 });
 
+test("profile resolver refuses overlap with the other product's dedicated profile", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "copilot-browser-sibling-profile-test-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const stateHome = join(root, "state");
+  const profilesRoot = join(root, "profiles");
+  const siblingProfile = join(profilesRoot, "CopilotBrowserAgentEdgeProfile");
+  await mkdir(stateHome);
+
+  for (const candidate of [
+    siblingProfile,
+    join(siblingProfile, "nested-chrome-profile"),
+    profilesRoot,
+  ]) {
+    await assert.rejects(
+      resolveSafeEdgeProfileDirectory(candidate, {
+        stateHome,
+        dedicatedProfileRoots: [siblingProfile],
+      }),
+      (error: unknown) =>
+        error instanceof AgentError &&
+        error.details.diagnosticCode === "EDGE_PROFILE_PATH_OVERLAP" &&
+        error.details.boundary === "dedicated-browser-profile",
+      candidate,
+    );
+  }
+
+  const selectedProductProfile = join(profilesRoot, "CopilotBrowserAgentChromeProfile");
+  assert.equal(
+    await resolveSafeEdgeProfileDirectory(selectedProductProfile, {
+      stateHome,
+      dedicatedProfileRoots: [siblingProfile],
+    }),
+    join(await realpath(root), "profiles", "CopilotBrowserAgentChromeProfile"),
+  );
+});
+
 test("profile resolver follows parent links before containment and returns a canonical prospective path", async (context) => {
   const root = await mkdtemp(join(tmpdir(), "copilot-browser-profile-link-test-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
@@ -172,7 +223,7 @@ test("profile resolver follows parent links before containment and returns a can
   assert.equal(accepted, join(await realpath(safeTarget), "future-profile"));
 });
 
-test("live configuration hands the canonical prospective profile path to the browser launcher", async (context) => {
+test("live configuration canonicalizes the profile and exposes a separate verified browser identity hash", async (context) => {
   const root = await mkdtemp(join(tmpdir(), "copilot-browser-profile-config-test-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
   const repositoryRoot = join(root, "repository");
@@ -220,30 +271,43 @@ test("live configuration hands the canonical prospective profile path to the bro
     edge_executable: process.execPath,
   }));
 
+  const browserIdentityVerifier = async (product: "edge" | "chrome", executablePath: string) => ({
+    product,
+    executablePath,
+    version: "149.0.1.2",
+    executableSha256: "a".repeat(64),
+    size: 1,
+    modifiedMs: 1,
+    evidence: {
+      platform: process.platform === "win32" ? "win32" as const : "darwin" as const,
+      productName: "Microsoft Edge Stable",
+      publisher: "fixture",
+      identifier: "fixture",
+      signatureStatus: "valid" as const,
+    },
+  });
   const loaded = await loadRuntimeConfiguration({
     repositoryRoot,
     stateHome,
     requireBrowser: true,
-    browserIdentityVerifier: async (product, executablePath) => ({
-      product,
-      executablePath,
-      version: "149.0.1.2",
-      executableSha256: "a".repeat(64),
-      size: 1,
-      modifiedMs: 1,
-      evidence: {
-        platform: process.platform === "win32" ? "win32" : "darwin",
-        productName: "Microsoft Edge Stable",
-        publisher: "fixture",
-        identifier: "fixture",
-        signatureStatus: "valid",
-      },
-    }),
+    browserIdentityVerifier,
   });
   assert.equal(
     loaded.browser?.profileDirectory,
     join(await realpath(safeTarget), "future-profile"),
   );
+  const afterUpdate = await loadRuntimeConfiguration({
+    repositoryRoot,
+    stateHome,
+    requireBrowser: true,
+    browserIdentityVerifier: async (product, executablePath) => ({
+      ...await browserIdentityVerifier(product, executablePath),
+      version: "150.0.2.3",
+      executableSha256: "b".repeat(64),
+    }),
+  });
+  assert.equal(afterUpdate.hashes.browser, loaded.hashes.browser);
+  assert.notEqual(afterUpdate.hashes.browserIdentity, loaded.hashes.browserIdentity);
 });
 
 test("live configuration binds launch to the canonical verified executable and rejects verifier mismatch", async (context) => {

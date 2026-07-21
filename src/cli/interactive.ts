@@ -180,12 +180,7 @@ export async function executeInteractiveCommand(
         workspace = await syncWorkspaceCopy(workspace, { interactive: true, output: io.stdout });
         break;
       case "/setup":
-        await executeSetupCommand({
-          command: "setup",
-          force: true,
-          json: false,
-          ...(command.stateHome === undefined ? {} : { stateHome: command.stateHome }),
-        }, io, host);
+        await executeSetupCommand(interactiveSetupCommand(command.stateHome), io, host);
         transportLabel = await configuredBrowserLabel(paths.browser);
         break;
       case "/config":
@@ -201,6 +196,17 @@ export async function executeInteractiveCommand(
         break;
     }
   }
+}
+
+export function interactiveSetupCommand(
+  stateHome?: string,
+): Extract<CliCommand, { readonly command: "setup" }> {
+  return {
+    command: "setup",
+    force: false,
+    json: false,
+    ...(stateHome === undefined ? {} : { stateHome }),
+  };
 }
 
 async function runObjective(

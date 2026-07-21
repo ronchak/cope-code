@@ -68,6 +68,7 @@ import {
 } from "./runtime-composition.js";
 import {
   SESSION_RUNTIME_MANIFEST_VERSION,
+  assertBrowserRuntimeManifestMatches,
   readRuntimeManifest,
   readSessionGrant,
   sourceFileIdentity,
@@ -971,6 +972,9 @@ function createRuntimeManifest(
     ...(configuration.hashes.browser === undefined
       ? {}
       : { browser_config_sha256: configuration.hashes.browser }),
+    ...(configuration.hashes.browserIdentity === undefined
+      ? {}
+      : { browser_identity_sha256: configuration.hashes.browserIdentity }),
     created_at: createdAt,
   };
 }
@@ -986,9 +990,7 @@ function assertConfigurationUnchanged(
   ) {
     throw new AgentError("RECOVERY_REQUIRED", "Policy configuration changed; start a new session with a new grant");
   }
-  if (manifest.browser_config_sha256 !== configuration.hashes.browser) {
-    throw new AgentError("RECOVERY_REQUIRED", "Browser configuration changed during the session");
-  }
+  assertBrowserRuntimeManifestMatches(manifest, configuration.hashes);
 }
 
 function assertGrantMatchesState(grant: SessionGrant, state: SessionState): void {

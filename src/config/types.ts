@@ -70,6 +70,7 @@ export interface LoadedRuntimeConfiguration {
     readonly organization: string;
     readonly repository: string;
     readonly browser?: string;
+    readonly browserIdentity?: string;
   };
   readonly files: {
     readonly organization: string;

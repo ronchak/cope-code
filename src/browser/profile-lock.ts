@@ -8,7 +8,7 @@ import { validateBrowserProfileDirectoryPath } from "./config.js";
 import { detectFilesystemIdentity, type FilesystemIdentity } from "../shared/filesystem-identity.js";
 import { CURRENT_HOST_PLATFORM, type HostPlatform } from "../platform/index.js";
 import { prepareDedicatedProfileRoot } from "../platform/private-storage.js";
-import type { BrowserProduct } from "./product.js";
+import { BROWSER_PRODUCTS, type BrowserProduct } from "./product.js";
 
 const LOCK_FILE = ".copilot-agent-profile.lock";
 const PROFILE_MARKER = ".copilot-agent-profile-v1.json";
@@ -26,6 +26,7 @@ export interface BrowserProfilePathBoundaries {
   readonly repositoryRoot?: string;
   readonly stateHome: string;
   readonly ordinaryProfileRoots?: readonly string[];
+  readonly dedicatedProfileRoots?: readonly string[];
 }
 
 /** @deprecated Compatibility alias for existing imports. */
@@ -83,6 +84,17 @@ export async function resolveSafeBrowserProfileDirectory(
         );
       }
     }
+    for (const dedicatedRoot of boundaries.dedicatedProfileRoots ?? []) {
+      const protectedProfile = await canonicalizeProspectiveDirectory(dedicatedRoot);
+      const protectedIdentity = await identityDetector(protectedProfile.existingAncestor);
+      if (pathsOverlap(profile.path, profileIdentity, protectedProfile.path, protectedIdentity)) {
+        throw new AgentError(
+          "CONFIG_INVALID",
+          "Dedicated browser profile directory must not overlap another Cope browser profile",
+          { diagnosticCode: "EDGE_PROFILE_PATH_OVERLAP", boundary: "dedicated-browser-profile" },
+        );
+      }
+    }
     return profile.path;
   } catch (error) {
     if (error instanceof AgentError) throw error;
@@ -93,6 +105,16 @@ export async function resolveSafeBrowserProfileDirectory(
       { cause: error },
     );
   }
+}
+
+export function otherDedicatedBrowserProfileRoots(
+  host: HostPlatform,
+  stateHome: string,
+  product: BrowserProduct,
+): readonly string[] {
+  return BROWSER_PRODUCTS
+    .filter((candidate) => candidate !== product)
+    .map((candidate) => host.profileHome(stateHome, candidate));
 }
 
 /** @deprecated Compatibility alias for existing imports. */

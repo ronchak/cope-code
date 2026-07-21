@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   SESSION_RUNTIME_MANIFEST_VERSION,
+  assertBrowserRuntimeManifestMatches,
   writeRuntimeManifest,
 } from "../../src/cli/session-files.js";
 import {
@@ -149,6 +150,38 @@ test("session pinning rejects a browser hash race before writing its runtime man
   }), (error: unknown) => error instanceof AgentError &&
     error.details.diagnosticCode === "BROWSER_CONFIG_START_RACE");
   assert.equal(manifestWritten, false);
+});
+
+test("legacy runtime manifests remain compatible while new manifests pin verified browser identity", () => {
+  const browserConfigHash = "a".repeat(64);
+  const originalIdentityHash = "b".repeat(64);
+  const updatedIdentityHash = "c".repeat(64);
+  const legacyManifest = {
+    schema_version: SESSION_RUNTIME_MANIFEST_VERSION,
+    transport: "edge" as const,
+    browser_config_sha256: browserConfigHash,
+    created_at: "2026-07-20T12:00:00.000Z",
+  };
+  assert.doesNotThrow(() => assertBrowserRuntimeManifestMatches(legacyManifest, {
+    browser: browserConfigHash,
+    browserIdentity: originalIdentityHash,
+  }));
+
+  const pinnedManifest = {
+    ...legacyManifest,
+    browser_identity_sha256: originalIdentityHash,
+  };
+  assert.doesNotThrow(() => assertBrowserRuntimeManifestMatches(pinnedManifest, {
+    browser: browserConfigHash,
+    browserIdentity: originalIdentityHash,
+  }));
+  assert.throws(
+    () => assertBrowserRuntimeManifestMatches(pinnedManifest, {
+      browser: browserConfigHash,
+      browserIdentity: updatedIdentityHash,
+    }),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
 });
 
 test("browser setup blocks on unreadable resumable session state and leaves configuration untouched", async (context) => {

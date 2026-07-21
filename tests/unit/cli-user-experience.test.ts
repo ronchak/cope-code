@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { executeCommand } from "../../src/cli/commands.js";
-import { configuredBrowserLabel } from "../../src/cli/interactive.js";
+import { configuredBrowserLabel, interactiveSetupCommand } from "../../src/cli/interactive.js";
 import { chatFooter, renderUserMessage, startupPanel } from "../../src/cli/presentation.js";
 import { chatPromptStartRow, inputViewport } from "../../src/cli/prompts.js";
 import {
@@ -41,6 +41,15 @@ test("interactive transport label follows the configured Chrome product", async 
     browser_executable_sha256: "a".repeat(64),
   }), "utf8");
   assert.equal(await configuredBrowserLabel(browserFile), "visible Chrome");
+});
+
+test("the in-session setup command preserves valid configuration by default", () => {
+  assert.deepEqual(interactiveSetupCommand("/managed/state"), {
+    command: "setup",
+    force: false,
+    json: false,
+    stateHome: "/managed/state",
+  });
 });
 
 test("package and installer expose a durable global cope command", async () => {

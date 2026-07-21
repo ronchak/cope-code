@@ -15,6 +15,7 @@ import {
   browserProductPresentation,
   discoverInstalledBrowsers,
   launchBrowserCopilotTransport,
+  otherDedicatedBrowserProfileRoots,
   resolveSafeBrowserProfileDirectory,
   verifyManualBrowserExecutable,
   type BrowserIdentityVerifier,
@@ -75,6 +76,7 @@ interface ExistingBrowserSetup {
   readonly file: BrowserFileConfig | LegacyEdgeBrowserFileConfig;
   readonly config: BrowserLaunchConfig;
   readonly browser: DiscoveredBrowser;
+  readonly evidenceChanged: boolean;
 }
 
 interface MachineSetupSummary {
@@ -293,6 +295,7 @@ export async function configureMachine(options: {
   // idempotent check. Interactive setup always shows the current selection.
   if (
     !options.interactive && current !== undefined && organizationPolicyToCreate === undefined &&
+    !current.evidenceChanged &&
     !options.force && options.browser === undefined && options.browserExecutable === undefined &&
     options.identity === undefined && options.entryUrl === undefined &&
     options.requireProtectionIndicator === undefined
@@ -342,6 +345,11 @@ export async function configureMachine(options: {
       stateHome: options.paths.stateHome,
       ordinaryProfileRoots: (["edge", "chrome"] as const).flatMap((product) =>
         options.host.ordinaryBrowserProfileRoots(product, process.env)),
+      dedicatedProfileRoots: otherDedicatedBrowserProfileRoots(
+        options.host,
+        options.paths.stateHome,
+        selected.product,
+      ),
     },
   );
   const currentFile = current?.file;
@@ -378,7 +386,7 @@ export async function configureMachine(options: {
     ...(currentFile?.waits === undefined ? {} : { waits: currentFile.waits }),
     ...(currentFile?.ui_contract === undefined ? {} : { ui_contract: currentFile.ui_contract }),
   };
-  const shouldWriteBrowser = current === undefined || options.force || materialBrowserChange ||
+  const shouldWriteBrowser = current === undefined || current.evidenceChanged || options.force || materialBrowserChange ||
     options.identity !== undefined || options.entryUrl !== undefined ||
     options.requireProtectionIndicator !== undefined;
   // When nothing is being persisted, validate exactly what will remain on
@@ -523,20 +531,19 @@ async function readExistingBrowserSetup(
       host: options.host,
       ...(identityVerifier === undefined ? {} : { identityVerifier }),
     });
-    if (
+    const evidenceChanged =
       parsed.config.browserVersion !== undefined && parsed.config.browserVersion !== browser.version ||
       parsed.config.browserExecutableSha256 !== undefined &&
-        parsed.config.browserExecutableSha256 !== browser.executableSha256
-    ) {
-      throw new AgentError("CONFIG_INVALID", "The configured browser identity no longer matches setup evidence", {
-        diagnosticCode: "BROWSER_EXECUTABLE_EVIDENCE_CHANGED",
-        next: "Restore the configured stable browser, or deliberately remove browser.json and rerun cope setup. The dedicated browser profile is separate and is not removed.",
-      });
-    }
+        parsed.config.browserExecutableSha256 !== browser.executableSha256;
     const profileDirectory = await resolveSafeBrowserProfileDirectory(parsed.config.profileDirectory, {
       stateHome: options.paths.stateHome,
       ordinaryProfileRoots: (["edge", "chrome"] as const).flatMap((product) =>
         options.host.ordinaryBrowserProfileRoots(product, process.env)),
+      dedicatedProfileRoots: otherDedicatedBrowserProfileRoots(
+        options.host,
+        options.paths.stateHome,
+        parsed.config.product,
+      ),
     });
     return {
       file: parsed.file,
@@ -548,12 +555,12 @@ async function readExistingBrowserSetup(
         browserExecutableSha256: browser.executableSha256,
       },
       browser,
+      evidenceChanged,
     };
   } catch (error) {
     if (
       error instanceof AgentError &&
-      (error.details.diagnosticCode === "BROWSER_EXECUTABLE_EVIDENCE_CHANGED" ||
-        error.details.next !== undefined)
+      error.details.next !== undefined
     ) throw error;
     throw new AgentError("CONFIG_INVALID", "The existing browser configuration is invalid or mismatched and was not replaced", {
       filename: options.paths.browser,
@@ -583,6 +590,9 @@ async function selectBrowserForSetup(input: {
   };
   if (input.options.browserExecutable !== undefined) {
     return input.verifyManual(input.options.browser!, input.options.browserExecutable, verificationOptions);
+  }
+  if (input.options.browser !== undefined) {
+    if (input.current?.browser.product === input.options.browser) return input.current.browser;
   }
   let discovered = await input.discover(verificationOptions);
   if (input.options.browser !== undefined) {
