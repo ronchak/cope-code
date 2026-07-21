@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -120,7 +120,7 @@ test("guided machine setup preselects the only detected browser and commits only
   const root = await mkdtemp(path.join(tmpdir(), "cope-machine-one-browser-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
   const stateHome = path.join(root, "state");
-  await mkdir(stateHome);
+  await mkdir(stateHome, { mode: 0o700 });
   const host = createStandardUserHost();
   const paths = configurationPaths(stateHome, host);
   const chrome = discoveredBrowser("chrome");
@@ -168,7 +168,7 @@ test("two-browser setup defaults to Edge and explicit automation can choose Chro
   const edge = discoveredBrowser("edge");
   const chrome = discoveredBrowser("chrome");
   const interactiveHome = path.join(root, "interactive");
-  await mkdir(interactiveHome);
+  await mkdir(interactiveHome, { mode: 0o700 });
   let selectedIndex = -1;
   await configureMachine({
     paths: configurationPaths(interactiveHome, host),
@@ -194,7 +194,7 @@ test("two-browser setup defaults to Edge and explicit automation can choose Chro
   assert.equal(selectedIndex, 0);
 
   const managedHome = path.join(root, "managed");
-  await mkdir(managedHome);
+  await mkdir(managedHome, { mode: 0o700 });
   let promptCalled = false;
   const result = await configureMachine({
     paths: configurationPaths(managedHome, host),
@@ -222,7 +222,7 @@ test("Retry redetects browsers and changing Edge to Chrome requires confirmation
   const chrome = discoveredBrowser("chrome");
 
   const retryHome = path.join(root, "retry");
-  await mkdir(retryHome);
+  await mkdir(retryHome, { mode: 0o700 });
   let discoveryCount = 0;
   const retryScreens: string[] = [];
   const retryResult = await configureMachine({
@@ -249,7 +249,7 @@ test("Retry redetects browsers and changing Edge to Chrome requires confirmation
   assert.deepEqual(retryScreens, ["none", "single"]);
 
   const changeHome = path.join(root, "change");
-  await mkdir(changeHome);
+  await mkdir(changeHome, { mode: 0o700 });
   const changePaths = configurationPaths(changeHome, host);
   const common = {
     verifyManualBrowser: async (product: BrowserProduct, executablePath: string) => ({
@@ -298,7 +298,7 @@ test("existing browser setup remains selected and is not silently rewritten", as
   const root = await mkdtemp(path.join(tmpdir(), "cope-machine-existing-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
   const stateHome = path.join(root, "state");
-  await mkdir(stateHome);
+  await mkdir(stateHome, { mode: 0o700 });
   const host = createStandardUserHost();
   const paths = configurationPaths(stateHome, host);
   const edge = discoveredBrowser("edge");
@@ -414,11 +414,93 @@ test("noninteractive idempotent setup does not require a live GUI session", asyn
   assert.deepEqual(eligibilityChecks, [false]);
 });
 
+test("first-time setup refuses a missing live GUI before creating state", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-machine-first-setup-headless-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const stateHome = path.join(root, "state");
+  const host = createStandardUserHost();
+  const eligibilityChecks: boolean[] = [];
+  const headlessHost = new Proxy(host, {
+    get(target, property) {
+      if (property === "verifyEligibility") {
+        return async (options: { readonly liveBrowser: boolean }) => {
+          eligibilityChecks.push(options.liveBrowser);
+          if (options.liveBrowser) throw new Error("Aqua GUI session unavailable");
+          return { standardUserVerified: true, guiSessionVerified: false };
+        };
+      }
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const output = { write: () => undefined };
+
+  await assert.rejects(executeSetupCommand({
+    command: "setup",
+    force: false,
+    json: true,
+    stateHome,
+    browser: "edge",
+    identity: "person@example.com",
+  }, { stdout: output, stderr: output }, headlessHost), /Aqua GUI session unavailable/u);
+
+  assert.deepEqual(eligibilityChecks, [false, true]);
+  await assert.rejects(lstat(stateHome), { code: "ENOENT" });
+});
+
+test("idempotent setup re-verifies private state after reading browser evidence", async (context) => {
+  if (process.platform !== "darwin") {
+    context.skip("Private state mode enforcement is macOS-specific");
+    return;
+  }
+  const root = await mkdtemp(path.join(tmpdir(), "cope-machine-idempotent-state-race-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const stateHome = path.join(root, "state");
+  const host = createStandardUserHost();
+  const edge = discoveredBrowser("edge");
+  const output = { write: () => undefined };
+  const dependencies = {
+    discoverBrowsers: async () => [edge],
+    verifyManualBrowser: async (product: BrowserProduct, executablePath: string) => ({
+      ...discoveredBrowser(product, executablePath),
+      source: "manual" as const,
+    }),
+    launchBrowser: async () => readyTransport([]),
+  };
+
+  await executeSetupCommand({
+    command: "setup",
+    force: false,
+    json: true,
+    stateHome,
+    browser: "edge",
+    identity: "person@example.com",
+  }, { stdout: output, stderr: output }, host, dependencies);
+
+  await assert.rejects(executeSetupCommand({
+    command: "setup",
+    force: false,
+    json: true,
+    stateHome,
+  }, { stdout: output, stderr: output }, host, {
+    ...dependencies,
+    verifyManualBrowser: async (product, executablePath) => {
+      await chmod(stateHome, 0o755);
+      return {
+        ...discoveredBrowser(product, executablePath),
+        source: "manual" as const,
+      };
+    },
+    launchBrowser: async () => { throw new Error("unsafe idempotent setup must not launch"); },
+  }), (error: unknown) =>
+    error instanceof AgentError && error.details.diagnosticCode === "DARWIN_PRIVATE_STATE_UNSAFE");
+});
+
 test("interactive setup prompts with the current identity and persists a correction", async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), "cope-machine-identity-correction-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
   const stateHome = path.join(root, "state");
-  await mkdir(stateHome);
+  await mkdir(stateHome, { mode: 0o700 });
   const host = createStandardUserHost();
   const paths = configurationPaths(stateHome, host);
   const edge = discoveredBrowser("edge");
@@ -475,7 +557,7 @@ test("guided setup verifies and persists a stable browser update before live use
   const root = await mkdtemp(path.join(tmpdir(), "cope-machine-browser-update-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
   const stateHome = path.join(root, "state");
-  await mkdir(stateHome);
+  await mkdir(stateHome, { mode: 0o700 });
   const host = createStandardUserHost();
   const paths = configurationPaths(stateHome, host);
   let observed = discoveredBrowser("edge");
@@ -531,7 +613,7 @@ test("same-product setup preserves a verified manual executable without discover
   const root = await mkdtemp(path.join(tmpdir(), "cope-machine-manual-browser-rerun-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
   const stateHome = path.join(root, "state");
-  await mkdir(stateHome);
+  await mkdir(stateHome, { mode: 0o700 });
   const host = createStandardUserHost();
   const paths = configurationPaths(stateHome, host);
   const manualExecutable = "/managed/Google Chrome";
@@ -580,7 +662,7 @@ test("existing Chrome and strict legacy Edge remain selected without silent migr
   const host = createStandardUserHost();
   for (const product of ["chrome", "edge"] as const) {
     const stateHome = path.join(root, product);
-    await mkdir(stateHome);
+    await mkdir(stateHome, { mode: 0o700 });
     const paths = configurationPaths(stateHome, host);
     const selected = discoveredBrowser(product);
     const common = {
@@ -642,7 +724,7 @@ test("no-browser setup offers manual installation selection and never saves befo
   const root = await mkdtemp(path.join(tmpdir(), "cope-machine-manual-browser-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
   const stateHome = path.join(root, "state");
-  await mkdir(stateHome);
+  await mkdir(stateHome, { mode: 0o700 });
   const host = createStandardUserHost();
   const paths = configurationPaths(stateHome, host);
   const screens: string[] = [];
@@ -685,7 +767,7 @@ test("corrupt policy and mismatched existing browser configuration fail with rec
   context.after(async () => rm(root, { recursive: true, force: true }));
   const host = createStandardUserHost();
   const policyHome = path.join(root, "policy");
-  await mkdir(path.join(policyHome, "config"), { recursive: true });
+  await mkdir(path.join(policyHome, "config"), { recursive: true, mode: 0o700 });
   const policyPaths = configurationPaths(policyHome, host);
   await writeFile(policyPaths.organizationPolicy, "{not-json\n", "utf8");
   await assert.rejects(configureMachine({
@@ -700,7 +782,7 @@ test("corrupt policy and mismatched existing browser configuration fail with rec
     typeof error.details.next === "string" && /policy/iu.test(error.details.next));
 
   const browserHome = path.join(root, "browser");
-  await mkdir(browserHome);
+  await mkdir(browserHome, { mode: 0o700 });
   const browserPaths = configurationPaths(browserHome, host);
   const edge = discoveredBrowser("edge");
   await configureMachine({
@@ -738,7 +820,7 @@ test("Ctrl+C during manual browser readiness cancels cleanly before persistence"
   const root = await mkdtemp(path.join(tmpdir(), "cope-machine-readiness-cancel-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
   const stateHome = path.join(root, "state");
-  await mkdir(stateHome);
+  await mkdir(stateHome, { mode: 0o700 });
   const host = createStandardUserHost();
   const paths = configurationPaths(stateHome, host);
   const chrome = discoveredBrowser("chrome");

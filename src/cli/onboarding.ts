@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { access, mkdir, open, readFile, rename } from "node:fs/promises";
+import { access, lstat, mkdir, open, readFile, rename } from "node:fs/promises";
 import path from "node:path";
 
 import { parseBrowserConfig, parseRepositoryConfig } from "../config/loader.js";
@@ -33,7 +33,7 @@ import {
 import { resolveStateHome } from "../session/paths.js";
 import { AgentError, errorMessage } from "../shared/errors.js";
 import { CURRENT_HOST_PLATFORM, type HostPlatform } from "../platform/index.js";
-import { preparePrivateStateHome } from "../platform/private-storage.js";
+import { preparePrivateStateHome, verifyPrivateStateHome } from "../platform/private-storage.js";
 import type { CommandDefinition } from "../tools/index.js";
 import type { CliCommand } from "./arguments.js";
 import { runHostEligibilityPreflight } from "../preflight/machine.js";
@@ -107,7 +107,7 @@ export async function executeSetupCommand(
   // portion is deferred until configureMachine knows a browser must open.
   await runHostEligibilityPreflight({ liveBrowser: false, host });
   const paths = configurationPaths(command.stateHome, host);
-  await preparePrivateStateHome(paths.stateHome, host);
+  await verifyExistingPrivateStateHome(paths.stateHome, host);
   // A redirected or low-capability output still gets the plain numbered setup
   // flow when stdin is interactive.
   const interactive = !command.json && process.stdin.isTTY === true;
@@ -300,12 +300,14 @@ export async function configureMachine(options: {
     options.identity === undefined && options.entryUrl === undefined &&
     options.requireProtectionIndicator === undefined
   ) {
+    await verifyPrivateStateHome(options.paths.stateHome, options.host);
     return setupSummary(options.paths, current.config);
   }
 
   // Eligibility includes the live GUI session, so defer it until after the
   // read-only idempotent path has decided no browser needs to open.
   await runHostEligibilityPreflight({ liveBrowser: true, host: options.host });
+  await preparePrivateStateHome(options.paths.stateHome, options.host);
 
   const selected = await selectBrowserForSetup({
     options,
@@ -487,6 +489,16 @@ export async function configureMachine(options: {
   keyValue("Account check", identity.trim(), options.output);
   info("Next: run cope from a project folder.", options.output);
   return setupSummary(options.paths, candidate);
+}
+
+async function verifyExistingPrivateStateHome(stateHome: string, host: HostPlatform): Promise<void> {
+  try {
+    await lstat(stateHome);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  await verifyPrivateStateHome(stateHome, host);
 }
 
 function setupSummary(paths: MachineConfigurationPaths, config: BrowserLaunchConfig): MachineSetupSummary {
