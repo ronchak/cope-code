@@ -44,6 +44,11 @@ test("setup accepts optional browser automation choices and rejects unsupported 
   assert.throws(() => parseCliArguments(["setup", "--browser", "brave"]), /edge or chrome/iu);
 });
 
+test("CLI parses the local update command", () => {
+  assert.deepEqual(parseCliArguments(["update"]), { command: "update", json: false });
+  assert.throws(() => parseCliArguments(["update", "unexpected"]), /Unexpected/);
+});
+
 test("CLI parses pause and pins explicit resume transport sources", () => {
   const pause = parseCliArguments(["pause", "session_12345678", "--reason", "operator break"]);
   assert.deepEqual(pause, {

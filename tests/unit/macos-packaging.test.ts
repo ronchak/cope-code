@@ -34,6 +34,7 @@ test("macOS packaging wrappers are syntactically valid and preserve the user-lev
   assert.match(installer, /expected_version=.*package\.json/u);
   assert.match(installer, /"\$installed_version" = "\$expected_version"/u);
   assert.match(installer, /installed_version=\$\("\$cope_command" --version\)/u);
+  assert.match(installer, /export COPE_SOURCE_DIR=/u);
   assert.match(installer, /"\$cope_command" setup/u);
   assert.doesNotMatch(installer, /(?:^|\n)\s*sudo\b/u);
   assert.doesNotMatch(installer, /playwright install|Microsoft Edge.*download/iu);
@@ -189,6 +190,7 @@ esac
   await execFileAsync("/bin/sh", [installPath, "--skip-build", "--skip-setup"], { env: defaultEnvironment });
   const profile = await readFile(path.join(home, ".zprofile"), "utf8");
   assert.equal(profile.match(/export PATH="\$HOME\/\.local\/bin:\$PATH"/gu)?.length, 1);
+  assert.equal(profile.match(/export COPE_SOURCE_DIR=/gu)?.length, 1);
   assert.equal((await execFileAsync(path.join(defaultPrefix, "bin", "cope"), ["--version"], { env: defaultEnvironment })).stdout.trim(), packageJson.version);
   await execFileAsync("/bin/sh", [uninstallPath], { env: defaultEnvironment });
 });

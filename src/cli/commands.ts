@@ -78,6 +78,7 @@ import {
 } from "./session-files.js";
 import { TerminalUserInteraction } from "./terminal-user.js";
 import { executeDoctorCommand } from "./doctor.js";
+import { executeUpdateCommand } from "./update.js";
 import { pinBrowserConfigurationForSession } from "./setup-transaction.js";
 import { executeDemoCommand } from "./demo.js";
 import { renderHumanResult } from "./friendly-output.js";
@@ -135,6 +136,8 @@ export async function executeCommand(
       return executeSetupCommand(command, io, host);
     case "doctor":
       return executeDoctorCommand(command, io, host);
+    case "update":
+      return executeUpdateCommand(command, io, host);
     case "sessions":
       return executeSessionsCommand(command, io, host);
     case "init":
@@ -1378,6 +1381,7 @@ Useful controls
   cope --inspect               Start read-only
   cope --auto                  Use the configured project policy with fewer prompts
   cope setup                   Run or change guided browser setup
+  cope update                  Rebuild and reinstall from your local Cope checkout
   cope doctor                  Check Node, Git, browser, and configuration
   cope sessions                Show recent work
 

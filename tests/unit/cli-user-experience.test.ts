@@ -6,7 +6,7 @@ import test from "node:test";
 
 import { executeCommand } from "../../src/cli/commands.js";
 import { configuredBrowserLabel, interactiveSetupCommand } from "../../src/cli/interactive.js";
-import { chatFooter, renderUserMessage, startupPanel } from "../../src/cli/presentation.js";
+import { chatFooter, renderUserMessage, setupHero, startupPanel } from "../../src/cli/presentation.js";
 import { chatPromptStartRow, inputViewport } from "../../src/cli/prompts.js";
 import {
   beginTerminalTakeover,
@@ -187,6 +187,23 @@ test("startup panel credits Ronak Chakraborty in the responsive top bar", () => 
     assert.ok(lines.every((line) => displayWidth(line) === columns));
     if (columns === 36) assert.doesNotMatch(lines[0] ?? "", /v0\.1\.2/u);
     else assert.match(lines[0] ?? "", /v0\.1\.2/u);
+  }
+});
+
+test("one-time setup opens with a responsive Cope Code hero and creator credit", () => {
+  for (const columns of [36, 88]) {
+    const output = new MemoryOutput();
+    setupHero(output, { columns });
+
+    const rendered = stripAnsi(output.value);
+    const lines = rendered.split("\n").filter((line) => line.length > 0);
+    assert.match(rendered, /Welcome to Cope Code/u);
+    assert.match(rendered, /Ronak Chakraborty/u);
+    assert.match(rendered, /Browser/u);
+    assert.match(rendered, /Account|account/u);
+    assert.match(rendered, /Ready|ready/u);
+    assert.match(rendered, /password stays.*browser/isu);
+    assert.ok(lines.every((line) => displayWidth(line) === Math.min(columns, 72)), `${String(columns)} columns`);
   }
 });
 

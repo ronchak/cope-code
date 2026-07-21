@@ -102,8 +102,32 @@ configure_default_path() {
   printf 'Open a new Terminal window before running cope, or run: export PATH="$HOME/.local/bin:$PATH"\n'
 }
 
+configure_source_checkout() {
+  home_real=$(CDPATH= cd -- "$HOME" && pwd -P)
+  if [ "$prefix" != "$home_real/.local" ]; then
+    printf 'Custom install prefix detected; COPE_SOURCE_DIR was not saved automatically.\n'
+    return
+  fi
+  profile="$HOME/.zprofile"
+  if [ -L "$profile" ] || { [ -e "$profile" ] && { [ ! -f "$profile" ] || [ ! -O "$profile" ]; }; }; then
+    printf 'COPE_SOURCE_DIR was not saved because %s is linked, non-regular, or not user-owned.\n' "$profile" >&2
+    printf 'Add COPE_SOURCE_DIR manually before running cope update.\n' >&2
+    return
+  fi
+  if [ ! -e "$profile" ]; then
+    umask 077
+    : > "$profile"
+  fi
+  source_line=$(node -e 'const value=JSON.stringify(process.argv[1]).replace(/\$/gu,"\\$").replace(/`/gu,"\\`"); process.stdout.write(`export COPE_SOURCE_DIR=${value}`)' "$project_root")
+  if ! /usr/bin/grep -Fqx "$source_line" "$profile"; then
+    printf '\n# Local checkout used by cope update\n%s\n' "$source_line" >> "$profile"
+  fi
+  printf 'Configured COPE_SOURCE_DIR for future Terminal sessions: %s\n' "$project_root"
+}
+
 if [ "$update_path" -eq 1 ]; then
   configure_default_path "$prefix/bin"
+  configure_source_checkout
 else
   printf 'PATH update skipped. Add this directory to PATH if needed: %s/bin\n' "$prefix"
 fi

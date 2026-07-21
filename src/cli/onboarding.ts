@@ -37,7 +37,7 @@ import { preparePrivateStateHome, verifyPrivateStateHome } from "../platform/pri
 import type { CommandDefinition } from "../tools/index.js";
 import type { CliCommand } from "./arguments.js";
 import { runHostEligibilityPreflight } from "../preflight/machine.js";
-import { hint, info, keyValue, section, success, warning, type Writable } from "./presentation.js";
+import { hint, info, keyValue, section, setupHero, success, warning, type Writable } from "./presentation.js";
 import { confirmPrompt, PromptCancelledError, selectPrompt, textPrompt } from "./prompts.js";
 import {
   browserSetupPrompt,
@@ -111,6 +111,7 @@ export async function executeSetupCommand(
   // A redirected or low-capability output still gets the plain numbered setup
   // flow when stdin is interactive.
   const interactive = !command.json && process.stdin.isTTY === true;
+  if (interactive) setupHero(io.stdout);
   let result;
   try {
     result = await configureMachine({
@@ -156,9 +157,7 @@ export async function ensureMachineConfiguration(options: {
     );
   }
   const output = options.output ?? process.stdout;
-  section("One-time setup", output);
-  status.problems.forEach((problem) => warning(problem, output));
-  hint("This creates local policy and a dedicated browser profile. It never stores your password.", output);
+  setupHero(output);
   await configureMachine({ paths, force: true, interactive: true, output, host: options.host });
   return paths;
 }
@@ -331,7 +330,7 @@ export async function configureMachine(options: {
     ? current.config.expectedIdentity
     : undefined;
   const identity = options.identity ?? (options.interactive
-    ? await promptText("Work account name or email shown in Copilot", {
+    ? await promptText("Work account email (as shown in Copilot)", {
         ...(currentIdentity === undefined ? {} : { defaultValue: currentIdentity }),
       })
     : currentIdentity);
