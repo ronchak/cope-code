@@ -368,14 +368,16 @@ export class ContextSemanticPage implements SemanticPage {
     // before navigation, foregrounding, or the first semantic snapshot.
     this.#delegate(page);
     this.#navigationEpochs.set(page, 0);
-    page.on("framenavigated", (frame) => {
-      const mainFrame = typeof page.mainFrame === "function" ? page.mainFrame() : undefined;
-      if (mainFrame !== undefined && frame !== mainFrame) return;
-      this.#navigationEpochs.set(page, (this.#navigationEpochs.get(page) ?? 0) + 1);
-      // A popup that navigates again is no longer the stale auth surface that
-      // was left behind by the prior completed handoff.
-      this.#staleAuthenticationPages.delete(page);
-    });
+    if (typeof page.on === "function") {
+      page.on("framenavigated", (frame) => {
+        const mainFrame = typeof page.mainFrame === "function" ? page.mainFrame() : undefined;
+        if (mainFrame !== undefined && frame !== mainFrame) return;
+        this.#navigationEpochs.set(page, (this.#navigationEpochs.get(page) ?? 0) + 1);
+        // A popup that navigates again is no longer the stale auth surface that
+        // was left behind by the prior completed handoff.
+        this.#staleAuthenticationPages.delete(page);
+      });
+    }
     page.setDefaultTimeout(this.#actionMs);
     page.setDefaultNavigationTimeout(this.#actionMs);
     this.#configuredPages.add(page);
