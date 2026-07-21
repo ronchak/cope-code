@@ -95,6 +95,7 @@ const WINDOWS_IDENTITIES = Object.freeze({
 const WINDOWS_SYSTEM_DIRECTORY = "C:\\Windows\\System32";
 const WINDOWS_POWERSHELL_EXECUTABLE =
   `${WINDOWS_SYSTEM_DIRECTORY}\\WindowsPowerShell\\v1.0\\powershell.exe`;
+const WINDOWS_BROWSER_IDENTITY_PATH_VARIABLE = "COPE_BROWSER_IDENTITY_PATH";
 
 export async function discoverInstalledBrowsers(
   options: BrowserDiscoveryOptions = {},
@@ -293,7 +294,8 @@ export async function verifyWindowsIdentity(
   const script = [
     "$ErrorActionPreference='Stop'",
     "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false)",
-    "$p=$args[0]",
+    `$p=[System.Environment]::GetEnvironmentVariable('${WINDOWS_BROWSER_IDENTITY_PATH_VARIABLE}', 'Process')`,
+    "if ([string]::IsNullOrWhiteSpace($p)) { throw 'Browser identity path is unavailable' }",
     "$v=[System.Diagnostics.FileVersionInfo]::GetVersionInfo($p)",
     "$s=Get-AuthenticodeSignature -LiteralPath $p",
     "[Console]::Out.WriteLine($v.ProductName)",
@@ -305,9 +307,9 @@ export async function verifyWindowsIdentity(
   ].join("; ");
   const result = await probe(
     WINDOWS_POWERSHELL_EXECUTABLE,
-    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script, executablePath],
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
     WINDOWS_SYSTEM_DIRECTORY,
-    environment,
+    { ...environment, [WINDOWS_BROWSER_IDENTITY_PATH_VARIABLE]: executablePath },
     true,
   );
   return parseWindowsBrowserIdentityEvidence(product, result);

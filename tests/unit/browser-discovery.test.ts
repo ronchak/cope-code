@@ -180,6 +180,48 @@ test("production Windows metadata parser requires exact product, company, filena
     error instanceof AgentError && error.details.diagnosticCode === "BROWSER_EXECUTABLE_PRODUCT_MISMATCH");
 });
 
+test("Windows identity probe keeps a spaced browser path out of PowerShell command source", async () => {
+  const executablePath = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
+  const host = new WindowsHostPlatform("x64");
+  let identityInvocation: Parameters<ProbeRunner> | undefined;
+  const runProbe: ProbeRunner = async (...invocation) => {
+    const [, args] = invocation;
+    if (args.some((argument) => argument.includes("GetFolderPath"))) {
+      return {
+        exitCode: 0,
+        stdout: [
+          "C:\\Program Files (x86)",
+          "C:\\Program Files",
+          "C:\\Users\\tester\\AppData\\Local",
+        ].join("\r\n"),
+        stderr: "",
+      };
+    }
+    identityInvocation = invocation;
+    return {
+      exitCode: 0,
+      stdout: [
+        "Microsoft Edge",
+        "Microsoft Corporation",
+        "msedge.exe",
+        "149.0.4022.98",
+        "Valid",
+        "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US",
+      ].join("\r\n"),
+      stderr: "",
+    };
+  };
+
+  const verified = await verifyWindowsIdentity("edge", executablePath, host, runProbe);
+
+  assert.equal(verified.version, "149.0.4022.98");
+  assert.ok(identityInvocation !== undefined);
+  const [, args, , environment] = identityInvocation;
+  assert.equal(environment.COPE_BROWSER_IDENTITY_PATH, executablePath);
+  assert.equal(args.at(-1)?.includes("GetEnvironmentVariable('COPE_BROWSER_IDENTITY_PATH', 'Process')"), true);
+  assert.equal(args.includes(executablePath), false);
+});
+
 test("Windows Stable identity requires the vendor Stable installation layout", () => {
   const trustedRoots = [
     "C:\\Program Files (x86)",
