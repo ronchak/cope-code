@@ -17,7 +17,9 @@ export class PlaywrightSemanticPage implements SemanticPage {
   readonly #page: Page;
   readonly #actionMs: number;
   readonly #onOperationTimeout: (() => Promise<void>) | undefined;
+  readonly #operationTimeoutSignal: AbortSignal | undefined;
   #operationTermination: Promise<void> | undefined;
+  #operationTimedOut = false;
   #nativeDialogDetected = false;
   #nativeDialogEpoch = 0;
 
@@ -26,6 +28,7 @@ export class PlaywrightSemanticPage implements SemanticPage {
     onNativeDialog?: () => boolean | void,
     actionMs = 15_000,
     onOperationTimeout?: () => Promise<void>,
+    operationTimeoutSignal?: AbortSignal,
   ) {
     if (!Number.isSafeInteger(actionMs) || actionMs <= 0) {
       throw new TypeError("Playwright operation timeout must be a positive integer");
@@ -33,6 +36,7 @@ export class PlaywrightSemanticPage implements SemanticPage {
     this.#page = page;
     this.#actionMs = actionMs;
     this.#onOperationTimeout = onOperationTimeout;
+    this.#operationTimeoutSignal = operationTimeoutSignal;
     // Do not accept, dismiss, inspect, or automate unknown browser dialogs.
     // Leaving the dialog visible blocks consequential actions and the sticky
     // signal makes the adapter fail closed until the session is restarted.
@@ -354,10 +358,18 @@ export class PlaywrightSemanticPage implements SemanticPage {
       },
       cause === undefined ? undefined : { cause },
     );
+    // A timeout permanently revokes this delegate. The original renderer call
+    // may still be unwinding while owner termination continues in background;
+    // no later operation may enter that session.
+    const sessionTimedOut = () =>
+      this.#operationTimedOut || this.#operationTimeoutSignal?.aborted === true;
+    if (sessionTimedOut()) throw timeoutError();
     const expire = () => {
       if (timedOut) return;
       timedOut = true;
+      this.#operationTimedOut = true;
       termination = this.#terminateTimedOutOperation();
+      void termination.catch(() => undefined);
     };
     const timeout = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => {
@@ -365,37 +377,50 @@ export class PlaywrightSemanticPage implements SemanticPage {
         // Set this before starting teardown. If the renderer operation settles
         // during termination, it must not win the race and report success.
         expire();
-        void termination!.then(
-          () => reject(timeoutError()),
-          (error) => reject(timeoutError(error)),
-        );
+        // Diagnostic settlement is bounded independently of Browser.close().
+        // Safety comes from the sticky terminal latch plus the last-boundary
+        // deadline check; teardown continues but is never awaited here.
+        reject(timeoutError());
       }, Math.max(0, deadline - performance.now()));
     });
+    let sessionTimeoutListener: (() => void) | undefined;
+    const sessionTimeout = new Promise<never>((_resolve, reject) => {
+      if (this.#operationTimeoutSignal === undefined) return;
+      sessionTimeoutListener = () => {
+        expire();
+        reject(timeoutError());
+      };
+      if (this.#operationTimeoutSignal.aborted) {
+        sessionTimeoutListener();
+        return;
+      }
+      this.#operationTimeoutSignal.addEventListener("abort", sessionTimeoutListener, {
+        once: true,
+      });
+    });
     const assertWithinDeadline = () => {
-      if (!timedOut && performance.now() < deadline) return;
+      if (!sessionTimedOut() && performance.now() < deadline) return;
       expire();
       throw timeoutError();
     };
 
     try {
-      const result = await Promise.race([operation(assertWithinDeadline), timeout]);
+      const result = await Promise.race([
+        operation(assertWithinDeadline),
+        timeout,
+        sessionTimeout,
+      ]);
       // Resolved-Promise microtasks or synchronous renderer work can starve the
       // timer callback past the absolute deadline. The operation still loses:
       // expire from the monotonic clock before accepting its result.
-      if (!timedOut && performance.now() >= deadline) expire();
+      if (!timedOut && (sessionTimedOut() || performance.now() >= deadline)) expire();
       if (timedOut) {
-        await termination;
         throw timeoutError();
       }
       return result;
     } catch (error) {
-      if (!timedOut && performance.now() >= deadline) expire();
+      if (!timedOut && (sessionTimedOut() || performance.now() >= deadline)) expire();
       if (!timedOut) throw error;
-      try {
-        await termination;
-      } catch (terminationError) {
-        throw timeoutError(terminationError);
-      }
       if (
         error instanceof AgentError &&
         error.details.diagnosticCode === "BROWSER_OPERATION_TIMEOUT"
@@ -405,6 +430,9 @@ export class PlaywrightSemanticPage implements SemanticPage {
       throw timeoutError(error);
     } finally {
       if (!timerFired && timer !== undefined) clearTimeout(timer);
+      if (sessionTimeoutListener !== undefined) {
+        this.#operationTimeoutSignal?.removeEventListener("abort", sessionTimeoutListener);
+      }
     }
   }
 

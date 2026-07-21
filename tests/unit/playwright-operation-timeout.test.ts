@@ -76,6 +76,26 @@ function timeoutError(error: unknown): AgentError {
   return error as AgentError;
 }
 
+async function rejectionWithin(promise: Promise<unknown>, milliseconds: number): Promise<unknown> {
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then(
+        () => assert.fail("operation unexpectedly fulfilled"),
+        (error: unknown) => error,
+      ),
+      new Promise<never>((_resolve, reject) => {
+        watchdog = setTimeout(
+          () => reject(new Error(`operation did not reject within ${milliseconds} ms`)),
+          milliseconds,
+        );
+      }),
+    ]);
+  } finally {
+    if (watchdog !== undefined) clearTimeout(watchdog);
+  }
+}
+
 test("a deadline during locator discovery cannot issue a late fill or click", async () => {
   for (const action of ["fill", "click"] as const) {
     const discovery = deferred<number>();
@@ -98,18 +118,15 @@ test("a deadline during locator discovery cannot issue a late fill or click", as
       ? semantic.fill(composerGroup, "must-not-disclose", () => {})
       : semantic.click(sendGroup, () => {});
     await timeoutStarted.promise;
+    const observedError = await rejectionWithin(operation, 100);
+    assert.equal(timeoutError(observedError).details.dispatchAttempted, false);
+    // The diagnostic must settle while owner teardown is deliberately stalled.
+    const laterError = await rejectionWithin(semantic.snapshot(composerGroup), 100);
+    assert.equal(timeoutError(laterError).details.dispatchAttempted, false);
     discovery.resolve(1);
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.equal(element.evaluateCalls, 0, `${action} dispatched after its deadline`);
     terminationRelease.resolve();
-
-    let observedError: unknown;
-    try {
-      await operation;
-    } catch (error) {
-      observedError = error;
-    }
-    assert.equal(timeoutError(observedError).details.dispatchAttempted, false);
     assert.equal(element.evaluateCalls, 0);
     assert.equal(terminationCalls, 1);
   }
@@ -138,16 +155,72 @@ test("concurrent blocked snapshots share one termination and cannot swallow time
     semantic.snapshot(composerGroup),
   ];
   await timeoutStarted.promise;
-  await new Promise((resolve) => setTimeout(resolve, 15));
+  const results = await Promise.all([
+    rejectionWithin(snapshots[0]!, 100),
+    rejectionWithin(snapshots[1]!, 100),
+  ]);
+  assert.equal(terminationCalls, 1);
+  for (const error of results) {
+    assert.equal(timeoutError(error).details.dispatchAttempted, false);
+  }
+  const laterError = await rejectionWithin(semantic.snapshot(composerGroup), 100);
+  assert.equal(timeoutError(laterError).details.dispatchAttempted, false);
   assert.equal(terminationCalls, 1);
   terminationRelease.resolve();
-  const results = await Promise.allSettled(snapshots);
+});
 
-  assert.equal(results.every((result) => result.status === "rejected"), true);
-  for (const result of results) {
-    if (result.status === "fulfilled") assert.fail("snapshot swallowed its timeout");
-    assert.equal(timeoutError(result.reason).details.dispatchAttempted, false);
-  }
+test("one delegate timeout immediately revokes concurrent work in another delegate", async () => {
+  const controller = new AbortController();
+  const terminationRelease = deferred<void>();
+  const blockedSnapshot = new Promise<number>(() => {});
+  const delayedDiscovery = deferred<number>();
+  const delayedElement = new TimeoutElement();
+  let terminationStarts = 0;
+  let sharedTermination: Promise<void> | undefined;
+  const terminate = () => {
+    controller.abort();
+    sharedTermination ??= (async () => {
+      terminationStarts += 1;
+      await terminationRelease.promise;
+    })();
+    return sharedTermination;
+  };
+  const shortDelegate = new PlaywrightSemanticPage(
+    new TimeoutPage(
+      new TimeoutLocator(blockedSnapshot, new TimeoutElement()),
+    ) as unknown as Page,
+    undefined,
+    10,
+    terminate,
+    controller.signal,
+  );
+  const longDelegate = new PlaywrightSemanticPage(
+    new TimeoutPage(
+      new TimeoutLocator(delayedDiscovery.promise, delayedElement),
+    ) as unknown as Page,
+    undefined,
+    1_000,
+    terminate,
+    controller.signal,
+  );
+
+  const concurrentFill = longDelegate.fill(composerGroup, "must-not-disclose", () => {});
+  const triggerTimeout = shortDelegate.snapshot(composerGroup);
+  const [snapshotError, fillError] = await Promise.all([
+    rejectionWithin(triggerTimeout, 100),
+    rejectionWithin(concurrentFill, 100),
+  ]);
+  assert.equal(timeoutError(snapshotError).details.dispatchAttempted, false);
+  assert.equal(timeoutError(fillError).details.dispatchAttempted, false);
+  assert.equal(terminationStarts, 1);
+
+  delayedDiscovery.resolve(1);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(delayedElement.evaluateCalls, 0);
+  const laterError = await rejectionWithin(longDelegate.snapshot(composerGroup), 100);
+  assert.equal(timeoutError(laterError).details.dispatchAttempted, false);
+  assert.equal(terminationStarts, 1);
+  terminationRelease.resolve();
 });
 
 function busySpin(milliseconds: number): void {
@@ -223,7 +296,11 @@ test("clock checks reject operations that settle after starving their deadline t
 
 class SharedDeadlineBrowser {
   public closeCalls = 0;
-  public async close(): Promise<void> { this.closeCalls += 1; }
+  public constructor(private readonly closeDelay: Promise<void> = Promise.resolve()) {}
+  public async close(): Promise<void> {
+    this.closeCalls += 1;
+    await this.closeDelay;
+  }
 }
 
 class SharedDeadlineElement {
@@ -300,7 +377,8 @@ class SharedDeadlineContext {
 }
 
 test("composer recheck and send dispatch share one semantic click deadline", async () => {
-  const browser = new SharedDeadlineBrowser();
+  const terminationRelease = deferred<void>();
+  const browser = new SharedDeadlineBrowser(terminationRelease.promise);
   const page = new SharedDeadlinePage("https://m365.cloud.microsoft/chat/conversation/deadline");
   const context = new SharedDeadlineContext(page, browser);
   const semantic = new ContextSemanticPage(
@@ -336,4 +414,8 @@ test("composer recheck and send dispatch share one semantic click deadline", asy
     `composer recheck and send used more than one 200 ms deadline: ${elapsedMs} ms`,
   );
   assert.equal(browser.closeCalls, 1);
+  const laterError = await rejectionWithin(semantic.currentUrl(), 100);
+  assert.equal(timeoutError(laterError).details.dispatchAttempted, false);
+  assert.equal(browser.closeCalls, 1);
+  terminationRelease.resolve();
 });

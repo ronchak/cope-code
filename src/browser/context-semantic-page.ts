@@ -61,6 +61,8 @@ export class ContextSemanticPage implements SemanticPage {
   #postFillObservationSeen = false;
   #authenticationPage: Page | undefined;
   #operationTermination: Promise<void> | undefined;
+  #operationTimedOut = false;
+  readonly #operationTimeoutController = new AbortController();
 
   public constructor(
     context: BrowserContext,
@@ -88,6 +90,7 @@ export class ContextSemanticPage implements SemanticPage {
   }
 
   public async focusActivePage(force = false): Promise<Page> {
+    this.#assertOperationAvailable();
     if (this.#nativeDialogEpoch > 0) return this.#activePage;
     let pages = this.#context.pages();
     const handoff = await this.#returnedConfiguredPage(pages);
@@ -128,6 +131,7 @@ export class ContextSemanticPage implements SemanticPage {
   }
 
   public async currentUrl(): Promise<string> {
+    this.#assertOperationAvailable();
     if (this.#nativeDialogEpoch > 0) {
       const currentUrl = this.#activePage.url();
       this.#observedUrl = currentUrl;
@@ -162,6 +166,7 @@ export class ContextSemanticPage implements SemanticPage {
   }
 
   public async snapshot(group: LocatorGroup): Promise<GroupSnapshot> {
+    this.#assertOperationAvailable();
     if (this.#nativeDialogEpoch > 0) return nativeDialogSnapshot(group);
     return this.#delegate(this.#activePage).snapshot(group);
   }
@@ -176,6 +181,7 @@ export class ContextSemanticPage implements SemanticPage {
     value: string,
     guard: SemanticActionGuard,
   ): Promise<void> {
+    this.#assertOperationAvailable();
     const page = this.#verifiedObservedPage();
     const expectedUrl = this.#observedUrl!;
     const expectedEpoch = this.#observedEpoch!;
@@ -214,6 +220,7 @@ export class ContextSemanticPage implements SemanticPage {
 
   /** Send activation requires a completed post-fill observation on the same page. */
   public async click(group: LocatorGroup, guard: SemanticActionGuard): Promise<void> {
+    this.#assertOperationAvailable();
     // Composer re-verification and send dispatch are one semantic action. Give
     // both delegate operations the same absolute deadline rather than allowing
     // each to consume a fresh actionMs window.
@@ -516,12 +523,18 @@ export class ContextSemanticPage implements SemanticPage {
       },
       this.#actionMs,
       () => this.#terminateTimedOutOperation(page),
+      this.#operationTimeoutController.signal,
     );
     this.#delegates.set(page, created);
     return created;
   }
 
   #terminateTimedOutOperation(page: Page): Promise<void> {
+    // Revoke the entire context synchronously before starting teardown. A
+    // Browser.close() promise is allowed to stall, but no delegate or later
+    // adapter retry may enter this session after the diagnostic is returned.
+    this.#operationTimedOut = true;
+    this.#operationTimeoutController.abort();
     // observeCopilotPage launches all signal snapshots concurrently. Cache one
     // teardown so simultaneous deadlines cannot race repeated Browser.close()
     // calls or let one delegate return before the shared owner is gone.
@@ -539,6 +552,18 @@ export class ContextSemanticPage implements SemanticPage {
       ]);
     })();
     return this.#operationTermination;
+  }
+
+  #assertOperationAvailable(): void {
+    if (!this.#operationTimedOut) return;
+    throw new AgentError(
+      "TRANSPORT_INDETERMINATE",
+      "A browser operation timeout revoked the dedicated session",
+      {
+        diagnosticCode: "BROWSER_OPERATION_TIMEOUT",
+        dispatchAttempted: false,
+      },
+    );
   }
 }
 
