@@ -97,6 +97,22 @@ test("an open authentication page outranks a newer replacement chat", () => {
   assert.equal(selected, authentication.asPage());
 });
 
+test("an open authentication page outranks ambiguity between configured chats", () => {
+  const first = new UrlPage("https://m365.cloud.microsoft/chat/conversation/first");
+  const authentication = new UrlPage(
+    "https://login.microsoftonline.com/common/oauth2/authorize?step=signin",
+  );
+  const replacement = new UrlPage("https://m365.cloud.microsoft/chat/conversation/replacement");
+
+  const selected = selectActiveCopilotPage(
+    [first.asPage(), authentication.asPage(), replacement.asPage()],
+    selectionConfig,
+    first.asPage(),
+  );
+
+  assert.equal(selected, authentication.asPage());
+});
+
 test("broad Office and M365 allowlist entries are not reusable authentication pages by host alone", () => {
   for (const value of [
     "https://m365.cloud.microsoft/search",

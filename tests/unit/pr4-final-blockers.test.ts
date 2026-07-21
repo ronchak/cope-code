@@ -141,6 +141,95 @@ test("an open authentication popup retains ownership until it closes", async () 
   assert.equal(await tracked.currentUrl(), chat.currentUrl);
 });
 
+test("a tracked authentication popup outranks multiple configured chats", async () => {
+  const original = new NavigationPage(
+    "https://m365.cloud.microsoft/chat/conversation/original",
+  );
+  const authentication = new NavigationPage(
+    "https://login.microsoftonline.com/common/oauth2/authorize?client_id=synthetic",
+  );
+  const context = new NavigationContext([original, authentication]);
+  const tracked = new ContextSemanticPage(
+    context.asContext(),
+    trackedPageConfig(),
+    original.asPage(),
+    1_000,
+  );
+
+  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+
+  const replacement = new NavigationPage(
+    "https://m365.cloud.microsoft/chat/conversation/replacement",
+  );
+  context.pageList.push(replacement);
+
+  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+});
+
+test("new auth aborts handoff before refreshed-page ambiguity", async () => {
+  const chat = new NavigationPage("https://m365.cloud.microsoft/chat/conversation/original");
+  const completedAuthentication = new NavigationPage(
+    "https://login.microsoftonline.com/common/oauth2/authorize?client_id=initial",
+  );
+  const context = new NavigationContext([chat, completedAuthentication]);
+  const tracked = new ContextSemanticPage(
+    context.asContext(),
+    trackedPageConfig(),
+    chat.asPage(),
+    1_000,
+  );
+
+  assert.equal(await tracked.currentUrl(), completedAuthentication.currentUrl);
+  completedAuthentication.closed = true;
+
+  const replacement = new NavigationPage(
+    "https://m365.cloud.microsoft/chat/conversation/replacement",
+  );
+  const newAuthentication = new NavigationPage(
+    "https://login.microsoftonline.com/common/oauth2/authorize?client_id=refreshed",
+  );
+  const injectionRead = context.pageReads + 2;
+  context.onPagesRead = (read) => {
+    if (read !== injectionRead) return;
+    context.pageList.push(replacement, newAuthentication);
+    context.onPagesRead = undefined;
+  };
+
+  assert.equal(await tracked.currentUrl(), newAuthentication.currentUrl);
+});
+
+test("new auth aborts handoff at the final context refresh", async () => {
+  const chat = new NavigationPage("https://m365.cloud.microsoft/chat/conversation/original");
+  const completedAuthentication = new NavigationPage(
+    "https://login.microsoftonline.com/common/oauth2/authorize?client_id=initial",
+  );
+  const context = new NavigationContext([chat, completedAuthentication]);
+  const tracked = new ContextSemanticPage(
+    context.asContext(),
+    trackedPageConfig(),
+    chat.asPage(),
+    1_000,
+  );
+
+  assert.equal(await tracked.currentUrl(), completedAuthentication.currentUrl);
+  completedAuthentication.closed = true;
+
+  const replacement = new NavigationPage(
+    "https://m365.cloud.microsoft/chat/conversation/replacement",
+  );
+  const newAuthentication = new NavigationPage(
+    "https://login.microsoftonline.com/common/oauth2/authorize?client_id=final",
+  );
+  const injectionRead = context.pageReads + 3;
+  context.onPagesRead = (read) => {
+    if (read !== injectionRead) return;
+    context.pageList.push(replacement, newAuthentication);
+    context.onPagesRead = undefined;
+  };
+
+  assert.equal(await tracked.currentUrl(), newAuthentication.currentUrl);
+});
+
 test("in-place chat hydration cannot displace an open authentication popup", async () => {
   const chat = new NavigationPage("https://m365.cloud.microsoft/chat/conversation/synthetic");
   const authentication = new NavigationPage(
@@ -570,12 +659,16 @@ class NavigationPage {
 class NavigationContext {
   readonly #listeners: Array<(page: Page) => void> = [];
   public readonly pageList: NavigationPage[];
+  public pageReads = 0;
+  public onPagesRead: ((read: number) => void) | undefined;
 
   public constructor(pages: readonly NavigationPage[]) {
     this.pageList = [...pages];
   }
 
   public pages(): Page[] {
+    this.pageReads += 1;
+    this.onPagesRead?.(this.pageReads);
     return this.pageList.map((page) => page.asPage());
   }
   public on(event: string, listener: (page: Page) => void): this {

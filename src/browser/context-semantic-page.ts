@@ -376,17 +376,18 @@ export class ContextSemanticPage implements SemanticPage {
     const authenticationPage = this.#authenticationPage;
     if (authenticationPage === undefined) return undefined;
 
-    const configuredPage = uniqueConfiguredCopilotPage(pages, this.#config.entryUrl);
-    if (configuredPage === undefined) return undefined;
-
     // An open authentication page can change DOM state without any observable
     // navigation event. Never suppress it: the operator or Microsoft must close
     // the popup before the configured chat can regain consequential ownership.
-    if (!authenticationPage.isClosed() && pages.includes(authenticationPage)) {
+    if (hasGenuineAuthenticationPage(pages, this.#config)) {
       return undefined;
     }
 
+    const configuredPage = uniqueConfiguredCopilotPage(pages, this.#config.entryUrl);
+    if (configuredPage === undefined) return undefined;
+
     const refreshedPages = this.#context.pages();
+    if (hasGenuineAuthenticationPage(refreshedPages, this.#config)) return undefined;
     if (uniqueConfiguredCopilotPage(refreshedPages, this.#config.entryUrl) !== configuredPage) {
       return undefined;
     }
@@ -407,6 +408,7 @@ export class ContextSemanticPage implements SemanticPage {
     handoff: ConfirmedAuthenticationHandoff,
     pages: readonly Page[],
   ): boolean {
+    if (hasGenuineAuthenticationPage(pages, this.#config)) return false;
     if (uniqueConfiguredCopilotPage(pages, this.#config.entryUrl) !== handoff.configuredPage) {
       return false;
     }
@@ -472,6 +474,14 @@ function uniqueConfiguredCopilotPage(
   return configured[0];
 }
 
+function hasGenuineAuthenticationPage(
+  pages: readonly Page[],
+  config: CopilotPageSelectionConfig,
+): boolean {
+  return pages.some((page) =>
+    !page.isClosed() && isGenuineManualAuthenticationUrl(page.url(), config));
+}
+
 /**
  * Any open genuine Microsoft authentication page outranks the configured chat.
  * DOM-only auth state changes have no synchronous epoch, so safe ownership can
@@ -483,11 +493,11 @@ export function selectActiveCopilotPage(
   preferred?: Page,
 ): Page {
   const openPages = pages.filter((page) => !page.isClosed());
-  const configuredPage = uniqueConfiguredCopilotPage(openPages, config.entryUrl);
   const authentication = openPages.filter((page) =>
     isGenuineManualAuthenticationUrl(page.url(), config));
   const newestAuthentication = authentication.at(-1);
   if (newestAuthentication !== undefined) return newestAuthentication;
+  const configuredPage = uniqueConfiguredCopilotPage(openPages, config.entryUrl);
   if (configuredPage !== undefined) return configuredPage;
 
   if (preferred !== undefined && !preferred.isClosed()) return preferred;
@@ -508,21 +518,19 @@ export async function openTrackedCopilotPage(
   config: EdgeLaunchConfig,
 ): Promise<ContextSemanticPage> {
   const existing = context.pages();
+  const authentication = existing.filter((page) =>
+    !page.isClosed() && isReusableExternalAuthenticationUrl(page.url(), config));
+  let initial = authentication.at(-1);
+
   const approved = existing.filter((page) =>
     !page.isClosed() && isConfiguredCopilotUrl(page.url(), config.entryUrl));
-  if (approved.length > 1) {
+  if (initial === undefined && approved.length > 1) {
     throw new AgentError("TRANSPORT_INDETERMINATE", "Multiple approved Copilot pages are open", {
       diagnosticCode: "AMBIGUOUS_COPILOT_PAGE",
       pageCount: approved.length,
     });
   }
-
-  let initial = approved[0];
-  if (initial === undefined) {
-    const authentication = existing.filter((page) =>
-      !page.isClosed() && isReusableExternalAuthenticationUrl(page.url(), config));
-    initial = authentication.at(-1);
-  }
+  initial ??= approved[0];
 
   let tracked: ContextSemanticPage;
   if (initial === undefined) {

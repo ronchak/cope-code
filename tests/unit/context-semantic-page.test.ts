@@ -163,6 +163,61 @@ test("launch reuses a pre-existing external Microsoft authentication page", asyn
   assert.equal(authentication.defaultNavigationTimeout, config.waits.actionMs);
 });
 
+test("launch gives external authentication ownership over ambiguous chats", async () => {
+  const first = new FakePage(`${entryUrl}/conversation/first`);
+  const olderAuthentication = new FakePage(`${authUrl}?step=older`);
+  const authentication = new FakePage(`${authUrl}?step=newer`);
+  const replacement = new FakePage(`${entryUrl}/conversation/replacement`);
+  const context = new FakeContext([
+    first,
+    olderAuthentication,
+    replacement,
+    authentication,
+  ]);
+  const config = browserConfig();
+
+  const tracked = await openTrackedCopilotPage(context.asContext(), config);
+
+  assert.equal(context.newPageCalls, 0);
+  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+  assert.ok(authentication.frontCount >= 1);
+
+  authentication.closed = true;
+  assert.equal(await tracked.currentUrl(), olderAuthentication.currentUrl);
+
+  olderAuthentication.closed = true;
+  await assert.rejects(
+    tracked.currentUrl(),
+    (error: unknown) =>
+      error instanceof AgentError &&
+      error.code === "TRANSPORT_INDETERMINATE" &&
+      error.details.diagnosticCode === "AMBIGUOUS_COPILOT_PAGE",
+  );
+});
+
+test("closed auth and unrelated Office pages do not suppress chat ambiguity", async () => {
+  for (const extra of [
+    new FakePage(authUrl),
+    new FakePage("https://www.office.com/"),
+  ]) {
+    if (extra.currentUrl === authUrl) extra.closed = true;
+    const context = new FakeContext([
+      new FakePage(`${entryUrl}/conversation/first`),
+      extra,
+      new FakePage(`${entryUrl}/conversation/replacement`),
+    ]);
+
+    await assert.rejects(
+      openTrackedCopilotPage(context.asContext(), browserConfig()),
+      (error: unknown) =>
+        error instanceof AgentError &&
+        error.code === "TRANSPORT_INDETERMINATE" &&
+        error.details.diagnosticCode === "AMBIGUOUS_COPILOT_PAGE",
+      extra.currentUrl,
+    );
+  }
+});
+
 test("tracked semantic page moves to the returned Copilot tab after auth closes", async () => {
   const authentication = new FakePage(authUrl);
   const context = new FakeContext([authentication]);
