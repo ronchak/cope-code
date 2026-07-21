@@ -54,19 +54,28 @@ export async function waitForStableManualReadiness(
 
     const observedAt = monotonicNow();
     const terminalInspection = isTerminalInspection(inspection);
+    const immediatelyUnsafe = terminalInspection &&
+      isImmediatelyUnsafe(inspection.classification.state);
     const hydrationMs = Math.min(
       Math.max(waits.minimumStableMs, waits.actionMs),
       maxWaitMs,
     );
 
-    // A visible dialog may legitimately need operator action, but it must not
-    // let a repeatedly observed hostile host evade the bounded unsafe window.
-    if (terminalInspection && isImmediatelyUnsafe(inspection.classification.state)) {
+    // Only a continuous immediately unsafe observation period is allowed to
+    // consume the short unsafe window. Once the page reaches sign-in, MFA,
+    // consent, or a recoverable dialog, stale host samples are discarded so
+    // the operator receives the full manual-readiness window.
+    if (immediatelyUnsafe) {
       if (unsafeSamples === 0) unsafePeriodSince = observedAt;
       unsafeSamples += 1;
       lastUnsafeInspection = inspection;
+    } else {
+      unsafePeriodSince = 0;
+      unsafeSamples = 0;
+      lastUnsafeInspection = undefined;
     }
     if (
+      immediatelyUnsafe &&
       unsafeSamples >= waits.stableSamples &&
       observedAt - unsafePeriodSince >= hydrationMs
     ) {
@@ -86,7 +95,7 @@ export async function waitForStableManualReadiness(
         stableKeySamples = 1;
       }
 
-      if (isImmediatelyUnsafe(inspection.classification.state)) {
+      if (immediatelyUnsafe) {
         const shortStableMs = Math.min(waits.minimumStableMs, maxWaitMs);
         if (
           stableKeySamples >= waits.stableSamples &&
