@@ -49,17 +49,25 @@ export class PlaywrightSemanticPage implements SemanticPage {
       group.candidates.map(async (candidate) => this.#snapshotCandidate(candidate, group)),
     );
     const matched = candidateSnapshots.filter((entry) => entry.length > 0);
-    // Candidate strategies are alternatives. Read from the richest successful
-    // candidate while still counting all independent matches for quorum.
-    const elements = matched.reduce<readonly ElementSnapshot[]>(
+    const richest = matched.reduce<readonly ElementSnapshot[]>(
       (best, current) => (current.length > best.length ? current : best),
       [],
     );
+    const firstActionable = matched.find((entry) =>
+      entry.some((element) => element.visible && element.enabled));
+    // Composer and send snapshots must expose the same first actionable
+    // candidate that fill/click/press will use. Other content-bearing groups
+    // retain the richest successful candidate to avoid duplicate text capture.
+    const elements =
+      (group.signal === "composer" || group.signal === "send") && firstActionable !== undefined
+        ? firstActionable
+        : richest;
+    const allElements = matched.flat();
     return {
       signal: group.signal,
       matchedCandidates: matched.length,
-      visibleElements: elements.filter((element) => element.visible).length,
-      enabledElements: elements.filter((element) => element.visible && element.enabled).length,
+      visibleElements: allElements.filter((element) => element.visible).length,
+      enabledElements: allElements.filter((element) => element.visible && element.enabled).length,
       elements,
     };
   }
