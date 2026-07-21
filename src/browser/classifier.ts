@@ -71,6 +71,15 @@ export function classifyCopilotPage(
   contract: CopilotUiContract,
   requirements: ClassifierRequirements,
 ): PageClassification {
+  const modal = matches(observation, contract, "modal");
+  if (modal && observation.modal.enabledElements === 0) {
+    // Native JavaScript dialogs are sticky for the lifetime of the page because
+    // Cope never accepts or dismisses them. Classify them before host and
+    // configured-surface gates so a dialog on a Microsoft authentication page
+    // cannot inherit the long manual-authentication window.
+    return result("blocking-modal", false, "NATIVE_BROWSER_DIALOG_DETECTED");
+  }
+
   if (!isApprovedUrl(observation.url, requirements.approvedHosts)) {
     return result("unapproved-host", false, "HOST_NOT_APPROVED");
   }
@@ -99,7 +108,6 @@ export function classifyCopilotPage(
   const identity = matches(observation, contract, "identity");
   const expectedIdentity = identity && identityTextMatches(observation.identity, requirements.expectedIdentity);
   const protection = matches(observation, contract, "protection");
-  const modal = matches(observation, contract, "modal");
 
   // On an already actionable configured chat, manual-authentication phrases or
   // links can be ordinary conversation content. They only override that surface
@@ -129,14 +137,10 @@ export function classifyCopilotPage(
     return result("service-error", true, "COPILOT_SERVICE_ERROR");
   }
   if (modal) {
-    // Native JavaScript dialogs are deliberately sticky in the Playwright
-    // adapter because Cope never accepts or dismisses them. Distinguish
-    // that unrecoverable session state from an ordinary DOM dialog that
-    // the operator can close manually on the configured Copilot surface.
-    const diagnosticCode = observation.modal.enabledElements === 0
-      ? "NATIVE_BROWSER_DIALOG_DETECTED"
-      : "UNEXPECTED_BLOCKING_MODAL";
-    return result("blocking-modal", false, diagnosticCode);
+    // Recoverable DOM dialogs remain visible to the operator. Cope never
+    // interacts with or submits through them, and readiness may recover after
+    // the operator closes or completes the dialog.
+    return result("blocking-modal", false, "UNEXPECTED_BLOCKING_MODAL");
   }
 
   if (
