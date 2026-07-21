@@ -153,6 +153,30 @@ test("identity token matching rejects extra name tokens between expected tokens"
   assert.equal(classification.state, "identity-unverified");
 });
 
+test("display-name identity matching rejects prefix and suffix account text", async () => {
+  const expectedIdentity = "Ronak Chakraborty";
+  const contract = createBaselineCopilotUiContract(expectedIdentity);
+
+  for (const candidate of [
+    "Other Ronak Chakraborty",
+    "Ronak Chakraborty Test",
+    "Work account Ronak Chakraborty",
+    "Chakraborty, Ronak (other tenant)",
+  ]) {
+    const observation = await observeCopilotPage(
+      new LiveShapePage(candidate),
+      contract,
+    );
+    const classification = classifyCopilotPage(
+      observation,
+      contract,
+      requirements(expectedIdentity),
+    );
+
+    assert.equal(classification.state, "identity-unverified", candidate);
+  }
+});
+
 test("a visible but disabled composer never qualifies the page as ready", async () => {
   const expectedIdentity = "Ronak Chakraborty";
   const contract = createBaselineCopilotUiContract(expectedIdentity);

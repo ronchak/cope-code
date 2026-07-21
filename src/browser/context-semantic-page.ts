@@ -8,13 +8,31 @@ import {
   type ApprovedHost,
   type EdgeLaunchConfig,
 } from "./config.js";
-import type { GroupSnapshot, LocatorGroup, SemanticPage } from "./contracts.js";
+import type {
+  CopilotUiContract,
+  GroupSnapshot,
+  LocatorGroup,
+  SemanticPage,
+} from "./contracts.js";
 import { PlaywrightSemanticPage } from "./playwright-semantic-page.js";
 
 export interface CopilotPageSelectionConfig {
   readonly entryUrl: string;
   readonly approvedHosts: readonly ApprovedHost[];
   readonly manualAuthenticationHosts?: readonly ApprovedHost[];
+  readonly uiContract?: CopilotUiContract;
+}
+
+interface AuthenticationPageStamp {
+  readonly page: Page;
+  readonly url: string;
+  readonly navigationEpoch: number;
+  readonly dialogEpoch: number;
+}
+
+interface ConfirmedAuthenticationHandoff {
+  readonly configuredPage: Page;
+  readonly authenticationPages: readonly AuthenticationPageStamp[];
 }
 
 const DEDICATED_MICROSOFT_LOGIN_HOSTS = new Set([
@@ -47,6 +65,7 @@ export class ContextSemanticPage implements SemanticPage {
   #configuredPageBeforeAuthentication: Page | undefined;
   #configuredUrlBeforeAuthentication: string | undefined;
   #configuredEpochBeforeAuthentication = 0;
+  #configuredComposerObservedNonActionable = false;
 
   public constructor(
     context: BrowserContext,
@@ -71,16 +90,23 @@ export class ContextSemanticPage implements SemanticPage {
   }
 
   public async focusActivePage(force = false): Promise<Page> {
-    const pages = this.#context.pages();
-    const returnedConfiguredPage = this.#returnedConfiguredPage(pages);
-    if (returnedConfiguredPage !== undefined) {
-      this.#markCurrentAuthenticationPagesStale(pages);
+    let pages = this.#context.pages();
+    const handoff = await this.#returnedConfiguredPage(pages);
+    // Page discovery and the in-place readiness probe can yield. Refresh the
+    // context before selecting or retiring any authentication surface.
+    pages = this.#context.pages();
+    const returnedConfiguredPage = handoff !== undefined &&
+        this.#handoffStillCurrent(handoff, pages)
+      ? handoff.configuredPage
+      : undefined;
+    if (handoff !== undefined && returnedConfiguredPage !== undefined) {
+      this.#markConfirmedAuthenticationPagesStale(handoff.authenticationPages);
     }
 
     const selected = returnedConfiguredPage ?? this.#selectCurrentPage(pages);
 
     if (isGenuineManualAuthenticationUrl(selected.url(), this.#config)) {
-      this.#trackAuthenticationSelection(pages, selected);
+      await this.#trackAuthenticationSelection(pages, selected);
     } else if (isConfiguredCopilotUrl(selected.url(), this.#config.entryUrl)) {
       this.#clearAuthenticationTracking();
     }
@@ -301,32 +327,91 @@ export class ContextSemanticPage implements SemanticPage {
     return selectActiveCopilotPage(selectablePages, this.#config, preferred);
   }
 
-  #returnedConfiguredPage(pages: readonly Page[]): Page | undefined {
+  async #returnedConfiguredPage(
+    pages: readonly Page[],
+  ): Promise<ConfirmedAuthenticationHandoff | undefined> {
     const authenticationPage = this.#authenticationPage;
     if (authenticationPage === undefined) return undefined;
 
     const configuredPage = uniqueConfiguredCopilotPage(pages, this.#config.entryUrl);
     if (configuredPage === undefined) return undefined;
+
+    const authenticationUrl = authenticationPage.url();
+    const authenticationEpoch = this.#navigationEpochs.get(authenticationPage) ?? 0;
+    if (
+      !authenticationPage.isClosed() &&
+      pages.includes(authenticationPage) &&
+      await this.#hasBlockingAuthenticationDialog(authenticationPage)
+    ) {
+      return undefined;
+    }
+
     if (authenticationPage.isClosed() || !pages.includes(authenticationPage)) {
-      return configuredPage;
+      const authenticationPages = await this.#confirmedAuthenticationHandoff(
+        configuredPage,
+        authenticationPage,
+        authenticationUrl,
+        authenticationEpoch,
+      );
+      return authenticationPages === undefined
+        ? undefined
+        : { configuredPage, authenticationPages };
     }
 
     const priorConfiguredPage = this.#configuredPageBeforeAuthentication;
+    let handoffCandidate: Page | undefined;
     if (priorConfiguredPage === undefined || configuredPage !== priorConfiguredPage) {
-      return configuredPage;
+      handoffCandidate = configuredPage;
+    } else if (configuredPage.url() !== this.#configuredUrlBeforeAuthentication) {
+      handoffCandidate = configuredPage;
+    } else {
+      const currentEpoch = this.#navigationEpochs.get(configuredPage) ?? 0;
+      if (currentEpoch > this.#configuredEpochBeforeAuthentication) {
+        handoffCandidate = configuredPage;
+      }
     }
-    if (configuredPage.url() !== this.#configuredUrlBeforeAuthentication) {
-      return configuredPage;
+
+    if (handoffCandidate !== undefined) {
+      const authenticationPages = await this.#confirmedAuthenticationHandoff(
+        handoffCandidate,
+        authenticationPage,
+        authenticationUrl,
+        authenticationEpoch,
+      );
+      return authenticationPages === undefined
+        ? undefined
+        : { configuredPage: handoffCandidate, authenticationPages };
     }
-    const currentEpoch = this.#navigationEpochs.get(configuredPage) ?? 0;
-    return currentEpoch > this.#configuredEpochBeforeAuthentication
-      ? configuredPage
-      : undefined;
+
+    // Microsoft can complete popup authentication by hydrating the original
+    // chat in place, without changing its Page, URL, or main-frame navigation
+    // epoch. Probe only the configured contract's composer, read-only, and
+    // prefer the chat once that exact action surface becomes enabled. The full
+    // classifier still verifies identity, protection, and every other trust
+    // gate before any prompt content can be disclosed.
+    const composer = this.#config.uiContract?.groups.composer;
+    if (composer === undefined) return undefined;
+    const actionable = await this.#composerActionable(configuredPage, composer);
+    if (actionable === false) {
+      this.#configuredComposerObservedNonActionable = true;
+      return undefined;
+    }
+    if (actionable !== true || !this.#configuredComposerObservedNonActionable) {
+      return undefined;
+    }
+    const authenticationPages = await this.#confirmedAuthenticationHandoff(
+      configuredPage,
+      authenticationPage,
+      authenticationUrl,
+      authenticationEpoch,
+    );
+    return authenticationPages === undefined
+      ? undefined
+      : { configuredPage, authenticationPages };
   }
 
-  #trackAuthenticationSelection(pages: readonly Page[], selected: Page): void {
-    if (this.#authenticationPage !== undefined) {
-      this.#authenticationPage = selected;
+  async #trackAuthenticationSelection(pages: readonly Page[], selected: Page): Promise<void> {
+    if (this.#authenticationPage === selected) {
       return;
     }
     const configuredPage = uniqueConfiguredCopilotPage(pages, this.#config.entryUrl);
@@ -336,13 +421,127 @@ export class ContextSemanticPage implements SemanticPage {
     this.#configuredEpochBeforeAuthentication = configuredPage === undefined
       ? 0
       : this.#navigationEpochs.get(configuredPage) ?? 0;
+    await this.#captureConfiguredComposerBaseline(pages);
   }
 
-  #markCurrentAuthenticationPagesStale(pages: readonly Page[]): void {
-    for (const page of pages) {
-      if (!page.isClosed() && isGenuineManualAuthenticationUrl(page.url(), this.#config)) {
-        this.#staleAuthenticationPages.add(page);
-      }
+  async #captureConfiguredComposerBaseline(pages: readonly Page[]): Promise<void> {
+    this.#configuredComposerObservedNonActionable = false;
+    const configuredPage = this.#configuredPageBeforeAuthentication;
+    const composer = this.#config.uiContract?.groups.composer;
+    if (
+      configuredPage === undefined ||
+      composer === undefined ||
+      configuredPage.isClosed() ||
+      !pages.includes(configuredPage)
+    ) {
+      return;
+    }
+    const actionable = await this.#composerActionable(configuredPage, composer);
+    this.#configuredComposerObservedNonActionable = actionable === false;
+  }
+
+  async #composerActionable(
+    page: Page,
+    composer: LocatorGroup,
+  ): Promise<boolean | undefined> {
+    try {
+      const snapshot = await this.#delegate(page).snapshot(composer);
+      return snapshot.matchedCandidates >= composer.minimumCandidateMatches &&
+        snapshot.enabledElements > 0;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async #hasBlockingAuthenticationDialog(page: Page): Promise<boolean> {
+    const modal = this.#config.uiContract?.groups.modal;
+    if (modal === undefined) return false;
+    try {
+      const snapshot = await this.#delegate(page).snapshot(modal);
+      return snapshot.matchedCandidates >= modal.minimumCandidateMatches &&
+        snapshot.visibleElements > 0;
+    } catch {
+      // A failed read does not prove that an authentication surface is safe to
+      // retire, so keep it selected.
+      return true;
+    }
+  }
+
+  async #confirmedAuthenticationHandoff(
+    configuredPage: Page,
+    authenticationPage: Page,
+    authenticationUrl: string,
+    authenticationEpoch: number,
+  ): Promise<readonly AuthenticationPageStamp[] | undefined> {
+    const dialogEpoch = this.#delegate(authenticationPage).nativeDialogEpoch();
+    if (
+      !authenticationPage.isClosed() &&
+      await this.#hasBlockingAuthenticationDialog(authenticationPage)
+    ) {
+      return undefined;
+    }
+    if (this.#delegate(authenticationPage).nativeDialogEpoch() !== dialogEpoch) {
+      return undefined;
+    }
+
+    const pages = this.#context.pages();
+    if (uniqueConfiguredCopilotPage(pages, this.#config.entryUrl) !== configuredPage) {
+      return undefined;
+    }
+    if (authenticationPage.isClosed() || !pages.includes(authenticationPage)) {
+      return this.#selectCurrentPage(pages, configuredPage) === configuredPage
+        ? this.#authenticationPageStamps(pages)
+        : undefined;
+    }
+    if (
+      this.#authenticationPage !== authenticationPage ||
+      authenticationPage.url() !== authenticationUrl ||
+      (this.#navigationEpochs.get(authenticationPage) ?? 0) !== authenticationEpoch
+    ) {
+      return undefined;
+    }
+    // A newer auth popup appearing during either read must win the next sample.
+    return this.#selectCurrentPage(pages, authenticationPage) === authenticationPage
+      ? this.#authenticationPageStamps(pages)
+      : undefined;
+  }
+
+  #authenticationPageStamps(pages: readonly Page[]): readonly AuthenticationPageStamp[] {
+    return pages
+      .filter((page) =>
+        !page.isClosed() &&
+        !this.#staleAuthenticationPages.has(page) &&
+        isGenuineManualAuthenticationUrl(page.url(), this.#config))
+      .map((page) => ({
+        page,
+        url: page.url(),
+        navigationEpoch: this.#navigationEpochs.get(page) ?? 0,
+        dialogEpoch: this.#delegate(page).nativeDialogEpoch(),
+      }));
+  }
+
+  #handoffStillCurrent(
+    handoff: ConfirmedAuthenticationHandoff,
+    pages: readonly Page[],
+  ): boolean {
+    if (uniqueConfiguredCopilotPage(pages, this.#config.entryUrl) !== handoff.configuredPage) {
+      return false;
+    }
+    const current = this.#authenticationPageStamps(pages);
+    return current.length === handoff.authenticationPages.length &&
+      handoff.authenticationPages.every((confirmed) =>
+        current.some((candidate) =>
+          candidate.page === confirmed.page &&
+          candidate.url === confirmed.url &&
+          candidate.navigationEpoch === confirmed.navigationEpoch &&
+          candidate.dialogEpoch === confirmed.dialogEpoch));
+  }
+
+  #markConfirmedAuthenticationPagesStale(
+    authenticationPages: readonly AuthenticationPageStamp[],
+  ): void {
+    for (const { page } of authenticationPages) {
+      this.#staleAuthenticationPages.add(page);
     }
     this.#clearAuthenticationTracking();
   }
@@ -352,6 +551,7 @@ export class ContextSemanticPage implements SemanticPage {
     this.#configuredPageBeforeAuthentication = undefined;
     this.#configuredUrlBeforeAuthentication = undefined;
     this.#configuredEpochBeforeAuthentication = 0;
+    this.#configuredComposerObservedNonActionable = false;
   }
 
   #clearFilledPagePin(): void {

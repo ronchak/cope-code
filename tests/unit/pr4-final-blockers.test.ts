@@ -139,6 +139,152 @@ test("a returned chat remains selected while the completed auth popup stays open
   assert.equal(authentication.closed, false);
 });
 
+test("an in-place hydrated chat displaces a completed auth popup without navigation", async () => {
+  const chat = new NavigationPage("https://m365.cloud.microsoft/chat/conversation/synthetic");
+  const authentication = new NavigationPage(
+    "https://login.microsoftonline.com/common/oauth2/authorize?client_id=synthetic",
+  );
+  const context = new NavigationContext([chat, authentication]);
+  const config = {
+    entryUrl: "https://m365.cloud.microsoft/chat",
+    approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
+    manualAuthenticationHosts: [{ hostname: "login.microsoftonline.com" }],
+    uiContract: createBaselineCopilotUiContract("Synthetic Work Account"),
+  };
+  const tracked = new ContextSemanticPage(
+    context.asContext(),
+    config,
+    chat.asPage(),
+    1_000,
+  );
+
+  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+
+  chat.composerEnabled = true;
+  assert.equal(await tracked.currentUrl(), chat.currentUrl);
+  assert.equal(await tracked.currentUrl(), chat.currentUrl);
+  assert.equal(authentication.closed, false);
+});
+
+test("an already-actionable chat cannot displace a newer active auth popup", async () => {
+  const chat = new NavigationPage("https://m365.cloud.microsoft/chat/conversation/synthetic");
+  chat.composerEnabled = true;
+  const authentication = new NavigationPage(
+    "https://login.microsoftonline.com/common/oauth2/authorize?client_id=synthetic",
+  );
+  const context = new NavigationContext([chat, authentication]);
+  const tracked = new ContextSemanticPage(
+    context.asContext(),
+    trackedPageConfig(),
+    chat.asPage(),
+    1_000,
+  );
+
+  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+});
+
+test("a sticky native dialog prevents retiring the auth popup", async () => {
+  const chat = new NavigationPage("https://m365.cloud.microsoft/chat/conversation/synthetic");
+  const authentication = new NavigationPage(
+    "https://login.microsoftonline.com/common/oauth2/authorize?client_id=synthetic",
+  );
+  const context = new NavigationContext([chat, authentication]);
+  const tracked = new ContextSemanticPage(
+    context.asContext(),
+    trackedPageConfig(),
+    chat.asPage(),
+    1_000,
+  );
+
+  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+  chat.composerEnabled = true;
+  authentication.emitDialog();
+
+  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+});
+
+test("auth navigation during the composer probe prevents a stale handoff", async () => {
+  const chat = new NavigationPage("https://m365.cloud.microsoft/chat/conversation/synthetic");
+  const authentication = new NavigationPage(
+    "https://login.microsoftonline.com/common/oauth2/authorize?client_id=synthetic",
+  );
+  const context = new NavigationContext([chat, authentication]);
+  const tracked = new ContextSemanticPage(
+    context.asContext(),
+    trackedPageConfig(),
+    chat.asPage(),
+    1_000,
+  );
+
+  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+  chat.composerEnabled = true;
+  chat.onComposerProbe = () => {
+    chat.onComposerProbe = undefined;
+    authentication.navigate(
+      "https://login.microsoftonline.com/common/oauth2/authorize?client_id=synthetic&step=mfa",
+    );
+  };
+
+  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+  assert.match(authentication.currentUrl, /step=mfa/u);
+});
+
+test("a new auth popup on the post-confirm refresh is never swept stale", async () => {
+  const chat = new NavigationPage("https://m365.cloud.microsoft/chat/conversation/synthetic");
+  const authenticationA = new NavigationPage(
+    "https://login.microsoftonline.com/common/oauth2/authorize?client_id=synthetic&popup=a",
+  );
+  const authenticationB = new NavigationPage(
+    "https://login.microsoftonline.com/common/oauth2/authorize?client_id=synthetic&popup=b",
+  );
+  const context = new NavigationContext([chat, authenticationA]);
+  const tracked = new ContextSemanticPage(
+    context.asContext(),
+    trackedPageConfig(),
+    chat.asPage(),
+    1_000,
+  );
+
+  assert.equal(await tracked.currentUrl(), authenticationA.currentUrl);
+  chat.composerEnabled = true;
+  let pageReads = 0;
+  context.onPages = () => {
+    pageReads += 1;
+    if (pageReads === 3) context.pageList.push(authenticationB);
+  };
+
+  assert.equal(await tracked.currentUrl(), authenticationB.currentUrl);
+  assert.equal(await tracked.currentUrl(), authenticationB.currentUrl);
+});
+
+test("a newer auth popup recaptures the chat baseline for its own episode", async () => {
+  const chatA = new NavigationPage("https://m365.cloud.microsoft/chat/conversation/first");
+  const authenticationA = new NavigationPage(
+    "https://login.microsoftonline.com/common/oauth2/authorize?client_id=synthetic&popup=a",
+  );
+  const context = new NavigationContext([chatA, authenticationA]);
+  const tracked = new ContextSemanticPage(
+    context.asContext(),
+    trackedPageConfig(),
+    chatA.asPage(),
+    1_000,
+  );
+
+  assert.equal(await tracked.currentUrl(), authenticationA.currentUrl);
+
+  const chatB = new NavigationPage("https://m365.cloud.microsoft/chat/conversation/second");
+  chatB.composerEnabled = true;
+  const authenticationB = new NavigationPage(
+    "https://login.microsoftonline.com/common/oauth2/authorize?client_id=synthetic&popup=b",
+  );
+  context.pageList.splice(0, context.pageList.length, authenticationA, chatB, authenticationB);
+
+  assert.equal(await tracked.currentUrl(), authenticationB.currentUrl);
+  assert.equal(await tracked.currentUrl(), authenticationB.currentUrl);
+});
+
 test("baseline identity evidence is limited to explicit account and profile controls", () => {
   const identity = createBaselineCopilotUiContract("Ronak Chakraborty").groups.identity;
 
@@ -153,6 +299,15 @@ test("baseline identity evidence is limited to explicit account and profile cont
     );
   }
 });
+
+function trackedPageConfig() {
+  return {
+    entryUrl: "https://m365.cloud.microsoft/chat",
+    approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
+    manualAuthenticationHosts: [{ hostname: "login.microsoftonline.com" }],
+    uiContract: createBaselineCopilotUiContract("Synthetic Work Account"),
+  } as const;
+}
 
 test("composer actionability follows the same later candidate that fill will use", async () => {
   const disabled = new CandidateItem(false, "disabled draft");
@@ -245,6 +400,8 @@ function groupSnapshot(
 
 class NavigationPage {
   public closed = false;
+  public composerEnabled = false;
+  public onComposerProbe: (() => void) | undefined;
   readonly #listeners = new Map<string, Array<(...args: unknown[]) => void>>();
   readonly #mainFrame = {} as Frame;
 
@@ -256,6 +413,16 @@ class NavigationPage {
   public setDefaultNavigationTimeout(_milliseconds: number): void {}
   public async bringToFront(): Promise<void> {}
   public mainFrame(): Frame { return this.#mainFrame; }
+  public getByRole(role: string): Locator {
+    return role === "textbox" ? this.#composerLocator() : this.#emptyLocator();
+  }
+  public getByPlaceholder(): Locator { return this.#composerLocator(); }
+  public getByLabel(): Locator { return this.#composerLocator(); }
+  public locator(selector: string): Locator {
+    return /textarea|contenteditable/iu.test(selector)
+      ? this.#composerLocator()
+      : this.#emptyLocator();
+  }
   public on(event: string, listener: (...args: unknown[]) => void): this {
     const listeners = this.#listeners.get(event) ?? [];
     listeners.push(listener);
@@ -268,15 +435,33 @@ class NavigationPage {
       listener(this.#mainFrame);
     }
   }
+  public emitDialog(): void {
+    for (const listener of this.#listeners.get("dialog") ?? []) listener({});
+  }
+  #composerLocator(): Locator {
+    return new CandidateCollection(
+      new CandidateItem(this.composerEnabled, "", () => this.onComposerProbe?.()),
+    ) as unknown as Locator;
+  }
+  #emptyLocator(): Locator {
+    return new CandidateCollection() as unknown as Locator;
+  }
   public asPage(): Page { return this as unknown as Page; }
 }
 
 class NavigationContext {
   readonly #listeners: Array<(page: Page) => void> = [];
+  public readonly pageList: NavigationPage[];
+  public onPages: (() => void) | undefined;
 
-  public constructor(private readonly pageList: readonly NavigationPage[]) {}
+  public constructor(pages: readonly NavigationPage[]) {
+    this.pageList = [...pages];
+  }
 
-  public pages(): Page[] { return this.pageList.map((page) => page.asPage()); }
+  public pages(): Page[] {
+    this.onPages?.();
+    return this.pageList.map((page) => page.asPage());
+  }
   public on(event: string, listener: (page: Page) => void): this {
     if (event === "page") this.#listeners.push(listener);
     return this;
@@ -290,10 +475,14 @@ class CandidateItem {
   public constructor(
     private readonly enabled: boolean,
     private readonly currentValue: string,
+    private readonly onEnabledProbe?: () => void,
   ) {}
 
   public async isVisible(): Promise<boolean> { return true; }
-  public async isEnabled(): Promise<boolean> { return this.enabled; }
+  public async isEnabled(): Promise<boolean> {
+    this.onEnabledProbe?.();
+    return this.enabled;
+  }
   public async innerText(): Promise<string> { return "Message"; }
   public async getAttribute(name: string): Promise<string | null> {
     return name === "aria-label" ? "Message" : null;
@@ -303,9 +492,12 @@ class CandidateItem {
 }
 
 class CandidateCollection {
-  public constructor(private readonly item: CandidateItem) {}
-  public async count(): Promise<number> { return 1; }
-  public nth(_index: number): Locator { return this.item as unknown as Locator; }
+  public constructor(private readonly item?: CandidateItem) {}
+  public async count(): Promise<number> { return this.item === undefined ? 0 : 1; }
+  public nth(_index: number): Locator {
+    if (this.item === undefined) throw new RangeError("No synthetic locator item");
+    return this.item as unknown as Locator;
+  }
 }
 
 class CandidatePage {

@@ -214,7 +214,9 @@ function identityTextMatches(snapshot: GroupSnapshot, expected: string | TextPat
  * Microsoft account controls commonly render a display name in surname-first
  * order or wrap the configured email in additional account text. Matching is
  * limited to exactly one complete email address or contiguous display-name
- * token order, including the common last-name-first rotation.
+ * token order, including the common last-name-first rotation. Display names
+ * must occupy the entire account-control value so labels for another account
+ * cannot satisfy the identity gate by merely containing the expected name.
  */
 function identityStringMatches(candidate: string, expected: string): boolean {
   const expectedComparable = expected.normalize("NFKC").trim().toLowerCase();
@@ -232,8 +234,8 @@ function identityStringMatches(candidate: string, expected: string): boolean {
   const surnameFirst = expectedTokens.length < 2
     ? expectedTokens
     : [expectedTokens.at(-1)!, ...expectedTokens.slice(0, -1)];
-  return containsTokenSequence(candidateTokens, expectedTokens) ||
-    containsTokenSequence(candidateTokens, surnameFirst);
+  return equalTokenSequence(candidateTokens, expectedTokens) ||
+    equalTokenSequence(candidateTokens, surnameFirst);
 }
 
 function extractEmailAddresses(value: string): readonly string[] {
@@ -250,15 +252,12 @@ function identityTokens(value: string): readonly string[] {
     .match(/[\p{L}\p{N}]+/gu) ?? [];
 }
 
-function containsTokenSequence(
+function equalTokenSequence(
   candidate: readonly string[],
   expected: readonly string[],
 ): boolean {
-  if (expected.length === 0 || expected.length > candidate.length) return false;
-  for (let start = 0; start <= candidate.length - expected.length; start += 1) {
-    if (expected.every((token, offset) => candidate[start + offset] === token)) return true;
-  }
-  return false;
+  return candidate.length === expected.length &&
+    expected.every((token, index) => candidate[index] === token);
 }
 
 /**

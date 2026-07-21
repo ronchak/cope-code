@@ -77,7 +77,7 @@ function snapshot(
   signal: CopilotSignal,
   visible: boolean,
   enabled: boolean,
-  text = signal,
+  text: string = signal,
 ): GroupSnapshot {
   const elements: readonly ElementSnapshot[] = visible
     ? [{ visible: true, enabled, text, value: "", accessibleLabel: text }]

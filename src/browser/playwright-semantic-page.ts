@@ -14,6 +14,7 @@ import {
 export class PlaywrightSemanticPage implements SemanticPage {
   readonly #page: Page;
   #nativeDialogDetected = false;
+  #nativeDialogEpoch = 0;
 
   public constructor(page: Page) {
     this.#page = page;
@@ -23,8 +24,14 @@ export class PlaywrightSemanticPage implements SemanticPage {
     if (typeof page.on === "function") {
       page.on("dialog", () => {
         this.#nativeDialogDetected = true;
+        this.#nativeDialogEpoch += 1;
       });
     }
+  }
+
+  /** Monotonic evidence used to pin cross-page handoff decisions. */
+  public nativeDialogEpoch(): number {
+    return this.#nativeDialogEpoch;
   }
 
   public async currentUrl(): Promise<string> {
