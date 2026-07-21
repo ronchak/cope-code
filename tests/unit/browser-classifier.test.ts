@@ -298,6 +298,30 @@ test("browser configuration and UI contracts reject unknown nested fields", () =
     () => validateBrowserConfig({ ...base, uiContract: unsafeEnterContract } as never),
     /only the send-control/ui,
   );
+  for (const unsafeCandidate of [
+    { kind: "text", text: { source: "protected", flags: "iu" } },
+    { kind: "test-id", testId: { source: "protection", flags: "iu" } },
+    { kind: "css", selector: '[data-testid*="protection" i]' },
+    {
+      kind: "role",
+      role: "status",
+      name: { source: "protected", flags: "iu" },
+    },
+  ]) {
+    const unsafeProtectionContract = structuredClone(base.uiContract) as unknown as {
+      groups: Record<string, { candidates: Array<Record<string, unknown>> }>;
+    };
+    const protection = unsafeProtectionContract.groups.protection;
+    assert.ok(protection);
+    protection.candidates = [unsafeCandidate];
+    assert.throws(
+      () => validateBrowserConfig({
+        ...base,
+        uiContract: unsafeProtectionContract,
+      } as never),
+      /protection/iu,
+    );
+  }
 });
 
 test("conversation identity distinguishes query state without retaining raw URL data", () => {

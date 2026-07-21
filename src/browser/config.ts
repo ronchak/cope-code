@@ -70,6 +70,9 @@ export const DEFAULT_BROWSER_WAITS: BrowserWaitConfig = Object.freeze({
   minimumStableMs: 750,
 });
 
+const PROTECTION_ACCESSIBLE_NAME_PATTERN =
+  "^(?:enterprise data protection|commercial data protection)$";
+
 /**
  * A conservative baseline. Deployments should certify and pin a replacement
  * when their approved Microsoft 365 Copilot surface differs.
@@ -195,12 +198,12 @@ export function createBaselineCopilotUiContract(
         {
           kind: "role",
           role: "status",
-          name: pattern("^(?:enterprise data protection|commercial data protection)$"),
+          name: pattern(PROTECTION_ACCESSIBLE_NAME_PATTERN),
         },
         {
           kind: "role",
           role: "img",
-          name: pattern("^(?:enterprise data protection|commercial data protection)$"),
+          name: pattern(PROTECTION_ACCESSIBLE_NAME_PATTERN),
         },
       ],
       "text",
@@ -547,6 +550,35 @@ function validateUiContract(contract: CopilotUiContract): void {
       throw new TypeError(`Invalid locator group capture: ${signal}`);
     }
     for (const candidate of groupValue.candidates) validateLocator(candidate);
+    if (signal === "protection") validateProtectionLocators(groupValue.candidates);
+  }
+}
+
+function validateProtectionLocators(candidates: readonly SemanticLocator[]): void {
+  for (const candidate of candidates) {
+    if (
+      candidate.kind !== "role" ||
+      (candidate.role !== "status" && candidate.role !== "img") ||
+      candidate.name === undefined
+    ) {
+      throw new TypeError(
+        "Protection locators must use status or img roles with an exact positive accessible name",
+      );
+    }
+    if (typeof candidate.name === "string") {
+      const normalized = candidate.name.trim().toLowerCase();
+      if (
+        candidate.exact !== true ||
+        (normalized !== "enterprise data protection" &&
+          normalized !== "commercial data protection")
+      ) {
+        throw new TypeError("Protection accessible names must be exact and positive");
+      }
+      continue;
+    }
+    if (candidate.name.source !== PROTECTION_ACCESSIBLE_NAME_PATTERN) {
+      throw new TypeError("Protection accessible-name patterns must be anchored and positive");
+    }
   }
 }
 
