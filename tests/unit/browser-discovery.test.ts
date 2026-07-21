@@ -8,16 +8,18 @@ import {
   discoverInstalledBrowsers,
   BrowserCopilotTransport,
   isApprovedWindowsStableBrowserPath,
+  parseWindowsStableBrowserRoots,
   parseWindowsBrowserIdentityEvidence,
   EdgeCopilotTransport,
   createBaselineCopilotUiContract,
   verifyManualBrowserExecutable,
   verifyBrowserExecutable,
+  verifyWindowsIdentity,
   type BrowserIdentityVerifier,
   type VerifiedBrowserExecutable,
 } from "../../src/browser/index.js";
 import { parseBrowserConfig } from "../../src/config/loader.js";
-import { DarwinHostPlatform } from "../../src/platform/index.js";
+import { DarwinHostPlatform, WindowsHostPlatform, type ProbeRunner } from "../../src/platform/index.js";
 import { AgentError } from "../../src/shared/errors.js";
 
 const digest = "a".repeat(64);
@@ -179,20 +181,20 @@ test("production Windows metadata parser requires exact product, company, filena
 });
 
 test("Windows Stable identity requires the vendor Stable installation layout", () => {
-  const environment = {
-    "ProgramFiles(x86)": "C:\\Program Files (x86)",
-    ProgramFiles: "C:\\Program Files",
-    LOCALAPPDATA: "C:\\Users\\user\\AppData\\Local",
-  };
+  const trustedRoots = [
+    "C:\\Program Files (x86)",
+    "C:\\Program Files",
+    "C:\\Users\\user\\AppData\\Local",
+  ];
   assert.equal(isApprovedWindowsStableBrowserPath(
     "edge",
     "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-    environment,
+    trustedRoots,
   ), true);
   assert.equal(isApprovedWindowsStableBrowserPath(
     "chrome",
     "C:\\Users\\user\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe",
-    environment,
+    trustedRoots,
   ), true);
   for (const [product, executable] of [
     ["edge", "C:\\Program Files (x86)\\Microsoft\\Edge Beta\\Application\\msedge.exe"],
@@ -204,13 +206,94 @@ test("Windows Stable identity requires the vendor Stable installation layout", (
     ["chrome", "D:\\Apps\\Google\\Chrome\\Application\\chrome.exe"],
     ["chrome", "\\\\server\\share\\Google\\Chrome\\Application\\chrome.exe"],
   ] as const) {
-    assert.equal(isApprovedWindowsStableBrowserPath(product, executable, environment), false, executable);
+    assert.equal(isApprovedWindowsStableBrowserPath(product, executable, trustedRoots), false, executable);
   }
   assert.equal(isApprovedWindowsStableBrowserPath(
     "chrome",
     "D:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-    { ...environment, ProgramFiles: "D:\\Program Files" },
+    ["D:\\Program Files", "C:\\Users\\user\\AppData\\Local"],
   ), true);
+  assert.equal(isApprovedWindowsStableBrowserPath(
+    "chrome",
+    "C:\\portable\\Google\\Chrome\\Application\\chrome.exe",
+    ["C:\\Program Files", "C:\\Users\\user\\AppData\\Local"],
+  ), false);
+});
+
+test("Windows Stable roots require bounded absolute OS folder results", () => {
+  assert.deepEqual(parseWindowsStableBrowserRoots("edge", {
+    exitCode: 0,
+    stdout: [
+      "C:\\Program Files (x86)",
+      "D:\\Program Files",
+      "C:\\Users\\user\\AppData\\Local",
+    ].join("\r\n"),
+    stderr: "",
+  }), ["C:\\Program Files (x86)", "D:\\Program Files", "C:\\Users\\user\\AppData\\Local"]);
+  for (const stdout of [
+    "C:\\portable",
+    "C:\\Program Files\r\n\\\\server\\share",
+    "C:\\Program Files\r\nrelative\\AppData",
+  ]) {
+    assert.throws(() => parseWindowsStableBrowserRoots("edge", {
+      exitCode: 0,
+      stdout,
+      stderr: "",
+    }), (error: unknown) => error instanceof AgentError &&
+      error.details.diagnosticCode === "BROWSER_EXECUTABLE_CHANNEL_UNVERIFIED");
+  }
+});
+
+test("Windows identity probes use an absolute system PowerShell outside poisoned search paths", async () => {
+  class PoisonedWindowsHost extends WindowsHostPlatform {
+    public override probeEnvironment(): NodeJS.ProcessEnv {
+      return { PATH: "C:\\portable", Path: "C:\\portable" };
+    }
+  }
+  const probes: Array<{
+    readonly executable: string;
+    readonly args: readonly string[];
+    readonly cwd: string;
+    readonly environment: NodeJS.ProcessEnv;
+  }> = [];
+  const runProbe: ProbeRunner = async (executable, args, cwd, environment) => {
+    probes.push({ executable, args, cwd, environment });
+    return probes.length === 1 ? {
+      exitCode: 0,
+      stdout: [
+        "C:\\Program Files (x86)",
+        "D:\\Program Files",
+        "C:\\Users\\josé\\AppData\\Local",
+      ].join("\r\n"),
+      stderr: "",
+    } : {
+      exitCode: 0,
+      stdout: [
+        "Google Chrome",
+        "Google LLC",
+        "chrome.exe",
+        "149.0.1.2",
+        "Valid",
+        "CN=Google LLC, O=Google LLC, C=US",
+      ].join("\r\n"),
+      stderr: "",
+    };
+  };
+
+  const result = await verifyWindowsIdentity(
+    "chrome",
+    "D:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    new PoisonedWindowsHost(),
+    runProbe,
+  );
+  assert.equal(result.version, "149.0.1.2");
+  assert.equal(probes.length, 2);
+  for (const observed of probes) {
+    assert.equal(observed.executable, "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    assert.equal(observed.cwd, "C:\\Windows\\System32");
+    assert.equal(observed.environment.Path, "C:\\portable");
+    assert.match(observed.args.join(" "), /OutputEncoding/iu);
+  }
 });
 
 test("browser config v1 maps strictly to Edge while v2 records explicit product evidence", () => {

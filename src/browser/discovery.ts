@@ -92,6 +92,10 @@ const WINDOWS_IDENTITIES = Object.freeze({
   readonly publisher: RegExp;
 }>>);
 
+const WINDOWS_SYSTEM_DIRECTORY = "C:\\Windows\\System32";
+const WINDOWS_POWERSHELL_EXECUTABLE =
+  `${WINDOWS_SYSTEM_DIRECTORY}\\WindowsPowerShell\\v1.0\\powershell.exe`;
+
 export async function discoverInstalledBrowsers(
   options: BrowserDiscoveryOptions = {},
 ): Promise<readonly DiscoveredBrowser[]> {
@@ -253,25 +257,42 @@ async function verifyDarwinIdentity(
   };
 }
 
-async function verifyWindowsIdentity(
+export async function verifyWindowsIdentity(
   product: BrowserProduct,
   executablePath: string,
   host: HostPlatform,
   probe: ProbeRunner,
 ): Promise<{ readonly version: string; readonly identity: BrowserIdentityEvidence }> {
   const expected = WINDOWS_IDENTITIES[product];
-  if (!isApprovedWindowsStableBrowserPath(product, executablePath, process.env)) {
-    throw identityError(product, "The selected executable is not in the expected stable browser installation layout", {
-      diagnosticCode: "BROWSER_EXECUTABLE_CHANNEL_UNVERIFIED",
-    });
-  }
   if (path.win32.basename(executablePath).toLowerCase() !== expected.executable) {
     throw identityError(product, "The selected executable name does not match the requested browser product", {
       diagnosticCode: "BROWSER_EXECUTABLE_PRODUCT_MISMATCH",
     });
   }
+  const environment = host.probeEnvironment(process.env);
+  const rootsScript = [
+    "$ErrorActionPreference='Stop'",
+    "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false)",
+    "[Console]::Out.WriteLine([System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::ProgramFilesX86))",
+    "[Console]::Out.WriteLine([System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::ProgramFiles))",
+    "[Console]::Out.WriteLine([System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::LocalApplicationData))",
+  ].join("; ");
+  const rootsResult = await probe(
+    WINDOWS_POWERSHELL_EXECUTABLE,
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", rootsScript],
+    WINDOWS_SYSTEM_DIRECTORY,
+    environment,
+    true,
+  );
+  const stableRoots = parseWindowsStableBrowserRoots(product, rootsResult);
+  if (!isApprovedWindowsStableBrowserPath(product, executablePath, stableRoots)) {
+    throw identityError(product, "The selected executable is not in the expected stable browser installation layout", {
+      diagnosticCode: "BROWSER_EXECUTABLE_CHANNEL_UNVERIFIED",
+    });
+  }
   const script = [
     "$ErrorActionPreference='Stop'",
+    "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false)",
     "$p=$args[0]",
     "$v=[System.Diagnostics.FileVersionInfo]::GetVersionInfo($p)",
     "$s=Get-AuthenticodeSignature -LiteralPath $p",
@@ -283,10 +304,10 @@ async function verifyWindowsIdentity(
     "[Console]::Out.WriteLine([string]$s.SignerCertificate.Subject)",
   ].join("; ");
   const result = await probe(
-    "powershell.exe",
+    WINDOWS_POWERSHELL_EXECUTABLE,
     ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script, executablePath],
-    path.win32.dirname(executablePath),
-    host.probeEnvironment(process.env),
+    WINDOWS_SYSTEM_DIRECTORY,
+    environment,
     true,
   );
   return parseWindowsBrowserIdentityEvidence(product, result);
@@ -301,19 +322,30 @@ async function verifyWindowsIdentity(
 export function isApprovedWindowsStableBrowserPath(
   product: BrowserProduct,
   executablePath: string,
-  environment: NodeJS.ProcessEnv = process.env,
+  trustedRoots: readonly string[],
 ): boolean {
   const suffix = WINDOWS_IDENTITIES[product].stableInstallSuffix;
-  const roots = [
-    environment["ProgramFiles(x86)"],
-    environment.ProgramFiles,
-    environment.LOCALAPPDATA,
-    "C:\\Program Files (x86)",
-    "C:\\Program Files",
-  ].filter((value): value is string => value !== undefined && /^[a-z]:[\\/]/iu.test(value));
-  const approved = new Set(roots.map((root) =>
+  const approved = new Set(trustedRoots.map((root) =>
     path.win32.normalize(`${root}${suffix}`).toLowerCase()));
   return approved.has(path.win32.normalize(executablePath).toLowerCase());
+}
+
+export function parseWindowsStableBrowserRoots(
+  product: BrowserProduct,
+  result: ProbeResult,
+): readonly string[] {
+  const roots = [...new Set(result.stdout.split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0))];
+  if (
+    result.exitCode !== 0 || roots.length < 2 || roots.length > 3 ||
+    roots.some((root) => !/^[a-z]:[\\/]/iu.test(root))
+  ) {
+    throw identityError(product, "Windows did not return trusted browser installation roots", {
+      diagnosticCode: "BROWSER_EXECUTABLE_CHANNEL_UNVERIFIED",
+    });
+  }
+  return roots;
 }
 
 export function parseWindowsBrowserIdentityEvidence(
