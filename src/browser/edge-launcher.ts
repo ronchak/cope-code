@@ -127,7 +127,6 @@ export class EdgeCopilotTransport implements ModelTransport {
         },
         dependencies.launchPersistentContext,
       );
-      assertPersistentContextOwner(context);
       const semanticPage = await openTrackedCopilotPage(context, config);
       const {
         profileDirectory: _profileDirectory,
@@ -294,14 +293,7 @@ export async function launchDedicatedPersistentContext(
   options: Parameters<PersistentContextLauncher>[1],
   launcher: PersistentContextLauncher = chromium.launchPersistentContext.bind(chromium),
 ): Promise<BrowserContext> {
-  const context = await launchPersistentContext(profileDirectory, options, launcher);
-  try {
-    assertPersistentContextOwner(context);
-  } catch (error) {
-    void terminateBrowserContext(context).catch(() => undefined);
-    throw error;
-  }
-  return context;
+  return launchPersistentContext(profileDirectory, options, launcher);
 }
 
 async function launchPersistentContext(
@@ -310,20 +302,6 @@ async function launchPersistentContext(
   launcher: PersistentContextLauncher = chromium.launchPersistentContext.bind(chromium),
 ): Promise<BrowserContext> {
   return launcher(profileDirectory, options);
-}
-
-function assertPersistentContextOwner(context: BrowserContext): void {
-  const browser = typeof context.browser === "function" ? context.browser() : null;
-  if (browser === null) {
-    throw new AgentError(
-      "TRANSPORT_UNAVAILABLE",
-      "The dedicated browser process owner is unavailable",
-      {
-        diagnosticCode: "BROWSER_PROCESS_OWNER_UNAVAILABLE",
-        next: "Close the dedicated browser window, run cope setup --force, and retry.",
-      },
-    );
-  }
 }
 
 export async function launchEdgeCopilotTransport(

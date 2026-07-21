@@ -108,11 +108,32 @@ class BlockingOperationContext {
   public async close(): Promise<void> {}
 }
 
-class OwnerlessLaunchContext {
+class OwnerlessOperationContext {
+  readonly #page = new BlockingPage();
   public closeCalls = 0;
   public constructor(private readonly closeResult: Promise<void>) {}
+  public pages(): readonly Page[] { return [this.#page as unknown as Page]; }
+  public browser(): null { return null; }
+  public on(): this { return this; }
+  public async close(): Promise<void> {
+    this.closeCalls += 1;
+    await this.closeResult;
+  }
+}
+
+class OwnerlessLaunchContext {
+  public closeCalls = 0;
+  public newPageCalls = 0;
+  public constructor(
+    private readonly closeResult: Promise<void>,
+    private readonly newPageResult: Promise<Page>,
+  ) {}
   public pages(): readonly Page[] { return []; }
   public browser(): null { return null; }
+  public async newPage(): Promise<Page> {
+    this.newPageCalls += 1;
+    return this.newPageResult;
+  }
   public async close(): Promise<void> {
     this.closeCalls += 1;
     await this.closeResult;
@@ -175,7 +196,8 @@ test("ownerless launch returns promptly while held fallback cleanup retains the 
   const root = await mkdtemp(path.join(tmpdir(), "cope-ownerless-close-held-"));
   t.after(async () => rm(root, { recursive: true, force: true }));
   const closeRelease = deferred<void>();
-  const context = new OwnerlessLaunchContext(closeRelease.promise);
+  const newPageResult = deferred<Page>();
+  const context = new OwnerlessLaunchContext(closeRelease.promise, newPageResult.promise);
   const { config, profile } = await launchFixture(root);
 
   const observedError = await rejectionWithin(
@@ -188,8 +210,9 @@ test("ownerless launch returns promptly while held fallback cleanup retains the 
   assert.equal(observedError instanceof AgentError, true);
   assert.equal(
     (observedError as AgentError).details.diagnosticCode,
-    "BROWSER_PROCESS_OWNER_UNAVAILABLE",
+    "BROWSER_OPERATION_TIMEOUT",
   );
+  assert.equal(context.newPageCalls, 1);
   assert.equal(context.closeCalls, 1);
   await assert.rejects(ExclusiveProfileLock.acquire(profile), lockedProfileError);
 
@@ -203,7 +226,8 @@ test("ownerless launch retains the lock when fallback cleanup rejects", async (t
   const root = await mkdtemp(path.join(tmpdir(), "cope-ownerless-close-rejected-"));
   t.after(async () => rm(root, { recursive: true, force: true }));
   const closeResult = deferred<void>();
-  const context = new OwnerlessLaunchContext(closeResult.promise);
+  const newPageResult = deferred<Page>();
+  const context = new OwnerlessLaunchContext(closeResult.promise, newPageResult.promise);
   const { config, profile } = await launchFixture(root);
 
   const observedError = await rejectionWithin(
@@ -216,9 +240,82 @@ test("ownerless launch retains the lock when fallback cleanup rejects", async (t
   assert.equal(observedError instanceof AgentError, true);
   assert.equal(
     (observedError as AgentError).details.diagnosticCode,
-    "BROWSER_PROCESS_OWNER_UNAVAILABLE",
+    "BROWSER_OPERATION_TIMEOUT",
   );
   closeResult.reject(new Error("synthetic ownerless context close failure"));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(context.closeCalls, 1);
+  await assert.rejects(ExclusiveProfileLock.acquire(profile), lockedProfileError);
+});
+
+test("context-owned persistent launch remains usable and releases its lock on close", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-ownerless-success-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const closeRelease = deferred<void>();
+  const context = new OwnerlessOperationContext(closeRelease.promise);
+  const { config, profile } = await launchFixture(root);
+
+  const transport = await EdgeCopilotTransport.launch(
+    config,
+    launchDependencies(context as unknown as BrowserContext),
+  );
+  await assert.rejects(ExclusiveProfileLock.acquire(profile), lockedProfileError);
+  const closePromise = transport.close();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(context.closeCalls, 1);
+  await assert.rejects(ExclusiveProfileLock.acquire(profile), lockedProfileError);
+  closeRelease.resolve();
+  await closePromise;
+
+  const reacquired = await ExclusiveProfileLock.acquire(profile);
+  await reacquired.release();
+});
+
+test("ownerless operation timeout shares context teardown and retains the lock until success", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-ownerless-operation-held-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const closeRelease = deferred<void>();
+  const context = new OwnerlessOperationContext(closeRelease.promise);
+  const { config, profile } = await launchFixture(root);
+  const transport = await EdgeCopilotTransport.launch(
+    config,
+    launchDependencies(context as unknown as BrowserContext),
+  );
+
+  const [firstError, secondError] = await Promise.all([
+    rejectionWithin(transport.inspectState(), 200),
+    rejectionWithin(transport.inspectState(), 200),
+  ]);
+  for (const error of [firstError, secondError]) {
+    assert.equal(error instanceof AgentError, true);
+    assert.equal((error as AgentError).details.diagnosticCode, "BROWSER_OPERATION_TIMEOUT");
+  }
+  await transport.close();
+  assert.equal(context.closeCalls, 1);
+  await assert.rejects(ExclusiveProfileLock.acquire(profile), lockedProfileError);
+
+  closeRelease.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const reacquired = await ExclusiveProfileLock.acquire(profile);
+  await reacquired.release();
+});
+
+test("rejected ownerless operation teardown retains the profile lock fail-closed", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-ownerless-operation-rejected-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const closeResult = deferred<void>();
+  const context = new OwnerlessOperationContext(closeResult.promise);
+  const { config, profile } = await launchFixture(root);
+  const transport = await EdgeCopilotTransport.launch(
+    config,
+    launchDependencies(context as unknown as BrowserContext),
+  );
+
+  const operationError = await rejectionWithin(transport.inspectState(), 200);
+  assert.equal(operationError instanceof AgentError, true);
+  assert.equal((operationError as AgentError).details.diagnosticCode, "BROWSER_OPERATION_TIMEOUT");
+  await transport.close();
+  closeResult.reject(new Error("synthetic ownerless operation close failure"));
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(context.closeCalls, 1);
   await assert.rejects(ExclusiveProfileLock.acquire(profile), lockedProfileError);
