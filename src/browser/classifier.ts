@@ -130,17 +130,18 @@ export function classifyCopilotPage(
     return result("unapproved-host", false, "COPILOT_SURFACE_NOT_APPROVED");
   }
 
+  if (modal) {
+    // Recoverable DOM dialogs remain visible to the operator. Cope never
+    // interacts with or submits through them, and readiness may recover after
+    // the operator closes or completes the dialog. Dialog ownership takes
+    // precedence over generic page-wide throttling or service-error text.
+    return result("blocking-modal", false, "UNEXPECTED_BLOCKING_MODAL");
+  }
   if (matches(observation, contract, "throttled")) {
     return result("throttled", true, "SERVICE_THROTTLED");
   }
   if (matches(observation, contract, "service-error")) {
     return result("service-error", true, "COPILOT_SERVICE_ERROR");
-  }
-  if (modal) {
-    // Recoverable DOM dialogs remain visible to the operator. Cope never
-    // interacts with or submits through them, and readiness may recover after
-    // the operator closes or completes the dialog.
-    return result("blocking-modal", false, "UNEXPECTED_BLOCKING_MODAL");
   }
 
   if (
