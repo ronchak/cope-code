@@ -61,14 +61,14 @@ export function browserReadinessGuidance(
       const missingSignals = coreMissingSignals(locatorQuorum);
       return {
         summary: "The visible Copilot page did not match Cope's certified control contract.",
-        next: "Run cope setup --force to refresh the managed browser configuration. If this persists, rerun with COPE_DEBUG=1 and report the diagnostic code.",
+        next: "Run cope setup --force to remove a stale pinned UI contract. If this persists, report the diagnostic code and missing signal names.",
         ...(missingSignals.length === 0 ? {} : { missingSignals }),
       };
     }
     case "unapproved-host":
       return {
-        summary: "Edge did not return to an approved Copilot conversation before the readiness deadline.",
-        next: "If Microsoft sign-in is visible, complete it manually and wait for Copilot Chat to return. Otherwise run cope setup --force and confirm the Microsoft 365 Copilot Chat URL.",
+        summary: "The dedicated Edge context did not expose an approved Copilot or Microsoft authentication page.",
+        next: "Close stray blank tabs in the dedicated Edge window and retry. If Microsoft sign-in appears, complete it manually and wait for Copilot Chat to return.",
       };
     case "blocking-modal":
       return {
@@ -108,8 +108,8 @@ export function browserReadinessGuidance(
     case "unknown": {
       const missingSignals = coreMissingSignals(locatorQuorum);
       return {
-        summary: "Cope could not classify the visible Copilot page before the readiness deadline.",
-        next: "Run cope doctor, then run cope setup --force if the browser configuration or visible account is stale.",
+        summary: "Cope reached the approved site, but no certified Copilot chat controls appeared within the bounded hydration window.",
+        next: "Retry once with the Copilot conversation visibly open. If this persists, report the diagnostic code and missing signal names.",
         ...(missingSignals.length === 0 ? {} : { missingSignals }),
       };
     }

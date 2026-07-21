@@ -35,8 +35,11 @@ import {
   type BrowserKillSwitch,
 } from "./kill-switch.js";
 
-const TASK_MARKER_PREFIX = "[[COPILOT_AGENT_TASK_V1:";
+const LEGACY_TASK_MARKER_PREFIX = "[[COPILOT_AGENT_TASK_V1:";
+const TASK_MARKER_PREFIX = "[[COPILOT_AGENT_TASK_V2:";
 const TASK_MARKER_SUFFIX = "]]";
+const LEGACY_RESPONSE_BASELINE_VERSION = "response-sequence/v1";
+const RESPONSE_BASELINE_VERSION = "response-sequence/v2";
 
 interface SubmissionRecord {
   readonly taskId: string;
@@ -46,7 +49,7 @@ interface SubmissionRecord {
   readonly marker: string;
   readonly conversationId: string;
   readonly baselineResponseCount: number;
-  readonly baselineLastResponseSha256: string | undefined;
+  readonly baselineResponseSequenceSha256: string;
   readonly baselineKnown: boolean;
   activationAttempted: boolean;
   receipt: SubmissionReceipt;
@@ -60,13 +63,18 @@ interface SubmissionIdentity {
 
 interface ResponseBaseline {
   readonly responseCount: number;
-  readonly lastResponseSha256?: string;
+  readonly responseSequenceSha256: string;
 }
 
 interface RecoveredTaskMarker {
   readonly marker: string;
   readonly baseline?: ResponseBaseline;
 }
+
+type TaskMarkerEvidence =
+  | { readonly status: "absent" }
+  | { readonly status: "ambiguous" }
+  | ({ readonly status: "unique" } & RecoveredTaskMarker);
 
 interface ObservedPageState {
   readonly observation: CopilotPageObservation;
@@ -182,6 +190,10 @@ export class CopilotBrowserAdapter implements ModelTransport {
     }
 
     const first = await this.#observe();
+    // The caller's signal is intentionally checked again after the trust
+    // observation. The signal can change while page state is being sampled,
+    // and no prompt content may be disclosed after that cancellation.
+    this.#assertUsable(options.signal);
     if (first.classification.state !== "ready") {
       return this.#storeKnownNotSubmitted(request, first.classification.diagnosticCode);
     }
@@ -204,15 +216,32 @@ export class CopilotBrowserAdapter implements ModelTransport {
       );
     }
 
-    const initialResponses = responseTexts(first.observation);
-    const initialLastResponse = initialResponses.at(-1);
+    const initialResponses = responseEnvelopeTexts(first.observation);
     const marker = createTaskMarker(request, {
       responseCount: initialResponses.length,
-      ...(initialLastResponse === undefined ? {} : { lastResponseSha256: sha256(initialLastResponse) }),
+      responseSequenceSha256: responseSequenceSha256(initialResponses),
     });
     const fullContent = `${request.content}\n\n${marker}`;
-    const existingMarker = findTaskMarker(first.observation, request);
-    if (existingMarker !== undefined) {
+    const existingMarker = taskMarkerEvidence(first.observation, request);
+    if (existingMarker.status === "ambiguous") {
+      const record = this.#createRecord(
+        request,
+        marker,
+        conversationId,
+        first.observation,
+        false,
+      );
+      record.receipt = this.#receipt(
+        request,
+        "indeterminate",
+        conversationId,
+        marker,
+        "TASK_MARKER_AMBIGUOUS",
+      );
+      this.#records.set(request.submissionId, record);
+      return record.receipt;
+    }
+    if (existingMarker.status === "unique") {
       const record = this.#createRecord(
         request,
         existingMarker.marker,
@@ -235,16 +264,22 @@ export class CopilotBrowserAdapter implements ModelTransport {
       true,
     );
     this.#records.set(request.submissionId, record);
+    const actionGuard = this.#actionGuard(options.signal);
 
     try {
-      await this.#page.fill(this.#config.uiContract.groups.composer, fullContent);
-    } catch {
+      await this.#page.fill(
+        this.#config.uiContract.groups.composer,
+        fullContent,
+        actionGuard,
+      );
+    } catch (error) {
+      const diagnosticCode = knownPreActivationDiagnostic(error);
       record.receipt = this.#receipt(
         request,
-        "not-submitted",
+        diagnosticCode === undefined ? "indeterminate" : "not-submitted",
         conversationId,
         marker,
-        "COMPOSER_FILL_FAILED",
+        diagnosticCode ?? "COMPOSER_FILL_INDETERMINATE",
       );
       return record.receipt;
     }
@@ -254,6 +289,9 @@ export class CopilotBrowserAdapter implements ModelTransport {
     let second: ObservedPageState;
     try {
       second = await this.#observe();
+      // Likewise, cancellation during the post-fill trust observation must
+      // prevent the consequential send action.
+      this.#assertUsable(options.signal);
     } catch {
       record.receipt = this.#receipt(
         request,
@@ -280,33 +318,41 @@ export class CopilotBrowserAdapter implements ModelTransport {
       return record.receipt;
     }
 
-    const strategy = this.#config.uiContract.submissionStrategy;
-    if (strategy === "send-control") {
-      const send = second.observation.send;
-      if (
-        !groupMatches(send, this.#config.uiContract.groups.send.minimumCandidateMatches) ||
-        send.enabledElements === 0
-      ) {
+    const send = second.observation.send;
+    if (
+      !groupMatches(send, this.#config.uiContract.groups.send.minimumCandidateMatches) ||
+      send.enabledElements === 0
+    ) {
+      record.activationAttempted = false;
+      record.receipt = this.#receipt(
+        request,
+        "not-submitted",
+        conversationId,
+        marker,
+        "SEND_CONTROL_NOT_ACTIONABLE",
+      );
+      return record.receipt;
+    }
+    record.activationAttempted = true;
+    this.#taskConversations.set(request.taskId, conversationId);
+    try {
+      await this.#page.click(this.#config.uiContract.groups.send, actionGuard);
+    } catch (error) {
+      const diagnosticCode = knownPreActivationDiagnostic(error);
+      if (diagnosticCode !== undefined) {
         record.activationAttempted = false;
+        if (establishedConversation === undefined) {
+          this.#taskConversations.delete(request.taskId);
+        }
         record.receipt = this.#receipt(
           request,
           "not-submitted",
           conversationId,
           marker,
-          "SEND_CONTROL_NOT_ACTIONABLE",
+          diagnosticCode,
         );
         return record.receipt;
       }
-    }
-    record.activationAttempted = true;
-    this.#taskConversations.set(request.taskId, conversationId);
-    try {
-      if (strategy === "send-control") {
-        await this.#page.click(this.#config.uiContract.groups.send);
-      } else {
-        await this.#page.press(this.#config.uiContract.groups.composer, "Enter");
-      }
-    } catch {
       // Playwright can throw after dispatch. Resolve only through page evidence.
     }
 
@@ -326,8 +372,18 @@ export class CopilotBrowserAdapter implements ModelTransport {
     if (record?.receipt.status === "submitted") return record.receipt;
 
     const state = await this.#observe();
-    const recoveredMarker = record === undefined ? findTaskMarker(state.observation, request) : undefined;
-    const marker = record?.marker ?? recoveredMarker?.marker ?? createTaskMarker(request);
+    const recoveredMarker = taskMarkerEvidence(state.observation, request);
+    const marker = record?.marker ??
+      (recoveredMarker.status === "unique" ? recoveredMarker.marker : createTaskMarker(request));
+    if (recoveredMarker.status === "ambiguous") {
+      return this.#receipt(
+        request,
+        "indeterminate",
+        conversationIdFromUrl(state.observation.url),
+        marker,
+        "TASK_MARKER_AMBIGUOUS",
+      );
+    }
     if (state.classification.state === "unapproved-host") {
       return this.#receipt(request, "indeterminate", undefined, marker, "HOST_NOT_APPROVED");
     }
@@ -353,7 +409,7 @@ export class CopilotBrowserAdapter implements ModelTransport {
         "CONVERSATION_CHANGED_AFTER_ATTEMPT",
       );
     }
-    if (record !== undefined ? containsMarker(state.observation, marker) : recoveredMarker !== undefined) {
+    if (recoveredMarker.status === "unique" && recoveredMarker.marker === marker) {
       const receipt = this.#receipt(request, "submitted", conversationId, marker, "MARKER_CONFIRMED");
       this.#taskConversations.set(request.taskId, conversationId);
       if (record !== undefined) record.receipt = receipt;
@@ -363,8 +419,8 @@ export class CopilotBrowserAdapter implements ModelTransport {
           marker,
           conversationId,
           state.observation,
-          recoveredMarker?.baseline !== undefined,
-          recoveredMarker?.baseline,
+          recoveredMarker.baseline !== undefined,
+          recoveredMarker.baseline,
         );
         recovered.receipt = receipt;
         this.#records.set(request.submissionId, recovered);
@@ -478,15 +534,28 @@ export class CopilotBrowserAdapter implements ModelTransport {
       ) {
         return this.#blockedForClassification(request, state.classification, conversationId);
       }
-      if (!containsMarker(state.observation, activeRecord.marker)) {
+      const markerEvidence = taskMarkerEvidence(state.observation, request);
+      if (
+        markerEvidence.status !== "unique" ||
+        markerEvidence.marker !== activeRecord.marker
+      ) {
         return this.#receiveBase(request, {
           status: "indeterminate",
-          diagnosticCode: "TASK_MARKER_NOT_OBSERVED",
+          diagnosticCode: markerEvidence.status === "ambiguous"
+            ? "TASK_MARKER_AMBIGUOUS"
+            : "TASK_MARKER_NOT_OBSERVED",
         }, conversationId);
       }
 
-      const candidate = associatedResponse(state.observation, activeRecord);
-      if (candidate !== undefined) {
+      const correlation = associatedResponse(state.observation, activeRecord);
+      if (correlation.status === "indeterminate") {
+        return this.#receiveBase(request, {
+          status: "indeterminate",
+          diagnosticCode: correlation.diagnosticCode,
+        }, conversationId);
+      }
+      if (correlation.status === "candidate") {
+        const candidate = correlation.content;
         sawCandidate = true;
         if (candidate.length > this.#config.maxResponseChars) {
           return this.#receiveBase(request, {
@@ -573,7 +642,17 @@ export class CopilotBrowserAdapter implements ModelTransport {
           "CONVERSATION_CHANGED_AFTER_ACTIVATION",
         );
       }
-      if (containsMarker(state.observation, record.marker)) {
+      const markerEvidence = taskMarkerEvidence(state.observation, record);
+      if (markerEvidence.status === "ambiguous") {
+        return this.#receipt(
+          record,
+          "indeterminate",
+          record.conversationId,
+          record.marker,
+          "TASK_MARKER_AMBIGUOUS",
+        );
+      }
+      if (markerEvidence.status === "unique" && markerEvidence.marker === record.marker) {
         return this.#receipt(
           record,
           "submitted",
@@ -632,8 +711,7 @@ export class CopilotBrowserAdapter implements ModelTransport {
     baselineKnown: boolean,
     recoveredBaseline?: ResponseBaseline,
   ): SubmissionRecord {
-    const responses = responseTexts(observation);
-    const lastResponse = responses.at(-1);
+    const responses = responseEnvelopeTexts(observation);
     return {
       taskId: request.taskId,
       turnId: request.turnId,
@@ -642,9 +720,8 @@ export class CopilotBrowserAdapter implements ModelTransport {
       marker,
       conversationId,
       baselineResponseCount: recoveredBaseline?.responseCount ?? responses.length,
-      baselineLastResponseSha256: recoveredBaseline === undefined
-        ? (lastResponse === undefined ? undefined : sha256(lastResponse))
-        : recoveredBaseline.lastResponseSha256,
+      baselineResponseSequenceSha256: recoveredBaseline?.responseSequenceSha256 ??
+        responseSequenceSha256(responses),
       baselineKnown,
       activationAttempted: false,
       receipt: this.#receipt(request, "not-submitted", conversationId, marker, "NOT_ACTIVATED"),
@@ -673,7 +750,7 @@ export class CopilotBrowserAdapter implements ModelTransport {
         marker,
         conversationId,
         baselineResponseCount: 0,
-        baselineLastResponseSha256: undefined,
+        baselineResponseSequenceSha256: responseSequenceSha256([]),
         baselineKnown: false,
         activationAttempted: false,
         receipt,
@@ -759,7 +836,10 @@ export class CopilotBrowserAdapter implements ModelTransport {
         maximumLength: this.#config.maxMessageChars,
       });
     }
-    if (content.includes(TASK_MARKER_PREFIX)) {
+    if (
+      content.includes(LEGACY_TASK_MARKER_PREFIX) ||
+      content.includes(TASK_MARKER_PREFIX)
+    ) {
       throw new AgentError("PROTOCOL_INVALID", "Transport message contains a reserved marker");
     }
   }
@@ -824,6 +904,24 @@ export class CopilotBrowserAdapter implements ModelTransport {
     }
   }
 
+  #actionGuard(signal?: AbortSignal): () => void {
+    return () => {
+      try {
+        this.#assertUsable(signal);
+      } catch (error) {
+        throw new AgentError(
+          "TRANSPORT_INDETERMINATE",
+          "The browser action was cancelled before dispatch",
+          {
+            diagnosticCode: "PRE_SUBMISSION_ASSERTION_ABORTED",
+            dispatchAttempted: false,
+          },
+          { cause: error },
+        );
+      }
+    };
+  }
+
   async #boundedSleep(deadline: number, signal?: AbortSignal): Promise<void> {
     const remaining = Math.max(0, deadline - this.#monotonicNow());
     await this.#sleep(Math.min(this.#config.waits.pollMs, remaining), signal);
@@ -850,50 +948,78 @@ export function createTaskMarker(
       correlation.submissionId,
       ...(baseline === undefined
         ? []
-        : [baseline.responseCount, baseline.lastResponseSha256 ?? null]),
+        : [
+            RESPONSE_BASELINE_VERSION,
+            baseline.responseCount,
+            baseline.responseSequenceSha256,
+          ]),
     ]),
     "utf8",
   ).toString("base64url");
   return `${TASK_MARKER_PREFIX}${encoded}${TASK_MARKER_SUFFIX}`;
 }
 
-function responseTexts(observation: CopilotPageObservation): readonly string[] {
+function knownPreActivationDiagnostic(error: unknown): string | undefined {
+  if (!(error instanceof AgentError) || error.details.dispatchAttempted !== false) {
+    return undefined;
+  }
+  const diagnosticCode = error.details.diagnosticCode;
+  return typeof diagnosticCode === "string" && diagnosticCode.length > 0
+    ? diagnosticCode
+    : "PRE_ACTIVATION_GUARD_FAILED";
+}
+
+function responseEnvelopeTexts(observation: CopilotPageObservation): readonly string[] {
   return observation.responses.elements
-    .map((element) => element.text.trim())
-    .filter((text) => text.length > 0);
+    .map((element) => element.text.trim());
+}
+
+function responseSequenceSha256(responses: readonly string[]): string {
+  return sha256(JSON.stringify(responses));
 }
 
 function associatedResponse(
   observation: CopilotPageObservation,
   record: SubmissionRecord,
-): string | undefined {
-  const responses = responseTexts(observation);
-  const last = responses.at(-1);
-  if (last === undefined) return undefined;
-  if (responses.length > record.baselineResponseCount) return last;
-  if (
-    responses.length === record.baselineResponseCount &&
-    record.baselineLastResponseSha256 !== sha256(last)
-  ) {
-    return last;
+):
+  | { readonly status: "pending" }
+  | { readonly status: "candidate"; readonly content: string }
+  | { readonly status: "indeterminate"; readonly diagnosticCode: string } {
+  const responses = responseEnvelopeTexts(observation);
+  if (responses.length < record.baselineResponseCount) {
+    return { status: "indeterminate", diagnosticCode: "RESPONSE_BASELINE_TRUNCATED" };
   }
-  return undefined;
+  if (
+    responseSequenceSha256(responses.slice(0, record.baselineResponseCount)) !==
+    record.baselineResponseSequenceSha256
+  ) {
+    return { status: "indeterminate", diagnosticCode: "RESPONSE_BASELINE_CHANGED" };
+  }
+  if (responses.length === record.baselineResponseCount) {
+    return { status: "pending" };
+  }
+  if (responses.length !== record.baselineResponseCount + 1) {
+    return { status: "indeterminate", diagnosticCode: "RESPONSE_SEQUENCE_AMBIGUOUS" };
+  }
+  const content = responses[record.baselineResponseCount]!;
+  return content.length === 0
+    ? { status: "pending" }
+    : { status: "candidate", content };
 }
 
-function containsMarker(observation: CopilotPageObservation, marker: string): boolean {
-  return observation["user-messages"].elements.some((element) => element.text.includes(marker));
-}
-
-function findTaskMarker(
+function taskMarkerEvidence(
   observation: CopilotPageObservation,
   correlation: Pick<SubmissionResolutionRequest, "taskId" | "turnId" | "submissionId">,
-): RecoveredTaskMarker | undefined {
-  const pattern = /\[\[COPILOT_AGENT_TASK_V1:([A-Za-z0-9_-]+)\]\]/gu;
+): TaskMarkerEvidence {
+  const pattern = /\[\[COPILOT_AGENT_TASK_(V1|V2):([A-Za-z0-9_-]+)\]\]/gu;
+  const recovered: RecoveredTaskMarker[] = [];
+  let invalidMatchingMarker = false;
   for (const element of observation["user-messages"].elements) {
     for (const match of element.text.matchAll(pattern)) {
       const marker = match[0];
-      const encoded = match[1];
-      if (marker === undefined || encoded === undefined) continue;
+      const version = match[1];
+      const encoded = match[2];
+      if (marker === undefined || version === undefined || encoded === undefined) continue;
       let value: unknown;
       try {
         value = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as unknown;
@@ -902,31 +1028,68 @@ function findTaskMarker(
       }
       if (
         !Array.isArray(value) ||
-        (value.length !== 3 && value.length !== 5) ||
+        value.length < 3 ||
         value[0] !== correlation.taskId ||
         value[1] !== correlation.turnId ||
         value[2] !== correlation.submissionId
       ) continue;
-      if (value.length === 3) return { marker };
-      const responseCount = value[3];
-      const lastResponseSha256 = value[4];
+      if (version === "V1") {
+        const responseCount = value[3];
+        const lastResponseSha256 = value[4];
+        const validLegacyShape = value.length === 3 || (
+          value.length === 5 &&
+          typeof responseCount === "number" &&
+          Number.isSafeInteger(responseCount) &&
+          responseCount >= 0 &&
+          (lastResponseSha256 === null ||
+            (typeof lastResponseSha256 === "string" &&
+              /^[a-f0-9]{64}$/u.test(lastResponseSha256)))
+        );
+        if (validLegacyShape) recovered.push({ marker });
+        else invalidMatchingMarker = true;
+        continue;
+      }
+      const baselineVersion = value[3];
+      const responseCount = value[4];
+      const responseSequenceDigest = value[5];
+      const validBaselineShape =
+        typeof responseCount === "number" &&
+        Number.isSafeInteger(responseCount) &&
+        responseCount >= 0 &&
+        typeof responseSequenceDigest === "string" &&
+        /^[a-f0-9]{64}$/u.test(responseSequenceDigest);
       if (
-        typeof responseCount !== "number" ||
-        !Number.isSafeInteger(responseCount) ||
-        responseCount < 0 ||
-        (lastResponseSha256 !== null &&
-          (typeof lastResponseSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(lastResponseSha256)))
-      ) continue;
-      return {
+        value.length === 6 &&
+        baselineVersion === LEGACY_RESPONSE_BASELINE_VERSION &&
+        validBaselineShape
+      ) {
+        // Historical V2 task markers used filtered non-empty response text.
+        // They can prove submission uniqueness, but their baseline cannot be
+        // interpreted by the envelope-aware correlator.
+        recovered.push({ marker });
+        continue;
+      }
+      if (
+        value.length !== 6 ||
+        baselineVersion !== RESPONSE_BASELINE_VERSION ||
+        !validBaselineShape
+      ) {
+        invalidMatchingMarker = true;
+        continue;
+      }
+      recovered.push({
         marker,
         baseline: {
           responseCount,
-          ...(lastResponseSha256 === null ? {} : { lastResponseSha256 }),
+          responseSequenceSha256: responseSequenceDigest,
         },
-      };
+      });
     }
   }
-  return undefined;
+  if (invalidMatchingMarker) return { status: "ambiguous" };
+  if (recovered.length === 0) return { status: "absent" };
+  if (recovered.length !== 1) return { status: "ambiguous" };
+  return { status: "unique", ...recovered[0]! };
 }
 
 function blockReason(state: PageClassification["state"]): TransportBlockReason {

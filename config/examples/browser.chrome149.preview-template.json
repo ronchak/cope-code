@@ -111,15 +111,8 @@
         "signal": "responses",
         "candidates": [
           {
-            "kind": "test-id",
-            "testId": {
-              "source": "assistant.*message|response",
-              "flags": "iu"
-            }
-          },
-          {
             "kind": "css",
-            "selector": "[data-content=\"ai-message\"], [data-author=\"assistant\"]"
+            "selector": "[data-content=\"ai-message\"], [data-author=\"assistant\"], [data-testid*=\"assistant\" i][data-testid*=\"message\" i], [data-testid*=\"response\" i][data-testid*=\"message\" i]"
           }
         ],
         "minimumCandidateMatches": 1,
@@ -130,15 +123,8 @@
         "signal": "user-messages",
         "candidates": [
           {
-            "kind": "test-id",
-            "testId": {
-              "source": "user.*message",
-              "flags": "iu"
-            }
-          },
-          {
             "kind": "css",
-            "selector": "[data-content=\"user-message\"], [data-author=\"user\"]"
+            "selector": "[data-content=\"user-message\"], [data-author=\"user\"], [data-testid*=\"user\" i][data-testid*=\"message\" i]"
           }
         ],
         "minimumCandidateMatches": 1,
@@ -165,35 +151,30 @@
         "signal": "identity",
         "candidates": [
           {
-            "kind": "role",
-            "role": "button",
-            "name": "REPLACE_WITH_APPROVED_WORK_ACCOUNT_DISPLAY_STRING",
-            "exact": true
-          },
-          {
-            "kind": "text",
-            "text": "REPLACE_WITH_APPROVED_WORK_ACCOUNT_DISPLAY_STRING",
-            "exact": true
+            "kind": "css",
+            "selector": "button[id*=\"mectrl\" i], [role=\"button\"][id*=\"mectrl\" i], button[id*=\"mecontrol\" i], [role=\"button\"][id*=\"mecontrol\" i], button[class*=\"mectrl\" i], [role=\"button\"][class*=\"mectrl\" i], button[class*=\"me-control\" i], [role=\"button\"][class*=\"me-control\" i], button[data-testid*=\"account-control\" i], [role=\"button\"][data-testid*=\"account-control\" i], button[data-testid*=\"account-menu\" i], [role=\"button\"][data-testid*=\"account-menu\" i], button[data-testid*=\"profile\" i], [role=\"button\"][data-testid*=\"profile\" i], button[data-testid*=\"persona\" i], [role=\"button\"][data-testid*=\"persona\" i]"
           }
         ],
         "minimumCandidateMatches": 1,
-        "maximumElements": 20,
+        "maximumElements": 50,
         "capture": "text"
       },
       "protection": {
         "signal": "protection",
         "candidates": [
           {
-            "kind": "text",
-            "text": {
-              "source": "enterprise data protection|protected",
+            "kind": "role",
+            "role": "status",
+            "name": {
+              "source": "^(?:enterprise data protection|commercial data protection)$",
               "flags": "iu"
             }
           },
           {
-            "kind": "test-id",
-            "testId": {
-              "source": "protection|commercial-data-protection",
+            "kind": "role",
+            "role": "img",
+            "name": {
+              "source": "^(?:enterprise data protection|commercial data protection)$",
               "flags": "iu"
             }
           }

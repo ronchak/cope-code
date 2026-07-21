@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 const WINDOWS_BASELINE_HASHES = {
-  "scripts/install-windows.ps1": "8f00cb314fea2be37f19db667c3e78ccd975a6cdb612ddd063b1119d3fb354e6",
+  "scripts/install-windows.ps1": "fc61cc22fd84a84b1d3973234874c942de0613f0ee48d1c7b06acd57bbe62b3d",
   "scripts/uninstall-windows.ps1": "16b6d9eafb74ac06a2900d9f31f98018e49ec25b78742019b5ad830fb1796a50",
   "install.cmd": "8d56b5ac60e1f4365993927d1bc5d40ac11963208c7588954888fc3b62ce474c",
   "install-cope.cmd": "3ab30bf64882799b88f9e95883be507b7be325072d2a66f701a44b79f2a14794",

@@ -381,12 +381,15 @@ test("Chrome launch uses exactly the verified executable and Chrome-dedicated pe
   const observed: Array<{ profile: string; options: Record<string, unknown> }> = [];
   const page = {
     url: () => "https://m365.cloud.microsoft/chat",
+    isClosed: () => false,
     on: () => page,
+    bringToFront: async () => undefined,
     setDefaultTimeout: () => undefined,
     setDefaultNavigationTimeout: () => undefined,
   };
   const browserContext = {
     pages: () => [page],
+    browser: () => ({ close: async () => undefined }),
     close: async () => undefined,
   };
   const transport = await BrowserCopilotTransport.launch({

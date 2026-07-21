@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { validateEdgeProfileDirectoryPath } from "../../src/browser/config.js";
+import {
+  validateBrowserConfig,
+  validateEdgeProfileDirectoryPath,
+} from "../../src/browser/config.js";
 import {
   ExclusiveProfileLock,
   prepareDedicatedProfile,
@@ -44,11 +47,29 @@ test("shipped browser templates make their product-specific uncertified UI contr
   ] as const) {
     const template = JSON.parse(await readFile(filename, "utf8")) as {
       product?: string;
-      ui_contract?: { version?: string; certifiedSurface?: string };
+      ui_contract?: { version?: string; certifiedSurface?: string } & Record<string, unknown>;
     };
     assert.equal(template.product, product);
     assert.match(template.ui_contract?.version ?? "", new RegExp(`uncertified-${product}149-template`, "u"));
     assert.match(template.ui_contract?.certifiedSurface ?? "", /UNDEPLOYABLE TEMPLATE/u);
+    assert.doesNotThrow(() => validateBrowserConfig({
+      entryUrl: "https://copilot.example.test/chat",
+      approvedHosts: [{ hostname: "copilot.example.test" }],
+      uiContract: template.ui_contract as never,
+      expectedIdentity: "Synthetic Work Account",
+      requireProtectionIndicator: true,
+      maxMessageChars: 1_000,
+      maxResponseChars: 1_000,
+      waits: {
+        actionMs: 100,
+        submissionConfirmationMs: 100,
+        responseMs: 100,
+        manualReadinessMs: 100,
+        pollMs: 10,
+        stableSamples: 2,
+        minimumStableMs: 10,
+      },
+    }));
   }
 });
 
@@ -404,7 +425,9 @@ test("live configuration binds launch to the canonical verified executable and r
 test("persistent Edge launch receives only the dedicated profile as its user-data directory", async () => {
   const dedicated = "/private/dedicated-cope-edge-profile";
   const calls: Array<{ readonly userDataDirectory: string; readonly options: Readonly<Record<string, unknown>> }> = [];
-  const returnedContext = {} as BrowserContext;
+  const returnedContext = {
+    browser: () => ({ close: async () => undefined }),
+  } as unknown as BrowserContext;
   const observed = await launchDedicatedPersistentContext(
     dedicated,
     { headless: false, acceptDownloads: false },
@@ -416,6 +439,22 @@ test("persistent Edge launch receives only the dedicated profile as its user-dat
   assert.equal(observed, returnedContext);
   assert.deepEqual(calls.map((call) => call.userDataDirectory), [dedicated]);
   assert.equal("userDataDir" in (calls[0]?.options ?? {}), false);
+});
+
+test("persistent browser launch accepts context-owned process teardown", async () => {
+  let closed = false;
+  const returnedContext = {
+    browser: () => null,
+    close: async () => { closed = true; },
+  } as unknown as BrowserContext;
+
+  const observed = await launchDedicatedPersistentContext(
+    "/private/dedicated-cope-edge-profile",
+    { headless: false },
+    async () => returnedContext,
+  );
+  assert.equal(observed, returnedContext);
+  assert.equal(closed, false);
 });
 
 test("dedicated profile lock is exclusive and recoverable after release", async () => {

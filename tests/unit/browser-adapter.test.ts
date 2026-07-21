@@ -13,6 +13,8 @@ import type {
   SemanticPage,
 } from "../../src/browser/contracts.js";
 import { MutableBrowserKillSwitch } from "../../src/browser/kill-switch.js";
+import { sha256 } from "../../src/shared/crypto.js";
+import { AgentError } from "../../src/shared/errors.js";
 
 type ActivationMode = "submitted" | "not-submitted" | "indeterminate";
 
@@ -26,10 +28,15 @@ class DynamicFakePage implements SemanticPage {
   public streaming = false;
   public sendEnabled = true;
   public activationMode: ActivationMode = "submitted";
+  public preActivationDiagnostic: string | undefined = undefined;
   public fillCalls = 0;
   public activationCalls = 0;
+  public currentUrlCalls = 0;
+  public onCurrentUrl: (() => void) | undefined = undefined;
 
   public async currentUrl(): Promise<string> {
+    this.currentUrlCalls += 1;
+    this.onCurrentUrl?.();
     return this.url;
   }
 
@@ -50,11 +57,22 @@ class DynamicFakePage implements SemanticPage {
   }
 
   public async click(): Promise<void> {
+    this.#assertPreActivationGuard();
     await this.#activate();
   }
 
   public async press(): Promise<void> {
+    this.#assertPreActivationGuard();
     await this.#activate();
+  }
+
+  #assertPreActivationGuard(): void {
+    if (this.preActivationDiagnostic === undefined) return;
+    throw new AgentError(
+      "TRANSPORT_INDETERMINATE",
+      "Synthetic pre-activation guard blocked dispatch",
+      { diagnosticCode: this.preActivationDiagnostic, dispatchAttempted: false },
+    );
   }
 
   async #activate(): Promise<void> {
@@ -157,7 +175,7 @@ test("adapter submits once, confirms its task marker, and captures a stable resp
   const { adapter, page } = makeHarness();
   const receipt = await adapter.submit(request);
   assert.equal(receipt.status, "submitted");
-  assert.match(receipt.transportMarker ?? "", /^\[\[COPILOT_AGENT_TASK_V1:/u);
+  assert.match(receipt.transportMarker ?? "", /^\[\[COPILOT_AGENT_TASK_V2:/u);
   assert.equal(page.activationCalls, 1);
   assert.equal(page.userMessages.length, 1);
 
@@ -198,6 +216,156 @@ test("fresh adapter recovers the response baseline from the persisted task marke
   assert.equal(page.activationCalls, 1, "recovery must not activate the composer again");
 });
 
+test("response correlation rejects baseline mutation instead of accepting same-count text drift", async () => {
+  const { adapter, page } = makeHarness();
+  assert.equal((await adapter.submit(request)).status, "submitted");
+  page.responses.splice(0, page.responses.length, "mutated prior response");
+
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "indeterminate");
+  if (response.status === "indeterminate") {
+    assert.equal(response.diagnosticCode, "RESPONSE_BASELINE_CHANGED");
+  }
+});
+
+test("a pre-existing empty assistant envelope cannot become the current response", async () => {
+  const { adapter, page } = makeHarness();
+  page.responses.push("");
+  assert.equal((await adapter.submit(request)).status, "submitted");
+  // Replace the empty pre-existing envelope with delayed text and remove the
+  // genuinely appended envelope. Envelope-aware correlation must see prefix
+  // drift rather than treating the delayed prior response as this task's append.
+  page.responses.splice(1, 2, "delayed prior response");
+
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "indeterminate");
+  if (response.status === "indeterminate") {
+    assert.equal(response.diagnosticCode, "RESPONSE_BASELINE_CHANGED");
+  }
+});
+
+test("the one appended assistant envelope may stream from empty to stable text", async () => {
+  const page = new DynamicFakePage();
+  const { adapter } = makeHarness(page, new MutableBrowserKillSwitch(), () => {
+    page.responses[page.responses.length - 1] = "completed response envelope";
+  });
+  assert.equal((await adapter.submit(request)).status, "submitted");
+  page.responses[page.responses.length - 1] = "";
+
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "completed");
+  if (response.status === "completed") {
+    assert.equal(response.content, "completed response envelope");
+  }
+});
+
+test("response correlation rejects more than one appended assistant envelope", async () => {
+  const { adapter, page } = makeHarness();
+  assert.equal((await adapter.submit(request)).status, "submitted");
+  page.responses.push("unrelated second assistant envelope");
+
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "indeterminate");
+  if (response.status === "indeterminate") {
+    assert.equal(response.diagnosticCode, "RESPONSE_SEQUENCE_AMBIGUOUS");
+  }
+});
+
+test("duplicate task markers are ambiguous and never confirm a response", async () => {
+  const { adapter, page } = makeHarness();
+  const receipt = await adapter.submit(request);
+  assert.equal(receipt.status, "submitted");
+  page.userMessages.push(receipt.transportMarker ?? "missing marker");
+
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "indeterminate");
+  if (response.status === "indeterminate") {
+    assert.equal(response.diagnosticCode, "TASK_MARKER_AMBIGUOUS");
+  }
+});
+
+test("legacy markers can prove submission but cannot recover a response baseline", async () => {
+  const page = new DynamicFakePage();
+  const encoded = Buffer.from(JSON.stringify([
+    request.taskId,
+    request.turnId,
+    request.submissionId,
+  ]), "utf8").toString("base64url");
+  page.userMessages.push(`legacy [[COPILOT_AGENT_TASK_V1:${encoded}]]`);
+  const { adapter } = makeHarness(page);
+
+  const resolved = await adapter.resolveSubmission(request);
+  assert.equal(resolved.status, "submitted");
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "indeterminate");
+  if (response.status === "indeterminate") {
+    assert.equal(response.diagnosticCode, "RESPONSE_BASELINE_UNKNOWN");
+  }
+  assert.equal(page.activationCalls, 0);
+});
+
+test("historical filtered-baseline V2 markers cannot correlate delayed empty envelopes", async () => {
+  const page = new DynamicFakePage();
+  const encoded = Buffer.from(JSON.stringify([
+    request.taskId,
+    request.turnId,
+    request.submissionId,
+    "response-sequence/v1",
+    0,
+    sha256(JSON.stringify([])),
+  ]), "utf8").toString("base64url");
+  page.userMessages.push(`[[COPILOT_AGENT_TASK_V2:${encoded}]]`);
+  page.responses.splice(0, page.responses.length, "delayed prior response");
+  const { adapter } = makeHarness(page);
+
+  const resolved = await adapter.resolveSubmission(request);
+  assert.equal(resolved.status, "submitted");
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "indeterminate");
+  if (response.status === "indeterminate") {
+    assert.equal(response.diagnosticCode, "RESPONSE_BASELINE_UNKNOWN");
+  }
+  assert.equal(page.activationCalls, 0);
+});
+
+test("new submissions reject both legacy and current reserved marker prefixes", async () => {
+  for (const prefix of [
+    "[[COPILOT_AGENT_TASK_V1:",
+    "[[COPILOT_AGENT_TASK_V2:",
+  ]) {
+    const { adapter, page } = makeHarness();
+    await assert.rejects(
+      adapter.submit({ ...request, content: `ordinary text ${prefix}injected]]` }),
+      (error: unknown) => error instanceof AgentError && error.code === "PROTOCOL_INVALID",
+    );
+    assert.equal(page.fillCalls, 0);
+    assert.equal(page.activationCalls, 0);
+  }
+});
+
+test("malformed correlation-matching legacy and current markers are ambiguous", async () => {
+  for (const [version, trailingFields] of [
+    ["V1", ["malformed-extra-field"]],
+    ["V2", []],
+    ["V2", ["malformed-extra-field"]],
+  ] as const) {
+    const page = new DynamicFakePage();
+    const encoded = Buffer.from(JSON.stringify([
+      request.taskId,
+      request.turnId,
+      request.submissionId,
+      ...trailingFields,
+    ]), "utf8").toString("base64url");
+    page.userMessages.push(`[[COPILOT_AGENT_TASK_${version}:${encoded}]]`);
+    const { adapter } = makeHarness(page);
+
+    const resolved = await adapter.resolveSubmission(request);
+    assert.equal(resolved.status, "indeterminate");
+    assert.equal(resolved.diagnosticCode, "TASK_MARKER_AMBIGUOUS");
+    assert.equal(page.activationCalls, 0);
+  }
+});
+
 test("response completion waits for streaming to end as well as stable content", async () => {
   const page = new DynamicFakePage();
   let polls = 0;
@@ -227,6 +395,22 @@ test("indeterminate activation cannot be retried until marker evidence resolves 
   page.userMessages.push(receipt.transportMarker ?? "missing marker");
   const recovered = await adapter.resolveSubmission(request);
   assert.equal(recovered.status, "submitted");
+  assert.equal(page.activationCalls, 1);
+});
+
+test("pre-activation guard failures are known not-submitted and safely retryable", async () => {
+  const { adapter, page } = makeHarness();
+  page.preActivationDiagnostic = "COMPOSER_CONTENT_CHANGED_BEFORE_SUBMIT";
+
+  const first = await adapter.submit(request);
+  assert.equal(first.status, "not-submitted");
+  assert.equal(first.diagnosticCode, "COMPOSER_CONTENT_CHANGED_BEFORE_SUBMIT");
+  assert.equal(page.activationCalls, 0);
+
+  page.preActivationDiagnostic = undefined;
+  page.url = "https://copilot.example.test/chat/conversation-2";
+  const retry = await adapter.submit(request);
+  assert.equal(retry.status, "submitted");
   assert.equal(page.activationCalls, 1);
 });
 
@@ -289,6 +473,37 @@ test("kill switch prevents browser action and receive waits are abortable", asyn
   controller.abort("test abort");
   const result = await active.adapter.receive(request, { signal: controller.signal });
   assert.equal(result.status, "cancelled");
+});
+
+test("cancellation during the first trust observation prevents composer disclosure", async () => {
+  const controller = new AbortController();
+  const page = new DynamicFakePage();
+  page.onCurrentUrl = () => controller.abort(new Error("cancelled during observation"));
+  const { adapter } = makeHarness(page);
+
+  await assert.rejects(
+    adapter.submit(request, { signal: controller.signal }),
+    /cancelled during observation/u,
+  );
+  assert.equal(page.fillCalls, 0);
+  assert.equal(page.activationCalls, 0);
+});
+
+test("cancellation during the second trust observation prevents activation", async () => {
+  const controller = new AbortController();
+  const page = new DynamicFakePage();
+  page.onCurrentUrl = () => {
+    if (page.currentUrlCalls === 2) {
+      controller.abort(new Error("cancelled before activation"));
+    }
+  };
+  const { adapter } = makeHarness(page);
+
+  const receipt = await adapter.submit(request, { signal: controller.signal });
+  assert.equal(receipt.status, "not-submitted");
+  assert.equal(receipt.diagnosticCode, "PRE_SUBMISSION_ASSERTION_ABORTED");
+  assert.equal(page.fillCalls, 1);
+  assert.equal(page.activationCalls, 0);
 });
 
 test("manual readiness waits on explicitly configured auth hosts without interacting", async () => {

@@ -6,6 +6,7 @@ import { test } from "node:test";
 import {
   classifyCopilotPage,
   observeCopilotPage,
+  type ClassifierRequirements,
   type CopilotPageState,
 } from "../../src/browser/classifier.js";
 import {
@@ -79,6 +80,15 @@ async function loadFixture(): Promise<StateFixture> {
   ) as StateFixture;
 }
 
+function requirements(identity: string): ClassifierRequirements {
+  return {
+    entryUrl: "https://copilot.example.test/chat",
+    approvedHosts: [{ hostname: "copilot.example.test" }],
+    expectedIdentity: identity,
+    requireProtectionIndicator: true,
+  };
+}
+
 test("synthetic page corpus classifies normal and adversarial browser states", async () => {
   const fixture = await loadFixture();
   assert.equal(fixture.schemaVersion, "synthetic-copilot-page-states/v1");
@@ -100,11 +110,11 @@ test("synthetic page corpus classifies normal and adversarial browser states", a
       new FixturePage(new Set(signals), fixture.identity),
       contract,
     );
-    const classification = classifyCopilotPage(observation, contract, {
-      approvedHosts: [{ hostname: "copilot.example.test" }],
-      expectedIdentity: fixture.identity,
-      requireProtectionIndicator: true,
-    });
+    const classification = classifyCopilotPage(
+      observation,
+      contract,
+      requirements(fixture.identity),
+    );
     assert.equal(classification.state, expected[name], name);
   }
 });
@@ -119,11 +129,7 @@ test("classifier fails closed for wrong identity, missing protection, and wrong 
     contract,
   );
   assert.equal(
-    classifyCopilotPage(wrongIdentity, contract, {
-      approvedHosts: [{ hostname: "copilot.example.test" }],
-      expectedIdentity: fixture.identity,
-      requireProtectionIndicator: true,
-    }).state,
+    classifyCopilotPage(wrongIdentity, contract, requirements(fixture.identity)).state,
     "identity-unverified",
   );
 
@@ -133,11 +139,7 @@ test("classifier fails closed for wrong identity, missing protection, and wrong 
     contract,
   );
   assert.equal(
-    classifyCopilotPage(unprotected, contract, {
-      approvedHosts: [{ hostname: "copilot.example.test" }],
-      expectedIdentity: fixture.identity,
-      requireProtectionIndicator: true,
-    }).state,
+    classifyCopilotPage(unprotected, contract, requirements(fixture.identity)).state,
     "protection-unverified",
   );
 
@@ -146,12 +148,48 @@ test("classifier fails closed for wrong identity, missing protection, and wrong 
     contract,
   );
   assert.equal(
-    classifyCopilotPage(wrongHost, contract, {
-      approvedHosts: [{ hostname: "copilot.example.test" }],
-      expectedIdentity: fixture.identity,
-      requireProtectionIndicator: true,
-    }).state,
+    classifyCopilotPage(wrongHost, contract, requirements(fixture.identity)).state,
     "unapproved-host",
+  );
+});
+
+test("approved-host pages outside the configured Copilot path cannot become ready", async () => {
+  const fixture = await loadFixture();
+  const contract = createBaselineCopilotUiContract(fixture.identity);
+  const ready = new Set(fixture.states.ready);
+
+  for (const url of [
+    "https://copilot.example.test/search",
+    "https://copilot.example.test/chatty",
+  ]) {
+    const observation = await observeCopilotPage(
+      new FixturePage(ready, fixture.identity, url),
+      contract,
+    );
+    const classification = classifyCopilotPage(
+      observation,
+      contract,
+      requirements(fixture.identity),
+    );
+    assert.equal(classification.state, "unapproved-host", url);
+    assert.equal(classification.diagnosticCode, "COPILOT_SURFACE_NOT_APPROVED", url);
+  }
+
+  const nestedConversation = await observeCopilotPage(
+    new FixturePage(
+      ready,
+      fixture.identity,
+      "https://copilot.example.test/chat/conversation/synthetic?opaque=state",
+    ),
+    contract,
+  );
+  assert.equal(
+    classifyCopilotPage(
+      nestedConversation,
+      contract,
+      requirements(fixture.identity),
+    ).state,
+    "ready",
   );
 });
 
@@ -162,11 +200,11 @@ test("minimal browser diagnostics contain only state and locator quorum", async 
     new FixturePage(new Set(fixture.states.ready), fixture.identity),
     contract,
   );
-  const classification = classifyCopilotPage(observation, contract, {
-    approvedHosts: [{ hostname: "copilot.example.test" }],
-    expectedIdentity: fixture.identity,
-    requireProtectionIndicator: true,
-  });
+  const classification = classifyCopilotPage(
+    observation,
+    contract,
+    requirements(fixture.identity),
+  );
   const serialized = JSON.stringify(minimalBrowserDiagnostic(observation, contract, classification));
   assert.doesNotMatch(serialized, /Synthetic Work Account/u);
   assert.doesNotMatch(serialized, /copilot\.example\.test/u);
@@ -251,6 +289,89 @@ test("browser configuration and UI contracts reject unknown nested fields", () =
   assert.throws(
     () => validateBrowserConfig({ ...base, uiContract } as never),
     /unknown fields/u,
+  );
+  const unsafeEnterContract = structuredClone(base.uiContract) as unknown as {
+    submissionStrategy: string;
+  };
+  unsafeEnterContract.submissionStrategy = "composer-enter";
+  assert.throws(
+    () => validateBrowserConfig({ ...base, uiContract: unsafeEnterContract } as never),
+    /only the send-control/ui,
+  );
+  for (const unsafeCandidate of [
+    { kind: "text", text: { source: "protected", flags: "iu" } },
+    { kind: "test-id", testId: { source: "protection", flags: "iu" } },
+    { kind: "css", selector: '[data-testid*="protection" i]' },
+    {
+      kind: "role",
+      role: "status",
+      name: { source: "protected", flags: "iu" },
+    },
+  ]) {
+    const unsafeProtectionContract = structuredClone(base.uiContract) as unknown as {
+      groups: Record<string, { candidates: Array<Record<string, unknown>> }>;
+    };
+    const protection = unsafeProtectionContract.groups.protection;
+    assert.ok(protection);
+    protection.candidates = [unsafeCandidate];
+    assert.throws(
+      () => validateBrowserConfig({
+        ...base,
+        uiContract: unsafeProtectionContract,
+      } as never),
+      /protection/iu,
+    );
+  }
+
+  const ownershipMutations: ReadonlyArray<{
+    readonly signal: "identity" | "responses" | "user-messages";
+    readonly mutate: (group: {
+      candidates: Array<Record<string, unknown>>;
+      minimumCandidateMatches: number;
+      maximumElements: number;
+      capture: string;
+    }) => void;
+  }> = [
+    { signal: "identity", mutate: (group) => { group.candidates = [{ kind: "text", text: ".*" }]; } },
+    { signal: "identity", mutate: (group) => { group.candidates = [{ kind: "role", role: "button" }]; } },
+    { signal: "identity", mutate: (group) => { group.candidates = [{ kind: "css", selector: "button [data-testid*=profile]" }]; } },
+    { signal: "responses", mutate: (group) => { group.candidates = [{ kind: "text", text: "marker" }]; } },
+    { signal: "responses", mutate: (group) => { group.candidates = [{ kind: "test-id", testId: { source: "response", flags: "iu" } }]; } },
+    { signal: "responses", mutate: (group) => { group.candidates = [{ kind: "css", selector: "main, [data-author=assistant]" }]; } },
+    { signal: "user-messages", mutate: (group) => { group.candidates = [{ kind: "label", label: ".*" }]; } },
+    { signal: "user-messages", mutate: (group) => { group.candidates = [{ kind: "css", selector: "[data-author=assistant]" }]; } },
+    { signal: "user-messages", mutate: (group) => { group.capture = "presence"; } },
+    { signal: "responses", mutate: (group) => { group.minimumCandidateMatches = 2; } },
+    { signal: "responses", mutate: (group) => { group.maximumElements = 201; } },
+    { signal: "identity", mutate: (group) => { group.candidates.push(structuredClone(group.candidates[0]!)); } },
+  ];
+  for (const { signal, mutate } of ownershipMutations) {
+    const unsafeContract = structuredClone(base.uiContract) as unknown as {
+      version: string;
+      groups: Record<string, {
+        candidates: Array<Record<string, unknown>>;
+        minimumCandidateMatches: number;
+        maximumElements: number;
+        capture: string;
+      }>;
+    };
+    unsafeContract.version = `${unsafeContract.version}:synthetic-certified-suffix`;
+    const ownedGroup = unsafeContract.groups[signal];
+    assert.ok(ownedGroup);
+    mutate(ownedGroup);
+    assert.throws(
+      () => validateBrowserConfig({ ...base, uiContract: unsafeContract } as never),
+      /locator group|immutable ownership boundary/iu,
+    );
+  }
+
+  const excessiveSnapshotContract = structuredClone(base.uiContract) as unknown as {
+    groups: Record<string, { maximumElements: number }>;
+  };
+  excessiveSnapshotContract.groups.shell!.maximumElements = 501;
+  assert.throws(
+    () => validateBrowserConfig({ ...base, uiContract: excessiveSnapshotContract } as never),
+    /invalid locator group/iu,
   );
 });
 

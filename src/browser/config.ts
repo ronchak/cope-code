@@ -70,41 +70,104 @@ export const DEFAULT_BROWSER_WAITS: BrowserWaitConfig = Object.freeze({
   minimumStableMs: 750,
 });
 
+const PROTECTION_ACCESSIBLE_NAME_PATTERN =
+  "^(?:enterprise data protection|commercial data protection)$";
+const ASSISTANT_MESSAGE_SELECTORS = [
+  '[data-content="ai-message"]',
+  '[data-author="assistant"]',
+  '[data-testid*="assistant" i][data-testid*="message" i]',
+  '[data-testid*="response" i][data-testid*="message" i]',
+] as const;
+const USER_MESSAGE_SELECTORS = [
+  '[data-content="user-message"]',
+  '[data-author="user"]',
+  '[data-testid*="user" i][data-testid*="message" i]',
+] as const;
+const IDENTITY_CONTROL_SELECTORS = [
+  'button[id*="mectrl" i]',
+  '[role="button"][id*="mectrl" i]',
+  'button[id*="mecontrol" i]',
+  '[role="button"][id*="mecontrol" i]',
+  'button[class*="mectrl" i]',
+  '[role="button"][class*="mectrl" i]',
+  'button[class*="me-control" i]',
+  '[role="button"][class*="me-control" i]',
+  'button[data-testid*="account-control" i]',
+  '[role="button"][data-testid*="account-control" i]',
+  'button[data-testid*="account-menu" i]',
+  '[role="button"][data-testid*="account-menu" i]',
+  'button[data-testid*="profile" i]',
+  '[role="button"][data-testid*="profile" i]',
+  'button[data-testid*="persona" i]',
+  '[role="button"][data-testid*="persona" i]',
+] as const;
+
 /**
  * A conservative baseline. Deployments should certify and pin a replacement
  * when their approved Microsoft 365 Copilot surface differs.
  */
 export function createBaselineCopilotUiContract(
-  expectedIdentity: string | TextPattern,
+  _expectedIdentity: string | TextPattern,
 ): CopilotUiContract {
   const groups: Record<CopilotSignal, LocatorGroup> = {
-    shell: group("shell", [{ kind: "role", role: "main" }], "presence"),
+    shell: group(
+      "shell",
+      [
+        { kind: "role", role: "main" },
+        { kind: "css", selector: 'main, [role="main"]' },
+      ],
+      "presence",
+    ),
     conversation: group(
       "conversation",
       [
         { kind: "role", role: "main" },
         { kind: "test-id", testId: pattern("chat|conversation") },
+        {
+          kind: "css",
+          selector: 'main, [role="main"], [data-testid*="chat" i], [data-testid*="conversation" i]',
+        },
       ],
       "presence",
     ),
     composer: group(
       "composer",
       [
-        { kind: "role", role: "textbox", name: pattern("message|ask|copilot") },
-        { kind: "placeholder", placeholder: pattern("message|ask|copilot") },
+        { kind: "role", role: "textbox", name: pattern("message|ask|copilot|prompt") },
+        { kind: "placeholder", placeholder: pattern("message|ask|copilot|prompt") },
+        { kind: "label", label: pattern("message|ask|copilot|prompt") },
+        {
+          kind: "css",
+          selector: [
+            'textarea[placeholder*="message" i]',
+            'textarea[placeholder*="ask" i]',
+            'textarea[placeholder*="copilot" i]',
+            '[contenteditable="true"][role="textbox"][aria-label*="message" i]',
+            '[contenteditable="true"][role="textbox"][aria-label*="ask" i]',
+            '[contenteditable="true"][role="textbox"][aria-label*="copilot" i]',
+          ].join(", "),
+        },
       ],
       "value-and-text",
     ),
     send: group(
       "send",
-      [{ kind: "role", role: "button", name: pattern("send|submit") }],
+      [
+        { kind: "role", role: "button", name: pattern("send|submit") },
+        {
+          kind: "css",
+          selector: 'button[aria-label*="send" i], [role="button"][aria-label*="send" i], button[data-testid*="send" i], [role="button"][data-testid*="send" i]',
+        },
+      ],
       "presence",
     ),
     responses: group(
       "responses",
       [
-        { kind: "test-id", testId: pattern("assistant.*message|response") },
-        { kind: "css", selector: '[data-content="ai-message"], [data-author="assistant"]' },
+        {
+          kind: "css",
+          selector: ASSISTANT_MESSAGE_SELECTORS.join(", "),
+        },
       ],
       "text",
       200,
@@ -112,8 +175,10 @@ export function createBaselineCopilotUiContract(
     "user-messages": group(
       "user-messages",
       [
-        { kind: "test-id", testId: pattern("user.*message") },
-        { kind: "css", selector: '[data-content="user-message"], [data-author="user"]' },
+        {
+          kind: "css",
+          selector: USER_MESSAGE_SELECTORS.join(", "),
+        },
       ],
       "text",
       200,
@@ -129,32 +194,91 @@ export function createBaselineCopilotUiContract(
     identity: group(
       "identity",
       [
-        { kind: "role", role: "button", name: expectedIdentity },
-        { kind: "text", text: expectedIdentity },
+        {
+          kind: "css",
+          selector: IDENTITY_CONTROL_SELECTORS.join(", "),
+        },
       ],
       "text",
+      50,
     ),
     protection: group(
       "protection",
       [
-        { kind: "text", text: pattern("enterprise data protection|protected") },
-        { kind: "test-id", testId: pattern("protection|commercial-data-protection") },
+        {
+          kind: "role",
+          role: "status",
+          name: pattern(PROTECTION_ACCESSIBLE_NAME_PATTERN),
+        },
+        {
+          kind: "role",
+          role: "img",
+          name: pattern(PROTECTION_ACCESSIBLE_NAME_PATTERN),
+        },
       ],
       "text",
     ),
     "signed-out": group(
       "signed-out",
-      [{ kind: "role", role: "button", name: pattern("sign in|log in") }],
+      [
+        { kind: "role", role: "button", name: pattern("sign in|log in|use another account") },
+        { kind: "test-id", testId: pattern("sign.?in|login|account.?picker") },
+        {
+          kind: "css",
+          selector: [
+            'button[aria-label*="sign in" i]',
+            'button[aria-label*="log in" i]',
+            '[role="button"][aria-label*="sign in" i]',
+            '[role="button"][aria-label*="log in" i]',
+            'button[data-testid*="sign-in" i]',
+            'button[data-testid*="signin" i]',
+            '[role="button"][data-testid*="sign-in" i]',
+            '[role="button"][data-testid*="signin" i]',
+          ].join(", "),
+        },
+      ],
       "presence",
     ),
     mfa: group(
       "mfa",
-      [{ kind: "text", text: pattern("approve sign.in|verification code|multi.factor") }],
+      [
+        { kind: "role", role: "textbox", name: pattern("verification code|security code|one.time code|passcode") },
+        { kind: "label", label: pattern("verification code|security code|one.time code|passcode") },
+        { kind: "placeholder", placeholder: pattern("verification code|security code|one.time code|passcode") },
+        { kind: "role", role: "status", name: pattern("approve sign.in|check your authenticator|verification required") },
+        { kind: "test-id", testId: pattern("mfa|multi.factor|verification.code|one.time.code|otp") },
+        {
+          kind: "css",
+          selector: [
+            'input[autocomplete="one-time-code"]',
+            'input[name*="otp" i]',
+            'input[name*="verification" i]',
+            'input[id*="verification" i]',
+            '[aria-label*="verification code" i]',
+            '[aria-label*="security code" i]',
+            '[data-testid*="mfa" i]',
+            '[data-testid*="otp" i]',
+          ].join(", "),
+        },
+      ],
       "presence",
     ),
     consent: group(
       "consent",
-      [{ kind: "text", text: pattern("permissions requested|consent|accept") }],
+      [
+        { kind: "role", role: "dialog", name: pattern("permissions requested|consent|review permissions|allow access") },
+        { kind: "test-id", testId: pattern("consent|permissions") },
+        {
+          kind: "css",
+          selector: [
+            'form[action*="consent" i]',
+            '[data-testid*="consent" i]',
+            '[data-testid*="permission" i]',
+            '[aria-label*="permissions requested" i]',
+            '[aria-label*="consent" i]',
+          ].join(", "),
+        },
+      ],
       "presence",
     ),
     throttled: group(
@@ -170,7 +294,7 @@ export function createBaselineCopilotUiContract(
     modal: group("modal", [{ kind: "role", role: "dialog" }], "presence"),
   };
   return {
-    version: COPILOT_UI_CONTRACT_VERSION,
+    version: `${COPILOT_UI_CONTRACT_VERSION}:m365-2026-07`,
     certifiedSurface: "Microsoft 365 Copilot Chat web",
     submissionStrategy: "send-control",
     groups,
@@ -391,11 +515,8 @@ function validateUiContract(contract: CopilotUiContract): void {
   ) {
     throw new TypeError("UI contract certified surface is invalid");
   }
-  if (
-    contract.submissionStrategy !== "send-control" &&
-    contract.submissionStrategy !== "composer-enter"
-  ) {
-    throw new TypeError("UI contract submission strategy is invalid");
+  if (contract.submissionStrategy !== "send-control") {
+    throw new TypeError("Only the send-control UI submission strategy is supported");
   }
   const expectedSignals: readonly CopilotSignal[] = [
     "shell",
@@ -431,7 +552,8 @@ function validateUiContract(contract: CopilotUiContract): void {
       groupValue.minimumCandidateMatches < 1 ||
       groupValue.minimumCandidateMatches > groupValue.candidates.length ||
       !Number.isSafeInteger(groupValue.maximumElements) ||
-      groupValue.maximumElements < 1
+      groupValue.maximumElements < 1 ||
+      groupValue.maximumElements > 500
     ) {
       throw new TypeError(`Invalid locator group: ${signal}`);
     }
@@ -439,6 +561,78 @@ function validateUiContract(contract: CopilotUiContract): void {
       throw new TypeError(`Invalid locator group capture: ${signal}`);
     }
     for (const candidate of groupValue.candidates) validateLocator(candidate);
+    if (signal === "protection") validateProtectionLocators(groupValue.candidates);
+    if (signal === "identity") {
+      validateImmutableOwnedLocatorGroup(groupValue, canonicalIdentityGroup());
+    }
+    if (signal === "responses") {
+      validateImmutableOwnedLocatorGroup(groupValue, canonicalResponsesGroup());
+    }
+    if (signal === "user-messages") {
+      validateImmutableOwnedLocatorGroup(groupValue, canonicalUserMessagesGroup());
+    }
+  }
+}
+
+function validateImmutableOwnedLocatorGroup(
+  groupValue: LocatorGroup,
+  canonical: LocatorGroup,
+): void {
+  const candidate = groupValue.candidates[0];
+  const canonicalCandidate = canonical.candidates[0];
+  if (
+    groupValue.signal !== canonical.signal ||
+    groupValue.minimumCandidateMatches !== canonical.minimumCandidateMatches ||
+    groupValue.maximumElements !== canonical.maximumElements ||
+    groupValue.capture !== canonical.capture ||
+    groupValue.candidates.length !== 1 ||
+    candidate?.kind !== "css" ||
+    canonicalCandidate?.kind !== "css" ||
+    candidate.selector !== canonicalCandidate.selector
+  ) {
+    throw new TypeError(
+      `${canonical.signal} locator group is an immutable ownership boundary`,
+    );
+  }
+}
+
+function canonicalIdentityGroup(): LocatorGroup {
+  return group("identity", [{ kind: "css", selector: IDENTITY_CONTROL_SELECTORS.join(", ") }], "text", 50);
+}
+
+function canonicalResponsesGroup(): LocatorGroup {
+  return group("responses", [{ kind: "css", selector: ASSISTANT_MESSAGE_SELECTORS.join(", ") }], "text", 200);
+}
+
+function canonicalUserMessagesGroup(): LocatorGroup {
+  return group("user-messages", [{ kind: "css", selector: USER_MESSAGE_SELECTORS.join(", ") }], "text", 200);
+}
+
+function validateProtectionLocators(candidates: readonly SemanticLocator[]): void {
+  for (const candidate of candidates) {
+    if (
+      candidate.kind !== "role" ||
+      (candidate.role !== "status" && candidate.role !== "img") ||
+      candidate.name === undefined
+    ) {
+      throw new TypeError(
+        "Protection locators must use status or img roles with an exact positive accessible name",
+      );
+    }
+    if (typeof candidate.name === "string") {
+      const normalized = candidate.name.trim().toLowerCase();
+      if (
+        candidate.exact !== true ||
+        (normalized !== "enterprise data protection" &&
+          normalized !== "commercial data protection")
+      ) {
+        throw new TypeError("Protection accessible names must be exact and positive");
+      }
+      continue;
+    }
+    if (candidate.name.source !== PROTECTION_ACCESSIBLE_NAME_PATTERN) {
+      throw new TypeError("Protection accessible-name patterns must be anchored and positive");
+    }
   }
 }
 

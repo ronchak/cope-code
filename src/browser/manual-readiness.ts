@@ -10,9 +10,11 @@ export interface ManualReadinessDependencies {
 }
 
 /**
- * Browser pages often expose the composer before identity and shell signals
- * finish hydrating. Non-retryable classifications therefore have to remain
- * unchanged for a bounded quorum before launch treats them as final.
+ * Browser pages often expose only part of the certified surface while the app
+ * hydrates. Continuous non-manual states receive one bounded hydration period,
+ * even if their diagnostic classification changes while the page is unstable.
+ * States that require operator action, including sign-in, MFA, consent, or a
+ * visible blocking dialog, may consume the full manual-readiness window.
  */
 export async function waitForStableManualReadiness(
   observe: (maxWaitMs: number, signal?: AbortSignal) => Promise<BrowserStateInspection>,
@@ -32,9 +34,14 @@ export async function waitForStableManualReadiness(
       isTerminalManualReadinessState(inspection.classification.state));
   const deadline = monotonicNow() + maxWaitMs;
   let lastInspection: BrowserStateInspection | undefined;
-  let terminalKey: string | undefined;
-  let terminalSamples = 0;
-  let terminalSince = 0;
+  let terminalPeriodSince = 0;
+  let terminalPeriodSamples = 0;
+  let stableKey: string | undefined;
+  let stableKeySince = 0;
+  let stableKeySamples = 0;
+  let unsafePeriodSince = 0;
+  let unsafeSamples = 0;
+  let lastUnsafeInspection: BrowserStateInspection | undefined;
 
   for (;;) {
     const beforeObservation = monotonicNow();
@@ -46,30 +53,73 @@ export async function waitForStableManualReadiness(
     if (inspection.classification.state === "ready") return inspection;
 
     const observedAt = monotonicNow();
-    if (isTerminalInspection(inspection)) {
+    const terminalInspection = isTerminalInspection(inspection);
+    const immediatelyUnsafe = terminalInspection &&
+      isImmediatelyUnsafe(inspection.classification.state);
+    const hydrationMs = Math.min(
+      Math.max(waits.minimumStableMs, waits.actionMs),
+      maxWaitMs,
+    );
+
+    // Only a continuous immediately unsafe observation period is allowed to
+    // consume the short unsafe window. Once the page reaches sign-in, MFA,
+    // consent, or a recoverable dialog, stale host samples are discarded so
+    // the operator receives the full manual-readiness window.
+    if (immediatelyUnsafe) {
+      if (unsafeSamples === 0) unsafePeriodSince = observedAt;
+      unsafeSamples += 1;
+      lastUnsafeInspection = inspection;
+    } else {
+      unsafePeriodSince = 0;
+      unsafeSamples = 0;
+      lastUnsafeInspection = undefined;
+    }
+    if (
+      immediatelyUnsafe &&
+      unsafeSamples >= waits.stableSamples &&
+      observedAt - unsafePeriodSince >= hydrationMs
+    ) {
+      return lastUnsafeInspection ?? inspection;
+    }
+
+    if (terminalInspection) {
+      if (terminalPeriodSamples === 0) terminalPeriodSince = observedAt;
+      terminalPeriodSamples += 1;
+
       const nextKey = `${inspection.classification.state}:${inspection.classification.diagnosticCode}`;
-      if (nextKey === terminalKey) {
-        terminalSamples += 1;
+      if (nextKey === stableKey) {
+        stableKeySamples += 1;
       } else {
-        terminalKey = nextKey;
-        terminalSamples = 1;
-        terminalSince = observedAt;
+        stableKey = nextKey;
+        stableKeySince = observedAt;
+        stableKeySamples = 1;
       }
-      const requiredStableMs = terminalStabilityMs(
-        inspection.classification.state,
-        waits,
-        maxWaitMs,
-      );
+
+      if (immediatelyUnsafe) {
+        const shortStableMs = Math.min(waits.minimumStableMs, maxWaitMs);
+        if (
+          stableKeySamples >= waits.stableSamples &&
+          observedAt - stableKeySince >= shortStableMs
+        ) {
+          return inspection;
+        }
+      }
+
+      // The action-bound fallback applies to every continuous non-manual
+      // period, including states that alternate and therefore never satisfy the
+      // same-diagnostic short quorum.
       if (
-        terminalSamples >= waits.stableSamples &&
-        observedAt - terminalSince >= requiredStableMs
+        terminalPeriodSamples >= waits.stableSamples &&
+        observedAt - terminalPeriodSince >= hydrationMs
       ) {
         return inspection;
       }
     } else {
-      terminalKey = undefined;
-      terminalSamples = 0;
-      terminalSince = 0;
+      terminalPeriodSince = 0;
+      terminalPeriodSamples = 0;
+      stableKey = undefined;
+      stableKeySince = 0;
+      stableKeySamples = 0;
     }
 
     const remainingAfterObservation = deadline - observedAt;
@@ -83,28 +133,25 @@ export async function waitForStableManualReadiness(
   }
 }
 
+/**
+ * Explicit authentication states and visible blocking dialogs remain open for
+ * operator action. Every other non-ready state must recover during its bounded
+ * hydration window or return a diagnostic instead of appearing hung.
+ */
 export function isTerminalManualReadinessState(
   state: BrowserStateInspection["classification"]["state"],
 ): boolean {
-  return state === "unapproved-host" ||
-    state === "blocking-modal" ||
-    state === "identity-unverified" ||
-    state === "protection-unverified" ||
-    state === "changed-selector";
+  return state !== "ready" &&
+    state !== "sign-in-required" &&
+    state !== "mfa-required" &&
+    state !== "consent-required" &&
+    state !== "blocking-modal";
 }
 
-function terminalStabilityMs(
+function isImmediatelyUnsafe(
   state: BrowserStateInspection["classification"]["state"],
-  waits: BrowserWaitConfig,
-  maxWaitMs: number,
-): number {
-  const hydrationSensitive = state === "identity-unverified" ||
-    state === "protection-unverified" ||
-    state === "changed-selector";
-  const desired = hydrationSensitive
-    ? Math.max(waits.minimumStableMs, waits.actionMs)
-    : waits.minimumStableMs;
-  return Math.min(desired, maxWaitMs);
+): boolean {
+  return state === "unapproved-host";
 }
 
 async function sleepWithAbort(milliseconds: number, signal?: AbortSignal): Promise<void> {
