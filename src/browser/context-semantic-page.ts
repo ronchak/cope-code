@@ -12,6 +12,7 @@ import type {
   CopilotUiContract,
   GroupSnapshot,
   LocatorGroup,
+  SemanticActionGuard,
   SemanticPage,
 } from "./contracts.js";
 import { PlaywrightSemanticPage } from "./playwright-semantic-page.js";
@@ -156,10 +157,14 @@ export class ContextSemanticPage implements SemanticPage {
    * observation. A successful fill starts a transaction pin that remains active
    * through the second trust observation and send activation.
    */
-  public async fill(group: LocatorGroup, value: string): Promise<void> {
+  public async fill(
+    group: LocatorGroup,
+    value: string,
+    guard: SemanticActionGuard,
+  ): Promise<void> {
     const page = this.#verifiedObservedPage();
     const expectedUrl = this.#observedUrl!;
-    await this.#delegate(page).fill(group, value);
+    await this.#delegate(page).fill(group, value, guard);
     if (page.isClosed() || page.url() !== expectedUrl) {
       this.#clearFilledPagePin();
       throw new AgentError(
@@ -176,20 +181,24 @@ export class ContextSemanticPage implements SemanticPage {
   }
 
   /** Send activation requires a completed post-fill observation on the same page. */
-  public async click(group: LocatorGroup): Promise<void> {
+  public async click(group: LocatorGroup, guard: SemanticActionGuard): Promise<void> {
     const page = await this.#activationPageOrThrow();
     try {
-      await this.#delegate(page).click(group);
+      await this.#delegate(page).click(group, guard);
     } finally {
       this.#clearFilledPagePin();
     }
   }
 
   /** Enter activation follows the same post-fill page-identity requirements. */
-  public async press(group: LocatorGroup, key: "Enter"): Promise<void> {
+  public async press(
+    group: LocatorGroup,
+    key: "Enter",
+    guard: SemanticActionGuard,
+  ): Promise<void> {
     const page = await this.#activationPageOrThrow();
     try {
-      await this.#delegate(page).press(group, key);
+      await this.#delegate(page).press(group, key, guard);
     } finally {
       this.#clearFilledPagePin();
     }

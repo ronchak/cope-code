@@ -372,7 +372,7 @@ test("composer actionability follows the same later candidate that fill will use
   assert.equal(snapshot.enabledElements, 1);
   assert.equal(snapshot.elements[0]?.value, "usable draft");
 
-  await semantic.fill(group, "new prompt");
+  await semantic.fill(group, "new prompt", () => {});
   assert.equal(disabled.filledValue, undefined);
   assert.equal(enabled.filledValue, "new prompt");
 });

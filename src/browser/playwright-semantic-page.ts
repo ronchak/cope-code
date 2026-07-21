@@ -5,6 +5,7 @@ import {
   type ElementSnapshot,
   type GroupSnapshot,
   type LocatorGroup,
+  type SemanticActionGuard,
   type SemanticLocator,
   type SemanticPage,
   type TextPattern,
@@ -79,18 +80,29 @@ export class PlaywrightSemanticPage implements SemanticPage {
     };
   }
 
-  public async fill(group: LocatorGroup, value: string): Promise<void> {
+  public async fill(
+    group: LocatorGroup,
+    value: string,
+    guard: SemanticActionGuard,
+  ): Promise<void> {
     const locator = await this.#firstActionable(group);
+    guard();
     await locator.fill(value);
   }
 
-  public async click(group: LocatorGroup): Promise<void> {
+  public async click(group: LocatorGroup, guard: SemanticActionGuard): Promise<void> {
     const locator = await this.#firstActionable(group);
+    guard();
     await locator.click();
   }
 
-  public async press(group: LocatorGroup, key: "Enter"): Promise<void> {
+  public async press(
+    group: LocatorGroup,
+    key: "Enter",
+    guard: SemanticActionGuard,
+  ): Promise<void> {
     const locator = await this.#firstActionable(group);
+    guard();
     await locator.press(key);
   }
 

@@ -30,8 +30,12 @@ class DynamicFakePage implements SemanticPage {
   public preActivationDiagnostic: string | undefined = undefined;
   public fillCalls = 0;
   public activationCalls = 0;
+  public currentUrlCalls = 0;
+  public onCurrentUrl: (() => void) | undefined = undefined;
 
   public async currentUrl(): Promise<string> {
+    this.currentUrlCalls += 1;
+    this.onCurrentUrl?.();
     return this.url;
   }
 
@@ -318,6 +322,37 @@ test("kill switch prevents browser action and receive waits are abortable", asyn
   controller.abort("test abort");
   const result = await active.adapter.receive(request, { signal: controller.signal });
   assert.equal(result.status, "cancelled");
+});
+
+test("cancellation during the first trust observation prevents composer disclosure", async () => {
+  const controller = new AbortController();
+  const page = new DynamicFakePage();
+  page.onCurrentUrl = () => controller.abort(new Error("cancelled during observation"));
+  const { adapter } = makeHarness(page);
+
+  await assert.rejects(
+    adapter.submit(request, { signal: controller.signal }),
+    /cancelled during observation/u,
+  );
+  assert.equal(page.fillCalls, 0);
+  assert.equal(page.activationCalls, 0);
+});
+
+test("cancellation during the second trust observation prevents activation", async () => {
+  const controller = new AbortController();
+  const page = new DynamicFakePage();
+  page.onCurrentUrl = () => {
+    if (page.currentUrlCalls === 2) {
+      controller.abort(new Error("cancelled before activation"));
+    }
+  };
+  const { adapter } = makeHarness(page);
+
+  const receipt = await adapter.submit(request, { signal: controller.signal });
+  assert.equal(receipt.status, "not-submitted");
+  assert.equal(receipt.diagnosticCode, "PRE_SUBMISSION_ASSERTION_ABORTED");
+  assert.equal(page.fillCalls, 1);
+  assert.equal(page.activationCalls, 0);
 });
 
 test("manual readiness waits on explicitly configured auth hosts without interacting", async () => {

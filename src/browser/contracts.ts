@@ -77,13 +77,16 @@ export interface GroupSnapshot {
   readonly elements: readonly ElementSnapshot[];
 }
 
+/** Synchronous fail-closed check run at the final browser-dispatch boundary. */
+export type SemanticActionGuard = () => void;
+
 /** Minimal page surface used by the adapter and implemented by Playwright or tests. */
 export interface SemanticPage {
   currentUrl(): Promise<string>;
   snapshot(group: LocatorGroup): Promise<GroupSnapshot>;
-  fill(group: LocatorGroup, value: string): Promise<void>;
-  click(group: LocatorGroup): Promise<void>;
-  press(group: LocatorGroup, key: "Enter"): Promise<void>;
+  fill(group: LocatorGroup, value: string, guard: SemanticActionGuard): Promise<void>;
+  click(group: LocatorGroup, guard: SemanticActionGuard): Promise<void>;
+  press(group: LocatorGroup, key: "Enter", guard: SemanticActionGuard): Promise<void>;
 }
 
 export type CopilotPageObservation = Readonly<Record<CopilotSignal, GroupSnapshot>> & {

@@ -182,6 +182,10 @@ export class CopilotBrowserAdapter implements ModelTransport {
     }
 
     const first = await this.#observe();
+    // The caller's signal is intentionally checked again after the trust
+    // observation. The signal can change while page state is being sampled,
+    // and no prompt content may be disclosed after that cancellation.
+    this.#assertUsable(options.signal);
     if (first.classification.state !== "ready") {
       return this.#storeKnownNotSubmitted(request, first.classification.diagnosticCode);
     }
@@ -235,16 +239,21 @@ export class CopilotBrowserAdapter implements ModelTransport {
       true,
     );
     this.#records.set(request.submissionId, record);
+    const actionGuard = this.#actionGuard(options.signal);
 
     try {
-      await this.#page.fill(this.#config.uiContract.groups.composer, fullContent);
-    } catch {
+      await this.#page.fill(
+        this.#config.uiContract.groups.composer,
+        fullContent,
+        actionGuard,
+      );
+    } catch (error) {
       record.receipt = this.#receipt(
         request,
         "not-submitted",
         conversationId,
         marker,
-        "COMPOSER_FILL_FAILED",
+        knownPreActivationDiagnostic(error) ?? "COMPOSER_FILL_FAILED",
       );
       return record.receipt;
     }
@@ -254,6 +263,9 @@ export class CopilotBrowserAdapter implements ModelTransport {
     let second: ObservedPageState;
     try {
       second = await this.#observe();
+      // Likewise, cancellation during the post-fill trust observation must
+      // prevent the consequential send action.
+      this.#assertUsable(options.signal);
     } catch {
       record.receipt = this.#receipt(
         request,
@@ -302,9 +314,13 @@ export class CopilotBrowserAdapter implements ModelTransport {
     this.#taskConversations.set(request.taskId, conversationId);
     try {
       if (strategy === "send-control") {
-        await this.#page.click(this.#config.uiContract.groups.send);
+        await this.#page.click(this.#config.uiContract.groups.send, actionGuard);
       } else {
-        await this.#page.press(this.#config.uiContract.groups.composer, "Enter");
+        await this.#page.press(
+          this.#config.uiContract.groups.composer,
+          "Enter",
+          actionGuard,
+        );
       }
     } catch (error) {
       const diagnosticCode = knownPreActivationDiagnostic(error);
@@ -837,6 +853,24 @@ export class CopilotBrowserAdapter implements ModelTransport {
     if (this.#closed) {
       throw new AgentError("TRANSPORT_UNAVAILABLE", "Browser transport is closed");
     }
+  }
+
+  #actionGuard(signal?: AbortSignal): () => void {
+    return () => {
+      try {
+        this.#assertUsable(signal);
+      } catch (error) {
+        throw new AgentError(
+          "TRANSPORT_INDETERMINATE",
+          "The browser action was cancelled before dispatch",
+          {
+            diagnosticCode: "PRE_SUBMISSION_ASSERTION_ABORTED",
+            dispatchAttempted: false,
+          },
+          { cause: error },
+        );
+      }
+    };
   }
 
   async #boundedSleep(deadline: number, signal?: AbortSignal): Promise<void> {

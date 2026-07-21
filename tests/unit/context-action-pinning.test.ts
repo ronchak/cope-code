@@ -24,10 +24,15 @@ const sendGroup: LocatorGroup = {
   capture: "presence",
 };
 
+const allowAction = () => {};
+
 class ActionLocator {
   public constructor(private readonly page: ActionPage) {}
 
-  public async count(): Promise<number> { return 1; }
+  public async count(): Promise<number> {
+    this.page.locatorProbeHook?.();
+    return 1;
+  }
   public nth(_index: number): Locator { return this as unknown as Locator; }
   public async isVisible(): Promise<boolean> { return true; }
   public async isEnabled(): Promise<boolean> { return true; }
@@ -46,6 +51,7 @@ class ActionPage {
   public closed = false;
   public composer = "";
   public readonly actions: string[] = [];
+  public locatorProbeHook: (() => void) | undefined = undefined;
 
   public constructor(public currentUrl: string) {}
 
@@ -73,9 +79,9 @@ test("an unchanged filled page remains actionable after its second observation",
   const tracked = createTracked(context, page);
 
   assert.equal(await tracked.currentUrl(), page.currentUrl);
-  await tracked.fill(composerGroup, "hello");
+  await tracked.fill(composerGroup, "hello", allowAction);
   assert.equal(await tracked.currentUrl(), page.currentUrl);
-  await tracked.click(sendGroup);
+  await tracked.click(sendGroup, allowAction);
 
   assert.deepEqual(page.actions, ["fill:hello", "click"]);
 });
@@ -86,11 +92,51 @@ test("composer-enter activation uses the same post-fill page pin", async () => {
   const tracked = createTracked(context, page);
 
   assert.equal(await tracked.currentUrl(), page.currentUrl);
-  await tracked.fill(composerGroup, "hello");
+  await tracked.fill(composerGroup, "hello", allowAction);
   assert.equal(await tracked.currentUrl(), page.currentUrl);
-  await tracked.press(composerGroup, "Enter");
+  await tracked.press(composerGroup, "Enter", allowAction);
 
   assert.deepEqual(page.actions, ["fill:hello", "press:Enter"]);
+});
+
+test("cancellation during locator discovery prevents composer fill dispatch", async () => {
+  const page = new ActionPage(`${entryUrl}/conversation/one`);
+  const context = new ActionContext([page]);
+  const tracked = createTracked(context, page);
+  const controller = new AbortController();
+  const guard = () => {
+    if (controller.signal.aborted) throw controller.signal.reason;
+  };
+
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  page.locatorProbeHook = () => controller.abort(new Error("cancelled during locator discovery"));
+
+  await assert.rejects(
+    tracked.fill(composerGroup, "must-not-disclose", guard),
+    /cancelled during locator discovery/u,
+  );
+  assert.deepEqual(page.actions, []);
+});
+
+test("cancellation during the post-fill guard prevents activation dispatch", async () => {
+  const page = new ActionPage(`${entryUrl}/conversation/one`);
+  const context = new ActionContext([page]);
+  const tracked = createTracked(context, page);
+  const controller = new AbortController();
+  const guard = () => {
+    if (controller.signal.aborted) throw controller.signal.reason;
+  };
+
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  await tracked.fill(composerGroup, "filled but not sent", allowAction);
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  page.locatorProbeHook = () => controller.abort(new Error("cancelled during activation guard"));
+
+  await assert.rejects(
+    tracked.click(sendGroup, guard),
+    /cancelled during activation guard/u,
+  );
+  assert.deepEqual(page.actions, ["fill:filled but not sent"]);
 });
 
 test("activation without the post-fill observation is rejected", async () => {
@@ -99,10 +145,10 @@ test("activation without the post-fill observation is rejected", async () => {
   const tracked = createTracked(context, page);
 
   assert.equal(await tracked.currentUrl(), page.currentUrl);
-  await tracked.fill(composerGroup, "hello");
+  await tracked.fill(composerGroup, "hello", allowAction);
 
   await assert.rejects(
-    tracked.click(sendGroup),
+    tracked.click(sendGroup, allowAction),
     (error: unknown) =>
       error instanceof AgentError &&
       error.details.diagnosticCode === "POST_FILL_OBSERVATION_REQUIRED",
@@ -116,12 +162,12 @@ test("composer content changed after fill is rejected before send", async () => 
   const tracked = createTracked(context, page);
 
   assert.equal(await tracked.currentUrl(), page.currentUrl);
-  await tracked.fill(composerGroup, "trusted prompt with marker");
+  await tracked.fill(composerGroup, "trusted prompt with marker", allowAction);
   assert.equal(await tracked.currentUrl(), page.currentUrl);
   page.composer = "different draft";
 
   await assert.rejects(
-    tracked.click(sendGroup),
+    tracked.click(sendGroup, allowAction),
     (error: unknown) =>
       error instanceof AgentError &&
       error.details.diagnosticCode === "COMPOSER_CONTENT_CHANGED_BEFORE_SUBMIT",
@@ -140,7 +186,7 @@ test("a replacement Copilot tab cannot receive a fill without a new observation"
   context.pageList.push(replacement);
 
   await assert.rejects(
-    tracked.fill(composerGroup, "must-not-move"),
+    tracked.fill(composerGroup, "must-not-move", allowAction),
     changedPageError,
   );
   assert.deepEqual(first.actions, []);
@@ -156,7 +202,7 @@ test("same-tab navigation after observation blocks the consequential action", as
   page.currentUrl = `${entryUrl}/conversation/two`;
 
   await assert.rejects(
-    tracked.fill(composerGroup, "must-not-disclose"),
+    tracked.fill(composerGroup, "must-not-disclose", allowAction),
     changedPageError,
   );
   assert.deepEqual(page.actions, []);
@@ -172,7 +218,7 @@ test("a second configured Copilot page creates a hard stop before prompt fill", 
   context.pageList.push(second);
 
   await assert.rejects(
-    tracked.fill(composerGroup, "must-not-disclose"),
+    tracked.fill(composerGroup, "must-not-disclose", allowAction),
     ambiguousPageError,
   );
   assert.deepEqual(first.actions, []);
@@ -186,7 +232,7 @@ test("a same-URL replacement after fill aborts the second trust observation", as
   const tracked = createTracked(context, first);
 
   assert.equal(await tracked.currentUrl(), firstUrl);
-  await tracked.fill(composerGroup, "filled-only-on-first");
+  await tracked.fill(composerGroup, "filled-only-on-first", allowAction);
   first.closed = true;
   const replacement = new ActionPage(firstUrl);
   context.pageList.push(replacement);
@@ -207,7 +253,7 @@ test("a second configured page appearing after fill aborts before activation", a
   const tracked = createTracked(context, first);
 
   assert.equal(await tracked.currentUrl(), first.currentUrl);
-  await tracked.fill(composerGroup, "filled-only-on-first");
+  await tracked.fill(composerGroup, "filled-only-on-first", allowAction);
   const second = new ActionPage(`${entryUrl}/conversation/two`);
   context.pageList.push(second);
 
