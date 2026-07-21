@@ -20,7 +20,7 @@ script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 prefix_input=${COPE_INSTALL_PREFIX:-"${HOME}/.local"}
 prefix=$(node "$script_directory/validate-macos-user-path.mjs" "$prefix_input")
 npm uninstall --global --prefix "$prefix" @local/copilot-browser-agent
-printf 'Removed the Cope package from %s. State and Edge profile were retained.\n' "$prefix"
+printf 'Removed the Cope package from %s. State and dedicated browser profiles were retained.\n' "$prefix"
 
 remove_exact_directory() {
   expected=$1
@@ -36,4 +36,9 @@ remove_exact_directory() {
 }
 
 [ "$remove_state" -eq 0 ] || remove_exact_directory "$HOME/Library/Application Support/CopilotBrowserAgent" "Cope state"
-[ "$remove_profile" -eq 0 ] || remove_exact_directory "$HOME/Library/Application Support/CopilotBrowserAgentEdgeProfile" "dedicated Edge profile"
+if [ "$remove_profile" -eq 0 ]; then
+  :
+else
+  remove_exact_directory "$HOME/Library/Application Support/CopilotBrowserAgentEdgeProfile" "dedicated Edge profile"
+  remove_exact_directory "$HOME/Library/Application Support/CopilotBrowserAgentChromeProfile" "dedicated Chrome profile"
+fi

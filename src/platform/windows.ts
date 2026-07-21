@@ -4,6 +4,7 @@ import path from "node:path";
 import { AgentError } from "../shared/errors.js";
 import { selectEnvironment, uniquePaths } from "./common.js";
 import type { HostPlatform } from "./contracts.js";
+import type { BrowserProduct } from "../browser/product.js";
 
 export class WindowsHostPlatform implements HostPlatform {
   public readonly platform = "win32" as const;
@@ -23,8 +24,38 @@ export class WindowsHostPlatform implements HostPlatform {
     return path.win32.join(environment.LOCALAPPDATA, "CopilotBrowserAgent");
   }
 
-  public profileHome(stateHome: string): string {
-    return path.win32.join(path.win32.dirname(stateHome), "CopilotBrowserAgentEdgeProfile");
+  public profileHome(stateHome: string, product: BrowserProduct = "edge"): string {
+    return path.win32.join(
+      path.win32.dirname(stateHome),
+      product === "edge" ? "CopilotBrowserAgentEdgeProfile" : "CopilotBrowserAgentChromeProfile",
+    );
+  }
+
+  public browserExecutableCandidates(
+    product: BrowserProduct,
+    environment: NodeJS.ProcessEnv = process.env,
+  ): readonly string[] {
+    if (product === "edge") {
+      return uniquePaths([environment.COPE_BROWSER_EXECUTABLE, ...this.edgeExecutableCandidates(environment)]);
+    }
+    return uniquePaths([
+      environment.COPE_BROWSER_EXECUTABLE,
+      environment["ProgramFiles(x86)"] === undefined ? undefined : path.win32.join(environment["ProgramFiles(x86)"], "Google", "Chrome", "Application", "chrome.exe"),
+      environment.ProgramFiles === undefined ? undefined : path.win32.join(environment.ProgramFiles, "Google", "Chrome", "Application", "chrome.exe"),
+      environment.LOCALAPPDATA === undefined ? undefined : path.win32.join(environment.LOCALAPPDATA, "Google", "Chrome", "Application", "chrome.exe"),
+      "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+      "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    ]);
+  }
+
+  public ordinaryBrowserProfileRoots(
+    product: BrowserProduct,
+    environment: NodeJS.ProcessEnv = process.env,
+  ): readonly string[] {
+    if (environment.LOCALAPPDATA === undefined) return [];
+    return [product === "edge"
+      ? path.win32.join(environment.LOCALAPPDATA, "Microsoft", "Edge", "User Data")
+      : path.win32.join(environment.LOCALAPPDATA, "Google", "Chrome", "User Data")];
   }
 
   public edgeExecutableCandidates(environment: NodeJS.ProcessEnv = process.env): readonly string[] {

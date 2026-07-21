@@ -15,7 +15,7 @@ The provided machine map records this intended first target:
 | PowerShell | Windows PowerShell available; `pwsh.exe` absent |
 | Filesystem | temporary directory, create, rename, case-insensitive lookup, and long filename probes succeeded |
 
-No global Playwright package was found. `playwright-core` is pinned locally and launches the existing managed Edge binary; installation must not download another browser.
+No global Playwright package was found. `playwright-core` is pinned locally and launches only the verified selected Edge or Chrome binary; installation and setup must not download another browser. The recorded Edge tuple remains the established compatibility target. Chrome is a **preview candidate / offline evidence only** until its own exact Windows tuple passes the live matrix.
 
 The inventory also reports no usable Python, .NET, Java, Go, Rust, ripgrep, pnpm, or yarn toolchain. Do not make build, packaging, search, or support procedures depend on them. A Microsoft Store `python.exe` alias is not a Python runtime.
 
@@ -27,7 +27,7 @@ For the 0.1.1 personal-preview release, extract the zip and run `install.cmd` fr
 
 The packed global installation is intentional. It does not remain linked to the extracted source folder, so moving or deleting that folder later does not break `cope`. No administrator rights, Windows service, or browser extension is required.
 
-For a governed deployment, the release owner must still verify the artifact, dependency lock, Node, npm, Git, and Edge tuple before running the installer. The runtime checks Windows integrity groups and refuses high/system integrity. Use `COPE_NO_PAUSE=1` only for controlled installer automation.
+For a governed deployment, the release owner must still verify the artifact, dependency lock, Node, npm, Git, and selected-browser tuple before running the installer. The runtime checks Windows integrity groups and refuses high/system integrity. Use `COPE_NO_PAUSE=1` only for controlled installer automation. The legacy Windows wrapper files and their existing prompt text remain byte-identical for compatibility; their setup action invokes the same browser-neutral `cope setup` workflow.
 
 Manual source verification remains available:
 
@@ -44,21 +44,21 @@ cope doctor
 cope C:\work\sample-repo
 ```
 
-The first project launch creates or reviews `.cba\repository.json`. A new dedicated local Edge profile is placed outside repositories and outside the Cope state root. Run an inspect-only task against a synthetic repository before disclosing real repository content.
+The first project launch creates or reviews `.cba\repository.json`. Setup creates a separate dedicated local profile for the selected product outside repositories and outside the Cope state root. Run an inspect-only task against a synthetic repository before disclosing real repository content.
 
-## Edge profile and authentication
+## Browser profiles and authentication
 
 The profile is credential-equivalent local state.
 
-- Use exactly one dedicated profile per authorized user/environment.
-- Never point at `Default`, an ordinary Edge user-data directory, a copied profile, a repository or agent-state directory, a shared drive, or another user's profile.
+- Use exactly one dedicated profile per product and authorized user/environment. Edge and Chrome must never share it.
+- Never point at `Default`, an ordinary Edge or Chrome user-data directory, a copied profile, a repository or agent-state directory, a shared drive, or another user's profile. The protected ordinary roots include `%LOCALAPPDATA%\Microsoft\Edge\User Data` and `%LOCALAPPDATA%\Google\Chrome\User Data`.
 - Use a conventional local absolute path. UNC, device-namespace, and shared-form paths are refused. The loader resolves an existing directory or its deepest existing parent, including symlinks/junctions, and refuses canonical overlap with repository or state storage.
-- Do not start another Edge process with that profile. The agent uses an exclusive lock and fails closed if a live owner exists.
+- Do not start another browser process with that profile. The agent uses a product marker and exclusive lock and fails closed on wrong-product, tampered, unmarked/non-empty, or live-owned profiles.
 - Let the user perform sign-in, MFA, Conditional Access, consent, reauthentication, and security interstitials in the visible window.
 - Never record passwords, MFA codes, cookies, tokens, storage state, authentication headers, or private network captures.
 - Protect the profile with Windows ACLs and include it in incident-response and decommissioning procedures.
 
-The launcher uses a persistent, headful context, disables downloads, and navigates only to the configured HTTPS entry URL. Authentication redirect hosts are allowed only while waiting for the user; they are never valid submission hosts.
+The launcher uses a persistent, headful context, disables downloads, and navigates only to the configured HTTPS entry URL. It launches the canonical executable whose requested product identity, version, and SHA-256 were verified; it does not fall back to another Playwright channel. Authentication redirect hosts are allowed only while waiting for the user; they are never valid submission hosts.
 
 ## Configure the target
 
@@ -69,7 +69,11 @@ cope setup
 cope --inspect C:\work\sample-repo
 ```
 
-Guided setup writes a local-user organization policy and browser configuration using the supplied Copilot URL and visible account identity. Guided project onboarding creates a repository-specific `.cba\repository.json` and detects bounded npm validation scripts. The files in `config/examples` remain nondeployable governance templates for organizations that need a separately reviewed policy and UI contract.
+Guided setup detects stable Edge and Chrome installations using a deterministic bounded order, verifies product identity, and asks only when a meaningful choice exists. A current valid configuration remains selected; a sole detected browser is preselected; both browsers produce a keyboard selector defaulting to the current choice or otherwise Edge; none produces retry and advanced manual-path actions. Browser changes require confirmation. The selection and product-specific profile are persisted only after visible manual readiness succeeds. Guided project onboarding creates a repository-specific `.cba\repository.json` and detects bounded npm validation scripts. The files in `config/examples` remain nondeployable governance templates for organizations that need a separately reviewed policy and UI contract.
+
+Windows discovery checks only the corresponding `Program Files (x86)`, `Program Files`, and `%LOCALAPPDATA%` application locations for `Microsoft\Edge\Application\msedge.exe` or `Google\Chrome\Application\chrome.exe`, after an applicable explicit override. Edge's pre-existing machine/user order is unchanged; Chrome candidates are additive. It does not use `PATH` or an unbounded filesystem search for browsers.
+
+For managed automation, `cope setup --browser edge|chrome` is available, and `--browser-executable <path>` may accompany the selected product. Normal users should use plain `cope setup`. `COPE_BROWSER_EXECUTABLE` is the browser-neutral process override; `COPE_EDGE_EXECUTABLE` remains an Edge-only compatibility alias. Overrides still undergo the same identity checks.
 
 For a personal-preview launch, `cope setup` writes a usable local configuration from the Copilot URL and visible account identity you provide. It does not copy the nondeployable `.invalid` template. The baseline semantic UI contract is still verified at runtime and fails closed when the page no longer matches.
 
@@ -78,7 +82,7 @@ For a governed deployment, separately record approval for:
 - the exact Copilot Chat work URL and every redirect/final hostname;
 - the exact visible work-account identity string or tenant-approved matching pattern;
 - the expected enterprise protection indicator and locator evidence;
-- the Edge profile path and executable;
+- the selected product, dedicated profile path, executable identity/version/hash, and support status;
 - every semantic locator candidate and completion signal;
 - acceptable response/action/manual-authentication timeouts; and
 - tenant terms, licensing, repository classification, and automation authorization.
@@ -104,19 +108,19 @@ The command boundary is not an OS filesystem, network, or resource sandbox. Appr
 
 ## Preflight behavior
 
-For all transports, preflight requires Node 24+, a working Git executable, a Git working tree, no index gitlinks, and no descendant `.git` file/directory. On Windows, Git resolution checks `%LOCALAPPDATA%\Programs\Git\cmd\git.exe`, then the machine-wide Program Files locations, then `git` on the controlled `PATH`; the selected executable is reused consistently by runtime and test helpers. For live Edge it additionally requires Windows, an explicit accessible Edge executable, and a verified non-elevated token. The Git-boundary invariant is also checked as repository tools are composed and on relevant path/completion access. Minimal environment values are inherited for probes and child commands.
+For all transports, preflight requires Node 24+, a working Git executable, a Git working tree, no index gitlinks, and no descendant `.git` file/directory. On Windows, Git resolution checks `%LOCALAPPDATA%\Programs\Git\cmd\git.exe`, then the machine-wide Program Files locations, then `git` on the controlled `PATH`; the selected executable is reused consistently by runtime and test helpers. For a live browser it additionally requires Windows, the verified configured Edge or Chrome executable, its recorded version, and a verified non-elevated token. The legacy Edge discovery order is frozen; Chrome candidates are additive and bounded to approved machine-wide and user-local locations. The Git-boundary invariant is also checked as repository tools are composed and on relevant path/completion access. Minimal environment values are inherited for probes and child commands.
 
-Preflight is necessary but not a compatibility certificate. It checks only Node's minimum major version and Git's reported command success rather than enforcing the recorded exact Node/Git tuple, and executable accessibility is not an authenticity/hash check. It also does not prove tenant authorization, locator correctness, endpoint reachability, repository eligibility, egress containment, antivirus/EDR status, sufficient disk/RAM, or live Copilot protocol adherence.
+Preflight is necessary but not a compatibility certificate. Browser configuration loading and launch require an exact `Program Files`/`LOCALAPPDATA` Stable location and verify product-specific Windows version metadata, expected company/product/original filename, Authenticode signer, canonical path/stat identity, version, and SHA-256. That rejects known prerelease/portable/lookalike locations, a mismatched supported product, and unsupported Chromium derivatives. It is not independent channel attestation and cannot defeat privileged replacement by another vendor-signed binary; exact binary/channel approval remains part of tuple certification. It also does not prove tenant authorization, locator correctness, future update identity, endpoint integrity, repository eligibility, egress containment, antivirus/EDR status, sufficient disk/RAM, or live Copilot protocol adherence.
 
 ## Upgrade and recertification
 
-Re-run offline and live gates after any change to Edge, Copilot UI, Node/npm, Git, Windows policy, Conditional Access, browser configuration, UI contract, protocol, command catalog, dependencies, or security controls. Pin the tested compatibility tuple rather than claiming compatibility with all future versions.
+Re-run offline and product-specific live gates after any change to Edge/Chrome, Copilot UI, Node/npm, Git, Windows policy, Conditional Access, browser configuration, UI contract, protocol, command catalog, dependencies, or security controls. Pin the tested compatibility tuple rather than claiming compatibility with all future versions. Chrome certification cannot be inferred from Edge's Chromium lineage.
 
-If Edge/Copilot changes unexpectedly, disable live transport, preserve metadata, avoid source-bearing diagnostics by default, and use fixture/replay or manual fallback until a new UI contract is certified.
+If the selected browser or Copilot changes unexpectedly, disable live transport, preserve metadata, avoid source-bearing diagnostics by default, and use fixture/replay or manual fallback until a new UI contract is certified.
 
 ## Uninstall and decommission
 
-1. Abort active sessions and confirm child processes/Edge context are closed.
+1. Abort active sessions and confirm child processes/browser context are closed.
 2. Retain or export approved non-source audit evidence per records policy.
 3. Remove source-bearing session artifacts using the approved secure-deletion process.
 4. Remove the dedicated profile as credential-equivalent data; revoke relevant sessions if incident policy requires.

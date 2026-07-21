@@ -5,6 +5,7 @@ import type { ChildProcess } from "node:child_process";
 import { AgentError } from "../shared/errors.js";
 import { defaultProfileHome, selectEnvironment, terminatePosixProcessGroup, uniquePaths } from "./common.js";
 import type { HostPlatform } from "./contracts.js";
+import type { BrowserProduct } from "../browser/product.js";
 
 export class UnsupportedHostPlatform implements HostPlatform {
   public readonly liveBrowserSupported = false;
@@ -21,7 +22,16 @@ export class UnsupportedHostPlatform implements HostPlatform {
   public stateHome(environment: NodeJS.ProcessEnv = process.env): string {
     return path.join(environment.XDG_STATE_HOME ?? path.join(environment.HOME ?? homedir(), ".local", "state"), "copilot-browser-agent");
   }
-  public profileHome(stateHome: string): string { return defaultProfileHome(stateHome); }
+  public profileHome(stateHome: string, product: BrowserProduct = "edge"): string {
+    return defaultProfileHome(stateHome, product);
+  }
+  public browserExecutableCandidates(
+    _product: BrowserProduct,
+    environment: NodeJS.ProcessEnv = process.env,
+  ): readonly string[] {
+    return uniquePaths([environment.COPE_BROWSER_EXECUTABLE]);
+  }
+  public ordinaryBrowserProfileRoots(): readonly string[] { return []; }
   public edgeExecutableCandidates(environment: NodeJS.ProcessEnv = process.env): readonly string[] {
     return uniquePaths([environment.COPE_EDGE_EXECUTABLE]);
   }
@@ -32,7 +42,7 @@ export class UnsupportedHostPlatform implements HostPlatform {
   public assertNonPrivileged(): void { /* unsupported hosts retain offline behavior */ }
   public async verifyEligibility(options: Parameters<HostPlatform["verifyEligibility"]>[0]) {
     if (options.liveBrowser) {
-      throw new AgentError("TRANSPORT_UNAVAILABLE", `The live Edge transport is unavailable on ${this.platform}`, {
+      throw new AgentError("TRANSPORT_UNAVAILABLE", `The live browser transport is unavailable on ${this.platform}`, {
         diagnosticCode: "LIVE_BROWSER_HOST_UNSUPPORTED",
       });
     }

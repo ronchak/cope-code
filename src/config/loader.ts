@@ -1,22 +1,27 @@
 import { readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import {
+  BROWSER_CONTRACT_VERSION,
   DEFAULT_BROWSER_WAITS,
   createBaselineCopilotUiContract,
-  resolveSafeEdgeProfileDirectory,
-  validateEdgeLaunchConfig,
-  type EdgeLaunchConfig,
+  isBrowserProduct,
+  otherDedicatedBrowserProfileRoots,
+  resolveSafeBrowserProfileDirectory,
+  validateBrowserLaunchConfig,
+  verifyBrowserExecutable,
+  type BrowserIdentityVerifier,
+  type BrowserLaunchConfig,
 } from "../browser/index.js";
 import { assertValidPolicyDocument, type PolicyDocument } from "../policy/index.js";
 import { sha256, stableJson } from "../shared/crypto.js";
 import { AgentError, errorMessage } from "../shared/errors.js";
 import { CURRENT_HOST_PLATFORM, type HostPlatform } from "../platform/index.js";
-import { homedir } from "node:os";
 import { CommandCatalog } from "../tools/index.js";
 import {
   BROWSER_CONFIG_VERSION,
+  LEGACY_BROWSER_CONFIG_VERSION,
   REPOSITORY_CONFIG_VERSION,
-  type BrowserFileConfig,
+  type AnyBrowserFileConfig,
   type LoadedRuntimeConfiguration,
   type RepositoryAgentConfig,
 } from "./types.js";
@@ -31,6 +36,7 @@ export interface LoadRuntimeConfigurationOptions {
   readonly repositoryConfigFile?: string;
   readonly browserConfigFile?: string;
   readonly host?: HostPlatform;
+  readonly browserIdentityVerifier?: BrowserIdentityVerifier;
 }
 
 export async function loadRuntimeConfiguration(
@@ -50,22 +56,64 @@ export async function loadRuntimeConfiguration(
   const repositoryRaw = await readJson(repositoryFile, "repository configuration");
   const repository = parseRepositoryConfig(repositoryRaw);
 
-  let browser: (EdgeLaunchConfig & { readonly edgeExecutable: string }) | undefined;
+  let browser: (BrowserLaunchConfig & { readonly browserExecutable: string }) | undefined;
   let browserHash: string | undefined;
+  let browserIdentityHash: string | undefined;
   if (options.requireBrowser) {
     const browserRaw = await readJson(browserFile, "browser configuration");
     const parsed = parseBrowserConfig(browserRaw);
+    const host = options.host ?? CURRENT_HOST_PLATFORM;
+    const verified = await (options.browserIdentityVerifier ?? ((product, executablePath) =>
+      verifyBrowserExecutable(product, executablePath, { host })))(
+      parsed.config.product,
+      parsed.config.browserExecutable,
+    );
+    const configuredCanonicalExecutable = await realpath(parsed.config.browserExecutable).catch(() => undefined);
+    if (
+      verified.product !== parsed.config.product || configuredCanonicalExecutable === undefined ||
+      verified.executablePath !== configuredCanonicalExecutable
+    ) {
+      throw new AgentError("CONFIG_INVALID", "Browser identity verification returned mismatched product or path evidence", {
+        diagnosticCode: "BROWSER_IDENTITY_EVIDENCE_MISMATCH",
+        product: parsed.config.product,
+      });
+    }
+    if (
+      parsed.config.browserVersion !== undefined && parsed.config.browserVersion !== verified.version ||
+      parsed.config.browserExecutableSha256 !== undefined &&
+        parsed.config.browserExecutableSha256 !== verified.executableSha256
+    ) {
+      throw new AgentError("CONFIG_INVALID", "The configured browser identity changed after setup", {
+        diagnosticCode: "BROWSER_EXECUTABLE_EVIDENCE_CHANGED",
+        product: parsed.config.product,
+        next: "Run cope setup to verify the updated browser before live use.",
+      });
+    }
+    const ordinaryProfileRoots = (["edge", "chrome"] as const).flatMap((product) =>
+      host.ordinaryBrowserProfileRoots(product, process.env));
     browser = {
       ...parsed.config,
-      profileDirectory: await resolveSafeEdgeProfileDirectory(parsed.config.profileDirectory, {
+      browserExecutable: verified.executablePath,
+      browserVersion: verified.version,
+      browserExecutableSha256: verified.executableSha256,
+      profileDirectory: await resolveSafeBrowserProfileDirectory(parsed.config.profileDirectory, {
         repositoryRoot: options.repositoryRoot,
         stateHome: options.stateHome,
-        ...(options.host?.platform === "darwin" || (options.host === undefined && CURRENT_HOST_PLATFORM.platform === "darwin")
-          ? { ordinaryProfileRoots: [path.join(process.env.HOME ?? homedir(), "Library", "Application Support", "Microsoft Edge")] }
-          : {}),
+        ordinaryProfileRoots,
+        dedicatedProfileRoots: otherDedicatedBrowserProfileRoots(
+          host,
+          options.stateHome,
+          parsed.config.product,
+        ),
       }),
     };
     browserHash = sha256(stableJson(browserRaw));
+    browserIdentityHash = sha256(stableJson({
+      product: verified.product,
+      executable_path: verified.executablePath,
+      version: verified.version,
+      executable_sha256: verified.executableSha256,
+    }));
   }
 
   return {
@@ -76,6 +124,7 @@ export async function loadRuntimeConfiguration(
       organization: sha256(stableJson(organizationRaw)),
       repository: sha256(stableJson(repositoryRaw)),
       ...(browserHash === undefined ? {} : { browser: browserHash }),
+      ...(browserIdentityHash === undefined ? {} : { browserIdentity: browserIdentityHash }),
     },
     files: {
       organization: await canonicalOrResolved(organizationFile),
@@ -164,11 +213,11 @@ export function parseRepositoryConfig(value: unknown): RepositoryAgentConfig {
 }
 
 export function parseBrowserConfig(value: unknown): {
-  readonly file: BrowserFileConfig;
-  readonly config: EdgeLaunchConfig & { readonly edgeExecutable: string };
+  readonly file: AnyBrowserFileConfig;
+  readonly config: BrowserLaunchConfig & { readonly browserExecutable: string };
 } {
   const object = record(value, "browser configuration");
-  exactKeys(object, [
+  const sharedKeys = [
     "schema_version",
     "entry_url",
     "approved_hosts",
@@ -176,15 +225,29 @@ export function parseBrowserConfig(value: unknown): {
     "expected_identity",
     "require_protection_indicator",
     "profile_directory",
-    "edge_executable",
     "max_message_chars",
     "max_response_chars",
     "waits",
     "ui_contract",
-  ], "browser configuration");
-  if (object.schema_version !== BROWSER_CONFIG_VERSION) {
-    throw new AgentError("CONFIG_INVALID", `Expected browser schema ${BROWSER_CONFIG_VERSION}`);
+  ] as const;
+  const legacy = object.schema_version === LEGACY_BROWSER_CONFIG_VERSION;
+  const current = object.schema_version === BROWSER_CONFIG_VERSION;
+  if (!legacy && !current) {
+    throw new AgentError(
+      "CONFIG_INVALID",
+      `Expected browser schema ${LEGACY_BROWSER_CONFIG_VERSION} or ${BROWSER_CONFIG_VERSION}`,
+    );
   }
+  exactKeys(object, legacy
+    ? [...sharedKeys, "edge_executable"]
+    : [
+        ...sharedKeys,
+        "product",
+        "browser_contract_version",
+        "browser_executable",
+        "browser_version",
+        "browser_executable_sha256",
+      ], "browser configuration");
   const expectedIdentity = nonEmptyString(object.expected_identity, "expected_identity");
   const approvedHosts = hostArray(object.approved_hosts, "approved_hosts");
   const manualAuthenticationHosts = object.manual_authentication_hosts === undefined
@@ -202,7 +265,22 @@ export function parseBrowserConfig(value: unknown): {
     ], "waits");
   }
   const waits = { ...DEFAULT_BROWSER_WAITS, ...(object.waits === undefined ? {} : integerRecord(object.waits, "waits")) };
-  const file = object as unknown as BrowserFileConfig;
+  const product = legacy ? "edge" : object.product;
+  if (!isBrowserProduct(product)) {
+    throw new AgentError("CONFIG_INVALID", "Browser product must be edge or chrome");
+  }
+  const browserContractVersionValue = legacy
+    ? BROWSER_CONTRACT_VERSION
+    : nonEmptyString(object.browser_contract_version, "browser_contract_version");
+  if (browserContractVersionValue !== BROWSER_CONTRACT_VERSION) {
+    throw new AgentError("CONFIG_INVALID", `Unsupported browser contract version: ${browserContractVersionValue}`);
+  }
+  const browserContractVersion = BROWSER_CONTRACT_VERSION;
+  const browserExecutable = nonEmptyString(
+    legacy ? object.edge_executable : object.browser_executable,
+    legacy ? "edge_executable" : "browser_executable",
+  );
+  const file = object as unknown as AnyBrowserFileConfig;
   const config = {
     entryUrl: nonEmptyString(object.entry_url, "entry_url"),
     approvedHosts,
@@ -212,18 +290,32 @@ export function parseBrowserConfig(value: unknown): {
     maxMessageChars: optionalPositiveInteger(object.max_message_chars, "max_message_chars") ?? 200_000,
     maxResponseChars: optionalPositiveInteger(object.max_response_chars, "max_response_chars") ?? 1_000_000,
     waits,
+    product,
+    browserContractVersion,
     profileDirectory: nonEmptyString(object.profile_directory, "profile_directory"),
     uiContract: object.ui_contract === undefined
       ? createBaselineCopilotUiContract(expectedIdentity)
       : object.ui_contract as never,
-    edgeExecutable: nonEmptyString(object.edge_executable, "edge_executable"),
-  } satisfies EdgeLaunchConfig & { readonly edgeExecutable: string };
+    browserExecutable,
+    ...(legacy ? {} : {
+      browserVersion: nonEmptyString(object.browser_version, "browser_version"),
+      browserExecutableSha256: browserExecutableHash(object.browser_executable_sha256),
+    }),
+  } satisfies BrowserLaunchConfig & { readonly browserExecutable: string };
   try {
-    validateEdgeLaunchConfig(config);
+    validateBrowserLaunchConfig(config);
   } catch (error) {
     throw new AgentError("CONFIG_INVALID", `Browser configuration is invalid: ${errorMessage(error)}`);
   }
   return { file, config };
+}
+
+function browserExecutableHash(value: unknown): string {
+  const hash = nonEmptyString(value, "browser_executable_sha256");
+  if (!/^[a-f0-9]{64}$/u.test(hash)) {
+    throw new AgentError("CONFIG_INVALID", "browser_executable_sha256 must be a lowercase SHA-256 digest");
+  }
+  return hash;
 }
 
 async function readJson(filename: string, label: string): Promise<unknown> {

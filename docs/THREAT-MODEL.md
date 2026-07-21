@@ -8,7 +8,7 @@ The exact macOS preview candidates add Aqua-session ambiguity, UID/root misuse, 
 
 The system gives an untrusted, browser-hosted reasoning component bounded access to one local Git repository through deterministic tools. Security means that model autonomy cannot exceed explicit organization, repository, and session authority; consequential actions are correlated, bounded, recoverable, and auditable; authentication remains user-controlled; and uncertainty fails closed.
 
-This model covers the local Node process, repository, child commands, local state/checkpoints, dedicated Edge profile, semantic UI adapter, and Copilot Chat exchange. It does not claim to model Microsoft service internals, the full Windows or macOS endpoint stack, a malicious administrator, or physical compromise.
+This model covers the local Node process, repository, child commands, local state/checkpoints, product-specific dedicated Edge/Chrome profiles, browser executable discovery and identity checks, semantic UI adapter, and Copilot Chat exchange. It does not claim to model Microsoft service internals, the full Windows or macOS endpoint stack, a malicious administrator, or physical compromise.
 
 ## Assets
 
@@ -17,7 +17,7 @@ This model covers the local Node process, repository, child commands, local stat
 - integrity and availability of the working tree;
 - organization/repository/session policy and grant integrity;
 - local audit, disclosure, operation, transient decision/outbox/response, fingerprint-key, completion-handoff, checkpoint, and review-export records;
-- authenticated Edge profile, cookies, tokens, account and tenant context;
+- authenticated dedicated browser profile, cookies, tokens, account and tenant context;
 - Copilot task/conversation correlation and completion truth;
 - developer workstation compute, disk, network, and child processes; and
 - release/update dependencies and signing provenance.
@@ -39,7 +39,7 @@ All model output, repository content, filenames, Git data, command output, brows
 Required assumptions:
 
 - the account and endpoint controls on the exact approved Windows or macOS tuple are trustworthy enough to protect the process, config, state root, and profile; on a Mac this includes the intended non-root console UID, Aqua-session ownership, FileVault/storage posture, and local Application Support protections;
-- the approved Edge executable and pinned Node dependencies are genuine;
+- the approved Edge or Chrome executable and pinned Node dependencies are genuine;
 - repository and organization policy authors are authorized;
 - command catalog facts are reviewed and truthful;
 - the configured identity/protection signals uniquely identify the approved Copilot context; and
@@ -71,14 +71,19 @@ The design does not assume Copilot follows instructions, repository text is beni
 | Audit, disclosure, fingerprint-key, or review-record tampering | sequence/session/hash chain; strict verification; partial-record rejection; existing sessions refuse a missing/malformed fingerprint key; review package derives only from verified evidence and carries a deterministic body digest; restrictive local modes | hash chains/package digest are unsigned/local; Windows ACLs need separate certification, while macOS ownership/mode/device checks do not resist a privileged attacker; approved ACL/signing/anchoring if required |
 | Checkpoint corruption or destructive rollback | external storage; bounded manifests/blobs; SHA-256/size/path checks; pre-rollback snapshot and restoration | checkpoint contains source; storage/retention and manual path review required |
 | Malicious fixture/replay | bounded strict JSON; correlation/order/content digest; pinned source file hash | fixture content is executable model intent within policy; review as test code and keep synthetic |
-| Supply-chain compromise | minimal exact dependencies and lockfile; offline tests; intended SBOM/provenance/signing gates | npm/Node/Playwright/Edge compromise has broad access; organizational release process is mandatory |
+| Wrong or substituted browser product | deterministic bounded candidates; explicit product choice; exact platform metadata/signature checks; canonical path, version, stat identity and SHA-256 pinning; recheck at launch | endpoint compromise can subvert local evidence; product identity is not tenant/UI/release certification |
+| Ordinary-profile or cross-product profile access | product-specific roots and markers; both ordinary Edge and Chrome roots denied; link/device/owner/mode checks; exclusive lock; non-empty unmarked and wrong-product roots rejected | a compromised browser or OS can still escape application controls; live zero-access observation remains required |
+| Supply-chain compromise | minimal exact dependencies and lockfile; offline tests; intended SBOM/provenance/signing gates | npm/Node/Playwright/Edge/Chrome compromise has broad access; organizational release process is mandatory |
 | UI update causes wrong action | versioned semantic contract, candidate quorum, expected counts, multi-signal completion, changed-selector state, kill switch | live UI is inherently unstable; continuous recertification and fast disable owner required |
-| Elevated, wrong-user, or hidden execution | Windows integrity preflight; macOS UID 0 refusal plus console-owner and `gui/<uid>` Aqua checks; visible headful Edge; explicit stop | a Windows UAC-filtered admin can still have a medium token; an Aqua probe cannot prove future UI reliability; organizational endpoint policy and exact-machine visible-launch tests decide eligibility |
+| Elevated, wrong-user, or hidden execution | Windows integrity preflight; macOS UID 0 refusal plus console-owner and `gui/<uid>` Aqua checks; visible headful selected browser; explicit stop | a Windows UAC-filtered admin can still have a medium token; an Aqua probe cannot prove future UI reliability; organizational endpoint policy and exact-machine visible-launch tests decide eligibility |
 
 ## Browser abuse cases
 
 The adapter must not:
 
+- accept Brave, Arc, Chromium, an embedded runtime, or one supported product under the other product name;
+- search unbounded filesystem locations, fall back to a Playwright channel, or download a browser;
+- reuse an Edge profile for Chrome, reuse a Chrome profile for Edge, or touch either ordinary profile root;
 - continue on a broad Microsoft hostname just because it resembles Copilot;
 - submit while on authentication/consent/MFA pages;
 - dismiss unknown modals;

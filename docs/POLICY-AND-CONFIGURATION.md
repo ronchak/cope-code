@@ -21,6 +21,7 @@ Experimental macOS preview candidate locations (same schemas and policy meanings
 ~/Library/Application Support/CopilotBrowserAgent/config/browser.json
 <canonical repository root>/.cba/repository.json
 ~/Library/Application Support/CopilotBrowserAgentEdgeProfile
+~/Library/Application Support/CopilotBrowserAgentChromeProfile
 ```
 
 The macOS state tree and Cope-owned profile files are ownership/mode verified on every startup; wrong or unverifiable storage fails closed. Location parity does not imply a certified live tuple.
@@ -183,17 +184,19 @@ An exact operation that evaluates to `ask` can use `allow_once` only for that al
 
 The expansion appends a canonical capability key/timestamp to `approved_capabilities`. A higher-layer deny remains absolute; a higher-layer ask is satisfied only by the explicit, scoped session approval and never by inference or a broader lower-layer allow. User-input and capability-decision artifacts can contain sensitive free-form text; they share the transient recovery-artifact retention policy and must be protected accordingly.
 
-## `cba-browser-config/1`
+## Browser configuration (`cba-browser-config/1` and `/2`)
 
 Browser configuration is machine/tenant specific and must remain outside repositories. Required facts:
 
+- exact product (`edge` or `chrome`) in version 2;
+- independent browser contract version (`cope-visible-browser/v1`);
 - exact HTTPS `entry_url`;
 - exact `approved_hosts`, with subdomains permitted only deliberately;
 - optional manual authentication redirect hosts;
 - expected work-account display signal (never a credential);
 - whether a protection indicator is mandatory;
 - absolute, dedicated local profile directory outside repository and agent-state roots, with no UNC/device/shared path form;
-- explicit Edge executable;
+- canonical verified browser executable, observed version, and SHA-256;
 - response/message bounds and state-based waits; and
 - a versioned semantic UI contract.
 
@@ -201,7 +204,15 @@ The adapter supports role, label, placeholder, test-id, text, and bounded CSS fa
 
 Signals cover shell, conversation, composer, send control, assistant responses, user messages, streaming, identity, protection, signed-out, MFA, consent, throttling, service error, and modal state. The adapter refuses unknown/ambiguous states.
 
-The shipped `browser.edge149.uncertified-template.json` contains a baseline, not evidence of tenant certification. Its Copilot and authentication hosts are reserved `.invalid` names. Replace those hosts plus the account/profile placeholders and certify every locator against the exact managed Copilot surface. The profile path is canonicalized before launch; a prospective path is evaluated through its deepest existing parent so a symlink/junction cannot redirect it into the repository or `%LOCALAPPDATA%\CopilotBrowserAgent` state root. If the tenant redirects to a different host, add only the precise approved host after governance review; do not set a wildcard or broad Microsoft parent domain.
+Version 1 is the exact legacy Edge-only schema with `edge_executable`. The strict compatibility parser treats it as `product: "edge"` and `cope-visible-browser/v1` in memory. A valid legacy document is not rewritten merely because setup runs, so its bytes, established Edge profile, authentication state, approved hosts, and optional UI settings remain intact. It cannot represent Chrome. Unknown, mixed v1/v2, corrupt, or ambiguous documents fail closed.
+
+Version 2 replaces `edge_executable` with `product`, `browser_contract_version`, `browser_executable`, `browser_version`, and `browser_executable_sha256`. Changing products requires explicit confirmation and selects/creates the other product's dedicated profile. Setup serializes changes under a lock and compare-and-swap check, refuses live resumable browser sessions, launches the proposed browser for manual readiness before persistence, and does not silently switch an existing user.
+
+`cope setup` is the primary interface. Detection is deterministic and bounded; one browser is preselected, two produce a keyboard choice (existing product first, otherwise Edge), and none produces Retry plus an advanced manual path. `cope setup --browser edge|chrome` and `--browser-executable` exist for managed automation. `COPE_BROWSER_EXECUTABLE` is the neutral override; `COPE_EDGE_EXECUTABLE` is retained only as an Edge compatibility alias. Every candidate and override undergoes the same identity verification. Installers remain browser-neutral and download no browser.
+
+macOS evidence includes the exact Stable bundle identifier, expected signing team, valid code signature, reported version, canonical path/stat identity, and SHA-256. Windows evidence combines an exact approved machine-wide/user-local Stable executable location (derived from `Program Files`/`LOCALAPPDATA`, never an override or lookalike suffix) with exact product/company/original-filename metadata, Authenticode signer, version, canonical path/stat identity, and SHA-256. This rejects known Beta/Dev/Canary/SxS locations, portable/lookalike paths, product mismatch, and unsupported Chromium derivatives. It proves a vendor-signed requested product occupied the approved Stable location at check time; it does not defeat a privileged replacement with another vendor-signed binary or independently attest the release channel. Exact binary/channel approval remains part of tuple certification, along with Copilot UI behavior, account/tenant eligibility, Conditional Access, future browser updates, and endpoint integrity.
+
+The shipped Edge and Chrome uncertified templates contain baselines, not tenant or browser certification. Their Copilot and authentication hosts are reserved `.invalid` names. Replace hosts, identity, profile, executable/version/hash placeholders and certify every locator against the exact managed Copilot surface. The profile path is canonicalized before launch; a prospective path is evaluated through its deepest existing parent so a symlink/junction cannot redirect it into the repository, `%LOCALAPPDATA%\CopilotBrowserAgent` state root, either ordinary browser profile, or the other product's Cope profile. If the tenant redirects to a different host, add only the precise approved host after governance review; do not set a wildcard or broad Microsoft parent domain.
 
 ## Review checklist
 
@@ -214,5 +225,5 @@ The shipped `browser.edge149.uncertified-template.json` contains a baseline, not
 - Required validation commands exist, are truthfully classified, and can run within the integrity boundary; no required command intentionally mutates tracked/nonignored source or control state.
 - Approved executables/transitive scripts and target endpoint, egress, filesystem, and resource containment have live-pilot owner approval.
 - Browser URL, identity, protection, profile, and locators have recorded evidence.
-- Retention settings and external procedures separately cover transient decision/outbox/response artifacts, checkpoints, fingerprint keys, completion handoffs, review packages, audit/disclosure metadata, and the Edge profile.
+- Retention settings and external procedures separately cover transient decision/outbox/response artifacts, checkpoints, fingerprint keys, completion handoffs, review packages, audit/disclosure metadata, and each product-specific dedicated browser profile.
 - Fixture/replay and adversarial tests pass after the change.

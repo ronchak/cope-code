@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
 
 import type { ProbeResult, ProbeRunner } from "./contracts.js";
+import type { BrowserProduct } from "../browser/product.js";
 
 export const runHostProbe: ProbeRunner = async (
   executable,
@@ -55,8 +56,11 @@ export function uniquePaths(values: readonly (string | undefined)[]): readonly s
   return [...new Set(values.filter((value): value is string => value !== undefined && value.length > 0))];
 }
 
-export function defaultProfileHome(stateHome: string): string {
-  return path.join(path.dirname(stateHome), "CopilotBrowserAgentEdgeProfile");
+export function defaultProfileHome(stateHome: string, product: BrowserProduct = "edge"): string {
+  return path.join(
+    path.dirname(stateHome),
+    product === "edge" ? "CopilotBrowserAgentEdgeProfile" : "CopilotBrowserAgentChromeProfile",
+  );
 }
 
 export function selectEnvironment(

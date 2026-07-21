@@ -150,3 +150,5 @@ Bootstrap messages place the task and operating envelope in distinct authoritati
 ## Versioning
 
 `cba/1` meanings are immutable. Compatible implementation hardening can occur without changing the wire version. Adding fields, changing tool semantics, relaxing an invariant, or reinterpreting a status requires a new protocol version and compatibility fixtures. The UI adapter has its own independent `copilot-ui/v1[:certification]` version because DOM evolution must not force repository-tool changes.
+
+Browser product selection is deliberately outside this wire contract. Edge and Chrome use the same bootstrap, envelopes, tool meanings, submission correlation, response capture, classifier, and agent loop. Browser product, executable identity, dedicated profile, and browser/UI contract are local configuration/runtime concerns. The persisted runtime-manifest value `edge` remains a compatibility discriminator for the live visible-browser transport, including Chrome-backed sessions; it is not a product claim and is not emitted to the model or users. Adding Chrome therefore does not change `cba/1` semantics.

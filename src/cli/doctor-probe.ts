@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { access } from "node:fs/promises";
+import { access, realpath } from "node:fs/promises";
 import path from "node:path";
 
 import {
@@ -85,7 +85,9 @@ export async function probeNpmVersion(
 
 export async function resolveNpmCliForCurrentRuntime(): Promise<string | undefined> {
   const executableDirectory = path.dirname(process.execPath);
+  const siblingNpmCli = await resolveSiblingNpmCli(executableDirectory);
   const candidates = unique([
+    siblingNpmCli,
     path.join(executableDirectory, "node_modules", "npm", "bin", "npm-cli.js"),
     path.resolve(executableDirectory, "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
     process.env.ProgramFiles === undefined
@@ -109,6 +111,18 @@ export async function resolveNpmCliForCurrentRuntime(): Promise<string | undefin
       return path.resolve(candidate);
     } catch {
       // Continue through the bounded, deterministic candidate list.
+    }
+  }
+  return undefined;
+}
+
+async function resolveSiblingNpmCli(executableDirectory: string): Promise<string | undefined> {
+  for (const name of ["npm", "npm.cmd"] as const) {
+    try {
+      const resolved = await realpath(path.join(executableDirectory, name));
+      if (isNpmCliEntryPoint(resolved)) return resolved;
+    } catch {
+      // Continue through the bounded sibling launcher list.
     }
   }
   return undefined;

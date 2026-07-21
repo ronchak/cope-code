@@ -91,7 +91,7 @@ export async function executeDemoCommand(
       case "/config":
         section("Configuration", io.stdout);
         keyValue("Status", "not loaded in demo mode", io.stdout);
-        hint("Run cope setup on Windows to configure a live Edge session.", io.stdout);
+        hint("Run cope setup to configure a supported visible browser session.", io.stdout);
         break;
       case "/sessions":
       case "/resume":
@@ -115,7 +115,7 @@ function showReady(repositoryRoot: string, mode: AutonomyMode, output: Writable)
 function showSimulatedTask(objective: string, output: Writable): void {
   renderUserMessage(objective, output);
   info("Task captured for demonstration only.", output);
-  hint("A live session would now verify policy, open Edge, and ask Copilot to work on the project.", output);
+  hint("A live session would now verify policy, open the selected browser, and ask Copilot to work on the project.", output);
   hint("No browser, network request, session, configuration, or file operation occurred.", output);
   output.write("\n");
 }
@@ -124,7 +124,7 @@ function showDemoDoctor(output: Writable): void {
   section("Environment check", output);
   keyValue("Platform", process.platform, output);
   keyValue("Node", process.versions.node, output);
-  keyValue("Live Edge", "skipped in demo mode", output);
+  keyValue("Live browser", "skipped in demo mode", output);
   success("Terminal demo is available.", output);
 }
 

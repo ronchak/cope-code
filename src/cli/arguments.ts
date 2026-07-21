@@ -1,5 +1,6 @@
 import { AgentError } from "../shared/errors.js";
 import type { AutonomyMode } from "../session/types.js";
+import type { BrowserProduct } from "../browser/product.js";
 
 export type TransportSelection = "edge" | "fixture" | "replay";
 
@@ -32,6 +33,8 @@ export type CliCommand =
       readonly identity?: string;
       readonly entryUrl?: string;
       readonly requireProtectionIndicator?: boolean;
+      readonly browser?: BrowserProduct;
+      readonly browserExecutable?: string;
     } & CommonOptions)
   | ({ readonly command: "doctor"; readonly repository: string } & CommonOptions)
   | ({ readonly command: "sessions"; readonly repository?: string; readonly all: boolean } & CommonOptions)
@@ -140,6 +143,9 @@ export function parseCliArguments(argv: readonly string[]): CliCommand {
       const force = takeFlag(args, "--force");
       const identity = takeOption(args, "--identity");
       const entryUrl = takeOption(args, "--entry-url");
+      const browserValue = takeOption(args, "--browser");
+      const browser = browserValue === undefined ? undefined : parseBrowserProduct(browserValue);
+      const browserExecutable = takeOption(args, "--browser-executable");
       const noProtection = takeFlag(args, "--no-protection");
       const requireProtection = takeFlag(args, "--require-protection");
       if (noProtection && requireProtection) {
@@ -152,6 +158,8 @@ export function parseCliArguments(argv: readonly string[]): CliCommand {
         ...common,
         ...(identity === undefined ? {} : { identity }),
         ...(entryUrl === undefined ? {} : { entryUrl }),
+        ...(browser === undefined ? {} : { browser }),
+        ...(browserExecutable === undefined ? {} : { browserExecutable }),
         ...(noProtection
           ? { requireProtectionIndicator: false }
           : requireProtection
@@ -410,6 +418,13 @@ function parseMode(value: string): AutonomyMode {
 function parseTransport(value: string): TransportSelection {
   if (value !== "edge" && value !== "fixture" && value !== "replay") {
     throw new AgentError("CONFIG_INVALID", `Invalid transport '${value}'`);
+  }
+  return value;
+}
+
+function parseBrowserProduct(value: string): BrowserProduct {
+  if (value !== "edge" && value !== "chrome") {
+    throw new AgentError("CONFIG_INVALID", `Invalid browser '${value}'; choose edge or chrome`);
   }
   return value;
 }
