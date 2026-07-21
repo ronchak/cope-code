@@ -46,7 +46,10 @@ class GuardedPage implements SemanticPage {
       throw new AgentError(
         "TRANSPORT_INDETERMINATE",
         "Synthetic pre-activation guard",
-        { diagnosticCode: this.preActivationGuardCode },
+        {
+          diagnosticCode: this.preActivationGuardCode,
+          dispatchAttempted: false,
+        },
       );
     }
     this.activationCalls += 1;
