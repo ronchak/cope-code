@@ -800,12 +800,10 @@ test("corrupt policy and mismatched existing browser configuration fail with rec
   });
   await assert.rejects(configureMachine({
     paths: browserPaths,
-    force: true,
+    force: false,
     interactive: false,
     output: { write: () => undefined },
     host,
-    browser: "edge",
-    identity: "person@example.com",
   }, {
     verifyManualBrowser: async () => {
       throw new AgentError("CONFIG_INVALID", "product mismatch", {
@@ -814,6 +812,65 @@ test("corrupt policy and mismatched existing browser configuration fail with rec
     },
   }), (error: unknown) => error instanceof AgentError &&
     typeof error.details.next === "string" && /browser configuration/iu.test(error.details.next));
+});
+
+test("explicit browser replacement recovers from a broken configured executable", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-machine-browser-replacement-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const stateHome = path.join(root, "state");
+  await mkdir(stateHome, { mode: 0o700 });
+  const host = createStandardUserHost();
+  const paths = configurationPaths(stateHome, host);
+  const originalExecutable = "/verified/edge";
+  const replacementExecutable = "/replacement/edge";
+  const launchBrowser = async () => readyTransport([]);
+
+  await configureMachine({
+    paths,
+    force: false,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+    browser: "edge",
+    browserExecutable: originalExecutable,
+    identity: "person@example.com",
+  }, {
+    verifyManualBrowser: async (product, executablePath) => ({
+      ...discoveredBrowser(product, executablePath),
+      source: "manual",
+    }),
+    launchBrowser,
+  });
+  const original = JSON.parse(await readFile(paths.browser, "utf8")) as Record<string, unknown>;
+
+  await configureMachine({
+    paths,
+    force: true,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+    browser: "edge",
+    browserExecutable: replacementExecutable,
+  }, {
+    verifyManualBrowser: async (product, executablePath) => {
+      if (executablePath === originalExecutable) {
+        throw new AgentError("CONFIG_INVALID", "configured executable is no longer valid", {
+          diagnosticCode: "BROWSER_EXECUTABLE_PRODUCT_MISMATCH",
+        });
+      }
+      return {
+        ...discoveredBrowser(product, executablePath),
+        source: "manual",
+      };
+    },
+    launchBrowser,
+  });
+
+  const replaced = JSON.parse(await readFile(paths.browser, "utf8")) as Record<string, unknown>;
+  assert.equal(replaced.browser_executable, replacementExecutable);
+  assert.equal(replaced.profile_directory, original.profile_directory);
+  assert.equal(replaced.expected_identity, original.expected_identity);
+  assert.deepEqual(replaced.approved_hosts, original.approved_hosts);
 });
 
 test("Ctrl+C during manual browser readiness cancels cleanly before persistence", async (context) => {

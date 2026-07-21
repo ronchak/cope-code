@@ -75,7 +75,7 @@ export interface MachineSetupDependencies {
 interface ExistingBrowserSetup {
   readonly file: BrowserFileConfig | LegacyEdgeBrowserFileConfig;
   readonly config: BrowserLaunchConfig;
-  readonly browser: DiscoveredBrowser;
+  readonly browser?: DiscoveredBrowser;
   readonly evidenceChanged: boolean;
 }
 
@@ -295,6 +295,7 @@ export async function configureMachine(options: {
   // idempotent check. Interactive setup always shows the current selection.
   if (
     !options.interactive && current !== undefined && organizationPolicyToCreate === undefined &&
+    current.browser !== undefined &&
     !current.evidenceChanged &&
     !options.force && options.browser === undefined && options.browserExecutable === undefined &&
     options.identity === undefined && options.entryUrl === undefined &&
@@ -318,10 +319,10 @@ export async function configureMachine(options: {
     promptText,
     ...(dependencies.identityVerifier === undefined ? {} : { identityVerifier: dependencies.identityVerifier }),
   });
-  const materialBrowserChange = current === undefined ||
+  const materialBrowserChange = current?.browser === undefined ||
     current.browser.product !== selected.product ||
     current.browser.executablePath !== selected.executablePath;
-  if (current !== undefined && materialBrowserChange && options.interactive) {
+  if (current?.browser !== undefined && materialBrowserChange && options.interactive) {
     const action = await promptBrowser({ kind: "confirm-change", from: current.browser, to: selected }, options.output);
     if (action.action !== "confirm-change") throw new PromptBackError();
   }
@@ -539,7 +540,13 @@ async function policyForSetup(filename: string): Promise<PolicyDocument | undefi
 }
 
 async function readExistingBrowserSetup(
-  options: { readonly paths: MachineConfigurationPaths; readonly host: HostPlatform },
+  options: {
+    readonly paths: MachineConfigurationPaths;
+    readonly host: HostPlatform;
+    readonly force: boolean;
+    readonly browser?: BrowserProduct;
+    readonly browserExecutable?: string;
+  },
   baseline: Awaited<ReturnType<typeof readBrowserConfigBaseline>>,
   verifyManual: typeof verifyManualBrowserExecutable,
   identityVerifier?: BrowserIdentityVerifier,
@@ -547,14 +554,6 @@ async function readExistingBrowserSetup(
   if (!baseline.exists) return undefined;
   try {
     const parsed = parseBrowserConfig(JSON.parse(baseline.bytes!.toString("utf8")) as unknown);
-    const browser = await verifyManual(parsed.config.product, parsed.config.browserExecutable, {
-      host: options.host,
-      ...(identityVerifier === undefined ? {} : { identityVerifier }),
-    });
-    const evidenceChanged =
-      parsed.config.browserVersion !== undefined && parsed.config.browserVersion !== browser.version ||
-      parsed.config.browserExecutableSha256 !== undefined &&
-        parsed.config.browserExecutableSha256 !== browser.executableSha256;
     const profileDirectory = await resolveSafeBrowserProfileDirectory(parsed.config.profileDirectory, {
       stateHome: options.paths.stateHome,
       ordinaryProfileRoots: (["edge", "chrome"] as const).flatMap((product) =>
@@ -565,6 +564,24 @@ async function readExistingBrowserSetup(
         parsed.config.product,
       ),
     });
+    let browser: DiscoveredBrowser;
+    try {
+      browser = await verifyManual(parsed.config.product, parsed.config.browserExecutable, {
+        host: options.host,
+        ...(identityVerifier === undefined ? {} : { identityVerifier }),
+      });
+    } catch (error) {
+      if (!options.force && options.browser === undefined && options.browserExecutable === undefined) throw error;
+      return {
+        file: parsed.file,
+        config: { ...parsed.config, profileDirectory },
+        evidenceChanged: false,
+      };
+    }
+    const evidenceChanged =
+      parsed.config.browserVersion !== undefined && parsed.config.browserVersion !== browser.version ||
+      parsed.config.browserExecutableSha256 !== undefined &&
+        parsed.config.browserExecutableSha256 !== browser.executableSha256;
     return {
       file: parsed.file,
       config: {
@@ -612,7 +629,7 @@ async function selectBrowserForSetup(input: {
     return input.verifyManual(input.options.browser!, input.options.browserExecutable, verificationOptions);
   }
   if (input.options.browser !== undefined) {
-    if (input.current?.browser.product === input.options.browser) return input.current.browser;
+    if (input.current?.browser?.product === input.options.browser) return input.current.browser;
   }
   let discovered = await input.discover(verificationOptions);
   if (input.options.browser !== undefined) {
@@ -626,7 +643,7 @@ async function selectBrowserForSetup(input: {
     return promptForManualBrowser(input.options.browser, input);
   }
   if (!input.options.interactive) {
-    if (input.current !== undefined) return input.current.browser;
+    if (input.current?.browser !== undefined) return input.current.browser;
     if (discovered.length === 1) return discovered[0]!;
     throw new AgentError("CONFIG_INVALID", discovered.length === 0
       ? "No supported stable browser was found"
@@ -634,7 +651,7 @@ async function selectBrowserForSetup(input: {
       next: "Use cope setup --browser edge or cope setup --browser chrome.",
     });
   }
-  if (input.current !== undefined) {
+  if (input.current?.browser !== undefined) {
     const action = await input.promptBrowser({ kind: "current", browser: input.current.browser }, input.options.output);
     if (action.action === "continue") return action.browser;
   }
@@ -661,9 +678,10 @@ async function selectBrowserForSetup(input: {
       if (action.action === "advanced") return promptForManualBrowser(undefined, input);
     }
     const browsers = discovered as readonly [DiscoveredBrowser, ...DiscoveredBrowser[]];
-    const selectedIndex = Math.max(0, input.current === undefined
+    const currentBrowser = input.current?.browser;
+    const selectedIndex = Math.max(0, currentBrowser === undefined
       ? browsers.findIndex((browser) => browser.product === "edge")
-      : browsers.findIndex((browser) => browser.product === input.current!.browser.product));
+      : browsers.findIndex((browser) => browser.product === currentBrowser.product));
     const action = await input.promptBrowser({ kind: "choose", browsers, selectedIndex }, input.options.output);
     if (action.action === "continue") return action.browser;
   }
