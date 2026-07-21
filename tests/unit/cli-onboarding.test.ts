@@ -15,9 +15,9 @@ import type {
   DiscoveredBrowser,
   EdgeCopilotTransport,
 } from "../../src/browser/index.js";
-import { UnsupportedHostPlatform } from "../../src/platform/index.js";
 import { AgentError } from "../../src/shared/errors.js";
 import { PromptCancelledError } from "../../src/cli/prompts.js";
+import { createStandardUserHost } from "../helpers/standard-user-host.js";
 
 test("guided project setup detects useful package scripts and chooses one completion check", async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), "cope-onboarding-"));
@@ -117,7 +117,7 @@ test("guided machine setup preselects the only detected browser and commits only
   context.after(async () => rm(root, { recursive: true, force: true }));
   const stateHome = path.join(root, "state");
   await mkdir(stateHome);
-  const host = new UnsupportedHostPlatform("linux", "x64");
+  const host = createStandardUserHost();
   const paths = configurationPaths(stateHome, host);
   const chrome = discoveredBrowser("chrome");
   const launched: BrowserLaunchConfig[] = [];
@@ -160,7 +160,7 @@ test("guided machine setup preselects the only detected browser and commits only
 test("two-browser setup defaults to Edge and explicit automation can choose Chrome without UI", async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), "cope-machine-two-browser-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
-  const host = new UnsupportedHostPlatform("linux", "x64");
+  const host = createStandardUserHost();
   const edge = discoveredBrowser("edge");
   const chrome = discoveredBrowser("chrome");
   const interactiveHome = path.join(root, "interactive");
@@ -213,7 +213,7 @@ test("two-browser setup defaults to Edge and explicit automation can choose Chro
 test("Retry redetects browsers and changing Edge to Chrome requires confirmation and a separate profile", async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), "cope-machine-retry-change-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
-  const host = new UnsupportedHostPlatform("linux", "x64");
+  const host = createStandardUserHost();
   const edge = discoveredBrowser("edge");
   const chrome = discoveredBrowser("chrome");
 
@@ -294,7 +294,7 @@ test("existing browser setup remains selected and is not silently rewritten", as
   context.after(async () => rm(root, { recursive: true, force: true }));
   const stateHome = path.join(root, "state");
   await mkdir(stateHome);
-  const host = new UnsupportedHostPlatform("linux", "x64");
+  const host = createStandardUserHost();
   const paths = configurationPaths(stateHome, host);
   const edge = discoveredBrowser("edge");
   const launched: BrowserLaunchConfig[] = [];
@@ -359,7 +359,7 @@ test("existing browser setup remains selected and is not silently rewritten", as
 test("existing Chrome and strict legacy Edge remain selected without silent migration", async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), "cope-machine-existing-products-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
-  const host = new UnsupportedHostPlatform("linux", "x64");
+  const host = createStandardUserHost();
   for (const product of ["chrome", "edge"] as const) {
     const stateHome = path.join(root, product);
     await mkdir(stateHome);
@@ -424,7 +424,7 @@ test("no-browser setup offers manual installation selection and never saves befo
   context.after(async () => rm(root, { recursive: true, force: true }));
   const stateHome = path.join(root, "state");
   await mkdir(stateHome);
-  const host = new UnsupportedHostPlatform("linux", "x64");
+  const host = createStandardUserHost();
   const paths = configurationPaths(stateHome, host);
   const screens: string[] = [];
   let closed = false;
@@ -464,7 +464,7 @@ test("no-browser setup offers manual installation selection and never saves befo
 test("corrupt policy and mismatched existing browser configuration fail with recovery actions", async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), "cope-machine-corrupt-recovery-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
-  const host = new UnsupportedHostPlatform("linux", "x64");
+  const host = createStandardUserHost();
   const policyHome = path.join(root, "policy");
   await mkdir(path.join(policyHome, "config"), { recursive: true });
   const policyPaths = configurationPaths(policyHome, host);
@@ -520,7 +520,7 @@ test("Ctrl+C during manual browser readiness cancels cleanly before persistence"
   context.after(async () => rm(root, { recursive: true, force: true }));
   const stateHome = path.join(root, "state");
   await mkdir(stateHome);
-  const host = new UnsupportedHostPlatform("linux", "x64");
+  const host = createStandardUserHost();
   const paths = configurationPaths(stateHome, host);
   const chrome = discoveredBrowser("chrome");
   const priorSigintListeners = process.listenerCount("SIGINT");

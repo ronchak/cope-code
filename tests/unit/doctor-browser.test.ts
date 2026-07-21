@@ -7,7 +7,7 @@ import test from "node:test";
 import type { BrowserIdentityVerifier, DiscoveredBrowser, EdgeCopilotTransport } from "../../src/browser/index.js";
 import { executeDoctorCommand } from "../../src/cli/doctor.js";
 import { configurationPaths, configureMachine } from "../../src/cli/onboarding.js";
-import { UnsupportedHostPlatform } from "../../src/platform/index.js";
+import { createStandardUserHost } from "../helpers/standard-user-host.js";
 
 const digest = "a".repeat(64);
 
@@ -16,7 +16,7 @@ test("doctor reports Chrome preview identity and privacy concisely while JSON in
   context.after(async () => rm(root, { recursive: true, force: true }));
   const stateHome = path.join(root, "state");
   await mkdir(stateHome, { mode: 0o700 });
-  const host = new UnsupportedHostPlatform("linux", "x64");
+  const host = createStandardUserHost();
   const executablePath = "/verified/Google Chrome";
   const identityVerifier: BrowserIdentityVerifier = async (product, selectedPath) => ({
     product,
