@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { executeUpdateCommand, resolveLocalUpdateCheckout } from "../../src/cli/update.js";
+import { DarwinHostPlatform, WindowsHostPlatform } from "../../src/platform/index.js";
 import { AgentError } from "../../src/shared/errors.js";
 import { createStandardUserHost } from "../helpers/standard-user-host.js";
 
@@ -28,7 +29,7 @@ test("local update validates the configured checkout and runs its installer", as
   const exitCode = await executeUpdateCommand(
     { command: "update", json: false },
     { stdout: output, stderr: output },
-    createStandardUserHost(),
+    createStandardUserHost(new DarwinHostPlatform("arm64", () => 501)),
     {
       environment: { COPE_SOURCE_DIR: root },
       runInstaller: async (installerPath, source, environment) => {
@@ -50,4 +51,18 @@ test("local update explains how to recover when its source environment is missin
   await assert.rejects(resolveLocalUpdateCheckout({}), (error: unknown) =>
     error instanceof AgentError && /COPE_SOURCE_DIR is not set/u.test(error.message) &&
     typeof error.details.next === "string" && /install-macos\.sh/u.test(error.details.next));
+});
+
+test("local update rejects unsupported host platforms before reading source configuration", async () => {
+  const output = new MemoryOutput();
+  await assert.rejects(
+    executeUpdateCommand(
+      { command: "update", json: false },
+      { stdout: output, stderr: output },
+      createStandardUserHost(new WindowsHostPlatform("x64")),
+      { environment: {} },
+    ),
+    (error: unknown) => error instanceof AgentError && /macOS install only/u.test(error.message),
+  );
+  assert.equal(output.value, "");
 });
