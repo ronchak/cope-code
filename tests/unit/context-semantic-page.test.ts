@@ -30,6 +30,7 @@ class FakePage {
   public url(): string { return this.currentUrl; }
   public isClosed(): boolean { return this.closed; }
   public async bringToFront(): Promise<void> { this.frontCount += 1; }
+  public async close(): Promise<void> { this.closed = true; }
   public setDefaultTimeout(milliseconds: number): void { this.defaultTimeout = milliseconds; }
   public setDefaultNavigationTimeout(milliseconds: number): void {
     this.defaultNavigationTimeout = milliseconds;
@@ -62,6 +63,86 @@ class FakeContext {
   public asContext(): BrowserContext { return this as unknown as BrowserContext; }
 }
 
+interface Deferred<T> {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+  readonly reject: (reason?: unknown) => void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((accept, decline) => {
+    resolve = accept;
+    reject = decline;
+  });
+  return { promise, resolve, reject };
+}
+
+class StalledLaunchBrowser {
+  public closeCalls = 0;
+  public constructor(private readonly closeRelease: Promise<void>) {}
+  public async close(): Promise<void> {
+    this.closeCalls += 1;
+    await this.closeRelease;
+  }
+}
+
+class StalledNewPageContext extends FakeContext {
+  public constructor(
+    pages: readonly FakePage[],
+    private readonly pageResult: Promise<Page>,
+    private readonly browserValue: StalledLaunchBrowser,
+  ) {
+    super(pages);
+  }
+
+  public override async newPage(): Promise<Page> {
+    this.newPageCalls += 1;
+    return this.pageResult;
+  }
+  public browser(): StalledLaunchBrowser { return this.browserValue; }
+}
+
+class BusyNewPageContext extends FakeContext {
+  public constructor(
+    pages: readonly FakePage[],
+    private readonly pageValue: FakePage,
+    private readonly browserValue: StalledLaunchBrowser,
+  ) {
+    super(pages);
+  }
+
+  public override async newPage(): Promise<Page> {
+    const deadline = performance.now() + 30;
+    while (performance.now() < deadline) {
+      // Starve the timeout callback while the protocol promise settles.
+    }
+    return this.pageValue.asPage();
+  }
+  public browser(): StalledLaunchBrowser { return this.browserValue; }
+}
+
+async function rejectionWithin(promise: Promise<unknown>, milliseconds: number): Promise<unknown> {
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then(
+        () => assert.fail("operation unexpectedly fulfilled"),
+        (error: unknown) => error,
+      ),
+      new Promise<never>((_resolve, reject) => {
+        watchdog = setTimeout(
+          () => reject(new Error(`operation did not reject within ${milliseconds} ms`)),
+          milliseconds,
+        );
+      }),
+    ]);
+  } finally {
+    if (watchdog !== undefined) clearTimeout(watchdog);
+  }
+}
+
 test("launch creates a fresh navigation tab instead of reusing an arbitrary startup blank", async () => {
   const startupBlank = new FakePage("about:blank");
   const context = new FakeContext([startupBlank]);
@@ -79,6 +160,121 @@ test("launch creates a fresh navigation tab instead of reusing an arbitrary star
   assert.equal(navigationPage.frontCount, frontCountAfterLaunch);
   assert.equal(navigationPage.defaultTimeout, config.waits.actionMs);
   assert.equal(navigationPage.defaultNavigationTimeout, config.waits.actionMs);
+});
+
+test("fresh launch bounds a stalled newPage independently of owner teardown", async () => {
+  const pageResult = deferred<Page>();
+  const closeRelease = deferred<void>();
+  const browser = new StalledLaunchBrowser(closeRelease.promise);
+  const context = new StalledNewPageContext(
+    [new FakePage("about:blank")],
+    pageResult.promise,
+    browser,
+  );
+  const config = browserConfig({ actionMs: 10 });
+
+  const observedError = await rejectionWithin(
+    openTrackedCopilotPage(context.asContext(), config),
+    100,
+  );
+  assert.equal(observedError instanceof AgentError, true);
+  assert.equal((observedError as AgentError).details.diagnosticCode, "BROWSER_OPERATION_TIMEOUT");
+  assert.equal((observedError as AgentError).details.dispatchAttempted, false);
+  assert.equal(browser.closeCalls, 1);
+
+  const latePage = new FakePage("about:blank");
+  pageResult.resolve(latePage.asPage());
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(latePage.closed, true);
+  closeRelease.resolve();
+});
+
+test("an expired launch deadline prevents issuing newPage", async () => {
+  const pageResult = deferred<Page>();
+  const browser = new StalledLaunchBrowser(Promise.resolve());
+  const context = new StalledNewPageContext(
+    [new FakePage("about:blank")],
+    pageResult.promise,
+    browser,
+  );
+
+  const launch = openTrackedCopilotPage(
+    context.asContext(),
+    browserConfig({ actionMs: 10 }),
+  );
+  const starvationDeadline = performance.now() + 30;
+  while (performance.now() < starvationDeadline) {
+    // Prevent the queued protocol microtask from running before its deadline.
+  }
+  const observedError = await rejectionWithin(launch, 100);
+  assert.equal(observedError instanceof AgentError, true);
+  assert.equal((observedError as AgentError).details.diagnosticCode, "BROWSER_OPERATION_TIMEOUT");
+  assert.equal(context.newPageCalls, 0);
+  assert.equal(browser.closeCalls, 1);
+});
+
+test("fresh launch retires a new page that settles after starving its deadline", async () => {
+  const latePage = new FakePage("about:blank");
+  const browser = new StalledLaunchBrowser(Promise.resolve());
+  const context = new BusyNewPageContext(
+    [new FakePage("about:blank")],
+    latePage,
+    browser,
+  );
+
+  const observedError = await rejectionWithin(
+    openTrackedCopilotPage(context.asContext(), browserConfig({ actionMs: 10 })),
+    100,
+  );
+  assert.equal(observedError instanceof AgentError, true);
+  assert.equal((observedError as AgentError).details.diagnosticCode, "BROWSER_OPERATION_TIMEOUT");
+  assert.equal(browser.closeCalls, 1);
+  assert.equal(latePage.closed, true);
+});
+
+test("a late newPage rejection after timeout remains observed", async () => {
+  const pageResult = deferred<Page>();
+  const closeRelease = deferred<void>();
+  const browser = new StalledLaunchBrowser(closeRelease.promise);
+  const context = new StalledNewPageContext(
+    [new FakePage("about:blank")],
+    pageResult.promise,
+    browser,
+  );
+
+  const observedError = await rejectionWithin(
+    openTrackedCopilotPage(context.asContext(), browserConfig({ actionMs: 10 })),
+    100,
+  );
+  assert.equal(observedError instanceof AgentError, true);
+  assert.equal((observedError as AgentError).details.diagnosticCode, "BROWSER_OPERATION_TIMEOUT");
+  // The launch race itself must continue observing this rejection after its
+  // timeout diagnostic has already settled.
+  pageResult.reject(new Error("late newPage rejection"));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  closeRelease.resolve();
+});
+
+test("fresh launch foregrounds the exact new page before navigating it", async () => {
+  const overlappingAuthentication = new FakePage(
+    "https://m365.cloud.microsoft/oauth2/authorize?client_id=client&state=opaque",
+  );
+  const context = new FakeContext([overlappingAuthentication]);
+  const navigationPage = new FakePage("about:blank");
+  navigationPage.onGoto = async () => {
+    assert.equal(navigationPage.frontCount, 1);
+    assert.equal(overlappingAuthentication.frontCount, 0);
+    navigationPage.currentUrl = entryUrl;
+    return null;
+  };
+  context.nextPage = navigationPage;
+
+  await openTrackedCopilotPage(context.asContext(), browserConfig());
+
+  assert.equal(navigationPage.frontCount, 1);
+  // Once navigation finishes, normal selection correctly returns ownership to
+  // the still-open genuine authentication surface.
+  assert.equal(overlappingAuthentication.frontCount, 1);
 });
 
 test("launch follows an approved replacement page when the original navigation tab stays blank", async () => {

@@ -1,6 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 
-import type { Browser, BrowserContext, Page } from "playwright-core";
+import type { BrowserContext, Page } from "playwright-core";
 
 import { AgentError } from "../shared/errors.js";
 import {
@@ -34,6 +34,52 @@ const DEDICATED_MICROSOFT_LOGIN_HOSTS = new Set([
   "login.microsoft.com",
 ]);
 
+const browserContextTerminations = new WeakMap<BrowserContext, Promise<void>>();
+
+/** Share one process-owner teardown across page operations and launcher cleanup. */
+export function terminateBrowserContext(
+  context: BrowserContext,
+  fallbackPage?: Page,
+): Promise<void> {
+  const existing = browserContextTerminations.get(context);
+  if (existing !== undefined) return existing;
+
+  let resolveTermination!: () => void;
+  let rejectTermination!: (reason?: unknown) => void;
+  const termination = new Promise<void>((resolve, reject) => {
+    resolveTermination = resolve;
+    rejectTermination = reject;
+  });
+  // Publish the promise before invoking Browser.close(), which can synchronously
+  // trigger re-entrant abort listeners in another delegate.
+  browserContextTerminations.set(context, termination);
+  void (async () => {
+    // Keep owner lookup inside the published async operation. If an invalid
+    // context accessor throws, the cached termination rejects instead of being
+    // stranded forever as a pending placeholder.
+    const browser = typeof context.browser === "function" ? context.browser() : null;
+    if (browser !== null && typeof browser.close === "function") {
+      await browser.close();
+      return;
+    }
+    await Promise.all([
+      fallbackPage !== undefined && typeof fallbackPage.close === "function"
+        ? fallbackPage.close({ runBeforeUnload: false }).catch(() => undefined)
+        : Promise.resolve(),
+      typeof context.close === "function"
+        ? context.close()
+        : Promise.resolve(),
+    ]);
+  })().then(resolveTermination, rejectTermination);
+  return termination;
+}
+
+export function browserContextTermination(
+  context: BrowserContext,
+): Promise<void> | undefined {
+  return browserContextTerminations.get(context);
+}
+
 /**
  * Tracks the page that currently owns the configured Copilot or Microsoft
  * manual-authentication surface. Microsoft may replace the original navigation
@@ -41,7 +87,6 @@ const DEDICATED_MICROSOFT_LOGIN_HOSTS = new Set([
  */
 export class ContextSemanticPage implements SemanticPage {
   readonly #context: BrowserContext;
-  readonly #browser: Browser | null;
   readonly #config: CopilotPageSelectionConfig;
   readonly #actionMs: number;
   readonly #delegates = new WeakMap<Page, PlaywrightSemanticPage>();
@@ -74,9 +119,6 @@ export class ContextSemanticPage implements SemanticPage {
       throw new TypeError("Context page action timeout must be a positive integer");
     }
     this.#context = context;
-    // Capture the owner once. The production persistent-context launcher
-    // verifies that this is non-null before any page can become actionable.
-    this.#browser = typeof context.browser === "function" ? context.browser() : null;
     this.#config = config;
     this.#activePage = initialPage;
     this.#actionMs = actionMs;
@@ -91,6 +133,7 @@ export class ContextSemanticPage implements SemanticPage {
 
   public async focusActivePage(force = false): Promise<Page> {
     this.#assertOperationAvailable();
+    const deadline = performance.now() + this.#actionMs;
     if (this.#nativeDialogEpoch > 0) return this.#activePage;
     let pages = this.#context.pages();
     const handoff = await this.#returnedConfiguredPage(pages);
@@ -121,8 +164,23 @@ export class ContextSemanticPage implements SemanticPage {
       this.#observedDialogEpoch = undefined;
     }
     this.#configurePage(selected);
-    if (force || changed) await selected.bringToFront().catch(() => undefined);
+    if (force || changed) await this.#delegate(selected).bringToFront(deadline);
     return selected;
+  }
+
+  /** Foreground one exact launch target without re-running page selection. */
+  public async focusTrackedPage(page: Page): Promise<void> {
+    this.#assertOperationAvailable();
+    const deadline = performance.now() + this.#actionMs;
+    if (page.isClosed() || !this.#context.pages().includes(page)) {
+      throw new AgentError(
+        "TRANSPORT_UNAVAILABLE",
+        "The tracked browser page closed before it could be foregrounded",
+        { diagnosticCode: "EDGE_PAGE_MISSING" },
+      );
+    }
+    this.#configurePage(page);
+    await this.#delegate(page).bringToFront(deadline);
   }
 
   /** External Microsoft authentication hosts retain the long manual window. */
@@ -506,20 +564,8 @@ export class ContextSemanticPage implements SemanticPage {
         // A dialog on any page can race a queued action on another target. Abort
         // the entire dedicated browser process first: target/context close
         // commands do not preempt an evaluate already queued on another page.
-        if (this.#browser !== null && typeof this.#browser.close === "function") {
-          void this.#browser.close().catch(() => undefined);
-          return true;
-        }
-        if (typeof this.#activePage.close === "function") {
-          void this.#activePage.close({ runBeforeUnload: false }).catch(() => undefined);
-        }
-        if (typeof this.#context.close === "function") {
-          void this.#context.close().catch(() => undefined);
-        }
-        // Without an owning Browser, also let the delegate close the page that
-        // raised the dialog. Mock/embedded contexts may not implement a context
-        // close that actually tears down every target.
-        return false;
+        void terminateBrowserContext(this.#context, page).catch(() => undefined);
+        return true;
       },
       this.#actionMs,
       () => this.#terminateTimedOutOperation(page),
@@ -538,25 +584,15 @@ export class ContextSemanticPage implements SemanticPage {
     // observeCopilotPage launches all signal snapshots concurrently. Cache one
     // teardown so simultaneous deadlines cannot race repeated Browser.close()
     // calls or let one delegate return before the shared owner is gone.
-    this.#operationTermination ??= (async () => {
-      // Default Playwright timeouts do not cover locator.count() or
-      // ElementHandle.evaluate(). Terminate the captured process owner so a
-      // timed-out renderer call cannot later disclose or activate anything.
-      if (this.#browser !== null && typeof this.#browser.close === "function") {
-        await this.#browser.close();
-        return;
-      }
-      await Promise.all([
-        page.close({ runBeforeUnload: false }).catch(() => undefined),
-        this.#context.close().catch(() => undefined),
-      ]);
-    })();
+    // Default Playwright timeouts do not cover locator.count(), evaluate(), or
+    // bringToFront(). Terminate the captured process owner so a timed-out raw
+    // protocol call cannot later disclose or activate anything.
+    this.#operationTermination ??= terminateBrowserContext(this.#context, page);
     return this.#operationTermination;
   }
 
-  #assertOperationAvailable(): void {
-    if (!this.#operationTimedOut) return;
-    throw new AgentError(
+  #operationTimeoutError(): AgentError {
+    return new AgentError(
       "TRANSPORT_INDETERMINATE",
       "A browser operation timeout revoked the dedicated session",
       {
@@ -564,6 +600,11 @@ export class ContextSemanticPage implements SemanticPage {
         dispatchAttempted: false,
       },
     );
+  }
+
+  #assertOperationAvailable(): void {
+    if (!this.#operationTimedOut) return;
+    throw this.#operationTimeoutError();
   }
 }
 
@@ -655,7 +696,7 @@ export async function openTrackedCopilotPage(
 
   let tracked: ContextSemanticPage;
   if (initial === undefined) {
-    initial = await context.newPage();
+    initial = await newPageWithinDeadline(context, config.waits.actionMs);
     // Install the native-dialog listener before navigation can execute page
     // script or open a replacement authentication window.
     tracked = new ContextSemanticPage(
@@ -664,7 +705,7 @@ export async function openTrackedCopilotPage(
       initial,
       config.waits.actionMs,
     );
-    await initial.bringToFront().catch(() => undefined);
+    await tracked.focusTrackedPage(initial);
     const navigationDeadline = performance.now() + config.waits.actionMs;
     let navigationError: unknown;
     try {
@@ -704,6 +745,84 @@ export async function openTrackedCopilotPage(
 
   await tracked.focusActivePage(true);
   return tracked;
+}
+
+async function newPageWithinDeadline(
+  context: BrowserContext,
+  actionMs: number,
+): Promise<Page> {
+  const deadline = performance.now() + actionMs;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timerFired = false;
+  let timedOut = false;
+  let createdPage: Page | undefined;
+  const timeoutError = (cause?: unknown) => new AgentError(
+    "TRANSPORT_INDETERMINATE",
+    "Creating the dedicated browser page exceeded its configured action timeout",
+    {
+      diagnosticCode: "BROWSER_OPERATION_TIMEOUT",
+      dispatchAttempted: false,
+    },
+    cause === undefined ? undefined : { cause },
+  );
+  const terminate = (): void => {
+    if (timedOut) return;
+    timedOut = true;
+    if (createdPage !== undefined && typeof createdPage.close === "function") {
+      void createdPage.close({ runBeforeUnload: false }).catch(() => undefined);
+    }
+    const termination = terminateBrowserContext(context, createdPage);
+    void termination.catch(() => undefined);
+  };
+
+  // Start the protocol call in a microtask after the timeout machinery can be
+  // installed; synchronous throws become observed promise rejections too.
+  const pagePromise = Promise.resolve().then(() => {
+    // The caller can starve the event loop before this microtask runs. Do not
+    // issue a new browser target after the absolute launch deadline.
+    if (performance.now() >= deadline) {
+      terminate();
+      throw timeoutError();
+    }
+    return context.newPage();
+  });
+  // Observe late settlement after a timeout and retire any page that materializes
+  // while owner teardown is still stalled.
+  void pagePromise.then(
+    (page) => {
+      createdPage = page;
+      if (timedOut && typeof page.close === "function") {
+        void page.close({ runBeforeUnload: false }).catch(() => undefined);
+      }
+    },
+    () => undefined,
+  );
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      timerFired = true;
+      terminate();
+      reject(timeoutError());
+    }, Math.max(0, deadline - performance.now()));
+  });
+
+  try {
+    const page = await Promise.race([pagePromise, timeoutPromise]);
+    if (performance.now() >= deadline) {
+      createdPage = page;
+      terminate();
+      throw timeoutError();
+    }
+    return page;
+  } catch (error) {
+    if (!timedOut && performance.now() >= deadline) terminate();
+    if (!timedOut) throw error;
+    if (error instanceof AgentError && error.details.diagnosticCode === "BROWSER_OPERATION_TIMEOUT") {
+      throw error;
+    }
+    throw timeoutError(error);
+  } finally {
+    if (!timerFired && timer !== undefined) clearTimeout(timer);
+  }
 }
 
 function isConfiguredCopilotUrl(value: string, entryValue: string): boolean {

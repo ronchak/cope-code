@@ -17,7 +17,12 @@ import {
   type BrowserWaitConfig,
   type EdgeLaunchConfig,
 } from "./config.js";
-import { ContextSemanticPage, openTrackedCopilotPage } from "./context-semantic-page.js";
+import {
+  browserContextTermination,
+  ContextSemanticPage,
+  openTrackedCopilotPage,
+  terminateBrowserContext,
+} from "./context-semantic-page.js";
 import {
   assertKillSwitchEnabled,
   MutableBrowserKillSwitch,
@@ -112,7 +117,7 @@ export class EdgeCopilotTransport implements ModelTransport {
       await prepareDedicatedProfile(config.profileDirectory, config.product);
       await verifyDedicatedProfileRoot(config.profileDirectory, host);
       assertKillSwitchEnabled(killSwitch);
-      context = await launchDedicatedPersistentContext(
+      context = await launchPersistentContext(
         config.profileDirectory,
         {
           executablePath: config.browserExecutable,
@@ -122,6 +127,7 @@ export class EdgeCopilotTransport implements ModelTransport {
         },
         dependencies.launchPersistentContext,
       );
+      assertPersistentContextOwner(context);
       const semanticPage = await openTrackedCopilotPage(context, config);
       const {
         profileDirectory: _profileDirectory,
@@ -144,8 +150,19 @@ export class EdgeCopilotTransport implements ModelTransport {
         config.waits,
       );
     } catch (error) {
-      if (context !== undefined) await context.close().catch(() => undefined);
-      await lock.release();
+      if (context !== undefined) {
+        const termination = browserContextTermination(context) ??
+          terminateBrowserContext(context);
+        // Never recreate an action-timeout hang by awaiting cleanup here. Keep
+        // the exclusive profile lock until owner shutdown positively succeeds;
+        // a rejected or stalled close leaves the profile fail-closed.
+        void termination.then(
+          async () => lock.release(),
+          () => undefined,
+        ).catch(() => undefined);
+      } else {
+        await lock.release();
+      }
       if (error instanceof AgentError) throw error;
       throw new AgentError(
         "TRANSPORT_UNAVAILABLE",
@@ -214,11 +231,19 @@ export class EdgeCopilotTransport implements ModelTransport {
     if (this.#closed) return;
     this.#closed = true;
     await this.#adapter.close();
-    try {
-      await this.#context.close();
-    } finally {
-      await this.#lock.release();
+    const existingTermination = browserContextTermination(this.#context);
+    if (existingTermination !== undefined) {
+      // A renderer timeout or native dialog may leave owner teardown pending
+      // indefinitely. Do not turn a bounded operation diagnostic into a hang in
+      // runtime/CLI finally cleanup; retain the profile lock until success.
+      void existingTermination.then(
+        async () => this.#lock.release(),
+        () => undefined,
+      ).catch(() => undefined);
+      return;
     }
+    await terminateBrowserContext(this.#context);
+    await this.#lock.release();
   }
 }
 
@@ -269,10 +294,27 @@ export async function launchDedicatedPersistentContext(
   options: Parameters<PersistentContextLauncher>[1],
   launcher: PersistentContextLauncher = chromium.launchPersistentContext.bind(chromium),
 ): Promise<BrowserContext> {
-  const context = await launcher(profileDirectory, options);
+  const context = await launchPersistentContext(profileDirectory, options, launcher);
+  try {
+    assertPersistentContextOwner(context);
+  } catch (error) {
+    void terminateBrowserContext(context).catch(() => undefined);
+    throw error;
+  }
+  return context;
+}
+
+async function launchPersistentContext(
+  profileDirectory: string,
+  options: Parameters<PersistentContextLauncher>[1],
+  launcher: PersistentContextLauncher = chromium.launchPersistentContext.bind(chromium),
+): Promise<BrowserContext> {
+  return launcher(profileDirectory, options);
+}
+
+function assertPersistentContextOwner(context: BrowserContext): void {
   const browser = typeof context.browser === "function" ? context.browser() : null;
   if (browser === null) {
-    await context.close().catch(() => undefined);
     throw new AgentError(
       "TRANSPORT_UNAVAILABLE",
       "The dedicated browser process owner is unavailable",
@@ -282,7 +324,6 @@ export async function launchDedicatedPersistentContext(
       },
     );
   }
-  return context;
 }
 
 export async function launchEdgeCopilotTransport(

@@ -64,6 +64,18 @@ export class PlaywrightSemanticPage implements SemanticPage {
     return this.#page.url();
   }
 
+  public async bringToFront(
+    deadline = performance.now() + this.#actionMs,
+  ): Promise<void> {
+    await this.#runBounded(async (assertWithinDeadline) => {
+      // Page.bringToFront() has no Playwright timeout option. Check the shared
+      // absolute deadline before issuing it, then let #runBounded race the raw
+      // protocol promise against the Context-wide terminal timeout signal.
+      assertWithinDeadline();
+      await this.#page.bringToFront();
+    }, () => false, deadline);
+  }
+
   public async snapshot(
     group: LocatorGroup,
     deadline = performance.now() + this.#actionMs,

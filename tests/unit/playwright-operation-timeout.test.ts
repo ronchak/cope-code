@@ -26,12 +26,17 @@ const sendGroup: LocatorGroup = {
 interface Deferred<T> {
   readonly promise: Promise<T>;
   readonly resolve: (value: T) => void;
+  readonly reject: (reason?: unknown) => void;
 }
 
 function deferred<T>(): Deferred<T> {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((accept) => { resolve = accept; });
-  return { promise, resolve };
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((accept, decline) => {
+    resolve = accept;
+    reject = decline;
+  });
+  return { promise, resolve, reject };
 }
 
 class TimeoutElement {
@@ -375,6 +380,104 @@ class SharedDeadlineContext {
   public on(): this { return this; }
   public async close(): Promise<void> { this.pageValue.closed = true; }
 }
+
+class StalledForegroundPage extends SharedDeadlinePage {
+  public bringToFrontCalls = 0;
+
+  public constructor(
+    currentUrl: string,
+    private readonly foregroundRelease: Promise<void> = Promise.resolve(),
+  ) {
+    super(currentUrl);
+  }
+
+  public override async bringToFront(): Promise<void> {
+    this.bringToFrontCalls += 1;
+    await this.foregroundRelease;
+  }
+}
+
+class MultiPageDeadlineContext {
+  public constructor(
+    private readonly pageValues: readonly SharedDeadlinePage[],
+    private readonly browserValue: SharedDeadlineBrowser,
+  ) {}
+
+  public pages(): readonly Page[] {
+    return this.pageValues.map((page) => page as unknown as Page);
+  }
+  public browser(): Browser { return this.browserValue as unknown as Browser; }
+  public on(): this { return this; }
+  public async close(): Promise<void> {
+    for (const page of this.pageValues) page.closed = true;
+  }
+}
+
+class BudgetBurningContext extends MultiPageDeadlineContext {
+  public override pages(): readonly Page[] {
+    busySpin(20);
+    return super.pages();
+  }
+}
+
+test("replacement-page foregrounding is bounded and permanently revokes the session", async () => {
+  const foregroundRelease = deferred<void>();
+  const terminationRelease = deferred<void>();
+  const browser = new SharedDeadlineBrowser(terminationRelease.promise);
+  const chat = new SharedDeadlinePage("https://m365.cloud.microsoft/chat/conversation/foreground");
+  const authentication = new StalledForegroundPage(
+    "https://login.microsoftonline.com/common/oauth2/authorize",
+    foregroundRelease.promise,
+  );
+  const context = new MultiPageDeadlineContext([chat, authentication], browser);
+  const semantic = new ContextSemanticPage(
+    context as unknown as BrowserContext,
+    {
+      entryUrl: "https://m365.cloud.microsoft/chat",
+      approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
+      manualAuthenticationHosts: [{ hostname: "login.microsoftonline.com" }],
+    },
+    chat as unknown as Page,
+    10,
+  );
+
+  const observedError = await rejectionWithin(semantic.currentUrl(), 100);
+  assert.equal(timeoutError(observedError).details.dispatchAttempted, false);
+  assert.equal(browser.closeCalls, 1);
+  const laterError = await rejectionWithin(semantic.currentUrl(), 100);
+  assert.equal(timeoutError(laterError).details.dispatchAttempted, false);
+  assert.equal(browser.closeCalls, 1);
+
+  // Promise.race must keep observing the raw activation after the diagnostic
+  // settles; a late browser rejection must not become unhandled.
+  foregroundRelease.reject(new Error("late target-closed rejection"));
+  terminationRelease.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+});
+
+test("an expired focus deadline prevents foreground dispatch", async () => {
+  const browser = new SharedDeadlineBrowser();
+  const chat = new SharedDeadlinePage("https://m365.cloud.microsoft/chat/conversation/focus-budget");
+  const authentication = new StalledForegroundPage(
+    "https://login.microsoftonline.com/common/oauth2/authorize",
+  );
+  const context = new BudgetBurningContext([chat, authentication], browser);
+  const semantic = new ContextSemanticPage(
+    context as unknown as BrowserContext,
+    {
+      entryUrl: "https://m365.cloud.microsoft/chat",
+      approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
+      manualAuthenticationHosts: [{ hostname: "login.microsoftonline.com" }],
+    },
+    chat as unknown as Page,
+    10,
+  );
+
+  const observedError = await rejectionWithin(semantic.currentUrl(), 100);
+  assert.equal(timeoutError(observedError).details.dispatchAttempted, false);
+  assert.equal(authentication.bringToFrontCalls, 0);
+  assert.equal(browser.closeCalls, 1);
+});
 
 test("composer recheck and send dispatch share one semantic click deadline", async () => {
   const terminationRelease = deferred<void>();
