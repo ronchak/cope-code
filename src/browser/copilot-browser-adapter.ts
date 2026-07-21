@@ -38,7 +38,8 @@ import {
 const LEGACY_TASK_MARKER_PREFIX = "[[COPILOT_AGENT_TASK_V1:";
 const TASK_MARKER_PREFIX = "[[COPILOT_AGENT_TASK_V2:";
 const TASK_MARKER_SUFFIX = "]]";
-const RESPONSE_BASELINE_VERSION = "response-sequence/v1";
+const LEGACY_RESPONSE_BASELINE_VERSION = "response-sequence/v1";
+const RESPONSE_BASELINE_VERSION = "response-sequence/v2";
 
 interface SubmissionRecord {
   readonly taskId: string;
@@ -215,7 +216,7 @@ export class CopilotBrowserAdapter implements ModelTransport {
       );
     }
 
-    const initialResponses = responseTexts(first.observation);
+    const initialResponses = responseEnvelopeTexts(first.observation);
     const marker = createTaskMarker(request, {
       responseCount: initialResponses.length,
       responseSequenceSha256: responseSequenceSha256(initialResponses),
@@ -710,7 +711,7 @@ export class CopilotBrowserAdapter implements ModelTransport {
     baselineKnown: boolean,
     recoveredBaseline?: ResponseBaseline,
   ): SubmissionRecord {
-    const responses = responseTexts(observation);
+    const responses = responseEnvelopeTexts(observation);
     return {
       taskId: request.taskId,
       turnId: request.turnId,
@@ -968,10 +969,9 @@ function knownPreActivationDiagnostic(error: unknown): string | undefined {
     : "PRE_ACTIVATION_GUARD_FAILED";
 }
 
-function responseTexts(observation: CopilotPageObservation): readonly string[] {
+function responseEnvelopeTexts(observation: CopilotPageObservation): readonly string[] {
   return observation.responses.elements
-    .map((element) => element.text.trim())
-    .filter((text) => text.length > 0);
+    .map((element) => element.text.trim());
 }
 
 function responseSequenceSha256(responses: readonly string[]): string {
@@ -985,7 +985,7 @@ function associatedResponse(
   | { readonly status: "pending" }
   | { readonly status: "candidate"; readonly content: string }
   | { readonly status: "indeterminate"; readonly diagnosticCode: string } {
-  const responses = responseTexts(observation);
+  const responses = responseEnvelopeTexts(observation);
   if (responses.length < record.baselineResponseCount) {
     return { status: "indeterminate", diagnosticCode: "RESPONSE_BASELINE_TRUNCATED" };
   }
@@ -1001,7 +1001,10 @@ function associatedResponse(
   if (responses.length !== record.baselineResponseCount + 1) {
     return { status: "indeterminate", diagnosticCode: "RESPONSE_SEQUENCE_AMBIGUOUS" };
   }
-  return { status: "candidate", content: responses[record.baselineResponseCount]! };
+  const content = responses[record.baselineResponseCount]!;
+  return content.length === 0
+    ? { status: "pending" }
+    : { status: "candidate", content };
 }
 
 function taskMarkerEvidence(
@@ -1049,14 +1052,27 @@ function taskMarkerEvidence(
       const baselineVersion = value[3];
       const responseCount = value[4];
       const responseSequenceDigest = value[5];
+      const validBaselineShape =
+        typeof responseCount === "number" &&
+        Number.isSafeInteger(responseCount) &&
+        responseCount >= 0 &&
+        typeof responseSequenceDigest === "string" &&
+        /^[a-f0-9]{64}$/u.test(responseSequenceDigest);
+      if (
+        value.length === 6 &&
+        baselineVersion === LEGACY_RESPONSE_BASELINE_VERSION &&
+        validBaselineShape
+      ) {
+        // Historical V2 task markers used filtered non-empty response text.
+        // They can prove submission uniqueness, but their baseline cannot be
+        // interpreted by the envelope-aware correlator.
+        recovered.push({ marker });
+        continue;
+      }
       if (
         value.length !== 6 ||
         baselineVersion !== RESPONSE_BASELINE_VERSION ||
-        typeof responseCount !== "number" ||
-        !Number.isSafeInteger(responseCount) ||
-        responseCount < 0 ||
-        typeof responseSequenceDigest !== "string" ||
-        !/^[a-f0-9]{64}$/u.test(responseSequenceDigest)
+        !validBaselineShape
       ) {
         invalidMatchingMarker = true;
         continue;

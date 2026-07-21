@@ -13,6 +13,7 @@ import type {
   SemanticPage,
 } from "../../src/browser/contracts.js";
 import { MutableBrowserKillSwitch } from "../../src/browser/kill-switch.js";
+import { sha256 } from "../../src/shared/crypto.js";
 import { AgentError } from "../../src/shared/errors.js";
 
 type ActivationMode = "submitted" | "not-submitted" | "indeterminate";
@@ -227,6 +228,37 @@ test("response correlation rejects baseline mutation instead of accepting same-c
   }
 });
 
+test("a pre-existing empty assistant envelope cannot become the current response", async () => {
+  const { adapter, page } = makeHarness();
+  page.responses.push("");
+  assert.equal((await adapter.submit(request)).status, "submitted");
+  // Replace the empty pre-existing envelope with delayed text and remove the
+  // genuinely appended envelope. Envelope-aware correlation must see prefix
+  // drift rather than treating the delayed prior response as this task's append.
+  page.responses.splice(1, 2, "delayed prior response");
+
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "indeterminate");
+  if (response.status === "indeterminate") {
+    assert.equal(response.diagnosticCode, "RESPONSE_BASELINE_CHANGED");
+  }
+});
+
+test("the one appended assistant envelope may stream from empty to stable text", async () => {
+  const page = new DynamicFakePage();
+  const { adapter } = makeHarness(page, new MutableBrowserKillSwitch(), () => {
+    page.responses[page.responses.length - 1] = "completed response envelope";
+  });
+  assert.equal((await adapter.submit(request)).status, "submitted");
+  page.responses[page.responses.length - 1] = "";
+
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "completed");
+  if (response.status === "completed") {
+    assert.equal(response.content, "completed response envelope");
+  }
+});
+
 test("response correlation rejects more than one appended assistant envelope", async () => {
   const { adapter, page } = makeHarness();
   assert.equal((await adapter.submit(request)).status, "submitted");
@@ -260,6 +292,30 @@ test("legacy markers can prove submission but cannot recover a response baseline
     request.submissionId,
   ]), "utf8").toString("base64url");
   page.userMessages.push(`legacy [[COPILOT_AGENT_TASK_V1:${encoded}]]`);
+  const { adapter } = makeHarness(page);
+
+  const resolved = await adapter.resolveSubmission(request);
+  assert.equal(resolved.status, "submitted");
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "indeterminate");
+  if (response.status === "indeterminate") {
+    assert.equal(response.diagnosticCode, "RESPONSE_BASELINE_UNKNOWN");
+  }
+  assert.equal(page.activationCalls, 0);
+});
+
+test("historical filtered-baseline V2 markers cannot correlate delayed empty envelopes", async () => {
+  const page = new DynamicFakePage();
+  const encoded = Buffer.from(JSON.stringify([
+    request.taskId,
+    request.turnId,
+    request.submissionId,
+    "response-sequence/v1",
+    0,
+    sha256(JSON.stringify([])),
+  ]), "utf8").toString("base64url");
+  page.userMessages.push(`[[COPILOT_AGENT_TASK_V2:${encoded}]]`);
+  page.responses.splice(0, page.responses.length, "delayed prior response");
   const { adapter } = makeHarness(page);
 
   const resolved = await adapter.resolveSubmission(request);
