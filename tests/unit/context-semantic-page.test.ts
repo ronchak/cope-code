@@ -149,6 +149,20 @@ test("an unrelated pre-existing Office tab cannot satisfy replacement-page disco
   assert.equal(officeRoot.frontCount, 0);
 });
 
+test("launch reuses a pre-existing external Microsoft authentication page", async () => {
+  const authentication = new FakePage(authUrl);
+  const context = new FakeContext([authentication]);
+  const config = browserConfig();
+
+  const tracked = await openTrackedCopilotPage(context.asContext(), config);
+
+  assert.equal(context.newPageCalls, 0);
+  assert.equal(await tracked.currentUrl(), authUrl);
+  assert.ok(authentication.frontCount >= 1);
+  assert.equal(authentication.defaultTimeout, config.waits.actionMs);
+  assert.equal(authentication.defaultNavigationTimeout, config.waits.actionMs);
+});
+
 test("tracked semantic page moves from Microsoft authentication to the returned Copilot tab", async () => {
   const authentication = new FakePage(authUrl);
   const context = new FakeContext([authentication]);

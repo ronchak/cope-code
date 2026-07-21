@@ -360,59 +360,64 @@ export async function openTrackedCopilotPage(
   }
 
   let initial = approved[0];
-  let tracked: ContextSemanticPage;
-if (initial === undefined) {
-  initial = await context.newPage();
-  // Install the native-dialog listener before navigation can execute page
-  // script or open a replacement authentication window.
-  tracked = new ContextSemanticPage(
-    context,
-    config,
-    initial,
-    config.waits.actionMs,
-  );
-  await initial.bringToFront().catch(() => undefined);
-  const navigationDeadline = performance.now() + config.waits.actionMs;
-  let navigationError: unknown;
-  try {
-    await initial.goto(config.entryUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: config.waits.actionMs,
-    });
-  } catch (error) {
-    navigationError = error;
+  if (initial === undefined) {
+    const authentication = existing.filter((page) =>
+      !page.isClosed() && isReusableExternalAuthenticationUrl(page.url(), config));
+    initial = authentication.at(-1);
   }
-  if (!hasAllowedPage(context, config)) {
-    const replacementFound = await waitForAllowedReplacementPage(
+
+  let tracked: ContextSemanticPage;
+  if (initial === undefined) {
+    initial = await context.newPage();
+    // Install the native-dialog listener before navigation can execute page
+    // script or open a replacement authentication window.
+    tracked = new ContextSemanticPage(
       context,
       config,
-      navigationDeadline,
+      initial,
+      config.waits.actionMs,
     );
-    if (!replacementFound) {
-      if (navigationError !== undefined) throw navigationError;
-      throw new AgentError(
-        "TRANSPORT_UNAVAILABLE",
-        "The dedicated Edge session did not open the configured Copilot surface",
-        {
-          diagnosticCode: "EDGE_NAVIGATION_NO_ALLOWED_PAGE",
-          next: "Close the dedicated Edge window, run cope setup --force, and retry.",
-        },
-      );
+    await initial.bringToFront().catch(() => undefined);
+    const navigationDeadline = performance.now() + config.waits.actionMs;
+    let navigationError: unknown;
+    try {
+      await initial.goto(config.entryUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: config.waits.actionMs,
+      });
+    } catch (error) {
+      navigationError = error;
     }
+    if (!hasAllowedPage(context, config)) {
+      const replacementFound = await waitForAllowedReplacementPage(
+        context,
+        config,
+        navigationDeadline,
+      );
+      if (!replacementFound) {
+        if (navigationError !== undefined) throw navigationError;
+        throw new AgentError(
+"TRANSPORT_UNAVAILABLE",
+"The dedicated Edge session did not open the configured Copilot surface",
+{
+  diagnosticCode: "EDGE_NAVIGATION_NO_ALLOWED_PAGE",
+  next: "Close the dedicated Edge window, run cope setup --force, and retry.",
+},
+        );
+      }
+    }
+  } else {
+    tracked = new ContextSemanticPage(
+      context,
+      config,
+      initial,
+      config.waits.actionMs,
+    );
   }
-} else {
-  tracked = new ContextSemanticPage(
-    context,
-    config,
-    initial,
-    config.waits.actionMs,
-  );
-}
 
-await tracked.focusActivePage(true);
-return tracked;
+  await tracked.focusActivePage(true);
+  return tracked;
 }
-
 function isConfiguredCopilotUrl(value: string, entryValue: string): boolean {
   try {
     const actual = new URL(value);
