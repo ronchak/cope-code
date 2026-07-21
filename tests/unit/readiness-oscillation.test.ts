@@ -61,7 +61,7 @@ test("alternating non-manual diagnostics share one bounded hydration window", as
   assert.equal(now, waits.actionMs);
 });
 
-test("alternating immediately unsafe diagnostics cannot consume the manual window", async () => {
+test("recoverable dialogs reset intermittent unsafe-host samples for the full manual window", async () => {
   let now = 0;
   let calls = 0;
 
@@ -82,9 +82,9 @@ test("alternating immediately unsafe diagnostics cannot consume the manual windo
     },
   );
 
-  assert.equal(result.classification.state, "unapproved-host");
-  assert.equal(calls, 5);
-  assert.equal(now, waits.actionMs);
+  assert.equal(result.classification.state, "blocking-modal");
+  assert.equal(calls, waits.manualReadinessMs / waits.pollMs);
+  assert.equal(now, waits.manualReadinessMs);
 });
 
 function inspection(state: CopilotPageState, diagnosticCode: string): BrowserStateInspection {
