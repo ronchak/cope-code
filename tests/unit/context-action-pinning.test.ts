@@ -58,13 +58,16 @@ class BoundActionElement {
   public async evaluate(
     _callback: (...args: readonly unknown[]) => unknown,
     value?: string,
-  ): Promise<void> {
+  ): Promise<unknown> {
     this.#beforeDispatch();
     if (value === undefined) {
+      if (this.page.boundClickPreDispatchFailure) return "pre-dispatch";
       this.page.actions.push("click");
+      return "dispatched";
     } else {
       this.page.composer = value;
       this.page.actions.push(`fill:${value}`);
+      return undefined;
     }
   }
 
@@ -81,6 +84,7 @@ class ActionPage {
   public composer = "";
   public documentEpoch = 0;
   public sendAvailable = true;
+  public boundClickPreDispatchFailure = false;
   public readonly actions: string[] = [];
   public locatorProbeHook: (() => void) | undefined = undefined;
   public boundActionHook: (() => void) | undefined = undefined;
@@ -374,6 +378,26 @@ test("a vanished send control is classified as conclusively pre-dispatch", async
     (error: unknown) =>
       error instanceof AgentError &&
       error.details.diagnosticCode === "ACTIONABLE_LOCATOR_NOT_FOUND" &&
+      error.details.dispatchAttempted === false,
+  );
+  assert.deepEqual(page.actions, ["fill:safe retry draft"]);
+});
+
+test("a bound send control becoming non-actionable remains conclusively pre-dispatch", async () => {
+  const page = new ActionPage(`${entryUrl}/conversation/one`);
+  const context = new ActionContext([page]);
+  const tracked = createTracked(context, page);
+
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  await tracked.fill(composerGroup, "safe retry draft", allowAction);
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  page.boundClickPreDispatchFailure = true;
+
+  await assert.rejects(
+    tracked.click(sendGroup, allowAction),
+    (error: unknown) =>
+      error instanceof AgentError &&
+      error.details.diagnosticCode === "ACTIONABLE_ELEMENT_CHANGED_BEFORE_DISPATCH" &&
       error.details.dispatchAttempted === false,
   );
   assert.deepEqual(page.actions, ["fill:safe retry draft"]);

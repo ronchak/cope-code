@@ -177,91 +177,112 @@ export class PlaywrightSemanticPage implements SemanticPage {
   public async click(group: LocatorGroup, guard: SemanticActionGuard): Promise<void> {
     const element = await this.#firstActionableOrThrow(group);
     guard();
-    await element.evaluate((node) => {
+    const dispatchStatus = await element.evaluate((node): "pre-dispatch" | "dispatched" => {
       if (!(node instanceof HTMLElement) || !node.isConnected) {
-        throw new Error("The bound send element is no longer connected");
+        return "pre-dispatch";
       }
-      let composedAncestor: Element | null = node;
-      while (composedAncestor !== null) {
-        if (composedAncestor.getAttribute("aria-disabled")?.trim().toLowerCase() === "true") {
-          throw new Error("The bound send element is inside a disabled control");
-        }
-        if (composedAncestor.parentElement !== null) {
-          composedAncestor = composedAncestor.parentElement;
-          continue;
-        }
-        const root = composedAncestor.getRootNode();
-        composedAncestor = root instanceof ShadowRoot ? root.host : null;
-      }
-      if (
-        node.matches(":disabled")
-      ) {
-        throw new Error("The bound send element is disabled");
-      }
-      // Keep the dispatch bound to this node while preserving the essential
-      // Playwright click actionability checks. These checks and click execute
-      // in one page task, so no Locator can auto-wait into a replacement DOM.
-      node.scrollIntoView({ block: "center", inline: "center" });
-      if (!node.isConnected) {
-        throw new Error("The bound send element detached while becoming actionable");
-      }
-      const view = node.ownerDocument.defaultView;
-      const style = view?.getComputedStyle(node);
-      if (
-        view === null ||
-        view === undefined ||
-        style === undefined ||
-        style.display === "none" ||
-        style.visibility === "hidden" ||
-        style.visibility === "collapse" ||
-        style.pointerEvents === "none"
-      ) {
-        throw new Error("The bound send element is not hit-testable");
-      }
-      const rectangles = Array.from(node.getClientRects()).filter(
-        (rectangle) => rectangle.width > 0 && rectangle.height > 0,
-      );
-      const hitTarget = rectangles
-        .map((rectangle) => {
-          const left = Math.max(0, rectangle.left);
-          const right = Math.min(view.innerWidth, rectangle.right);
-          const top = Math.max(0, rectangle.top);
-          const bottom = Math.min(view.innerHeight, rectangle.bottom);
-          if (right <= left || bottom <= top) return null;
-          const x = left + (right - left) / 2;
-          const y = top + (bottom - top) / 2;
-          let target = node.ownerDocument.elementFromPoint(
-            x,
-            y,
-          );
-          // Document hit-testing stops at a shadow host. Descend only through
-          // open roots reached by that same top-level hit, preserving overlay
-          // rejection while supporting a configured control in open shadow DOM.
-          while (target?.shadowRoot !== null && target?.shadowRoot !== undefined) {
-            const nestedTarget = target.shadowRoot.elementFromPoint(x, y);
-            if (nestedTarget === null || nestedTarget === target) break;
-            target = nestedTarget;
-          }
-          return target;
-        })
-        .find((target) => {
-          let composedTarget: Element | null = target;
-          while (composedTarget !== null) {
-            if (composedTarget === node) return true;
-            if (composedTarget.parentElement !== null) {
-              composedTarget = composedTarget.parentElement;
+      const actionable = (() => {
+        try {
+          let composedAncestor: Element | null = node;
+          while (composedAncestor !== null) {
+            if (composedAncestor.getAttribute("aria-disabled")?.trim().toLowerCase() === "true") {
+              throw new Error("The bound send element is inside a disabled control");
+            }
+            if (composedAncestor.parentElement !== null) {
+              composedAncestor = composedAncestor.parentElement;
               continue;
             }
-            const root = composedTarget.getRootNode();
-            composedTarget = root instanceof ShadowRoot ? root.host : null;
+            const root = composedAncestor.getRootNode();
+            composedAncestor = root instanceof ShadowRoot ? root.host : null;
           }
+          if (
+            node.matches(":disabled")
+          ) {
+            throw new Error("The bound send element is disabled");
+          }
+          // Keep the dispatch bound to this node while preserving the essential
+          // Playwright click actionability checks. These checks and click execute
+          // in one page task, so no Locator can auto-wait into a replacement DOM.
+          node.scrollIntoView({ block: "center", inline: "center" });
+          if (!node.isConnected) {
+            throw new Error("The bound send element detached while becoming actionable");
+          }
+          const view = node.ownerDocument.defaultView;
+          const style = view?.getComputedStyle(node);
+          if (
+            view === null ||
+            view === undefined ||
+            style === undefined ||
+            style.display === "none" ||
+            style.visibility === "hidden" ||
+            style.visibility === "collapse" ||
+            style.pointerEvents === "none"
+          ) {
+            throw new Error("The bound send element is not hit-testable");
+          }
+          const rectangles = Array.from(node.getClientRects()).filter(
+            (rectangle) => rectangle.width > 0 && rectangle.height > 0,
+          );
+          const hitTarget = rectangles
+            .map((rectangle) => {
+              const left = Math.max(0, rectangle.left);
+              const right = Math.min(view.innerWidth, rectangle.right);
+              const top = Math.max(0, rectangle.top);
+              const bottom = Math.min(view.innerHeight, rectangle.bottom);
+              if (right <= left || bottom <= top) return null;
+              const x = left + (right - left) / 2;
+              const y = top + (bottom - top) / 2;
+              let target = node.ownerDocument.elementFromPoint(
+                x,
+                y,
+              );
+              // Document hit-testing stops at a shadow host. Descend only through
+              // open roots reached by that same top-level hit, preserving overlay
+              // rejection while supporting a configured control in open shadow DOM.
+              while (target?.shadowRoot !== null && target?.shadowRoot !== undefined) {
+                const nestedTarget = target.shadowRoot.elementFromPoint(x, y);
+                if (nestedTarget === null || nestedTarget === target) break;
+                target = nestedTarget;
+              }
+              return target;
+            })
+            .find((target) => {
+              let composedTarget: Element | null = target;
+              while (composedTarget !== null) {
+                if (composedTarget === node) return true;
+                if (composedTarget.parentElement !== null) {
+                  composedTarget = composedTarget.parentElement;
+                  continue;
+                }
+                const root = composedTarget.getRootNode();
+                composedTarget = root instanceof ShadowRoot ? root.host : null;
+              }
+              return false;
+            });
+          if (hitTarget === undefined) {
+            throw new Error("The bound send element does not receive pointer events");
+          }
+          return true;
+        } catch {
           return false;
-        });
-      if (hitTarget === undefined) {
-        throw new Error("The bound send element does not receive pointer events");
-      }
+        }
+      })();
+      if (!actionable) return "pre-dispatch";
+      // Keep this outside the preflight catch: an exception at the click
+      // boundary cannot prove whether page code observed a dispatch.
       node.click();
+      return "dispatched";
     });
+    if (dispatchStatus === "pre-dispatch") {
+      throw new AgentError(
+        "TRANSPORT_INDETERMINATE",
+        "The bound send element changed before browser dispatch",
+        {
+          diagnosticCode: "ACTIONABLE_ELEMENT_CHANGED_BEFORE_DISPATCH",
+          dispatchAttempted: false,
+        },
+      );
+    }
   }
 
   async #snapshotCandidate(
