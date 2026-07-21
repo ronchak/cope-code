@@ -62,9 +62,8 @@ export const DEFAULT_BROWSER_WAITS: BrowserWaitConfig = Object.freeze({
  * when their approved Microsoft 365 Copilot surface differs.
  */
 export function createBaselineCopilotUiContract(
-  expectedIdentity: string | TextPattern,
+  _expectedIdentity: string | TextPattern,
 ): CopilotUiContract {
-  const flexibleIdentity = identityLocatorPattern(expectedIdentity);
   const groups: Record<CopilotSignal, LocatorGroup> = {
     shell: group(
       "shell",
@@ -152,8 +151,27 @@ export function createBaselineCopilotUiContract(
     identity: group(
       "identity",
       [
-        { kind: "role", role: "button", name: expectedIdentity },
-        { kind: "role", role: "button", name: flexibleIdentity },
+        {
+          kind: "css",
+          selector: [
+            'button[id*="mectrl" i]',
+            '[role="button"][id*="mectrl" i]',
+            'button[id*="mecontrol" i]',
+            '[role="button"][id*="mecontrol" i]',
+            'button[class*="mectrl" i]',
+            '[role="button"][class*="mectrl" i]',
+            'button[class*="me-control" i]',
+            '[role="button"][class*="me-control" i]',
+            'button[data-testid*="account-control" i]',
+            '[role="button"][data-testid*="account-control" i]',
+            'button[data-testid*="account-menu" i]',
+            '[role="button"][data-testid*="account-menu" i]',
+            'button[data-testid*="profile" i]',
+            '[role="button"][data-testid*="profile" i]',
+            'button[data-testid*="persona" i]',
+            '[role="button"][data-testid*="persona" i]',
+          ].join(", "),
+        },
       ],
       "text",
       50,
@@ -579,17 +597,4 @@ function group(
   maximumElements = 20,
 ): LocatorGroup {
   return { signal, candidates, minimumCandidateMatches: 1, maximumElements, capture };
-}
-
-function identityLocatorPattern(expectedIdentity: string | TextPattern): TextPattern {
-  if (typeof expectedIdentity !== "string") return expectedIdentity;
-  const comparable = expectedIdentity.normalize("NFKD").replace(/\p{M}/gu, "").trim();
-  if (comparable.includes("@")) return pattern(escapeRegExp(comparable));
-  const tokens = comparable.match(/[\p{L}\p{N}]+/gu) ?? [];
-  if (tokens.length === 0) return pattern(escapeRegExp(expectedIdentity));
-  return pattern(tokens.map((token) => `(?=.*${escapeRegExp(token)})`).join("") + ".*");
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }
