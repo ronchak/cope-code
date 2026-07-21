@@ -220,6 +220,132 @@ test("duplicate email channels and a generic account label remain compatible", a
   }
 });
 
+test("a matching display-name channel cannot override conflicting accessible identity", async () => {
+  const expectedIdentity = "Ronak Chakraborty";
+  const contract = createBaselineCopilotUiContract(expectedIdentity);
+  for (const identity of [
+    { text: "Ronak Chakraborty", accessibleLabel: "Other Person" },
+    { text: "Other Person", accessibleLabel: "Ronak Chakraborty" },
+  ]) {
+    const observation = await observeCopilotPage(new LiveShapePage([identity]), contract);
+    const classification = classifyCopilotPage(
+      observation,
+      contract,
+      requirements(expectedIdentity),
+    );
+    assert.equal(classification.state, "identity-unverified");
+  }
+});
+
+test("an expected email channel cannot override a conflicting display identity", async () => {
+  const expectedIdentity = "approved@example.com";
+  const contract = createBaselineCopilotUiContract(expectedIdentity);
+  for (const identity of [
+    { text: expectedIdentity, accessibleLabel: "Other Person" },
+    { text: "Other Person", accessibleLabel: expectedIdentity },
+    { text: `Ronak Chakraborty ${expectedIdentity}`, accessibleLabel: "Account manager" },
+  ]) {
+    const observation = await observeCopilotPage(new LiveShapePage([identity]), contract);
+    const classification = classifyCopilotPage(
+      observation,
+      contract,
+      requirements(expectedIdentity),
+    );
+    assert.equal(classification.state, "identity-unverified");
+  }
+});
+
+test("a broad identity pattern cannot merge distinct visible account controls", async () => {
+  const expectedIdentity: TextPattern = { source: "account", flags: "iu" };
+  const contract = createBaselineCopilotUiContract(expectedIdentity);
+  const observation = await observeCopilotPage(
+    new LiveShapePage([
+      "Current account Alice",
+      "Switch account Bob",
+    ]),
+    contract,
+  );
+
+  const classification = classifyCopilotPage(
+    observation,
+    contract,
+    requirements(expectedIdentity),
+  );
+  assert.equal(classification.state, "identity-unverified");
+});
+
+test("identity patterns match canonical subjects, not generic account wrappers", async () => {
+  for (const fixture of [
+    {
+      expected: { source: "account", flags: "iu" } as TextPattern,
+      identities: ["Account manager"],
+      expectedState: "identity-unverified",
+    },
+    {
+      expected: { source: "alice", flags: "iu" } as TextPattern,
+      identities: ["Current account Alice", "Switch account Alice"],
+      expectedState: "ready",
+    },
+    {
+      expected: { source: "alice|bob", flags: "iu" } as TextPattern,
+      identities: ["Current account Alice", "Switch account Bob"],
+      expectedState: "identity-unverified",
+    },
+    {
+      expected: { source: "approved@example\\.com", flags: "iu" } as TextPattern,
+      identities: [
+        "Work account approved@example.com",
+        "Switch to approved@example.com",
+      ],
+      expectedState: "ready",
+    },
+    {
+      expected: { source: "will smith", flags: "iu" } as TextPattern,
+      identities: ["Will Account Smith", "Will Smith"],
+      expectedState: "identity-unverified",
+    },
+    {
+      expected: { source: "ronak|kumar|chakraborty", flags: "iu" } as TextPattern,
+      identities: ["Ronak Kumar Chakraborty", "Chakraborty Kumar Ronak"],
+      expectedState: "identity-unverified",
+    },
+    {
+      expected: { source: "approved@example\\.com", flags: "iu" } as TextPattern,
+      identities: ["account work approved@example.com"],
+      expectedState: "identity-unverified",
+    },
+  ] as const) {
+    const contract = createBaselineCopilotUiContract(fixture.expected);
+    const observation = await observeCopilotPage(
+      new LiveShapePage(fixture.identities),
+      contract,
+    );
+    const classification = classifyCopilotPage(
+      observation,
+      contract,
+      requirements(fixture.expected),
+    );
+    assert.equal(classification.state, fixture.expectedState);
+  }
+});
+
+test("generic labels and presentation order remain compatible with one display identity", async () => {
+  const expectedIdentity = "Ronak Chakraborty";
+  const contract = createBaselineCopilotUiContract(expectedIdentity);
+  for (const identity of [
+    { text: "Ronak Chakraborty", accessibleLabel: "Account manager" },
+    { text: "Ronak Chakraborty", accessibleLabel: "Chakraborty, Ronak" },
+  ]) {
+    const observation = await observeCopilotPage(new LiveShapePage([identity]), contract);
+    const classification = classifyCopilotPage(
+      observation,
+      contract,
+      requirements(expectedIdentity),
+    );
+    assert.equal(classification.state, "ready");
+  }
+});
+
 test("identity patterns reject empty and conflicting explicit channels", async () => {
   const expectedIdentity: TextPattern = { source: "approved", flags: "iu" };
   const contract = createBaselineCopilotUiContract(expectedIdentity);

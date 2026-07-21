@@ -213,42 +213,159 @@ function identityTextMatches(snapshot: GroupSnapshot, expected: string | TextPat
   // and alternate-profile controls in an open account menu. Never accept the
   // expected identity merely because it appears somewhere in that set: every
   // visible account control must consistently identify the configured account.
-  return snapshot.elements.every((element) => identityElementMatches(element, expected));
+  const elementIdentities = snapshot.elements.map((element) =>
+    identityElementIdentity(element, expected));
+  return elementIdentities.every((identity) => identity !== undefined) &&
+    new Set(elementIdentities).size === 1;
 }
 
-function identityElementMatches(
+function identityElementIdentity(
   element: ElementSnapshot,
   expected: string | TextPattern,
-): boolean {
+): string | undefined {
   const channels = [element.text, element.accessibleLabel]
     .map((channel) => channel.normalize("NFKC").trim())
     .filter((channel) => channel !== "");
-  if (channels.length === 0) return false;
+  if (channels.length === 0) return undefined;
 
   const addresses = new Set(channels.flatMap((channel) => extractEmailAddresses(channel)));
-  if (addresses.size > 1) return false;
+  if (addresses.size > 1) return undefined;
 
-  if (typeof expected !== "string") {
-    // Generic labels may accompany the actual identity, but a channel carrying
-    // an explicit address must itself satisfy the trusted pattern.
-    if (
-      addresses.size === 1 &&
-      channels.some((channel) =>
-        extractEmailAddresses(channel).length > 0 && !matchesText(expected, channel))
-    ) {
-      return false;
+  const evidence = channels.map((channel) => ({
+    channel,
+    subject: identityChannelSubject(channel),
+  }));
+  // Unparseable or mixed name/email payloads are explicit ambiguity, not
+  // generic chrome. Only exact allowlisted UI labels may be ignored.
+  if (evidence.some((entry) => entry.subject === undefined)) return undefined;
+  const explicit = evidence.filter(
+    (entry): entry is { channel: string; subject: IdentitySubject } =>
+      entry.subject !== undefined && entry.subject !== GENERIC_IDENTITY_LABEL,
+  );
+  if (explicit.length === 0) return undefined;
+
+  if (typeof expected === "string") {
+    // Every explicit text/ARIA channel must independently verify the literal
+    // identity. One matching channel can never override another person's name.
+    if (!explicit.every((entry) => identityStringMatches(entry.channel, expected))) {
+      return undefined;
     }
-    return channels.some((channel) => matchesText(expected, channel));
+    const expectedComparable = expected.normalize("NFKC").trim().toLowerCase();
+    return expectedComparable.includes("@")
+      ? `email:${expectedComparable}`
+      : `literal:${[...identityTokens(expectedComparable)].sort().join("\u0000")}`;
   }
 
-  const expectedComparable = expected.normalize("NFKC").trim().toLowerCase();
-  if (expectedComparable.includes("@")) {
-    return addresses.size === 1 && addresses.has(expectedComparable);
+  // Patterns apply only to the parsed identity subject, never account/profile
+  // wrapper words. Every explicit channel must match and identify one account.
+  if (!explicit.every((entry) => matchesText(expected, entry.subject.subject))) {
+    return undefined;
   }
-  // A literal display name cannot safely disambiguate an address exposed by a
-  // conflicting channel. Require name-only evidence for display-name configs.
-  if (addresses.size > 0) return false;
-  return channels.some((channel) => identityStringMatches(channel, expected));
+  const keys = new Set(explicit.map((entry) => entry.subject.key));
+  return keys.size === 1 ? explicit[0]!.subject.key : undefined;
+}
+
+interface IdentitySubject {
+  readonly subject: string;
+  readonly key: string;
+}
+
+const GENERIC_IDENTITY_LABEL = Symbol("generic-identity-label");
+
+const GENERIC_IDENTITY_LABELS = new Set([
+  "account",
+  "account manager",
+  "account menu",
+  "current account",
+  "manage account",
+  "microsoft account",
+  "personal account",
+  "profile",
+  "profile menu",
+  "switch account",
+  "user account",
+  "work account",
+]);
+
+const IDENTITY_PREFIX_PHRASES: readonly (readonly string[])[] = [
+  ["current", "account"],
+  ["account", "manager"],
+  ["manage", "account"],
+  ["microsoft", "account"],
+  ["personal", "account"],
+  ["switch", "account"],
+  ["switch", "to"],
+  ["user", "account"],
+  ["work", "account"],
+  ["account"],
+  ["profile"],
+];
+
+const IDENTITY_SUFFIX_PHRASES: readonly (readonly string[])[] = [
+  ["account", "manager"],
+  ["account", "menu"],
+  ["profile", "menu"],
+  ["microsoft", "account"],
+  ["personal", "account"],
+  ["user", "account"],
+  ["work", "account"],
+  ["account"],
+  ["profile"],
+];
+
+function identityChannelSubject(
+  channel: string,
+): IdentitySubject | typeof GENERIC_IDENTITY_LABEL | undefined {
+  const comparable = channel.normalize("NFKC").trim();
+  const lowerComparable = comparable.toLowerCase();
+  if (GENERIC_IDENTITY_LABELS.has(lowerComparable)) return GENERIC_IDENTITY_LABEL;
+
+  const addresses = extractEmailAddresses(channel);
+  if (addresses.length > 1) return undefined;
+  if (addresses.length === 1) {
+    const match = /[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+/iu.exec(comparable);
+    if (match === null || match.index === undefined) return undefined;
+    const prefixTokens = identityTokens(comparable.slice(0, match.index));
+    const suffixTokens = identityTokens(comparable.slice(match.index + match[0].length));
+    if (
+      !isEmptyOrExactWrapper(prefixTokens, IDENTITY_PREFIX_PHRASES) ||
+      !isEmptyOrExactWrapper(suffixTokens, IDENTITY_SUFFIX_PHRASES)
+    ) {
+      return undefined;
+    }
+    return { subject: addresses[0]!, key: `email:${addresses[0]}` };
+  }
+
+  const channelTokens = comparable.match(/[\p{L}\p{N}]+/gu) ?? [];
+  const subjectTokens = stripBoundaryWrapperPhrases(channelTokens);
+  if (subjectTokens.length === 0) return undefined;
+  const keyTokens = subjectTokens.map((token) =>
+    token.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase());
+  return {
+    subject: subjectTokens.join(" "),
+    key: `name:${keyTokens.join("\u0000")}`,
+  };
+}
+
+function isEmptyOrExactWrapper(
+  tokens: readonly string[],
+  phrases: readonly (readonly string[])[],
+): boolean {
+  return tokens.length === 0 || phrases.some((phrase) => equalTokenSequence(tokens, phrase));
+}
+
+function stripBoundaryWrapperPhrases(tokens: readonly string[]): readonly string[] {
+  let start = 0;
+  let end = tokens.length;
+  const lower = tokens.map((token) => token.toLowerCase());
+  const prefix = IDENTITY_PREFIX_PHRASES.find((phrase) =>
+    phrase.length <= end && equalTokenSequence(lower.slice(0, phrase.length), phrase));
+  if (prefix !== undefined) start += prefix.length;
+  const suffix = IDENTITY_SUFFIX_PHRASES.find((phrase) =>
+    phrase.length <= end - start &&
+    equalTokenSequence(lower.slice(end - phrase.length, end), phrase));
+  if (suffix !== undefined) end -= suffix.length;
+  return tokens.slice(start, end);
 }
 
 /**

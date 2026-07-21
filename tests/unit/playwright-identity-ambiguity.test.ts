@@ -117,6 +117,19 @@ test("normalized and patterned identity evidence cannot hide conflicting Chromiu
         <button id="mectrl-current">Current account other@example.com</button>
         <button data-testid="profile-alternate">Switch to approved@example.com</button>`,
     },
+    {
+      expected: "Ronak Chakraborty",
+      markup: `
+        <button id="mectrl-current" aria-label="Other Person">
+          Ronak Chakraborty
+        </button>`,
+    },
+    {
+      expected: { source: "account", flags: "iu" },
+      markup: `
+        <button id="mectrl-current">Current account Alice</button>
+        <button data-testid="profile-alternate">Switch account Bob</button>`,
+    },
   ];
 
   for (const [index, fixture] of cases.entries()) {
