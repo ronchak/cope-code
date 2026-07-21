@@ -57,8 +57,10 @@ export class ContextSemanticPage implements SemanticPage {
   readonly #staleAuthenticationPages = new WeakMap<Page, AuthenticationPageStamp>();
   #activePage: Page;
   #observedUrl: string | undefined;
+  #observedEpoch: number | undefined;
   #filledPage: Page | undefined;
   #filledUrl: string | undefined;
+  #filledEpoch: number | undefined;
   #filledGroup: LocatorGroup | undefined;
   #filledValue: string | undefined;
   #postFillObservationSeen = false;
@@ -114,7 +116,10 @@ export class ContextSemanticPage implements SemanticPage {
 
     const changed = selected !== this.#activePage;
     this.#activePage = selected;
-    if (changed) this.#observedUrl = undefined;
+    if (changed) {
+      this.#observedUrl = undefined;
+      this.#observedEpoch = undefined;
+    }
     this.#configurePage(selected);
     if (force || changed) await selected.bringToFront().catch(() => undefined);
     return selected;
@@ -134,6 +139,7 @@ export class ContextSemanticPage implements SemanticPage {
       const currentUrl = page.url();
       this.#activePage = page;
       this.#observedUrl = currentUrl;
+      this.#observedEpoch = this.#navigationEpochs.get(page) ?? 0;
       this.#postFillObservationSeen = true;
       return currentUrl;
     }
@@ -145,6 +151,7 @@ export class ContextSemanticPage implements SemanticPage {
     const page = await this.focusActivePage();
     const currentUrl = page.url();
     this.#observedUrl = currentUrl;
+    this.#observedEpoch = this.#navigationEpochs.get(page) ?? 0;
     return currentUrl;
   }
 
@@ -164,8 +171,22 @@ export class ContextSemanticPage implements SemanticPage {
   ): Promise<void> {
     const page = this.#verifiedObservedPage();
     const expectedUrl = this.#observedUrl!;
-    await this.#delegate(page).fill(group, value, guard);
-    if (page.isClosed() || page.url() !== expectedUrl) {
+    const expectedEpoch = this.#observedEpoch!;
+    const dispatchGuard = this.#composeDispatchGuard(guard, () => {
+      if (this.#verifiedObservedPage() !== page) {
+        throw new AgentError(
+          "TRANSPORT_INDETERMINATE",
+          "The observed Copilot page changed before composer dispatch",
+          { diagnosticCode: "ACTIVE_PAGE_CHANGED_BEFORE_ACTION" },
+        );
+      }
+    });
+    await this.#delegate(page).fill(group, value, dispatchGuard);
+    if (
+      page.isClosed() ||
+      page.url() !== expectedUrl ||
+      (this.#navigationEpochs.get(page) ?? 0) !== expectedEpoch
+    ) {
       this.#clearFilledPagePin();
       throw new AgentError(
         "TRANSPORT_INDETERMINATE",
@@ -175,6 +196,7 @@ export class ContextSemanticPage implements SemanticPage {
     }
     this.#filledPage = page;
     this.#filledUrl = expectedUrl;
+    this.#filledEpoch = expectedEpoch;
     this.#filledGroup = group;
     this.#filledValue = value;
     this.#postFillObservationSeen = false;
@@ -183,8 +205,17 @@ export class ContextSemanticPage implements SemanticPage {
   /** Send activation requires a completed post-fill observation on the same page. */
   public async click(group: LocatorGroup, guard: SemanticActionGuard): Promise<void> {
     const page = await this.#activationPageOrThrow();
+    const dispatchGuard = this.#composeDispatchGuard(guard, () => {
+      if (this.#verifiedFilledPage() !== page) {
+        throw new AgentError(
+          "TRANSPORT_INDETERMINATE",
+          "The filled Copilot page changed before activation dispatch",
+          { diagnosticCode: "ACTIVE_PAGE_CHANGED_AFTER_FILL" },
+        );
+      }
+    });
     try {
-      await this.#delegate(page).click(group, guard);
+      await this.#delegate(page).click(group, dispatchGuard);
     } finally {
       this.#clearFilledPagePin();
     }
@@ -197,8 +228,17 @@ export class ContextSemanticPage implements SemanticPage {
     guard: SemanticActionGuard,
   ): Promise<void> {
     const page = await this.#activationPageOrThrow();
+    const dispatchGuard = this.#composeDispatchGuard(guard, () => {
+      if (this.#verifiedFilledPage() !== page) {
+        throw new AgentError(
+          "TRANSPORT_INDETERMINATE",
+          "The filled Copilot page changed before activation dispatch",
+          { diagnosticCode: "ACTIVE_PAGE_CHANGED_AFTER_FILL" },
+        );
+      }
+    });
     try {
-      await this.#delegate(page).press(group, key, guard);
+      await this.#delegate(page).press(group, key, dispatchGuard);
     } finally {
       this.#clearFilledPagePin();
     }
@@ -229,6 +269,32 @@ export class ContextSemanticPage implements SemanticPage {
     }
   }
 
+  #composeDispatchGuard(
+    guard: SemanticActionGuard,
+    assertPinnedState: () => void,
+  ): SemanticActionGuard {
+    return () => {
+      try {
+        guard();
+        assertPinnedState();
+      } catch (error) {
+        if (error instanceof AgentError && error.details.dispatchAttempted === false) {
+          throw error;
+        }
+        const diagnosticCode =
+          error instanceof AgentError && typeof error.details.diagnosticCode === "string"
+            ? error.details.diagnosticCode
+            : "PRE_ACTIVATION_GUARD_FAILED";
+        throw new AgentError(
+          "TRANSPORT_INDETERMINATE",
+          "The Copilot dispatch guard blocked the browser action",
+          { diagnosticCode, dispatchAttempted: false },
+          { cause: error },
+        );
+      }
+    };
+  }
+
   #verifiedObservedPage(): Page {
     const selected = this.#selectCurrentPage(
       this.#context.pages(),
@@ -239,7 +305,9 @@ export class ContextSemanticPage implements SemanticPage {
       selected !== this.#activePage ||
       this.#activePage.isClosed() ||
       this.#observedUrl === undefined ||
-      currentUrl !== this.#observedUrl
+      this.#observedEpoch === undefined ||
+      currentUrl !== this.#observedUrl ||
+      (this.#navigationEpochs.get(this.#activePage) ?? 0) !== this.#observedEpoch
     ) {
       throw new AgentError(
         "TRANSPORT_INDETERMINATE",
@@ -291,7 +359,12 @@ export class ContextSemanticPage implements SemanticPage {
   #verifiedFilledPage(): Page {
     const filledPage = this.#filledPage;
     const filledUrl = this.#filledUrl;
-    if (filledPage === undefined || filledUrl === undefined) {
+    const filledEpoch = this.#filledEpoch;
+    if (
+      filledPage === undefined ||
+      filledUrl === undefined ||
+      filledEpoch === undefined
+    ) {
       throw new AgentError(
         "TRANSPORT_INDETERMINATE",
         "The filled Copilot page transaction is unavailable",
@@ -313,7 +386,8 @@ export class ContextSemanticPage implements SemanticPage {
     if (
       selected !== filledPage ||
       filledPage.isClosed() ||
-      filledPage.url() !== filledUrl
+      filledPage.url() !== filledUrl ||
+      (this.#navigationEpochs.get(filledPage) ?? 0) !== filledEpoch
     ) {
       this.#clearFilledPagePin();
       throw new AgentError(
@@ -577,6 +651,7 @@ export class ContextSemanticPage implements SemanticPage {
   #clearFilledPagePin(): void {
     this.#filledPage = undefined;
     this.#filledUrl = undefined;
+    this.#filledEpoch = undefined;
     this.#filledGroup = undefined;
     this.#filledValue = undefined;
     this.#postFillObservationSeen = false;

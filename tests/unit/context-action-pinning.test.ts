@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { BrowserContext, Locator, Page } from "playwright-core";
+import type { BrowserContext, Frame, Locator, Page } from "playwright-core";
 
 import { ContextSemanticPage } from "../../src/browser/context-semantic-page.js";
 import type { LocatorGroup } from "../../src/browser/contracts.js";
@@ -52,6 +52,7 @@ class ActionPage {
   public composer = "";
   public readonly actions: string[] = [];
   public locatorProbeHook: (() => void) | undefined = undefined;
+  readonly #navigationListeners: Array<(frame: Frame) => void> = [];
 
   public constructor(public currentUrl: string) {}
 
@@ -60,7 +61,17 @@ class ActionPage {
   public setDefaultTimeout(_milliseconds: number): void {}
   public setDefaultNavigationTimeout(_milliseconds: number): void {}
   public async bringToFront(): Promise<void> {}
-  public on(_event: string, _listener: (...args: readonly unknown[]) => void): this { return this; }
+  public on(event: string, listener: (...args: readonly unknown[]) => void): this {
+    if (event === "framenavigated") {
+      this.#navigationListeners.push(listener as (frame: Frame) => void);
+    }
+    return this;
+  }
+  public mainFrame(): Frame { return this as unknown as Frame; }
+  public navigateSameUrl(): void {
+    const frame = this.mainFrame();
+    for (const listener of this.#navigationListeners) listener(frame);
+  }
   public locator(_selector: string): Locator {
     return new ActionLocator(this) as unknown as Locator;
   }
@@ -113,7 +124,10 @@ test("cancellation during locator discovery prevents composer fill dispatch", as
 
   await assert.rejects(
     tracked.fill(composerGroup, "must-not-disclose", guard),
-    /cancelled during locator discovery/u,
+    (error: unknown) =>
+      error instanceof AgentError &&
+      error.details.diagnosticCode === "PRE_ACTIVATION_GUARD_FAILED" &&
+      error.details.dispatchAttempted === false,
   );
   assert.deepEqual(page.actions, []);
 });
@@ -134,7 +148,10 @@ test("cancellation during the post-fill guard prevents activation dispatch", asy
 
   await assert.rejects(
     tracked.click(sendGroup, guard),
-    /cancelled during activation guard/u,
+    (error: unknown) =>
+      error instanceof AgentError &&
+      error.details.diagnosticCode === "PRE_ACTIVATION_GUARD_FAILED" &&
+      error.details.dispatchAttempted === false,
   );
   assert.deepEqual(page.actions, ["fill:filled but not sent"]);
 });
@@ -206,6 +223,106 @@ test("same-tab navigation after observation blocks the consequential action", as
     changedPageError,
   );
   assert.deepEqual(page.actions, []);
+});
+
+test("same-URL navigation after observation blocks composer fill", async () => {
+  const page = new ActionPage(`${entryUrl}/conversation/one`);
+  const context = new ActionContext([page]);
+  const tracked = createTracked(context, page);
+
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  page.navigateSameUrl();
+
+  await assert.rejects(
+    tracked.fill(composerGroup, "must-not-disclose", allowAction),
+    changedPageError,
+  );
+  assert.deepEqual(page.actions, []);
+});
+
+test("same-URL navigation during fill locator discovery blocks dispatch", async () => {
+  const page = new ActionPage(`${entryUrl}/conversation/one`);
+  const context = new ActionContext([page]);
+  const tracked = createTracked(context, page);
+
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  page.locatorProbeHook = () => {
+    page.locatorProbeHook = undefined;
+    page.navigateSameUrl();
+  };
+
+  await assert.rejects(
+    tracked.fill(composerGroup, "must-not-disclose", allowAction),
+    changedPageError,
+  );
+  assert.deepEqual(page.actions, []);
+});
+
+test("same-URL navigation after fill blocks activation even if the draft survives", async () => {
+  const page = new ActionPage(`${entryUrl}/conversation/one`);
+  const context = new ActionContext([page]);
+  const tracked = createTracked(context, page);
+
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  await tracked.fill(composerGroup, "restored draft", allowAction);
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  page.navigateSameUrl();
+
+  await assert.rejects(
+    tracked.click(sendGroup, allowAction),
+    (error: unknown) =>
+      error instanceof AgentError &&
+      error.details.diagnosticCode === "ACTIVE_PAGE_CHANGED_AFTER_FILL",
+  );
+  assert.deepEqual(page.actions, ["fill:restored draft"]);
+});
+
+test("same-URL navigation during click locator discovery blocks dispatch", async () => {
+  const page = new ActionPage(`${entryUrl}/conversation/one`);
+  const context = new ActionContext([page]);
+  const tracked = createTracked(context, page);
+
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  await tracked.fill(composerGroup, "restored draft", allowAction);
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  let locatorProbes = 0;
+  page.locatorProbeHook = () => {
+    locatorProbes += 1;
+    if (locatorProbes === 2) page.navigateSameUrl();
+  };
+
+  await assert.rejects(
+    tracked.click(sendGroup, allowAction),
+    (error: unknown) =>
+      error instanceof AgentError &&
+      error.details.diagnosticCode === "ACTIVE_PAGE_CHANGED_AFTER_FILL" &&
+      error.details.dispatchAttempted === false,
+  );
+  assert.deepEqual(page.actions, ["fill:restored draft"]);
+});
+
+test("same-URL navigation during Enter locator discovery blocks dispatch", async () => {
+  const page = new ActionPage(`${entryUrl}/conversation/one`);
+  const context = new ActionContext([page]);
+  const tracked = createTracked(context, page);
+
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  await tracked.fill(composerGroup, "restored draft", allowAction);
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  let locatorProbes = 0;
+  page.locatorProbeHook = () => {
+    locatorProbes += 1;
+    if (locatorProbes === 2) page.navigateSameUrl();
+  };
+
+  await assert.rejects(
+    tracked.press(composerGroup, "Enter", allowAction),
+    (error: unknown) =>
+      error instanceof AgentError &&
+      error.details.diagnosticCode === "ACTIVE_PAGE_CHANGED_AFTER_FILL" &&
+      error.details.dispatchAttempted === false,
+  );
+  assert.deepEqual(page.actions, ["fill:restored draft"]);
 });
 
 test("a second configured Copilot page creates a hard stop before prompt fill", async () => {
