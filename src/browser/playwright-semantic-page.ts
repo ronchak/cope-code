@@ -306,7 +306,12 @@ export class PlaywrightSemanticPage implements SemanticPage {
   ): Promise<readonly ElementSnapshot[]> {
     try {
       const locator = this.#locator(candidate);
-      const count = Math.min(await locator.count(), group.maximumElements);
+      const locatorCount = await locator.count();
+      // Identity is an ownership boundary, not content capture. Truncating a
+      // larger result set could hide the conflicting current account after a
+      // prefix of alternate-profile controls, so overflow contributes no quorum.
+      if (group.signal === "identity" && locatorCount > group.maximumElements) return [];
+      const count = Math.min(locatorCount, group.maximumElements);
       const snapshots: ElementSnapshot[] = [];
       for (let index = 0; index < count; index += 1) {
         const item = locator.nth(index);

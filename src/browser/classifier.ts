@@ -3,6 +3,7 @@ import {
   type CopilotPageObservation,
   type CopilotSignal,
   type CopilotUiContract,
+  type ElementSnapshot,
   type GroupSnapshot,
   type SemanticPage,
   type TextPattern,
@@ -197,17 +198,57 @@ function matches(
 }
 
 function identityTextMatches(snapshot: GroupSnapshot, expected: string | TextPattern): boolean {
-  if (typeof expected !== "string") {
-    return snapshot.elements.some(
-      (element) =>
-        matchesText(expected, element.text) || matchesText(expected, element.accessibleLabel),
-    );
-  }
-  return snapshot.elements.some(
-    (element) =>
-      identityStringMatches(element.text, expected) ||
-      identityStringMatches(element.accessibleLabel, expected),
+  if (snapshot.elements.length === 0) return false;
+  const snapshotAddresses = new Set(
+    snapshot.elements.flatMap((element) =>
+      [element.text, element.accessibleLabel]
+        .map((channel) => channel.normalize("NFKC").trim())
+        .filter((channel) => channel !== "")
+        .flatMap((channel) => extractEmailAddresses(channel))),
   );
+  // Conflicting explicit accounts remain ambiguous even when a trusted pattern
+  // happens to match every address independently.
+  if (snapshotAddresses.size > 1) return false;
+  // The canonical ownership locator can see both the current account button
+  // and alternate-profile controls in an open account menu. Never accept the
+  // expected identity merely because it appears somewhere in that set: every
+  // visible account control must consistently identify the configured account.
+  return snapshot.elements.every((element) => identityElementMatches(element, expected));
+}
+
+function identityElementMatches(
+  element: ElementSnapshot,
+  expected: string | TextPattern,
+): boolean {
+  const channels = [element.text, element.accessibleLabel]
+    .map((channel) => channel.normalize("NFKC").trim())
+    .filter((channel) => channel !== "");
+  if (channels.length === 0) return false;
+
+  const addresses = new Set(channels.flatMap((channel) => extractEmailAddresses(channel)));
+  if (addresses.size > 1) return false;
+
+  if (typeof expected !== "string") {
+    // Generic labels may accompany the actual identity, but a channel carrying
+    // an explicit address must itself satisfy the trusted pattern.
+    if (
+      addresses.size === 1 &&
+      channels.some((channel) =>
+        extractEmailAddresses(channel).length > 0 && !matchesText(expected, channel))
+    ) {
+      return false;
+    }
+    return channels.some((channel) => matchesText(expected, channel));
+  }
+
+  const expectedComparable = expected.normalize("NFKC").trim().toLowerCase();
+  if (expectedComparable.includes("@")) {
+    return addresses.size === 1 && addresses.has(expectedComparable);
+  }
+  // A literal display name cannot safely disambiguate an address exposed by a
+  // conflicting channel. Require name-only evidence for display-name configs.
+  if (addresses.size > 0) return false;
+  return channels.some((channel) => identityStringMatches(channel, expected));
 }
 
 /**

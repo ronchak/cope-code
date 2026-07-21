@@ -12,6 +12,7 @@ import type {
   GroupSnapshot,
   LocatorGroup,
   SemanticPage,
+  TextPattern,
 } from "../../src/browser/contracts.js";
 
 const readySignals = new Set<CopilotSignal>([
@@ -25,7 +26,10 @@ const readySignals = new Set<CopilotSignal>([
 
 class LiveShapePage implements SemanticPage {
   public constructor(
-    private readonly identityText: string,
+    private readonly identityText: string | readonly (string | {
+      readonly text: string;
+      readonly accessibleLabel: string;
+    })[],
     private readonly composerEnabled = true,
     private readonly extraSignals: ReadonlySet<CopilotSignal> = new Set(),
   ) {}
@@ -37,19 +41,23 @@ class LiveShapePage implements SemanticPage {
   public async snapshot(group: LocatorGroup): Promise<GroupSnapshot> {
     const visible = readySignals.has(group.signal) || this.extraSignals.has(group.signal);
     const enabled = visible && (group.signal !== "composer" || this.composerEnabled);
+    const identityValues = Array.isArray(this.identityText)
+      ? this.identityText
+      : [this.identityText];
+    const values = group.signal === "identity" ? identityValues : [group.signal];
     return {
       signal: group.signal,
       matchedCandidates: visible ? group.minimumCandidateMatches : 0,
-      visibleElements: visible ? 1 : 0,
-      enabledElements: enabled ? 1 : 0,
+      visibleElements: visible ? values.length : 0,
+      enabledElements: enabled ? values.length : 0,
       elements: visible
-        ? [{
+        ? values.map((value) => ({
             visible: true,
             enabled,
-            text: group.signal === "identity" ? this.identityText : group.signal,
+            text: typeof value === "string" ? value : value.text,
             value: "",
-            accessibleLabel: group.signal === "identity" ? this.identityText : group.signal,
-          }]
+            accessibleLabel: typeof value === "string" ? value : value.accessibleLabel,
+          }))
         : [],
     };
   }
@@ -59,7 +67,7 @@ class LiveShapePage implements SemanticPage {
   public async press(): Promise<void> { throw new Error("not used"); }
 }
 
-function requirements(expectedIdentity: string): ClassifierRequirements {
+function requirements(expectedIdentity: string | TextPattern): ClassifierRequirements {
   return {
     entryUrl: "https://m365.cloud.microsoft/chat",
     approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
@@ -134,6 +142,103 @@ test("an address that merely contains the configured email is rejected", async (
   );
 
   assert.equal(classification.state, "identity-unverified");
+});
+
+test("an expected alternate profile cannot override a conflicting current account", async () => {
+  const expectedIdentity = "approved@example.com";
+  const contract = createBaselineCopilotUiContract(expectedIdentity);
+  const observation = await observeCopilotPage(
+    new LiveShapePage([
+      "Current account other@example.com",
+      "Switch to approved@example.com",
+    ]),
+    contract,
+  );
+
+  const classification = classifyCopilotPage(
+    observation,
+    contract,
+    requirements(expectedIdentity),
+  );
+
+  assert.equal(classification.state, "identity-unverified");
+  assert.equal(classification.diagnosticCode, "IDENTITY_NOT_VERIFIED");
+});
+
+test("duplicate controls for the configured current account remain valid", async () => {
+  const expectedIdentity = "approved@example.com";
+  const contract = createBaselineCopilotUiContract(expectedIdentity);
+  const observation = await observeCopilotPage(
+    new LiveShapePage([
+      "Work account approved@example.com",
+      "Account manager approved@example.com",
+    ]),
+    contract,
+  );
+
+  const classification = classifyCopilotPage(
+    observation,
+    contract,
+    requirements(expectedIdentity),
+  );
+
+  assert.equal(classification.state, "ready");
+});
+
+test("conflicting email channels on one account control fail closed", async () => {
+  const expectedIdentity = "approved@example.com";
+  const contract = createBaselineCopilotUiContract(expectedIdentity);
+  for (const identity of [
+    { text: "Current other@example.com", accessibleLabel: "approved@example.com" },
+    { text: "approved@example.com", accessibleLabel: "Current other@example.com" },
+    { text: "Current other＠example.com", accessibleLabel: "approved@example.com" },
+  ]) {
+    const observation = await observeCopilotPage(new LiveShapePage([identity]), contract);
+    const classification = classifyCopilotPage(
+      observation,
+      contract,
+      requirements(expectedIdentity),
+    );
+    assert.equal(classification.state, "identity-unverified");
+  }
+});
+
+test("duplicate email channels and a generic account label remain compatible", async () => {
+  const expectedIdentity = "approved@example.com";
+  const contract = createBaselineCopilotUiContract(expectedIdentity);
+  for (const identity of [
+    { text: "approved@example.com", accessibleLabel: "approved@example.com" },
+    { text: "approved@example.com", accessibleLabel: "Account manager" },
+  ]) {
+    const observation = await observeCopilotPage(new LiveShapePage([identity]), contract);
+    const classification = classifyCopilotPage(
+      observation,
+      contract,
+      requirements(expectedIdentity),
+    );
+    assert.equal(classification.state, "ready");
+  }
+});
+
+test("identity patterns reject empty and conflicting explicit channels", async () => {
+  const expectedIdentity: TextPattern = { source: "approved", flags: "iu" };
+  const contract = createBaselineCopilotUiContract(expectedIdentity);
+  for (const identity of [
+    { text: "", accessibleLabel: "" },
+    { text: "other@example.com", accessibleLabel: "approved@example.com" },
+    "other@example.com",
+  ]) {
+    const identityControls = typeof identity === "string"
+      ? [identity, "approved@example.com"]
+      : [identity];
+    const observation = await observeCopilotPage(new LiveShapePage(identityControls), contract);
+    const classification = classifyCopilotPage(
+      observation,
+      contract,
+      requirements(expectedIdentity),
+    );
+    assert.equal(classification.state, "identity-unverified");
+  }
 });
 
 test("identity token matching rejects extra name tokens between expected tokens", async () => {
