@@ -222,7 +222,14 @@ test("the baseline contract carries the current M365 locator revision and semant
   assert.deepEqual(
     contract.groups.identity.candidates.map((candidate) =>
       candidate.kind === "role" ? candidate.role : candidate.kind),
-    ["button", "button"],
+    ["css"],
+  );
+  const identityCss = contract.groups.identity.candidates[0];
+  assert.ok(identityCss?.kind === "css");
+  assert.equal(
+    identityCss.selector.split(",").every((selector) =>
+      /mectrl|mecontrol|me-control|account-control|account-menu|profile|persona/iu.test(selector)),
+    true,
   );
   assert.equal(
     contract.groups.identity.candidates.some((candidate) =>
