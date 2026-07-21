@@ -60,7 +60,10 @@ export class PlaywrightSemanticPage implements SemanticPage {
     return this.#page.url();
   }
 
-  public async snapshot(group: LocatorGroup): Promise<GroupSnapshot> {
+  public async snapshot(
+    group: LocatorGroup,
+    deadline = performance.now() + this.#actionMs,
+  ): Promise<GroupSnapshot> {
     return this.#runBounded(async () => {
       if (this.#nativeDialogDetected) {
         const elements: readonly ElementSnapshot[] =
@@ -100,13 +103,14 @@ export class PlaywrightSemanticPage implements SemanticPage {
         enabledElements: allElements.filter((element) => element.visible && element.enabled).length,
         elements,
       };
-    }, () => false);
+    }, () => false, deadline);
   }
 
   public async fill(
     group: LocatorGroup,
     value: string,
     guard: SemanticActionGuard,
+    deadline = performance.now() + this.#actionMs,
   ): Promise<void> {
     let dispatchAttempted = false;
     await this.#runBounded(async (assertWithinDeadline) => {
@@ -205,10 +209,14 @@ export class PlaywrightSemanticPage implements SemanticPage {
       node.dispatchEvent(inputEvent);
       }, value);
       this.#assertNoNativeDialog(true);
-    }, () => dispatchAttempted);
+    }, () => dispatchAttempted, deadline);
   }
 
-  public async click(group: LocatorGroup, guard: SemanticActionGuard): Promise<void> {
+  public async click(
+    group: LocatorGroup,
+    guard: SemanticActionGuard,
+    deadline = performance.now() + this.#actionMs,
+  ): Promise<void> {
     let dispatchAttempted = false;
     await this.#runBounded(async (assertWithinDeadline) => {
       this.#assertNoNativeDialog();
@@ -325,14 +333,16 @@ export class PlaywrightSemanticPage implements SemanticPage {
           },
         );
       }
-    }, () => dispatchAttempted);
+    }, () => dispatchAttempted, deadline);
   }
 
   async #runBounded<T>(
     operation: (assertWithinDeadline: () => void) => Promise<T>,
     dispatchAttempted: () => boolean,
+    deadline: number,
   ): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let timerFired = false;
     let timedOut = false;
     let termination: Promise<void> | undefined;
     const timeoutError = (cause?: unknown) => new AgentError(
@@ -344,30 +354,42 @@ export class PlaywrightSemanticPage implements SemanticPage {
       },
       cause === undefined ? undefined : { cause },
     );
+    const expire = () => {
+      if (timedOut) return;
+      timedOut = true;
+      termination = this.#terminateTimedOutOperation();
+    };
     const timeout = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => {
+        timerFired = true;
         // Set this before starting teardown. If the renderer operation settles
         // during termination, it must not win the race and report success.
-        timedOut = true;
-        termination = this.#terminateTimedOutOperation();
-        void termination.then(
+        expire();
+        void termination!.then(
           () => reject(timeoutError()),
           (error) => reject(timeoutError(error)),
         );
-      }, this.#actionMs);
+      }, Math.max(0, deadline - performance.now()));
     });
     const assertWithinDeadline = () => {
-      if (timedOut) throw timeoutError();
+      if (!timedOut && performance.now() < deadline) return;
+      expire();
+      throw timeoutError();
     };
 
     try {
       const result = await Promise.race([operation(assertWithinDeadline), timeout]);
+      // Resolved-Promise microtasks or synchronous renderer work can starve the
+      // timer callback past the absolute deadline. The operation still loses:
+      // expire from the monotonic clock before accepting its result.
+      if (!timedOut && performance.now() >= deadline) expire();
       if (timedOut) {
         await termination;
         throw timeoutError();
       }
       return result;
     } catch (error) {
+      if (!timedOut && performance.now() >= deadline) expire();
       if (!timedOut) throw error;
       try {
         await termination;
@@ -382,7 +404,7 @@ export class PlaywrightSemanticPage implements SemanticPage {
       }
       throw timeoutError(error);
     } finally {
-      if (!timedOut && timer !== undefined) clearTimeout(timer);
+      if (!timerFired && timer !== undefined) clearTimeout(timer);
     }
   }
 

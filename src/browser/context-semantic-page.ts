@@ -214,7 +214,11 @@ export class ContextSemanticPage implements SemanticPage {
 
   /** Send activation requires a completed post-fill observation on the same page. */
   public async click(group: LocatorGroup, guard: SemanticActionGuard): Promise<void> {
-    const page = await this.#activationPageOrThrow();
+    // Composer re-verification and send dispatch are one semantic action. Give
+    // both delegate operations the same absolute deadline rather than allowing
+    // each to consume a fresh actionMs window.
+    const deadline = performance.now() + this.#actionMs;
+    const page = await this.#activationPageOrThrow(deadline);
     const dispatchGuard = this.#composeDispatchGuard(guard, () => {
       if (this.#verifiedFilledPage() !== page) {
         throw new AgentError(
@@ -225,7 +229,7 @@ export class ContextSemanticPage implements SemanticPage {
       }
     });
     try {
-      await this.#delegate(page).click(group, dispatchGuard);
+      await this.#delegate(page).click(group, dispatchGuard, deadline);
       this.#verifiedFilledPage();
     } finally {
       this.#clearFilledPagePin();
@@ -237,9 +241,9 @@ export class ContextSemanticPage implements SemanticPage {
    * pre-dispatch. Preserve that fact for the adapter so a guarded failure
    * remains safely retryable instead of being treated as indeterminate.
    */
-  async #activationPageOrThrow(): Promise<Page> {
+  async #activationPageOrThrow(deadline: number): Promise<Page> {
     try {
-      return await this.#verifiedActivationPage();
+      return await this.#verifiedActivationPage(deadline);
     } catch (error) {
       if (error instanceof AgentError && error.details.dispatchAttempted === false) {
         throw error;
@@ -312,7 +316,7 @@ export class ContextSemanticPage implements SemanticPage {
     return this.#activePage;
   }
 
-  async #verifiedActivationPage(): Promise<Page> {
+  async #verifiedActivationPage(deadline: number): Promise<Page> {
     if (
       this.#filledPage === undefined ||
       this.#filledUrl === undefined ||
@@ -328,7 +332,7 @@ export class ContextSemanticPage implements SemanticPage {
     }
 
     const page = this.#verifiedFilledPage();
-    const composer = await this.#delegate(page).snapshot(this.#filledGroup);
+    const composer = await this.#delegate(page).snapshot(this.#filledGroup, deadline);
     const filledValue = this.#filledValue;
     const contentStillPresent = composer.elements.some(
       (element) =>

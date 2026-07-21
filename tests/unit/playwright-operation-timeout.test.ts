@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import type { BrowserContext, ElementHandle, Locator, Page } from "playwright-core";
+import type { Browser, BrowserContext, ElementHandle, Frame, Locator, Page } from "playwright-core";
 
+import { ContextSemanticPage } from "../../src/browser/context-semantic-page.js";
 import { PlaywrightSemanticPage } from "../../src/browser/playwright-semantic-page.js";
 import { AgentError } from "../../src/shared/errors.js";
 import type { LocatorGroup } from "../../src/browser/contracts.js";
@@ -60,7 +61,7 @@ class TimeoutLocator {
 }
 
 class TimeoutPage {
-  public constructor(private readonly locatorValue: TimeoutLocator) {}
+  public constructor(private readonly locatorValue: unknown) {}
 
   public on(): this { return this; }
   public locator(): Locator { return this.locatorValue as unknown as Locator; }
@@ -147,4 +148,192 @@ test("concurrent blocked snapshots share one termination and cannot swallow time
     if (result.status === "fulfilled") assert.fail("snapshot swallowed its timeout");
     assert.equal(timeoutError(result.reason).details.dispatchAttempted, false);
   }
+});
+
+function busySpin(milliseconds: number): void {
+  const deadline = performance.now() + milliseconds;
+  while (performance.now() < deadline) {
+    // Deliberately starve timer callbacks while Promise continuations remain
+    // eligible for the microtask queue.
+  }
+}
+
+class BusyCountLocator {
+  public async count(): Promise<number> { busySpin(70); return 1; }
+  public nth(_index: number): Locator { return this as unknown as Locator; }
+  public async isVisible(): Promise<boolean> { return true; }
+  public async isEnabled(): Promise<boolean> { return true; }
+  public async isEditable(): Promise<boolean> { return true; }
+  public async getAttribute(_name: string): Promise<string | null> { return null; }
+  public async innerText(): Promise<string> { return "ready"; }
+  public async inputValue(): Promise<string> { return "ready"; }
+}
+
+class BusyEvaluateElement extends TimeoutElement {
+  public override async evaluate(): Promise<unknown> {
+    this.evaluateCalls += 1;
+    busySpin(70);
+    return "dispatched";
+  }
+}
+
+test("clock checks reject operations that settle after starving their deadline timer", async () => {
+  let snapshotTerminations = 0;
+  const snapshotPage = new PlaywrightSemanticPage(
+    new TimeoutPage(new BusyCountLocator()) as unknown as Page,
+    undefined,
+    50,
+    async () => { snapshotTerminations += 1; },
+  );
+  let snapshotError: unknown;
+  try {
+    await snapshotPage.snapshot(composerGroup);
+  } catch (error) {
+    snapshotError = error;
+  }
+  assert.equal(timeoutError(snapshotError).details.dispatchAttempted, false);
+  assert.equal(snapshotTerminations, 1);
+
+  for (const action of ["fill", "click"] as const) {
+    const element = new BusyEvaluateElement();
+    let terminations = 0;
+    const semantic = new PlaywrightSemanticPage(
+      new TimeoutPage(
+        new TimeoutLocator(Promise.resolve(1), element),
+      ) as unknown as Page,
+      undefined,
+      50,
+      async () => { terminations += 1; },
+    );
+    let observedError: unknown;
+    try {
+      if (action === "fill") {
+        await semantic.fill(composerGroup, "late disclosure", () => {});
+      } else {
+        await semantic.click(sendGroup, () => {});
+      }
+    } catch (error) {
+      observedError = error;
+    }
+    assert.equal(timeoutError(observedError).details.dispatchAttempted, true);
+    assert.equal(element.evaluateCalls, 1);
+    assert.equal(terminations, 1);
+  }
+});
+
+class SharedDeadlineBrowser {
+  public closeCalls = 0;
+  public async close(): Promise<void> { this.closeCalls += 1; }
+}
+
+class SharedDeadlineElement {
+  public constructor(private readonly page: SharedDeadlinePage) {}
+
+  public async isVisible(): Promise<boolean> { return true; }
+  public async isEnabled(): Promise<boolean> { return true; }
+  public async isEditable(): Promise<boolean> { return true; }
+  public async getAttribute(_name: string): Promise<string | null> { return null; }
+  public async evaluate(
+    _callback: (...args: readonly unknown[]) => unknown,
+    value?: string,
+  ): Promise<unknown> {
+    if (value !== undefined) {
+      this.page.composer = value;
+      return undefined;
+    }
+    return new Promise<never>(() => {});
+  }
+}
+
+class SharedDeadlineLocator {
+  public constructor(
+    private readonly page: SharedDeadlinePage,
+    private readonly selector: string,
+  ) {}
+
+  public async count(): Promise<number> { return 1; }
+  public nth(_index: number): Locator { return this as unknown as Locator; }
+  public async elementHandle(): Promise<ElementHandle> {
+    return new SharedDeadlineElement(this.page) as unknown as ElementHandle;
+  }
+  public async isVisible(): Promise<boolean> { return true; }
+  public async isEnabled(): Promise<boolean> { return true; }
+  public async isEditable(): Promise<boolean> { return true; }
+  public async getAttribute(_name: string): Promise<string | null> { return null; }
+  public async innerText(): Promise<string> { return this.page.composer; }
+  public async inputValue(): Promise<string> {
+    if (this.selector === "textarea") await this.page.snapshotDelay;
+    return this.page.composer;
+  }
+}
+
+class SharedDeadlinePage {
+  public composer = "";
+  public snapshotDelay: Promise<void> = Promise.resolve();
+  public closed = false;
+
+  public constructor(public readonly currentUrl: string) {}
+
+  public url(): string { return this.currentUrl; }
+  public isClosed(): boolean { return this.closed; }
+  public mainFrame(): Frame { return this as unknown as Frame; }
+  public on(): this { return this; }
+  public setDefaultTimeout(_milliseconds: number): void {}
+  public setDefaultNavigationTimeout(_milliseconds: number): void {}
+  public async bringToFront(): Promise<void> {}
+  public async close(): Promise<void> { this.closed = true; }
+  public locator(selector: string): Locator {
+    return new SharedDeadlineLocator(this, selector) as unknown as Locator;
+  }
+}
+
+class SharedDeadlineContext {
+  public constructor(
+    private readonly pageValue: SharedDeadlinePage,
+    private readonly browserValue: SharedDeadlineBrowser,
+  ) {}
+
+  public pages(): readonly Page[] { return [this.pageValue as unknown as Page]; }
+  public browser(): Browser { return this.browserValue as unknown as Browser; }
+  public on(): this { return this; }
+  public async close(): Promise<void> { this.pageValue.closed = true; }
+}
+
+test("composer recheck and send dispatch share one semantic click deadline", async () => {
+  const browser = new SharedDeadlineBrowser();
+  const page = new SharedDeadlinePage("https://m365.cloud.microsoft/chat/conversation/deadline");
+  const context = new SharedDeadlineContext(page, browser);
+  const semantic = new ContextSemanticPage(
+    context as unknown as BrowserContext,
+    {
+      entryUrl: "https://m365.cloud.microsoft/chat",
+      approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
+    },
+    page as unknown as Page,
+    200,
+  );
+
+  assert.equal(await semantic.currentUrl(), page.currentUrl);
+  await semantic.fill(composerGroup, "prepared draft", () => {});
+  assert.equal(await semantic.currentUrl(), page.currentUrl);
+  const snapshotRelease = deferred<void>();
+  page.snapshotDelay = snapshotRelease.promise;
+  const releaseTimer = setTimeout(() => snapshotRelease.resolve(), 100);
+  const startedAt = performance.now();
+  let observedError: unknown;
+  try {
+    await semantic.click(sendGroup, () => {});
+  } catch (error) {
+    observedError = error;
+  } finally {
+    clearTimeout(releaseTimer);
+  }
+  const elapsedMs = performance.now() - startedAt;
+
+  assert.equal(timeoutError(observedError).details.dispatchAttempted, true);
+  assert.ok(
+    elapsedMs < 260,
+    `composer recheck and send used more than one 200 ms deadline: ${elapsedMs} ms`,
+  );
+  assert.equal(browser.closeCalls, 1);
 });
