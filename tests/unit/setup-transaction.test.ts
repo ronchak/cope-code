@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, rmdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 
 import {
   SESSION_RUNTIME_MANIFEST_VERSION,
@@ -136,6 +137,46 @@ test("browser configuration lock is exclusive and stale recovery cannot delete a
   await winners[0]!.value.release();
   const afterRelease = await BrowserConfigTransactionLock.acquire(root);
   await afterRelease.release();
+});
+
+test("browser configuration lock retries transient owner creation and release windows", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-setup-lock-transient-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const lockDirectory = path.join(root, "config", ".browser-config.lock");
+  const ownerFile = path.join(lockDirectory, "owner.json");
+
+  await mkdir(lockDirectory, { recursive: true });
+  const ownerAppeared = delay(5).then(() => writeFile(ownerFile, JSON.stringify({
+    version: 1,
+    pid: process.pid,
+    token: "browser-config-lock-live-owner-token",
+    createdAt: "2026-07-20T12:00:00.000Z",
+  }), "utf8"));
+  await assert.rejects(
+    BrowserConfigTransactionLock.acquire(root),
+    (error: unknown) => error instanceof AgentError && error.details.diagnosticCode === "BROWSER_CONFIG_LOCKED",
+  );
+  await ownerAppeared;
+
+  await rm(ownerFile);
+  const directoryReleased = delay(5).then(() => rmdir(lockDirectory));
+  const acquired = await BrowserConfigTransactionLock.acquire(root);
+  await directoryReleased;
+  await acquired.release();
+});
+
+test("browser configuration lock still rejects persistently unreadable owner metadata", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-setup-lock-unreadable-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const lockDirectory = path.join(root, "config", ".browser-config.lock");
+  await mkdir(lockDirectory, { recursive: true });
+  await writeFile(path.join(lockDirectory, "owner.json"), "{partial", "utf8");
+
+  await assert.rejects(
+    BrowserConfigTransactionLock.acquire(root),
+    (error: unknown) => error instanceof AgentError &&
+      error.details.diagnosticCode === "BROWSER_CONFIG_LOCK_UNREADABLE",
+  );
 });
 
 test("session pinning rejects a browser hash race before writing its runtime manifest", async (context) => {

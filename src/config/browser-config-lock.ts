@@ -1,5 +1,6 @@
 import { mkdir, open, readFile, rmdir, unlink } from "node:fs/promises";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { newId } from "../shared/crypto.js";
 import { AgentError } from "../shared/errors.js";
@@ -7,6 +8,8 @@ import { AgentError } from "../shared/errors.js";
 const LOCK_DIRECTORY = ".browser-config.lock";
 const OWNER_FILENAME = "owner.json";
 const RECOVERY_FILENAME = "recovery.claim";
+const LOCK_ACQUIRE_ATTEMPTS = 4;
+const TRANSIENT_OWNER_RETRY_MS = 25;
 
 interface BrowserConfigLockMetadata {
   readonly version: 1;
@@ -35,7 +38,7 @@ export class BrowserConfigTransactionLock {
     const configDirectory = path.join(stateHome, "config");
     await mkdir(configDirectory, { recursive: true, mode: 0o700 });
     const lockDirectory = path.join(configDirectory, LOCK_DIRECTORY);
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    for (let attempt = 0; attempt < LOCK_ACQUIRE_ATTEMPTS; attempt += 1) {
       const token = newId("browser-config-lock");
       try {
         await mkdir(lockDirectory, { mode: 0o700 });
@@ -65,6 +68,10 @@ export class BrowserConfigTransactionLock {
 
       const owner = await readMetadata(path.join(lockDirectory, OWNER_FILENAME));
       if (owner === undefined) {
+        if (attempt < LOCK_ACQUIRE_ATTEMPTS - 1) {
+          await delay(TRANSIENT_OWNER_RETRY_MS);
+          continue;
+        }
         throw recoveryError("The browser configuration lock cannot be verified", "BROWSER_CONFIG_LOCK_UNREADABLE");
       }
       if (isProcessAlive(owner.pid)) {
