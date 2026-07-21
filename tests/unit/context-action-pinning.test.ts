@@ -23,6 +23,13 @@ const sendGroup: LocatorGroup = {
   maximumElements: 1,
   capture: "presence",
 };
+const modalGroup: LocatorGroup = {
+  signal: "modal",
+  candidates: [{ kind: "role", role: "dialog" }],
+  minimumCandidateMatches: 1,
+  maximumElements: 1,
+  capture: "presence",
+};
 
 const allowAction = () => {};
 
@@ -364,7 +371,7 @@ test("same-URL navigation after fill blocks activation even if the draft survive
   assert.deepEqual(page.actions, ["fill:restored draft"]);
 });
 
-test("a native dialog after fill revokes the second observation", async () => {
+test("a native dialog after fill makes the second observation terminal", async () => {
   const page = new ActionPage(`${entryUrl}/conversation/one`);
   const context = new ActionContext([page]);
   const tracked = createTracked(context, page);
@@ -373,11 +380,16 @@ test("a native dialog after fill revokes the second observation", async () => {
   await tracked.fill(composerGroup, "filled but never sent", allowAction);
   page.emitDialog();
 
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  const modal = await tracked.snapshot(modalGroup);
+  assert.equal(modal.matchedCandidates, 1);
+  assert.equal(modal.enabledElements, 0);
+
   await assert.rejects(
-    tracked.currentUrl(),
+    tracked.click(sendGroup, allowAction),
     (error: unknown) =>
       error instanceof AgentError &&
-      error.details.diagnosticCode === "ACTIVE_PAGE_CHANGED_AFTER_FILL",
+      error.details.dispatchAttempted === false,
   );
   assert.deepEqual(page.actions, ["fill:filled but never sent"]);
 });

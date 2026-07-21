@@ -18,7 +18,7 @@ export class PlaywrightSemanticPage implements SemanticPage {
   #nativeDialogDetected = false;
   #nativeDialogEpoch = 0;
 
-  public constructor(page: Page) {
+  public constructor(page: Page, onNativeDialog?: () => boolean | void) {
     this.#page = page;
     // Do not accept, dismiss, inspect, or automate unknown browser dialogs.
     // Leaving the dialog visible blocks consequential actions and the sticky
@@ -27,10 +27,11 @@ export class PlaywrightSemanticPage implements SemanticPage {
       page.on("dialog", () => {
         this.#nativeDialogDetected = true;
         this.#nativeDialogEpoch += 1;
+        const teardownOwned = onNativeDialog?.() === true;
         // A native dialog can queue an already-authorized evaluate call behind
         // the browser modal. Tear down the target immediately so dismissing the
         // dialog cannot release a stale fill or click into the page.
-        if (typeof page.close === "function") {
+        if (!teardownOwned && typeof page.close === "function") {
           void page.close({ runBeforeUnload: false }).catch(() => undefined);
         }
       });

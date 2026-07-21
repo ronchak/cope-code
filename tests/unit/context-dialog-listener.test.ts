@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { BrowserContext, Page } from "playwright-core";
 
+import { classifyCopilotPage, observeCopilotPage } from "../../src/browser/classifier.js";
+import { createBaselineCopilotUiContract } from "../../src/browser/config.js";
 import { ContextSemanticPage } from "../../src/browser/context-semantic-page.js";
 import type { LocatorGroup } from "../../src/browser/contracts.js";
 
@@ -18,6 +20,8 @@ const selectionConfig = {
   approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
   manualAuthenticationHosts: [{ hostname: "login.microsoftonline.com" }],
 } as const;
+const identity = "Synthetic Work Account";
+const contract = createBaselineCopilotUiContract(identity);
 
 class DialogPage {
   public closed = false;
@@ -30,6 +34,7 @@ class DialogPage {
   public setDefaultTimeout(_milliseconds: number): void {}
   public setDefaultNavigationTimeout(_milliseconds: number): void {}
   public async bringToFront(): Promise<void> {}
+  public async close(): Promise<void> { this.closed = true; }
   public on(event: string, listener: (...args: unknown[]) => void): this {
     const listeners = this.#listeners.get(event) ?? [];
     listeners.push(listener);
@@ -84,7 +89,7 @@ test("the initial page has its native-dialog listener before the first snapshot"
   assert.equal(snapshot.enabledElements, 0);
 });
 
-test("a replacement page is guarded before it is selected or inspected", async () => {
+test("a dialog on a replacement page remains terminal after that target closes", async () => {
   const chat = new DialogPage(`${entryUrl}/conversation/initial`);
   const context = new DialogContext([chat]);
   const tracked = new ContextSemanticPage(
@@ -100,10 +105,19 @@ test("a replacement page is guarded before it is selected or inspected", async (
   context.addPage(authentication);
   assert.equal(authentication.listenerCount("dialog"), 1);
   authentication.emitDialog();
-  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
-  const snapshot = await tracked.snapshot(modalGroup);
+  assert.equal(authentication.closed, true);
 
-  assert.equal(snapshot.matchedCandidates, 1);
-  assert.equal(snapshot.visibleElements, 1);
-  assert.equal(snapshot.enabledElements, 0);
+  const observation = await observeCopilotPage(tracked, contract);
+  const classification = classifyCopilotPage(observation, contract, {
+    entryUrl,
+    approvedHosts: selectionConfig.approvedHosts,
+    expectedIdentity: identity,
+    requireProtectionIndicator: false,
+  });
+
+  assert.equal(observation.url, chat.currentUrl);
+  assert.equal(observation.modal.matchedCandidates, 1);
+  assert.equal(observation.modal.enabledElements, 0);
+  assert.equal(classification.state, "blocking-modal");
+  assert.equal(classification.diagnosticCode, "NATIVE_BROWSER_DIALOG_DETECTED");
 });

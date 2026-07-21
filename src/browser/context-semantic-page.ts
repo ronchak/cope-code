@@ -46,6 +46,7 @@ export class ContextSemanticPage implements SemanticPage {
   readonly #delegates = new WeakMap<Page, PlaywrightSemanticPage>();
   readonly #configuredPages = new WeakSet<Page>();
   readonly #navigationEpochs = new WeakMap<Page, number>();
+  #nativeDialogEpoch = 0;
   #activePage: Page;
   #observedUrl: string | undefined;
   #observedEpoch: number | undefined;
@@ -82,6 +83,7 @@ export class ContextSemanticPage implements SemanticPage {
   }
 
   public async focusActivePage(force = false): Promise<Page> {
+    if (this.#nativeDialogEpoch > 0) return this.#activePage;
     let pages = this.#context.pages();
     const handoff = await this.#returnedConfiguredPage(pages);
     // Page discovery and the in-place readiness probe can yield. Refresh the
@@ -121,6 +123,13 @@ export class ContextSemanticPage implements SemanticPage {
   }
 
   public async currentUrl(): Promise<string> {
+    if (this.#nativeDialogEpoch > 0) {
+      const currentUrl = this.#activePage.url();
+      this.#observedUrl = currentUrl;
+      this.#observedEpoch = this.#navigationEpochs.get(this.#activePage) ?? 0;
+      this.#observedDialogEpoch = this.#nativeDialogEpoch;
+      return currentUrl;
+    }
     // The first observation after composer fill is part of the same submission
     // transaction. It must inspect the exact page that received the prompt, not
     // silently adopt a replacement tab with the same conversation URL.
@@ -130,7 +139,7 @@ export class ContextSemanticPage implements SemanticPage {
       this.#activePage = page;
       this.#observedUrl = currentUrl;
       this.#observedEpoch = this.#navigationEpochs.get(page) ?? 0;
-      this.#observedDialogEpoch = this.#delegate(page).nativeDialogEpoch();
+      this.#observedDialogEpoch = this.#nativeDialogEpoch;
       this.#postFillObservationSeen = true;
       return currentUrl;
     }
@@ -143,11 +152,12 @@ export class ContextSemanticPage implements SemanticPage {
     const currentUrl = page.url();
     this.#observedUrl = currentUrl;
     this.#observedEpoch = this.#navigationEpochs.get(page) ?? 0;
-    this.#observedDialogEpoch = this.#delegate(page).nativeDialogEpoch();
+    this.#observedDialogEpoch = this.#nativeDialogEpoch;
     return currentUrl;
   }
 
   public async snapshot(group: LocatorGroup): Promise<GroupSnapshot> {
+    if (this.#nativeDialogEpoch > 0) return nativeDialogSnapshot(group);
     return this.#delegate(this.#activePage).snapshot(group);
   }
 
@@ -179,7 +189,7 @@ export class ContextSemanticPage implements SemanticPage {
       page.isClosed() ||
       page.url() !== expectedUrl ||
       (this.#navigationEpochs.get(page) ?? 0) !== expectedEpoch ||
-      this.#delegate(page).nativeDialogEpoch() !== expectedDialogEpoch
+      this.#nativeDialogEpoch !== expectedDialogEpoch
     ) {
       this.#clearFilledPagePin();
       throw new AgentError(
@@ -283,7 +293,7 @@ export class ContextSemanticPage implements SemanticPage {
       this.#observedDialogEpoch !== 0 ||
       currentUrl !== this.#observedUrl ||
       (this.#navigationEpochs.get(this.#activePage) ?? 0) !== this.#observedEpoch ||
-      this.#delegate(this.#activePage).nativeDialogEpoch() !== this.#observedDialogEpoch
+      this.#nativeDialogEpoch !== this.#observedDialogEpoch
     ) {
       throw new AgentError(
         "TRANSPORT_INDETERMINATE",
@@ -370,7 +380,7 @@ export class ContextSemanticPage implements SemanticPage {
       filledDialogEpoch !== 0 ||
       filledPage.url() !== filledUrl ||
       (this.#navigationEpochs.get(filledPage) ?? 0) !== filledEpoch ||
-      this.#delegate(filledPage).nativeDialogEpoch() !== filledDialogEpoch
+      this.#nativeDialogEpoch !== filledDialogEpoch
     ) {
       this.#clearFilledPagePin();
       throw new AgentError(
@@ -473,10 +483,45 @@ export class ContextSemanticPage implements SemanticPage {
   #delegate(page: Page): PlaywrightSemanticPage {
     const existing = this.#delegates.get(page);
     if (existing !== undefined) return existing;
-    const created = new PlaywrightSemanticPage(page);
+    const created = new PlaywrightSemanticPage(page, () => {
+      this.#nativeDialogEpoch += 1;
+      // A dialog on any page can race a queued action on another target. Abort
+      // the entire dedicated browser process first: target/context close
+      // commands do not preempt an evaluate already queued on another page.
+      const browser = typeof this.#context.browser === "function"
+        ? this.#context.browser()
+        : null;
+      if (browser !== null && typeof browser.close === "function") {
+        void browser.close().catch(() => undefined);
+        return true;
+      }
+      if (typeof this.#activePage.close === "function") {
+        void this.#activePage.close({ runBeforeUnload: false }).catch(() => undefined);
+      }
+      if (typeof this.#context.close === "function") {
+        void this.#context.close().catch(() => undefined);
+      }
+      // Without an owning Browser, also let the delegate close the page that
+      // raised the dialog. Mock/embedded contexts may not implement a context
+      // close that actually tears down every target.
+      return false;
+    });
     this.#delegates.set(page, created);
     return created;
   }
+}
+
+function nativeDialogSnapshot(group: LocatorGroup): GroupSnapshot {
+  const elements = group.signal === "modal"
+    ? [{ visible: true, enabled: false, text: "", value: "", accessibleLabel: "" }]
+    : [];
+  return {
+    signal: group.signal,
+    matchedCandidates: group.signal === "modal" ? group.minimumCandidateMatches : 0,
+    visibleElements: elements.length,
+    enabledElements: 0,
+    elements,
+  };
 }
 
 function uniqueConfiguredCopilotPage(
