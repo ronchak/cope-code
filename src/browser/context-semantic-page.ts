@@ -77,16 +77,7 @@ export class ContextSemanticPage implements SemanticPage {
       this.#markCurrentAuthenticationPagesStale(pages);
     }
 
-    const selectablePages = returnedConfiguredPage === undefined
-      ? pages.filter((page) =>
-        !this.#staleAuthenticationPages.has(page) ||
-        !isGenuineManualAuthenticationUrl(page.url(), this.#config))
-      : pages;
-    const selected = returnedConfiguredPage ?? selectActiveCopilotPage(
-      selectablePages,
-      this.#config,
-      this.#activePage,
-    );
+    const selected = returnedConfiguredPage ?? this.#selectCurrentPage(pages);
 
     if (isGenuineManualAuthenticationUrl(selected.url(), this.#config)) {
       this.#trackAuthenticationSelection(pages, selected);
@@ -204,9 +195,8 @@ export class ContextSemanticPage implements SemanticPage {
   }
 
   #verifiedObservedPage(): Page {
-    const selected = selectActiveCopilotPage(
+    const selected = this.#selectCurrentPage(
       this.#context.pages(),
-      this.#config,
       this.#activePage,
     );
     const currentUrl = this.#activePage.url();
@@ -276,9 +266,8 @@ export class ContextSemanticPage implements SemanticPage {
 
     let selected: Page;
     try {
-      selected = selectActiveCopilotPage(
+      selected = this.#selectCurrentPage(
         this.#context.pages(),
-        this.#config,
         filledPage,
       );
     } catch (error) {
@@ -299,6 +288,17 @@ export class ContextSemanticPage implements SemanticPage {
       );
     }
     return filledPage;
+  }
+
+  #selectCurrentPage(
+    pages: readonly Page[],
+    preferred: Page = this.#activePage,
+  ): Page {
+    const selectablePages = pages.filter((page) =>
+      !this.#staleAuthenticationPages.has(page) ||
+      !isGenuineManualAuthenticationUrl(page.url(), this.#config)
+    );
+    return selectActiveCopilotPage(selectablePages, this.#config, preferred);
   }
 
   #returnedConfiguredPage(pages: readonly Page[]): Page | undefined {
