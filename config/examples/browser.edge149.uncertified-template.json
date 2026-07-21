@@ -184,16 +184,18 @@
         "signal": "protection",
         "candidates": [
           {
-            "kind": "text",
-            "text": {
-              "source": "enterprise data protection|protected",
+            "kind": "role",
+            "role": "status",
+            "name": {
+              "source": "^(?:enterprise data protection|commercial data protection)$",
               "flags": "iu"
             }
           },
           {
-            "kind": "test-id",
-            "testId": {
-              "source": "protection|commercial-data-protection",
+            "kind": "role",
+            "role": "img",
+            "name": {
+              "source": "^(?:enterprise data protection|commercial data protection)$",
               "flags": "iu"
             }
           }

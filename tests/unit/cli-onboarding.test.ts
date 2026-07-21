@@ -16,6 +16,8 @@ import type {
   DiscoveredBrowser,
   EdgeCopilotTransport,
 } from "../../src/browser/index.js";
+import { createBaselineCopilotUiContract } from "../../src/browser/index.js";
+import { parseBrowserConfig } from "../../src/config/loader.js";
 import { AgentError } from "../../src/shared/errors.js";
 import { PromptCancelledError } from "../../src/cli/prompts.js";
 import { createStandardUserHost } from "../helpers/standard-user-host.js";
@@ -360,6 +362,127 @@ test("existing browser setup remains selected and is not silently rewritten", as
   assert.deepEqual(launched.at(-1)?.manualAuthenticationHosts, [
     { hostname: "login.microsoftonline.com", allowSubdomains: false },
   ]);
+});
+
+test("forced setup replaces only an invalid pinned UI contract", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-machine-stale-contract-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const stateHome = path.join(root, "state");
+  await mkdir(stateHome, { mode: 0o700 });
+  const host = createStandardUserHost();
+  const paths = configurationPaths(stateHome, host);
+  const edge = discoveredBrowser("edge");
+  const launched: BrowserLaunchConfig[] = [];
+  const dependencies = {
+    discoverBrowsers: async () => [edge],
+    verifyManualBrowser: async (product: BrowserProduct, executablePath: string) => ({
+      ...discoveredBrowser(product, executablePath),
+      source: "manual" as const,
+    }),
+    launchBrowser: async (config: BrowserLaunchConfig) => {
+      launched.push(config);
+      return readyTransport(launched);
+    },
+    promptText: acceptPromptDefault,
+  };
+
+  await configureMachine({
+    paths,
+    force: false,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+    browser: "edge",
+    identity: "person@example.com",
+  }, dependencies);
+
+  const stale = JSON.parse(await readFile(paths.browser, "utf8")) as Record<string, unknown>;
+  const unsafeContract = structuredClone(
+    createBaselineCopilotUiContract("person@example.com"),
+  ) as unknown as {
+    groups: Record<string, { candidates: Array<Record<string, unknown>> }>;
+  };
+  const protection = unsafeContract.groups.protection;
+  assert.ok(protection);
+  protection.candidates = [{
+    kind: "text",
+    text: { source: "enterprise data protection|protected", flags: "iu" },
+  }];
+  stale.ui_contract = unsafeContract;
+  const staleBytes = `${JSON.stringify(stale)}\n`;
+  await writeFile(paths.browser, staleBytes, "utf8");
+
+  assert.throws(() => parseBrowserConfig(stale), /protection/iu);
+  await assert.rejects(
+    configureMachine({
+      paths,
+      force: false,
+      interactive: false,
+      output: { write: () => undefined },
+      host,
+    }, dependencies),
+    /was not replaced/u,
+  );
+  assert.equal(await readFile(paths.browser, "utf8"), staleBytes);
+
+  const invalidBeyondContract = { ...stale, unexpected_top_level: true };
+  const invalidBytes = `${JSON.stringify(invalidBeyondContract)}\n`;
+  await writeFile(paths.browser, invalidBytes, "utf8");
+  await assert.rejects(
+    configureMachine({
+      paths,
+      force: true,
+      interactive: false,
+      output: { write: () => undefined },
+      host,
+    }, dependencies),
+    /was not replaced/u,
+  );
+  assert.equal(await readFile(paths.browser, "utf8"), invalidBytes);
+
+  await writeFile(paths.browser, staleBytes, "utf8");
+  launched.length = 0;
+  await configureMachine({
+    paths,
+    force: true,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+  }, dependencies);
+
+  assert.equal(launched.length, 1);
+  assert.ok(launched[0]?.uiContract.groups.protection.candidates.every(
+    (candidate) => candidate.kind === "role" &&
+      (candidate.role === "status" || candidate.role === "img"),
+  ));
+  const recovered = JSON.parse(await readFile(paths.browser, "utf8")) as Record<string, unknown>;
+  assert.equal(Object.hasOwn(recovered, "ui_contract"), false);
+  assert.doesNotThrow(() => parseBrowserConfig(recovered));
+
+  await writeFile(paths.browser, staleBytes, "utf8");
+  const externalChange = "external browser config change\n";
+  await assert.rejects(
+    configureMachine({
+      paths,
+      force: true,
+      interactive: false,
+      output: { write: () => undefined },
+      host,
+    }, {
+      ...dependencies,
+      launchBrowser: async (config) => {
+        assert.ok(config.uiContract.groups.protection.candidates.every(
+          (candidate) => candidate.kind === "role",
+        ));
+        await writeFile(paths.browser, externalChange, "utf8");
+        return readyTransport([]);
+      },
+    }),
+    (error: unknown) =>
+      error instanceof AgentError &&
+      error.details.diagnosticCode === "BROWSER_CONFIG_COMPARE_AND_SWAP_FAILED",
+  );
+  assert.equal(await readFile(paths.browser, "utf8"), externalChange);
 });
 
 test("noninteractive idempotent setup does not require a live GUI session", async (context) => {

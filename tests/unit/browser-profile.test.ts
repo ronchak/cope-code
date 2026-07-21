@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { validateEdgeProfileDirectoryPath } from "../../src/browser/config.js";
+import {
+  validateBrowserConfig,
+  validateEdgeProfileDirectoryPath,
+} from "../../src/browser/config.js";
 import {
   ExclusiveProfileLock,
   prepareDedicatedProfile,
@@ -44,11 +47,29 @@ test("shipped browser templates make their product-specific uncertified UI contr
   ] as const) {
     const template = JSON.parse(await readFile(filename, "utf8")) as {
       product?: string;
-      ui_contract?: { version?: string; certifiedSurface?: string };
+      ui_contract?: { version?: string; certifiedSurface?: string } & Record<string, unknown>;
     };
     assert.equal(template.product, product);
     assert.match(template.ui_contract?.version ?? "", new RegExp(`uncertified-${product}149-template`, "u"));
     assert.match(template.ui_contract?.certifiedSurface ?? "", /UNDEPLOYABLE TEMPLATE/u);
+    assert.doesNotThrow(() => validateBrowserConfig({
+      entryUrl: "https://copilot.example.test/chat",
+      approvedHosts: [{ hostname: "copilot.example.test" }],
+      uiContract: template.ui_contract as never,
+      expectedIdentity: "Synthetic Work Account",
+      requireProtectionIndicator: true,
+      maxMessageChars: 1_000,
+      maxResponseChars: 1_000,
+      waits: {
+        actionMs: 100,
+        submissionConfirmationMs: 100,
+        responseMs: 100,
+        manualReadinessMs: 100,
+        pollMs: 10,
+        stableSamples: 2,
+        minimumStableMs: 10,
+      },
+    }));
   }
 });
 
