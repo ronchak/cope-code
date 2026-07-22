@@ -150,6 +150,8 @@ Define separate periods for:
 
 Use the shortest period compatible with recovery, incident handling, and records obligations. This code uses restrictive creation modes and best-effort deletion, but does not provide cryptographic secure erase, BitLocker management, enterprise backup exclusion, or eDiscovery integration. SSD/file-system deletion semantics require the organization's endpoint policy.
 
+For a managed-policy failure, do not delete both managed files to obtain local fallback. Verify the installed bundle/trust hashes against the deployment record, inspect the source-free diagnostic, and have the policy owner atomically deliver a newly signed, fresh bundle or corrected trust pair. An active signed kill switch is intentionally non-recoverable from repository/session policy. Emergency re-enable requires a valid current bundle through the governed endpoint channel.
+
 Never include state directories, checkpoints, dedicated browser profiles, or raw diagnostics in Git, support tickets, chat, email, or test fixtures.
 
 ## Browser configuration and product recovery

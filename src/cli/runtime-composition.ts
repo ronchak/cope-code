@@ -385,6 +385,11 @@ export function effectiveGrantSummary(
       repository: configuration.hashes.repository,
       grant: sha256(stableJson(grant)),
     },
+    managed_policy: configuration.managedPolicy === undefined ? null : {
+      source: "verified_local_bundle",
+      ...configuration.managedPolicy.provenance,
+      killSwitchEnabled: configuration.managedPolicy.killSwitch.enabled,
+    },
   }, null, 2);
 }
 
