@@ -294,10 +294,14 @@ test("ownerless operation timeout shares context teardown and retains the lock u
     rejectionWithin(transport.inspectState(), ASYNC_DEADLOCK_WATCHDOG_MS),
     rejectionWithin(transport.inspectState(), ASYNC_DEADLOCK_WATCHDOG_MS),
   ]);
-  for (const error of [firstError, secondError]) {
+  const diagnosticCodes = [firstError, secondError].map((error) => {
     assert.equal(error instanceof AgentError, true);
-    assert.equal((error as AgentError).details.diagnosticCode, "BROWSER_OPERATION_TIMEOUT");
-  }
+    return (error as AgentError).details.diagnosticCode;
+  }).sort();
+  assert.deepEqual(diagnosticCodes, [
+    "BROWSER_OPERATION_TIMEOUT",
+    "CONCURRENT_BROWSER_OPERATION",
+  ]);
   await transport.close();
   assert.equal(context.closeCalls, 1);
   await assert.rejects(ExclusiveProfileLock.acquire(profile), lockedProfileError);

@@ -53,6 +53,13 @@ snapshot remains sticky. Navigation, replacement-page, authentication-popup,
 second-configured-page, and native-dialog races therefore cannot certify a
 mixed-time `READY` state.
 
+The adapter also rejects overlapping inspect, readiness, submit, resolve, and
+receive operations before a second operation can sample or act. This keeps the
+observation evidence private to one logical transport operation and prevents a
+later caller from laundering a same-URL navigation into an earlier snapshot.
+The rejection is pre-dispatch and source-free; emergency stop remains
+immediately available.
+
 The action, manual-readiness, and polling bounds are unchanged. Timeout
 revocation and owner teardown remain fail-closed. The first timed-out operation
 now supplies one sanitized origin to every concurrently revoked probe, so

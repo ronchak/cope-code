@@ -112,6 +112,7 @@ export class CopilotBrowserAdapter implements ModelTransport {
   readonly #taskConversations = new Map<string, string>();
   #stopped = false;
   #closed = false;
+  #operationActive = false;
 
   public constructor(
     page: SemanticPage,
@@ -128,6 +129,10 @@ export class CopilotBrowserAdapter implements ModelTransport {
   }
 
   public async inspectState(): Promise<BrowserStateInspection> {
+    return this.#runExclusiveBrowserOperation(() => this.#inspectState());
+  }
+
+  async #inspectState(): Promise<BrowserStateInspection> {
     this.#assertUsable();
     const { observation, classification } = await this.#observeReadiness();
     return this.#inspection(observation, classification);
@@ -136,6 +141,15 @@ export class CopilotBrowserAdapter implements ModelTransport {
   /** Waits for the user to complete sign-in, MFA, or consent; never interacts with those controls. */
   public async waitForManualReadiness(
     maxWaitMs = this.#config.waits.manualReadinessMs,
+    signal?: AbortSignal,
+  ): Promise<BrowserStateInspection> {
+    return this.#runExclusiveBrowserOperation(
+      () => this.#waitForManualReadiness(maxWaitMs, signal),
+    );
+  }
+
+  async #waitForManualReadiness(
+    maxWaitMs: number,
     signal?: AbortSignal,
   ): Promise<BrowserStateInspection> {
     const boundedWait = Math.min(maxWaitMs, this.#config.waits.manualReadinessMs);
@@ -173,6 +187,13 @@ export class CopilotBrowserAdapter implements ModelTransport {
     request: SubmissionRequest,
     options: TransportCallOptions = {},
   ): Promise<SubmissionReceipt> {
+    return this.#runExclusiveBrowserOperation(() => this.#submit(request, options));
+  }
+
+  async #submit(
+    request: SubmissionRequest,
+    options: TransportCallOptions,
+  ): Promise<SubmissionReceipt> {
     this.#assertUsable(options.signal);
     assertValidCorrelation(request);
     this.#validateContent(request.content);
@@ -183,7 +204,7 @@ export class CopilotBrowserAdapter implements ModelTransport {
       this.#assertRecordMatches(existing, request, true);
       if (existing.receipt.status === "submitted") return existing.receipt;
       if (existing.receipt.status === "indeterminate") {
-        const resolved = await this.resolveSubmission(request, options);
+        const resolved = await this.#resolveSubmission(request, options);
         if (resolved.status !== "not-submitted") return resolved;
       }
       // A repeated call is an explicit retry and is only allowed after the
@@ -365,6 +386,15 @@ export class CopilotBrowserAdapter implements ModelTransport {
     request: SubmissionResolutionRequest,
     options: TransportCallOptions = {},
   ): Promise<SubmissionReceipt> {
+    return this.#runExclusiveBrowserOperation(
+      () => this.#resolveSubmission(request, options),
+    );
+  }
+
+  async #resolveSubmission(
+    request: SubmissionResolutionRequest,
+    options: TransportCallOptions,
+  ): Promise<SubmissionReceipt> {
     this.#assertUsable(options.signal);
     assertValidCorrelation(request);
     this.#assertKnownCorrelation(request);
@@ -461,6 +491,13 @@ export class CopilotBrowserAdapter implements ModelTransport {
     request: ReceiveRequest,
     options: TransportCallOptions = {},
   ): Promise<ReceiveResult> {
+    return this.#runExclusiveBrowserOperation(() => this.#receive(request, options));
+  }
+
+  async #receive(
+    request: ReceiveRequest,
+    options: TransportCallOptions,
+  ): Promise<ReceiveResult> {
     if (isAborted(options.signal)) return this.#cancelled(request, "ABORTED");
     try {
       this.#assertUsable(options.signal);
@@ -475,7 +512,7 @@ export class CopilotBrowserAdapter implements ModelTransport {
 
     const record = this.#records.get(request.submissionId);
     if (record !== undefined) this.#assertRecordMatches(record, request, false);
-    const resolution = await this.resolveSubmission(request, options);
+    const resolution = await this.#resolveSubmission(request, options);
     if (resolution.status !== "submitted") {
       return this.#receiveBase(request, {
         status: "blocked",
@@ -608,6 +645,25 @@ export class CopilotBrowserAdapter implements ModelTransport {
 
   public async close(): Promise<void> {
     this.#closed = true;
+  }
+
+  async #runExclusiveBrowserOperation<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.#operationActive) {
+      throw new AgentError(
+        "TRANSPORT_INDETERMINATE",
+        "Another semantic browser operation is already in progress",
+        {
+          diagnosticCode: "CONCURRENT_BROWSER_OPERATION",
+          dispatchAttempted: false,
+        },
+      );
+    }
+    this.#operationActive = true;
+    try {
+      return await operation();
+    } finally {
+      this.#operationActive = false;
+    }
   }
 
   async #confirmSubmission(record: SubmissionRecord, signal?: AbortSignal): Promise<SubmissionReceipt> {
