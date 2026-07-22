@@ -19,6 +19,7 @@ import {
   classifyCopilotPage,
   groupMatches,
   observeCopilotPage,
+  observeCopilotReadinessPage,
   type PageClassification,
 } from "./classifier.js";
 import {
@@ -128,7 +129,7 @@ export class CopilotBrowserAdapter implements ModelTransport {
 
   public async inspectState(): Promise<BrowserStateInspection> {
     this.#assertUsable();
-    const { observation, classification } = await this.#observe();
+    const { observation, classification } = await this.#observeReadiness();
     return this.#inspection(observation, classification);
   }
 
@@ -142,7 +143,7 @@ export class CopilotBrowserAdapter implements ModelTransport {
       throw new TypeError("Manual readiness wait must be positive and bounded");
     }
     const deadline = this.#monotonicNow() + boundedWait;
-    let observed = await this.#observe();
+    let observed = await this.#observeReadiness();
     let inspection = this.#inspection(observed.observation, observed.classification);
     while (inspection.classification.state !== "ready" && this.#monotonicNow() < deadline) {
       const approvedManualAuthenticationRedirect =
@@ -162,7 +163,7 @@ export class CopilotBrowserAdapter implements ModelTransport {
         return inspection;
       }
       await this.#boundedSleep(deadline, signal);
-      observed = await this.#observe();
+      observed = await this.#observeReadiness();
       inspection = this.#inspection(observed.observation, observed.classification);
     }
     return inspection;
@@ -684,6 +685,18 @@ export class CopilotBrowserAdapter implements ModelTransport {
   async #observe(): Promise<ObservedPageState> {
     this.#assertUsable();
     const observation = await observeCopilotPage(this.#page, this.#config.uiContract);
+    this.#assertUsable();
+    const classification = classifyCopilotPage(
+      observation,
+      this.#config.uiContract,
+      this.#config,
+    );
+    return { observation, classification };
+  }
+
+  async #observeReadiness(): Promise<ObservedPageState> {
+    this.#assertUsable();
+    const observation = await observeCopilotReadinessPage(this.#page, this.#config.uiContract);
     this.#assertUsable();
     const classification = classifyCopilotPage(
       observation,

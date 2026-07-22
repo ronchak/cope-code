@@ -56,15 +56,54 @@ const SIGNALS: readonly CopilotSignal[] = [
   "modal",
 ];
 
+// Setup/manual readiness proves whether the current page is safe and actionable;
+// it never consumes historical prompt or response text. Keep transcript capture
+// out of this path so a large authenticated conversation cannot turn an
+// otherwise ready page into a session-revoking observation timeout. Submission
+// and response correlation continue to use the full SIGNALS observation below.
+const READINESS_SIGNALS: readonly CopilotSignal[] = SIGNALS.filter(
+  (signal) => signal !== "responses" && signal !== "user-messages",
+);
+
 export async function observeCopilotPage(
   page: SemanticPage,
   contract: CopilotUiContract,
 ): Promise<CopilotPageObservation> {
+  return observeSignals(page, contract, SIGNALS);
+}
+
+export async function observeCopilotReadinessPage(
+  page: SemanticPage,
+  contract: CopilotUiContract,
+): Promise<CopilotPageObservation> {
+  return observeSignals(page, contract, READINESS_SIGNALS);
+}
+
+async function observeSignals(
+  page: SemanticPage,
+  contract: CopilotUiContract,
+  signals: readonly CopilotSignal[],
+): Promise<CopilotPageObservation> {
   const url = await page.currentUrl();
   const entries = await Promise.all(
-    SIGNALS.map(async (signal) => [signal, await page.snapshot(contract.groups[signal])] as const),
+    signals.map(async (signal) => [signal, await page.snapshot(contract.groups[signal])] as const),
   );
-  return { url, ...Object.fromEntries(entries) } as CopilotPageObservation;
+  const emptyEntries = SIGNALS.map((signal) => [signal, emptySnapshot(signal)] as const);
+  return {
+    url,
+    ...Object.fromEntries(emptyEntries),
+    ...Object.fromEntries(entries),
+  } as CopilotPageObservation;
+}
+
+function emptySnapshot(signal: CopilotSignal): GroupSnapshot {
+  return {
+    signal,
+    matchedCandidates: 0,
+    visibleElements: 0,
+    enabledElements: 0,
+    elements: [],
+  };
 }
 
 export function classifyCopilotPage(

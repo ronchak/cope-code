@@ -7,6 +7,7 @@ import { ContextSemanticPage } from "../../src/browser/context-semantic-page.js"
 import { PlaywrightSemanticPage } from "../../src/browser/playwright-semantic-page.js";
 import { AgentError } from "../../src/shared/errors.js";
 import type { LocatorGroup } from "../../src/browser/contracts.js";
+import { renderHumanError } from "../../src/cli/friendly-output.js";
 
 const composerGroup: LocatorGroup = {
   signal: "composer",
@@ -21,6 +22,13 @@ const sendGroup: LocatorGroup = {
   minimumCandidateMatches: 1,
   maximumElements: 1,
   capture: "presence",
+};
+const responsesGroup: LocatorGroup = {
+  signal: "responses",
+  candidates: [{ kind: "css", selector: "[data-content='ai-message']" }],
+  minimumCandidateMatches: 1,
+  maximumElements: 200,
+  capture: "text",
 };
 
 interface Deferred<T> {
@@ -73,6 +81,15 @@ class TimeoutPage {
   public context(): BrowserContext {
     return { browser: () => null } as unknown as BrowserContext;
   }
+}
+
+class BlockedTextLocator {
+  public async count(): Promise<number> { return 1; }
+  public nth(_index: number): Locator { return this as unknown as Locator; }
+  public async isVisible(): Promise<boolean> { return true; }
+  public async isEnabled(): Promise<boolean> { return true; }
+  public async innerText(): Promise<string> { return new Promise<string>(() => {}); }
+  public async getAttribute(_name: string): Promise<string | null> { return null; }
 }
 
 function timeoutError(error: unknown): AgentError {
@@ -171,6 +188,37 @@ test("concurrent blocked snapshots share one termination and cannot swallow time
   const laterError = await rejectionWithin(semantic.snapshot(composerGroup), 100);
   assert.equal(timeoutError(laterError).details.dispatchAttempted, false);
   assert.equal(terminationCalls, 1);
+  terminationRelease.resolve();
+});
+
+test("snapshot timeout diagnostics identify only the stalled semantic operation", async () => {
+  const terminationRelease = deferred<void>();
+  const semantic = new PlaywrightSemanticPage(
+    new TimeoutPage(new BlockedTextLocator()) as unknown as Page,
+    undefined,
+    10,
+    async () => { await terminationRelease.promise; },
+  );
+
+  const observedError = timeoutError(await rejectionWithin(
+    semantic.snapshot(responsesGroup),
+    100,
+  ));
+  assert.equal(observedError.details.semanticGroup, "responses");
+  assert.equal(observedError.details.semanticOperation, "locator.innerText");
+  assert.equal(observedError.details.locatorKind, "css");
+  assert.equal(observedError.details.locatorCandidateIndex, 1);
+  assert.equal(observedError.details.elementIndex, 1);
+
+  const serialized = JSON.stringify(observedError.details);
+  assert.equal(serialized.includes("ai-message"), false);
+  assert.equal(serialized.includes("selector"), false);
+  const rendered = renderHumanError(observedError);
+  assert.match(
+    rendered,
+    /Stalled browser probe: responses \/ locator\.innerText; css candidate 1; element 1/u,
+  );
+  assert.equal(rendered.includes("ai-message"), false);
   terminationRelease.resolve();
 });
 

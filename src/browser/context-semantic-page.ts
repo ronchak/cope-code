@@ -598,6 +598,8 @@ export class ContextSemanticPage implements SemanticPage {
       {
         diagnosticCode: "BROWSER_OPERATION_TIMEOUT",
         dispatchAttempted: false,
+        semanticGroup: "context",
+        semanticOperation: "session-revoked",
       },
     );
   }

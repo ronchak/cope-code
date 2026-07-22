@@ -2,7 +2,52 @@
 
 ## Status
 
-Urgent live Windows blocker. Reproduced on a Windows workstation after updating to current `main` and rebuilding/linking Cope 0.1.2.
+Root cause isolated and a focused fix is under validation in PR #25. The
+original live Windows reproduction remains the required release gate; this
+document does not claim that gate has passed until the exact final commit is
+rerun on the authenticated Windows Edge profile.
+
+## Root cause
+
+Setup readiness used the same full semantic observation as prompt/response
+correlation. `CopilotBrowserAdapter.inspectState()` called
+`observeCopilotPage()`, which started every semantic group concurrently and
+waited for all of them. That included the `responses` and `user-messages`
+groups, even though neither historical transcript is consumed by readiness
+classification.
+
+Each transcript CSS candidate can match up to 200 elements. The Playwright
+adapter then inspected those elements sequentially with `isVisible()`,
+`isEnabled()`, and `innerText()` calls. A history-rich authenticated page could
+therefore hold the entire observation behind hundreds of renderer round trips.
+If the response candidate was still in `locator.innerText()` when the shared
+15-second action deadline expired, the required session-wide timeout revocation
+correctly terminated the browser context and surfaced
+`BROWSER_OPERATION_TIMEOUT`.
+
+The fault was isolated without changing any timeout: a real Playwright page
+with an immediately actionable composer and 200 historical response elements
+completed the composer probe promptly while the response-group scan scaled
+linearly across 200 visibility and 200 text calls. A deterministic adapter
+regression then reproduced the setup failure by stalling only the historical
+transcript probe; it fails on the original PR behavior and passes with the fix.
+
+## Fix
+
+Readiness now uses a purpose-specific semantic observation that omits only
+`responses` and `user-messages`. It still verifies the configured page and all
+readiness and safety signals: shell, conversation, actionable composer, send,
+streaming, identity, protection, signed-out, MFA, consent, throttling, service
+errors, and blocking/native dialogs. Full prompt submission, response
+correlation, and exactly-once recovery continue to use the complete transcript
+observation.
+
+The action, manual-readiness, and polling bounds are unchanged. Timeout
+revocation and owner teardown are unchanged. When a bounded Playwright call
+does stall, the error now reports source-free fields for the semantic group,
+Playwright operation, locator kind/candidate number, and element number. These
+fields never include selector source, URL, identity, page text, prompt text, or
+response text.
 
 ## User-visible failure
 
