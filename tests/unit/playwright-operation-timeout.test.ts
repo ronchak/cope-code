@@ -4,9 +4,14 @@ import test from "node:test";
 import type { Browser, BrowserContext, ElementHandle, Frame, Locator, Page } from "playwright-core";
 
 import { ContextSemanticPage } from "../../src/browser/context-semantic-page.js";
-import { PlaywrightSemanticPage } from "../../src/browser/playwright-semantic-page.js";
+import {
+  PlaywrightSemanticPage,
+  type BrowserOperationTimeoutOrigin,
+} from "../../src/browser/playwright-semantic-page.js";
 import { AgentError } from "../../src/shared/errors.js";
 import type { LocatorGroup } from "../../src/browser/contracts.js";
+import { renderHumanError } from "../../src/cli/friendly-output.js";
+import { main } from "../../src/cli/main.js";
 
 const composerGroup: LocatorGroup = {
   signal: "composer",
@@ -21,6 +26,13 @@ const sendGroup: LocatorGroup = {
   minimumCandidateMatches: 1,
   maximumElements: 1,
   capture: "presence",
+};
+const responsesGroup: LocatorGroup = {
+  signal: "responses",
+  candidates: [{ kind: "css", selector: "[data-content='ai-message']" }],
+  minimumCandidateMatches: 1,
+  maximumElements: 200,
+  capture: "text",
 };
 
 interface Deferred<T> {
@@ -73,6 +85,15 @@ class TimeoutPage {
   public context(): BrowserContext {
     return { browser: () => null } as unknown as BrowserContext;
   }
+}
+
+class BlockedTextLocator {
+  public async count(): Promise<number> { return 1; }
+  public nth(_index: number): Locator { return this as unknown as Locator; }
+  public async isVisible(): Promise<boolean> { return true; }
+  public async isEnabled(): Promise<boolean> { return true; }
+  public async innerText(): Promise<string> { return new Promise<string>(() => {}); }
+  public async getAttribute(_name: string): Promise<string | null> { return null; }
 }
 
 function timeoutError(error: unknown): AgentError {
@@ -174,6 +195,117 @@ test("concurrent blocked snapshots share one termination and cannot swallow time
   terminationRelease.resolve();
 });
 
+test("snapshot timeout diagnostics identify only the stalled semantic operation", async () => {
+  const terminationRelease = deferred<void>();
+  const semantic = new PlaywrightSemanticPage(
+    new TimeoutPage(new BlockedTextLocator()) as unknown as Page,
+    undefined,
+    10,
+    async () => { await terminationRelease.promise; },
+  );
+  const multiCandidateResponses: LocatorGroup = {
+    ...responsesGroup,
+    candidates: [
+      ...responsesGroup.candidates,
+      { kind: "css", selector: "[data-private-second-candidate='never-log']" },
+    ],
+  };
+
+  const observedError = timeoutError(await rejectionWithin(
+    semantic.snapshot(multiCandidateResponses),
+    100,
+  ));
+  assert.equal(observedError.details.semanticGroup, "responses");
+  assert.equal(observedError.details.semanticOperation, "locator.innerText");
+  assert.equal(observedError.details.locatorKind, "css");
+  assert.equal(observedError.details.locatorCandidateIndex, 1);
+  assert.equal(observedError.details.elementIndex, 1);
+  assert.equal(
+    Array.isArray(observedError.details.pendingSemanticOperations),
+    true,
+  );
+
+  const serialized = JSON.stringify(observedError.details);
+  assert.equal(serialized.includes("ai-message"), false);
+  assert.equal(serialized.includes("never-log"), false);
+  assert.equal(serialized.includes("selector"), false);
+  const rendered = renderHumanError(observedError);
+  assert.match(
+    rendered,
+    /Stalled browser probe: responses \/ locator\.innerText; css candidate 1; element 1/u,
+  );
+  assert.equal(rendered.includes("ai-message"), false);
+  terminationRelease.resolve();
+});
+
+test("JSON, human, and debug timeout output omit selector, URL, identity, and content taints", async () => {
+  const taints = [
+    "[data-private-selector='tenant-secret']",
+    "https://m365.cloud.microsoft/chat/conversation/private-id",
+    "operator@private.example",
+    "private prior chat text",
+    "private prompt and response text",
+  ] as const;
+  const taintedLocator = {
+    count: async () => {
+      busySpin(20);
+      throw new Error(taints.join(" | "));
+    },
+  };
+  const semantic = new PlaywrightSemanticPage(
+    new TimeoutPage(taintedLocator) as unknown as Page,
+    undefined,
+    10,
+    async () => undefined,
+  );
+  const taintedGroup: LocatorGroup = {
+    ...composerGroup,
+    candidates: [{ kind: "css", selector: taints[0] }],
+  };
+  const observed = timeoutError(await rejectionWithin(semantic.snapshot(taintedGroup), 100));
+  const publicError = new AgentError(
+    observed.code,
+    observed.message,
+    observed.details,
+    { cause: new Error(taints.join(" | ")) },
+  );
+  assert.equal((publicError.cause as Error).message, taints.join(" | "));
+
+  let jsonOutput = "";
+  const jsonExit = await main(["setup", "--json"], {
+    stdout: stream((value) => { jsonOutput += value; }),
+    stderr: stream(() => undefined),
+    executeCommand: async () => { throw publicError; },
+  });
+  assert.equal(jsonExit, 1);
+
+  let humanOutput = "";
+  const previousDebug = process.env.COPE_DEBUG;
+  process.env.COPE_DEBUG = "1";
+  try {
+    const humanExit = await main(["setup"], {
+      stdout: stream(() => undefined),
+      stderr: stream((value) => { humanOutput += value; }),
+      executeCommand: async () => { throw publicError; },
+    });
+    assert.equal(humanExit, 1);
+  } finally {
+    if (previousDebug === undefined) delete process.env.COPE_DEBUG;
+    else process.env.COPE_DEBUG = previousDebug;
+  }
+
+  for (const output of [jsonOutput, humanOutput]) {
+    for (const taint of taints) assert.equal(output.includes(taint), false);
+    assert.match(output, /BROWSER_OPERATION_TIMEOUT/u);
+    assert.match(output, /composer/u);
+    assert.match(output, /locator\.count/u);
+  }
+});
+
+function stream<T>(write: (value: string) => void): T {
+  return { write: (value: string) => { write(value); return true; } } as unknown as T;
+}
+
 test("one delegate timeout immediately revokes concurrent work in another delegate", async () => {
   const controller = new AbortController();
   const terminationRelease = deferred<void>();
@@ -226,6 +358,53 @@ test("one delegate timeout immediately revokes concurrent work in another delega
   assert.equal(timeoutError(laterError).details.dispatchAttempted, false);
   assert.equal(terminationStarts, 1);
   terminationRelease.resolve();
+});
+
+test("shared revocation reports the first stalled operation instead of the first rejection", async () => {
+  const controller = new AbortController();
+  let origin: BrowserOperationTimeoutOrigin | undefined;
+  let terminationCalls = 0;
+  let sharedTermination: Promise<void> | undefined;
+  const terminate = (candidate: BrowserOperationTimeoutOrigin) => {
+    origin ??= candidate;
+    controller.abort();
+    sharedTermination ??= Promise.resolve().then(() => { terminationCalls += 1; });
+    return sharedTermination;
+  };
+  const originEvidence = () => origin;
+  const peer = new PlaywrightSemanticPage(
+    new TimeoutPage(
+      new TimeoutLocator(new Promise<number>(() => {}), new TimeoutElement()),
+    ) as unknown as Page,
+    undefined,
+    1_000,
+    terminate,
+    controller.signal,
+    originEvidence,
+  );
+  const trigger = new PlaywrightSemanticPage(
+    new TimeoutPage(new BlockedTextLocator()) as unknown as Page,
+    undefined,
+    10,
+    terminate,
+    controller.signal,
+    originEvidence,
+  );
+
+  // Register the peer first so its abort rejection wins Promise.all. Public
+  // attribution must still identify the response innerText that fired first.
+  const observed = timeoutError(await rejectionWithin(Promise.all([
+    peer.snapshot(composerGroup),
+    trigger.snapshot(responsesGroup),
+  ]), 100));
+
+  assert.equal(observed.details.semanticGroup, "responses");
+  assert.equal(observed.details.semanticOperation, "locator.innerText");
+  assert.equal(observed.details.locatorKind, "css");
+  assert.equal(observed.details.locatorCandidateIndex, 1);
+  assert.equal(observed.details.elementIndex, 1);
+  assert.equal(observed.details.dispatchAttempted, false);
+  assert.equal(terminationCalls, 1);
 });
 
 function busySpin(milliseconds: number): void {

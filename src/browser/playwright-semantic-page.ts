@@ -8,27 +8,48 @@ import {
   type LocatorGroup,
   type SemanticActionGuard,
   type SemanticLocator,
+  type SemanticObservationCompletion,
   type SemanticPage,
   type TextPattern,
 } from "./contracts.js";
+
+export interface BrowserOperationTimeoutOrigin {
+  readonly semanticGroup: string;
+  readonly semanticOperation: string;
+  readonly locatorKind?: SemanticLocator["kind"];
+  readonly locatorCandidateIndex?: number;
+  readonly elementIndex?: number;
+  readonly pendingSemanticOperations?: readonly BrowserOperationTimeoutPoint[];
+}
+
+interface BrowserOperationTimeoutPoint {
+  readonly operation: string;
+  readonly locatorKind?: SemanticLocator["kind"];
+  readonly locatorCandidateIndex?: number;
+  readonly elementIndex?: number;
+}
 
 /** The only module that translates the UI contract into Playwright locators. */
 export class PlaywrightSemanticPage implements SemanticPage {
   readonly #page: Page;
   readonly #actionMs: number;
-  readonly #onOperationTimeout: (() => Promise<void>) | undefined;
+  readonly #onOperationTimeout:
+    ((origin: BrowserOperationTimeoutOrigin) => Promise<void>) | undefined;
   readonly #operationTimeoutSignal: AbortSignal | undefined;
+  readonly #operationTimeoutOrigin: (() => BrowserOperationTimeoutOrigin | undefined) | undefined;
   #operationTermination: Promise<void> | undefined;
   #operationTimedOut = false;
   #nativeDialogDetected = false;
   #nativeDialogEpoch = 0;
+  #observationDeadline: number | undefined;
 
   public constructor(
     page: Page,
     onNativeDialog?: () => boolean | void,
     actionMs = 15_000,
-    onOperationTimeout?: () => Promise<void>,
+    onOperationTimeout?: (origin: BrowserOperationTimeoutOrigin) => Promise<void>,
     operationTimeoutSignal?: AbortSignal,
+    operationTimeoutOrigin?: () => BrowserOperationTimeoutOrigin | undefined,
   ) {
     if (!Number.isSafeInteger(actionMs) || actionMs <= 0) {
       throw new TypeError("Playwright operation timeout must be a positive integer");
@@ -37,6 +58,7 @@ export class PlaywrightSemanticPage implements SemanticPage {
     this.#actionMs = actionMs;
     this.#onOperationTimeout = onOperationTimeout;
     this.#operationTimeoutSignal = operationTimeoutSignal;
+    this.#operationTimeoutOrigin = operationTimeoutOrigin;
     // Do not accept, dismiss, inspect, or automate unknown browser dialogs.
     // Leaving the dialog visible blocks consequential actions and the sticky
     // signal makes the adapter fail closed until the session is restarted.
@@ -61,25 +83,37 @@ export class PlaywrightSemanticPage implements SemanticPage {
   }
 
   public async currentUrl(): Promise<string> {
+    this.#observationDeadline = performance.now() + this.#actionMs;
     return this.#page.url();
+  }
+
+  public async completeObservation(): Promise<SemanticObservationCompletion> {
+    try {
+      return { nativeDialogDetected: this.#nativeDialogDetected };
+    } finally {
+      this.#observationDeadline = undefined;
+    }
   }
 
   public async bringToFront(
     deadline = performance.now() + this.#actionMs,
   ): Promise<void> {
+    const trace = operationTrace("page", "page.bringToFront");
     await this.#runBounded(async (assertWithinDeadline) => {
       // Page.bringToFront() has no Playwright timeout option. Check the shared
       // absolute deadline before issuing it, then let #runBounded race the raw
       // protocol promise against the Context-wide terminal timeout signal.
       assertWithinDeadline();
-      await this.#page.bringToFront();
-    }, () => false, deadline);
+      await traceOperation(trace, "page", { operation: "page.bringToFront" }, () =>
+        this.#page.bringToFront());
+    }, () => false, deadline, trace);
   }
 
   public async snapshot(
     group: LocatorGroup,
-    deadline = performance.now() + this.#actionMs,
+    deadline = this.#observationDeadline ?? performance.now() + this.#actionMs,
   ): Promise<GroupSnapshot> {
+    const trace = operationTrace(group.signal, "snapshot.aggregate");
     return this.#runBounded(async () => {
       if (this.#nativeDialogDetected) {
         const elements: readonly ElementSnapshot[] =
@@ -95,7 +129,8 @@ export class PlaywrightSemanticPage implements SemanticPage {
         };
       }
       const candidateSnapshots = await Promise.all(
-        group.candidates.map(async (candidate) => this.#snapshotCandidate(candidate, group)),
+        group.candidates.map(async (candidate, candidateIndex) =>
+          this.#snapshotCandidate(candidate, candidateIndex, group, trace)),
       );
       const matched = candidateSnapshots.filter((entry) => entry.length > 0);
       const richest = matched.reduce<readonly ElementSnapshot[]>(
@@ -119,7 +154,7 @@ export class PlaywrightSemanticPage implements SemanticPage {
         enabledElements: allElements.filter((element) => element.visible && element.enabled).length,
         elements,
       };
-    }, () => false, deadline);
+    }, () => false, deadline, trace);
   }
 
   public async fill(
@@ -129,9 +164,10 @@ export class PlaywrightSemanticPage implements SemanticPage {
     deadline = performance.now() + this.#actionMs,
   ): Promise<void> {
     let dispatchAttempted = false;
+    const trace = operationTrace(group.signal, "actionable-locator.search");
     await this.#runBounded(async (assertWithinDeadline) => {
       this.#assertNoNativeDialog();
-      const element = await this.#firstActionableOrThrow(group);
+      const element = await this.#firstActionableOrThrow(group, trace);
       this.#assertNoNativeDialog();
       guard();
       this.#assertNoNativeDialog();
@@ -140,7 +176,8 @@ export class PlaywrightSemanticPage implements SemanticPage {
       // boundary so no late evaluate can follow a timed-out discovery.
       assertWithinDeadline();
       dispatchAttempted = true;
-      await element.evaluate((node, nextValue) => {
+      await traceOperation(trace, "dispatch", { operation: "element.evaluate.fill" }, () =>
+        element.evaluate((node, nextValue) => {
       if (!(node instanceof HTMLElement) || !node.isConnected) {
         throw new Error("The bound composer element is no longer connected");
       }
@@ -223,9 +260,9 @@ export class PlaywrightSemanticPage implements SemanticPage {
           })
         : new Event("input", { bubbles: true });
       node.dispatchEvent(inputEvent);
-      }, value);
+        }, value));
       this.#assertNoNativeDialog(true);
-    }, () => dispatchAttempted, deadline);
+    }, () => dispatchAttempted, deadline, trace);
   }
 
   public async click(
@@ -234,15 +271,20 @@ export class PlaywrightSemanticPage implements SemanticPage {
     deadline = performance.now() + this.#actionMs,
   ): Promise<void> {
     let dispatchAttempted = false;
+    const trace = operationTrace(group.signal, "actionable-locator.search");
     await this.#runBounded(async (assertWithinDeadline) => {
       this.#assertNoNativeDialog();
-      const element = await this.#firstActionableOrThrow(group);
+      const element = await this.#firstActionableOrThrow(group, trace);
       this.#assertNoNativeDialog();
       guard();
       this.#assertNoNativeDialog();
       assertWithinDeadline();
       dispatchAttempted = true;
-      const dispatchStatus = await element.evaluate((node): "pre-dispatch" | "dispatched" => {
+      const dispatchStatus = await traceOperation(
+        trace,
+        "dispatch",
+        { operation: "element.evaluate.click" },
+        () => element.evaluate((node): "pre-dispatch" | "dispatched" => {
       if (!(node instanceof HTMLElement) || !node.isConnected) {
         return "pre-dispatch";
       }
@@ -337,7 +379,8 @@ export class PlaywrightSemanticPage implements SemanticPage {
       // boundary cannot prove whether page code observed a dispatch.
       node.click();
       return "dispatched";
-      });
+        }),
+      );
       this.#assertNoNativeDialog(true);
       if (dispatchStatus === "pre-dispatch") {
         throw new AgentError(
@@ -349,13 +392,14 @@ export class PlaywrightSemanticPage implements SemanticPage {
           },
         );
       }
-    }, () => dispatchAttempted, deadline);
+    }, () => dispatchAttempted, deadline, trace);
   }
 
   async #runBounded<T>(
     operation: (assertWithinDeadline: () => void) => Promise<T>,
     dispatchAttempted: () => boolean,
     deadline: number,
+    trace: BrowserOperationTrace,
   ): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let timerFired = false;
@@ -367,6 +411,7 @@ export class PlaywrightSemanticPage implements SemanticPage {
       {
         diagnosticCode: "BROWSER_OPERATION_TIMEOUT",
         dispatchAttempted: dispatchAttempted(),
+        ...(this.#operationTimeoutOrigin?.() ?? operationTraceDetails(trace)),
       },
       cause === undefined ? undefined : { cause },
     );
@@ -380,7 +425,7 @@ export class PlaywrightSemanticPage implements SemanticPage {
       if (timedOut) return;
       timedOut = true;
       this.#operationTimedOut = true;
-      termination = this.#terminateTimedOutOperation();
+      termination = this.#terminateTimedOutOperation(operationTraceDetails(trace));
       void termination.catch(() => undefined);
     };
     const timeout = new Promise<never>((_resolve, reject) => {
@@ -448,14 +493,14 @@ export class PlaywrightSemanticPage implements SemanticPage {
     }
   }
 
-  #terminateTimedOutOperation(): Promise<void> {
-    this.#operationTermination ??= this.#performTimedOutTermination();
+  #terminateTimedOutOperation(origin: BrowserOperationTimeoutOrigin): Promise<void> {
+    this.#operationTermination ??= this.#performTimedOutTermination(origin);
     return this.#operationTermination;
   }
 
-  async #performTimedOutTermination(): Promise<void> {
+  async #performTimedOutTermination(origin: BrowserOperationTimeoutOrigin): Promise<void> {
     if (this.#onOperationTimeout !== undefined) {
-      await this.#onOperationTimeout();
+      await this.#onOperationTimeout(origin);
       return;
     }
     const context = this.#page.context();
@@ -472,11 +517,25 @@ export class PlaywrightSemanticPage implements SemanticPage {
 
   async #snapshotCandidate(
     candidate: SemanticLocator,
+    candidateIndex: number,
     group: LocatorGroup,
+    trace: BrowserOperationTrace,
   ): Promise<readonly ElementSnapshot[]> {
+    const traceKey = `candidate:${candidateIndex}`;
+    const point = (operation: string, elementIndex?: number): BrowserOperationTracePoint => ({
+      operation,
+      locatorKind: candidate.kind,
+      locatorCandidateIndex: candidateIndex + 1,
+      ...(elementIndex === undefined ? {} : { elementIndex: elementIndex + 1 }),
+    });
     try {
       const locator = this.#locator(candidate);
-      const locatorCount = await locator.count();
+      const locatorCount = await traceOperation(
+        trace,
+        traceKey,
+        point("locator.count"),
+        () => locator.count(),
+      );
       // Identity is an ownership boundary, not content capture. Truncating a
       // larger result set could hide the conflicting current account after a
       // prefix of alternate-profile controls, so overflow contributes no quorum.
@@ -485,21 +544,60 @@ export class PlaywrightSemanticPage implements SemanticPage {
       const snapshots: ElementSnapshot[] = [];
       for (let index = 0; index < count; index += 1) {
         const item = locator.nth(index);
-        const visible = await safeBoolean(() => item.isVisible());
+        const visible = await safeBoolean(() => traceOperation(
+          trace,
+          traceKey,
+          point("locator.isVisible", index),
+          () => item.isVisible(),
+        ));
         if (!visible) continue;
         const enabled = await safeBoolean(async () => {
-          if (!await item.isEnabled()) return false;
+          if (!await traceOperation(
+            trace,
+            traceKey,
+            point("locator.isEnabled", index),
+            () => item.isEnabled(),
+          )) return false;
           if (group.signal !== "composer") return true;
-          if (!await item.isEditable()) return false;
-          return (await item.getAttribute("aria-readonly"))?.trim().toLowerCase() !== "true";
+          if (!await traceOperation(
+            trace,
+            traceKey,
+            point("locator.isEditable", index),
+            () => item.isEditable(),
+          )) return false;
+          return (await traceOperation(
+            trace,
+            traceKey,
+            point("locator.getAttribute", index),
+            () => item.getAttribute("aria-readonly"),
+          ))?.trim().toLowerCase() !== "true";
         });
         const captureText = group.capture !== "presence";
-        const text = captureText ? await safeString(() => item.innerText()) : "";
+        const text = captureText
+          ? await safeString(() => traceOperation(
+              trace,
+              traceKey,
+              point("locator.innerText", index),
+              () => item.innerText(),
+            ))
+          : "";
         const accessibleLabel = captureText
-          ? await safeString(async () => (await item.getAttribute("aria-label")) ?? "")
+          ? await safeString(async () => (await traceOperation(
+              trace,
+              traceKey,
+              point("locator.getAttribute", index),
+              () => item.getAttribute("aria-label"),
+            )) ?? "")
           : "";
         const value =
-          group.capture === "value-and-text" ? await safeString(() => item.inputValue()) : "";
+          group.capture === "value-and-text"
+            ? await safeString(() => traceOperation(
+                trace,
+                traceKey,
+                point("locator.inputValue", index),
+                () => item.inputValue(),
+              ))
+            : "";
         snapshots.push({ visible, enabled, text, value, accessibleLabel });
       }
       return snapshots;
@@ -510,9 +608,12 @@ export class PlaywrightSemanticPage implements SemanticPage {
     }
   }
 
-  async #firstActionableOrThrow(group: LocatorGroup): Promise<ElementHandle> {
+  async #firstActionableOrThrow(
+    group: LocatorGroup,
+    trace: BrowserOperationTrace,
+  ): Promise<ElementHandle> {
     try {
-      return await this.#firstActionable(group);
+      return await this.#firstActionable(group, trace);
     } catch (error) {
       if (error instanceof AgentError) throw error;
       throw new AgentError(
@@ -539,12 +640,27 @@ export class PlaywrightSemanticPage implements SemanticPage {
     );
   }
 
-  async #firstActionable(group: LocatorGroup): Promise<ElementHandle> {
-    for (const candidate of group.candidates) {
+  async #firstActionable(
+    group: LocatorGroup,
+    trace: BrowserOperationTrace,
+  ): Promise<ElementHandle> {
+    for (const [candidateIndex, candidate] of group.candidates.entries()) {
+      const traceKey = `candidate:${candidateIndex}`;
+      const point = (operation: string, elementIndex?: number): BrowserOperationTracePoint => ({
+        operation,
+        locatorKind: candidate.kind,
+        locatorCandidateIndex: candidateIndex + 1,
+        ...(elementIndex === undefined ? {} : { elementIndex: elementIndex + 1 }),
+      });
       try {
         this.#assertNoNativeDialog();
         const locator = this.#locator(candidate);
-        const locatorCount = await locator.count();
+        const locatorCount = await traceOperation(
+          trace,
+          traceKey,
+          point("locator.count"),
+          () => locator.count(),
+        );
         this.#assertNoNativeDialog();
         const count = Math.min(locatorCount, group.maximumElements);
         for (let index = 0; index < count; index += 1) {
@@ -552,20 +668,45 @@ export class PlaywrightSemanticPage implements SemanticPage {
           // Bind the concrete DOM node before actionability checks. A Locator
           // may re-resolve into a new document during Playwright auto-wait;
           // an ElementHandle instead fails if navigation detaches this node.
-          const element = await item.elementHandle();
+          const element = await traceOperation(
+            trace,
+            traceKey,
+            point("locator.elementHandle", index),
+            () => item.elementHandle(),
+          );
           this.#assertNoNativeDialog();
           if (element === null) continue;
-          const visible = await safeBoolean(() => element.isVisible());
+          const visible = await safeBoolean(() => traceOperation(
+            trace,
+            traceKey,
+            point("element.isVisible", index),
+            () => element.isVisible(),
+          ));
           this.#assertNoNativeDialog();
           if (!visible) continue;
-          const enabled = await safeBoolean(() => element.isEnabled());
+          const enabled = await safeBoolean(() => traceOperation(
+            trace,
+            traceKey,
+            point("element.isEnabled", index),
+            () => element.isEnabled(),
+          ));
           this.#assertNoNativeDialog();
           if (!enabled) continue;
           if (group.signal === "composer") {
-            const editable = await safeBoolean(() => element.isEditable());
+            const editable = await safeBoolean(() => traceOperation(
+              trace,
+              traceKey,
+              point("element.isEditable", index),
+              () => element.isEditable(),
+            ));
             this.#assertNoNativeDialog();
             if (!editable) continue;
-            const readonly = await element.getAttribute("aria-readonly").catch(() => undefined);
+            const readonly = await traceOperation(
+              trace,
+              traceKey,
+              point("element.getAttribute", index),
+              () => element.getAttribute("aria-readonly"),
+            ).catch(() => undefined);
             this.#assertNoNativeDialog();
             if (readonly?.trim().toLowerCase() === "true") continue;
           }
@@ -611,6 +752,80 @@ export class PlaywrightSemanticPage implements SemanticPage {
 
 function textMatcher(value: string | TextPattern): string | RegExp {
   return typeof value === "string" ? value : toRegExp(value);
+}
+
+interface BrowserOperationTracePoint {
+  readonly operation: string;
+  readonly locatorKind?: SemanticLocator["kind"];
+  readonly locatorCandidateIndex?: number;
+  readonly elementIndex?: number;
+}
+
+interface BrowserOperationTrace {
+  readonly semanticGroup: string;
+  readonly pending: Map<string, BrowserOperationTracePoint>;
+  last: BrowserOperationTracePoint;
+}
+
+function operationTrace(
+  semanticGroup: string,
+  initialOperation: string,
+): BrowserOperationTrace {
+  return {
+    semanticGroup,
+    pending: new Map(),
+    last: { operation: initialOperation },
+  };
+}
+
+async function traceOperation<T>(
+  trace: BrowserOperationTrace,
+  key: string,
+  point: BrowserOperationTracePoint,
+  operation: () => Promise<T>,
+): Promise<T> {
+  trace.last = point;
+  trace.pending.set(key, point);
+  try {
+    return await operation();
+  } finally {
+    if (trace.pending.get(key) === point) trace.pending.delete(key);
+  }
+}
+
+function operationTraceDetails(trace: BrowserOperationTrace): BrowserOperationTimeoutOrigin {
+  const active = [...trace.pending.values()].sort(compareTracePoints);
+  const primary = active[0] ?? trace.last;
+  return {
+    semanticGroup: trace.semanticGroup,
+    semanticOperation: primary.operation,
+    ...(primary.locatorKind === undefined ? {} : { locatorKind: primary.locatorKind }),
+    ...(primary.locatorCandidateIndex === undefined
+      ? {}
+      : { locatorCandidateIndex: primary.locatorCandidateIndex }),
+    ...(primary.elementIndex === undefined ? {} : { elementIndex: primary.elementIndex }),
+    ...(active.length <= 1
+      ? {}
+      : {
+          pendingSemanticOperations: active.map((point) => ({
+            operation: point.operation,
+            ...(point.locatorKind === undefined ? {} : { locatorKind: point.locatorKind }),
+            ...(point.locatorCandidateIndex === undefined
+              ? {}
+              : { locatorCandidateIndex: point.locatorCandidateIndex }),
+            ...(point.elementIndex === undefined ? {} : { elementIndex: point.elementIndex }),
+          })),
+        }),
+  };
+}
+
+function compareTracePoints(
+  left: BrowserOperationTracePoint,
+  right: BrowserOperationTracePoint,
+): number {
+  return (left.locatorCandidateIndex ?? 0) - (right.locatorCandidateIndex ?? 0) ||
+    (left.elementIndex ?? 0) - (right.elementIndex ?? 0) ||
+    left.operation.localeCompare(right.operation);
 }
 
 async function safeBoolean(operation: () => Promise<boolean>): Promise<boolean> {

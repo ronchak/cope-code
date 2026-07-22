@@ -65,6 +65,22 @@ export function renderHumanError(error: unknown): string {
       const stateSuffix = typeof state === "string" && state.length > 0 ? ` (${state})` : "";
       lines.push(`\n${dim(`Diagnostic: ${diagnosticCode}${stateSuffix}`)}`);
     }
+    const semanticGroup = error.details.semanticGroup;
+    const semanticOperation = error.details.semanticOperation;
+    if (
+      typeof semanticGroup === "string" && semanticGroup.length > 0 &&
+      typeof semanticOperation === "string" && semanticOperation.length > 0
+    ) {
+      const locatorKind = error.details.locatorKind;
+      const locatorCandidateIndex = error.details.locatorCandidateIndex;
+      const elementIndex = error.details.elementIndex;
+      const candidate = typeof locatorKind === "string" &&
+          typeof locatorCandidateIndex === "number"
+        ? `; ${locatorKind} candidate ${locatorCandidateIndex}`
+        : "";
+      const element = typeof elementIndex === "number" ? `; element ${elementIndex}` : "";
+      lines.push(`${dim(`Stalled browser probe: ${semanticGroup} / ${semanticOperation}${candidate}${element}`)}`);
+    }
     const missingSignals = error.details.missingSignals;
     if (Array.isArray(missingSignals)) {
       const signals = missingSignals.filter((value): value is string => typeof value === "string" && value.length > 0);
