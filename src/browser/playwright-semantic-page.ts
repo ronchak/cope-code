@@ -8,16 +8,35 @@ import {
   type LocatorGroup,
   type SemanticActionGuard,
   type SemanticLocator,
+  type SemanticObservationCompletion,
   type SemanticPage,
   type TextPattern,
 } from "./contracts.js";
+
+export interface BrowserOperationTimeoutOrigin {
+  readonly semanticGroup: string;
+  readonly semanticOperation: string;
+  readonly locatorKind?: SemanticLocator["kind"];
+  readonly locatorCandidateIndex?: number;
+  readonly elementIndex?: number;
+  readonly pendingSemanticOperations?: readonly BrowserOperationTimeoutPoint[];
+}
+
+interface BrowserOperationTimeoutPoint {
+  readonly operation: string;
+  readonly locatorKind?: SemanticLocator["kind"];
+  readonly locatorCandidateIndex?: number;
+  readonly elementIndex?: number;
+}
 
 /** The only module that translates the UI contract into Playwright locators. */
 export class PlaywrightSemanticPage implements SemanticPage {
   readonly #page: Page;
   readonly #actionMs: number;
-  readonly #onOperationTimeout: (() => Promise<void>) | undefined;
+  readonly #onOperationTimeout:
+    ((origin: BrowserOperationTimeoutOrigin) => Promise<void>) | undefined;
   readonly #operationTimeoutSignal: AbortSignal | undefined;
+  readonly #operationTimeoutOrigin: (() => BrowserOperationTimeoutOrigin | undefined) | undefined;
   #operationTermination: Promise<void> | undefined;
   #operationTimedOut = false;
   #nativeDialogDetected = false;
@@ -27,8 +46,9 @@ export class PlaywrightSemanticPage implements SemanticPage {
     page: Page,
     onNativeDialog?: () => boolean | void,
     actionMs = 15_000,
-    onOperationTimeout?: () => Promise<void>,
+    onOperationTimeout?: (origin: BrowserOperationTimeoutOrigin) => Promise<void>,
     operationTimeoutSignal?: AbortSignal,
+    operationTimeoutOrigin?: () => BrowserOperationTimeoutOrigin | undefined,
   ) {
     if (!Number.isSafeInteger(actionMs) || actionMs <= 0) {
       throw new TypeError("Playwright operation timeout must be a positive integer");
@@ -37,6 +57,7 @@ export class PlaywrightSemanticPage implements SemanticPage {
     this.#actionMs = actionMs;
     this.#onOperationTimeout = onOperationTimeout;
     this.#operationTimeoutSignal = operationTimeoutSignal;
+    this.#operationTimeoutOrigin = operationTimeoutOrigin;
     // Do not accept, dismiss, inspect, or automate unknown browser dialogs.
     // Leaving the dialog visible blocks consequential actions and the sticky
     // signal makes the adapter fail closed until the session is restarted.
@@ -62,6 +83,10 @@ export class PlaywrightSemanticPage implements SemanticPage {
 
   public async currentUrl(): Promise<string> {
     return this.#page.url();
+  }
+
+  public async completeObservation(): Promise<SemanticObservationCompletion> {
+    return { nativeDialogDetected: this.#nativeDialogDetected };
   }
 
   public async bringToFront(
@@ -380,7 +405,7 @@ export class PlaywrightSemanticPage implements SemanticPage {
       {
         diagnosticCode: "BROWSER_OPERATION_TIMEOUT",
         dispatchAttempted: dispatchAttempted(),
-        ...operationTraceDetails(trace),
+        ...(this.#operationTimeoutOrigin?.() ?? operationTraceDetails(trace)),
       },
       cause === undefined ? undefined : { cause },
     );
@@ -394,7 +419,7 @@ export class PlaywrightSemanticPage implements SemanticPage {
       if (timedOut) return;
       timedOut = true;
       this.#operationTimedOut = true;
-      termination = this.#terminateTimedOutOperation();
+      termination = this.#terminateTimedOutOperation(operationTraceDetails(trace));
       void termination.catch(() => undefined);
     };
     const timeout = new Promise<never>((_resolve, reject) => {
@@ -462,14 +487,14 @@ export class PlaywrightSemanticPage implements SemanticPage {
     }
   }
 
-  #terminateTimedOutOperation(): Promise<void> {
-    this.#operationTermination ??= this.#performTimedOutTermination();
+  #terminateTimedOutOperation(origin: BrowserOperationTimeoutOrigin): Promise<void> {
+    this.#operationTermination ??= this.#performTimedOutTermination(origin);
     return this.#operationTermination;
   }
 
-  async #performTimedOutTermination(): Promise<void> {
+  async #performTimedOutTermination(origin: BrowserOperationTimeoutOrigin): Promise<void> {
     if (this.#onOperationTimeout !== undefined) {
-      await this.#onOperationTimeout();
+      await this.#onOperationTimeout(origin);
       return;
     }
     const context = this.#page.context();
@@ -762,7 +787,7 @@ async function traceOperation<T>(
   }
 }
 
-function operationTraceDetails(trace: BrowserOperationTrace): Readonly<Record<string, unknown>> {
+function operationTraceDetails(trace: BrowserOperationTrace): BrowserOperationTimeoutOrigin {
   const active = [...trace.pending.values()].sort(compareTracePoints);
   const primary = active[0] ?? trace.last;
   return {

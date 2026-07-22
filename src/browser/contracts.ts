@@ -80,10 +80,20 @@ export interface GroupSnapshot {
 /** Synchronous fail-closed check run at the final browser-dispatch boundary. */
 export type SemanticActionGuard = () => void;
 
+/** Closing evidence for a semantic observation that may span concurrent reads. */
+export interface SemanticObservationCompletion {
+  readonly nativeDialogDetected: boolean;
+}
+
 /** Minimal page surface used by the adapter and implemented by Playwright or tests. */
 export interface SemanticPage {
   currentUrl(): Promise<string>;
   snapshot(group: LocatorGroup): Promise<GroupSnapshot>;
+  /**
+   * Revalidate page ownership after all snapshots. Context-aware implementations
+   * use this to reject navigation, replacement-page, popup, and dialog races.
+   */
+  completeObservation?(): Promise<SemanticObservationCompletion>;
   fill(group: LocatorGroup, value: string, guard: SemanticActionGuard): Promise<void>;
   click(group: LocatorGroup, guard: SemanticActionGuard): Promise<void>;
 }

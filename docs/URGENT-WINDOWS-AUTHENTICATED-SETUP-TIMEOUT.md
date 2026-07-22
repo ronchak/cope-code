@@ -2,12 +2,12 @@
 
 ## Status
 
-Root cause isolated and a focused fix is under validation in PR #25. The
-original live Windows reproduction remains the required release gate; this
-document does not claim that gate has passed until the exact final commit is
-rerun on the authenticated Windows Edge profile.
+The authoritative root cause is not yet identified. PR #25 contains source-free
+operation diagnostics, a candidate readiness-scope fix, and observation-race
+hardening, but the original Windows report predates the new diagnostic fields.
+The live authenticated Windows reproduction remains a mandatory merge gate.
 
-## Root cause
+## Confirmed architectural fault and remaining root-cause question
 
 Setup readiness used the same full semantic observation as prompt/response
 correlation. `CopilotBrowserAdapter.inspectState()` called
@@ -17,22 +17,25 @@ groups, even though neither historical transcript is consumed by readiness
 classification.
 
 Each transcript CSS candidate can match up to 200 elements. The Playwright
-adapter then inspected those elements sequentially with `isVisible()`,
-`isEnabled()`, and `innerText()` calls. A history-rich authenticated page could
-therefore hold the entire observation behind hundreds of renderer round trips.
-If the response candidate was still in `locator.innerText()` when the shared
-15-second action deadline expired, the required session-wide timeout revocation
-correctly terminated the browser context and surfaced
-`BROWSER_OPERATION_TIMEOUT`.
+adapter then inspects those elements sequentially with `isVisible()`,
+`isEnabled()`, and `innerText()` calls. A history-rich authenticated page can
+therefore hold readiness behind hundreds of renderer round trips. A focused
+Playwright regression proves that a stalled response `locator.innerText()`
+causes the former full-readiness path to revoke the session with
+`BROWSER_OPERATION_TIMEOUT`, while the purpose-specific readiness path does not
+enter either transcript group. Full submission observation still enters the
+group and fails closed before prompt fill.
 
-The fault was isolated without changing any timeout: a real Playwright page
-with an immediately actionable composer and 200 historical response elements
-completed the composer probe promptly while the response-group scan scaled
-linearly across 200 visibility and 200 text calls. A deterministic adapter
-regression then reproduced the setup failure by stalling only the historical
-transcript probe; it fails on the original PR behavior and passes with the fix.
+That establishes a real bug in the old readiness scope, but not that it caused
+the reported Edge 149 failure. The original Windows record contains only the
+generic timeout and unverified-ready-state outcomes; it does not identify a
+semantic group, locator candidate, or Playwright operation. Visible chats may
+also be sidebar history rather than nodes matched by the immutable transcript
+selectors. The authoritative root cause must therefore remain open until a live
+Windows run records the new source-free stalled-operation fields (or equivalent
+pre-fix diagnostic evidence) and the exact final commit then succeeds.
 
-## Fix
+## Candidate fix and safety hardening
 
 Readiness now uses a purpose-specific semantic observation that omits only
 `responses` and `user-messages`. It still verifies the configured page and all
@@ -42,12 +45,22 @@ errors, and blocking/native dialogs. Full prompt submission, response
 correlation, and exactly-once recovery continue to use the complete transcript
 observation.
 
+Semantic observations now close with an ownership consistency barrier. The
+same page, URL, navigation epoch, native-dialog epoch, authentication-page
+precedence, and unique configured-page ownership must still hold after the
+snapshots. Modal inspection runs last, and a dialog arriving during any
+snapshot remains sticky. Navigation, replacement-page, authentication-popup,
+second-configured-page, and native-dialog races therefore cannot certify a
+mixed-time `READY` state.
+
 The action, manual-readiness, and polling bounds are unchanged. Timeout
-revocation and owner teardown are unchanged. When a bounded Playwright call
-does stall, the error now reports source-free fields for the semantic group,
-Playwright operation, locator kind/candidate number, and element number. These
-fields never include selector source, URL, identity, page text, prompt text, or
-response text.
+revocation and owner teardown remain fail-closed. The first timed-out operation
+now supplies one sanitized origin to every concurrently revoked probe, so
+Promise rejection order cannot misattribute the stall. Every bounded browser
+operation, including `context.newPage`, reports source-free semantic group and
+operation fields plus controlled locator kind/candidate and element indices
+when applicable. These fields never include selector source, URL, identity,
+page text, prompt text, or response text.
 
 ## User-visible failure
 
@@ -121,16 +134,21 @@ A transiently slow semantic locator or renderer operation must not be misreporte
 
 A visibly authenticated and usable Copilot page is not accepted as ready. A single semantic-page operation can exceed the 15-second action deadline, permanently revoke the delegate, tear down the browser session, and surface `BROWSER_OPERATION_TIMEOUT` even though the outer manual-readiness window is ten minutes.
 
-## Suspected code boundary
+## Open live-investigation boundary
 
-This is not yet a confirmed root cause. The likely boundary is the interaction between:
+The likely boundary is the interaction between:
 
 - `src/cli/onboarding.ts`, which waits for manual readiness before committing setup
 - `src/browser/manual-readiness.ts`, which allows manual authentication states to consume the broader readiness window
 - `src/browser/playwright-semantic-page.ts`, where each semantic snapshot is bounded by `actionMs` and an operation timeout permanently terminates the delegate
-- the authenticated Microsoft 365 Copilot identity, composer, modal, or shell locator groups
+- retained authenticated-page groups such as identity, composer, modal, shell,
+  send, or streaming, if the transcript hypothesis is not the live cause
 
-The investigation should determine which exact locator group or Playwright call stalls on the real Windows page. Raising the timeout blindly is not an acceptable fix.
+The live investigation must identify the exact group, candidate, element, and
+Playwright operation on the real Windows page. It must also distinguish a true
+operation timeout from a completed observation that remains identity-,
+protection-, composer-, or selector-unverified. Raising the timeout blindly is
+not an acceptable fix.
 
 ## Required fix behavior
 
@@ -151,3 +169,6 @@ Setup is not considered fixed until all of the following are true:
 3. A focused automated regression test fails before the fix and passes after it.
 4. Native-dialog and renderer-stall safety tests remain green.
 5. Full validation passes on the exact final commit.
+6. The source-free Windows evidence identifies the original stalled operation,
+   or the root-cause claim is otherwise demonstrated with equivalent live
+   evidence.

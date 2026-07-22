@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import type { BrowserContext, Locator, Page } from "playwright-core";
+
 import { CopilotBrowserAdapter } from "../../src/browser/copilot-browser-adapter.js";
 import { createBaselineCopilotUiContract, type CopilotBrowserAdapterConfig } from "../../src/browser/config.js";
+import { observeCopilotPage } from "../../src/browser/classifier.js";
+import { PlaywrightSemanticPage } from "../../src/browser/playwright-semantic-page.js";
 import type {
   CopilotSignal,
   GroupSnapshot,
@@ -10,10 +14,21 @@ import type {
   SemanticActionGuard,
   SemanticPage,
 } from "../../src/browser/contracts.js";
-import { AgentError } from "../../src/shared/errors.js";
 
 class AuthenticatedReadinessPage implements SemanticPage {
   public readonly inspectedSignals: CopilotSignal[] = [];
+  public fillCalls = 0;
+  public terminationCalls = 0;
+  readonly #transcriptDelegate: PlaywrightSemanticPage;
+
+  public constructor() {
+    this.#transcriptDelegate = new PlaywrightSemanticPage(
+      new StalledTranscriptPage() as unknown as Page,
+      undefined,
+      20,
+      async () => { this.terminationCalls += 1; },
+    );
+  }
 
   public async currentUrl(): Promise<string> {
     return "https://m365.cloud.microsoft/chat/conversation/ready";
@@ -21,18 +36,7 @@ class AuthenticatedReadinessPage implements SemanticPage {
 
   public async snapshot(group: LocatorGroup): Promise<GroupSnapshot> {
     this.inspectedSignals.push(group.signal);
-    if (group.signal === "responses" || group.signal === "user-messages") {
-      throw new AgentError(
-        "TRANSPORT_INDETERMINATE",
-        "A historical transcript probe exceeded the browser action timeout",
-        {
-          diagnosticCode: "BROWSER_OPERATION_TIMEOUT",
-          semanticGroup: group.signal,
-          semanticOperation: "locator.innerText",
-          dispatchAttempted: false,
-        },
-      );
-    }
+    if (group.signal === "responses") return this.#transcriptDelegate.snapshot(group);
 
     const matched = group.signal === "conversation" ||
       group.signal === "composer" ||
@@ -47,6 +51,7 @@ class AuthenticatedReadinessPage implements SemanticPage {
     _value: string,
     _guard: SemanticActionGuard,
   ): Promise<void> {
+    this.fillCalls += 1;
     throw new Error("fill is outside this readiness regression");
   }
 
@@ -64,21 +69,82 @@ test("authenticated setup readiness does not inspect historical transcript conte
   assert.equal(inspection.classification.state, "ready");
   assert.equal(page.inspectedSignals.includes("responses"), false);
   assert.equal(page.inspectedSignals.includes("user-messages"), false);
-  for (const required of [
-    "conversation",
-    "composer",
-    "identity",
-    "protection",
-    "signed-out",
-    "mfa",
-    "consent",
-    "throttled",
-    "service-error",
-    "modal",
-  ] as const) {
-    assert.equal(page.inspectedSignals.includes(required), true, `readiness skipped ${required}`);
-  }
+  assert.deepEqual(
+    [...page.inspectedSignals].sort(),
+    [
+      "shell",
+      "conversation",
+      "composer",
+      "send",
+      "streaming",
+      "identity",
+      "protection",
+      "signed-out",
+      "mfa",
+      "consent",
+      "throttled",
+      "service-error",
+      "modal",
+    ].sort(),
+  );
+  assert.equal(page.terminationCalls, 0);
 });
+
+test("the former full readiness observation hits a real Playwright transcript timeout", async () => {
+  const page = new AuthenticatedReadinessPage();
+
+  await assert.rejects(
+    observeCopilotPage(page, config().uiContract),
+    (error: unknown) =>
+      isTranscriptTimeout(error),
+  );
+
+  assert.equal(page.terminationCalls, 1);
+  assert.equal(page.fillCalls, 0);
+});
+
+test("submission still uses full transcript observation and fails before prompt fill", async () => {
+  const page = new AuthenticatedReadinessPage();
+  const adapter = new CopilotBrowserAdapter(page, config());
+
+  await assert.rejects(
+    adapter.submit({
+      taskId: "task-readiness-regression",
+      turnId: "turn-1",
+      submissionId: "submission-1",
+      content: "must-not-disclose",
+    }),
+    (error: unknown) => isTranscriptTimeout(error),
+  );
+
+  assert.equal(page.terminationCalls, 1);
+  assert.equal(page.fillCalls, 0);
+});
+
+class StalledTranscriptPage {
+  public on(): this { return this; }
+  public locator(): Locator { return new StalledTranscriptLocator() as unknown as Locator; }
+  public context(): BrowserContext {
+    return { browser: () => null } as unknown as BrowserContext;
+  }
+}
+
+class StalledTranscriptLocator {
+  public async count(): Promise<number> { return 1; }
+  public nth(): Locator { return this as unknown as Locator; }
+  public async isVisible(): Promise<boolean> { return true; }
+  public async isEnabled(): Promise<boolean> { return true; }
+  public async getAttribute(): Promise<string | null> { return null; }
+  public async innerText(): Promise<string> { return new Promise<string>(() => {}); }
+}
+
+function isTranscriptTimeout(error: unknown): boolean {
+  if (!(error instanceof Error) || !("details" in error)) return false;
+  const details = (error as { readonly details: Readonly<Record<string, unknown>> }).details;
+  return details.diagnosticCode === "BROWSER_OPERATION_TIMEOUT" &&
+    details.semanticGroup === "responses" &&
+    details.semanticOperation === "locator.innerText";
+}
 
 function config(): CopilotBrowserAdapterConfig {
   return {

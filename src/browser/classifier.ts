@@ -85,14 +85,28 @@ async function observeSignals(
   signals: readonly CopilotSignal[],
 ): Promise<CopilotPageObservation> {
   const url = await page.currentUrl();
+  // Native/DOM modal evidence is the final semantic snapshot. A modal that
+  // appears while another group is being read must not be hidden by an earlier
+  // empty modal result from the concurrent batch.
+  const concurrentSignals = signals.filter((signal) => signal !== "modal");
   const entries = await Promise.all(
-    signals.map(async (signal) => [signal, await page.snapshot(contract.groups[signal])] as const),
+    concurrentSignals.map(
+      async (signal) => [signal, await page.snapshot(contract.groups[signal])] as const,
+    ),
   );
+  let modal = signals.includes("modal")
+    ? await page.snapshot(contract.groups.modal)
+    : emptySnapshot("modal");
+  const completion = await page.completeObservation?.();
+  if (completion?.nativeDialogDetected === true) {
+    modal = nativeDialogSnapshot(contract.groups.modal);
+  }
   const emptyEntries = SIGNALS.map((signal) => [signal, emptySnapshot(signal)] as const);
   return {
     url,
     ...Object.fromEntries(emptyEntries),
     ...Object.fromEntries(entries),
+    modal,
   } as CopilotPageObservation;
 }
 
@@ -103,6 +117,16 @@ function emptySnapshot(signal: CopilotSignal): GroupSnapshot {
     visibleElements: 0,
     enabledElements: 0,
     elements: [],
+  };
+}
+
+function nativeDialogSnapshot(group: CopilotUiContract["groups"]["modal"]): GroupSnapshot {
+  return {
+    signal: "modal",
+    matchedCandidates: group.minimumCandidateMatches,
+    visibleElements: 1,
+    enabledElements: 0,
+    elements: [{ visible: true, enabled: false, text: "", value: "", accessibleLabel: "" }],
   };
 }
 

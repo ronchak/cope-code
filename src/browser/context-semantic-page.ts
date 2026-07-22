@@ -13,9 +13,13 @@ import type {
   GroupSnapshot,
   LocatorGroup,
   SemanticActionGuard,
+  SemanticObservationCompletion,
   SemanticPage,
 } from "./contracts.js";
-import { PlaywrightSemanticPage } from "./playwright-semantic-page.js";
+import {
+  PlaywrightSemanticPage,
+  type BrowserOperationTimeoutOrigin,
+} from "./playwright-semantic-page.js";
 
 export interface CopilotPageSelectionConfig {
   readonly entryUrl: string;
@@ -107,6 +111,7 @@ export class ContextSemanticPage implements SemanticPage {
   #authenticationPage: Page | undefined;
   #operationTermination: Promise<void> | undefined;
   #operationTimedOut = false;
+  #operationTimeoutOrigin: BrowserOperationTimeoutOrigin | undefined;
   readonly #operationTimeoutController = new AbortController();
 
   public constructor(
@@ -226,7 +231,25 @@ export class ContextSemanticPage implements SemanticPage {
   public async snapshot(group: LocatorGroup): Promise<GroupSnapshot> {
     this.#assertOperationAvailable();
     if (this.#nativeDialogEpoch > 0) return nativeDialogSnapshot(group);
-    return this.#delegate(this.#activePage).snapshot(group);
+    const page = this.#activePage;
+    const dialogEpoch = this.#nativeDialogEpoch;
+    const snapshot = await this.#delegate(page).snapshot(group);
+    // A native dialog is sticky and outranks any snapshot that was already in
+    // flight when the listener revoked the browser context.
+    if (this.#nativeDialogEpoch !== dialogEpoch) return nativeDialogSnapshot(group);
+    // Reject mixed-document observations immediately. The final completion
+    // barrier repeats this check after every concurrent snapshot settles.
+    this.#verifiedObservationPage();
+    return snapshot;
+  }
+
+  public async completeObservation(): Promise<SemanticObservationCompletion> {
+    this.#assertOperationAvailable();
+    if (this.#nativeDialogEpoch > 0) {
+      return { nativeDialogDetected: true };
+    }
+    this.#verifiedObservationPage();
+    return { nativeDialogDetected: false };
   }
 
   /**
@@ -353,6 +376,20 @@ export class ContextSemanticPage implements SemanticPage {
   }
 
   #verifiedObservedPage(): Page {
+    return this.#assertObservedPageCurrent(
+      "ACTIVE_PAGE_CHANGED_BEFORE_ACTION",
+      "The observed Copilot page changed before the browser action",
+    );
+  }
+
+  #verifiedObservationPage(): Page {
+    return this.#assertObservedPageCurrent(
+      "ACTIVE_PAGE_CHANGED_DURING_OBSERVATION",
+      "The Copilot page changed during semantic readiness inspection",
+    );
+  }
+
+  #assertObservedPageCurrent(diagnosticCode: string, message: string): Page {
     const selected = this.#selectCurrentPage(
       this.#context.pages(),
       this.#activePage,
@@ -371,9 +408,9 @@ export class ContextSemanticPage implements SemanticPage {
     ) {
       throw new AgentError(
         "TRANSPORT_INDETERMINATE",
-        "The observed Copilot page changed before the browser action",
+        message,
         {
-          diagnosticCode: "ACTIVE_PAGE_CHANGED_BEFORE_ACTION",
+          diagnosticCode,
           dispatchAttempted: false,
         },
       );
@@ -568,18 +605,23 @@ export class ContextSemanticPage implements SemanticPage {
         return true;
       },
       this.#actionMs,
-      () => this.#terminateTimedOutOperation(page),
+      (origin) => this.#terminateTimedOutOperation(page, origin),
       this.#operationTimeoutController.signal,
+      () => this.#operationTimeoutOrigin,
     );
     this.#delegates.set(page, created);
     return created;
   }
 
-  #terminateTimedOutOperation(page: Page): Promise<void> {
+  #terminateTimedOutOperation(
+    page: Page,
+    origin: BrowserOperationTimeoutOrigin,
+  ): Promise<void> {
     // Revoke the entire context synchronously before starting teardown. A
     // Browser.close() promise is allowed to stall, but no delegate or later
     // adapter retry may enter this session after the diagnostic is returned.
     this.#operationTimedOut = true;
+    this.#operationTimeoutOrigin ??= origin;
     this.#operationTimeoutController.abort();
     // observeCopilotPage launches all signal snapshots concurrently. Cache one
     // teardown so simultaneous deadlines cannot race repeated Browser.close()
@@ -598,8 +640,10 @@ export class ContextSemanticPage implements SemanticPage {
       {
         diagnosticCode: "BROWSER_OPERATION_TIMEOUT",
         dispatchAttempted: false,
-        semanticGroup: "context",
-        semanticOperation: "session-revoked",
+        ...(this.#operationTimeoutOrigin ?? {
+          semanticGroup: "context",
+          semanticOperation: "session-revoked",
+        }),
       },
     );
   }
@@ -764,6 +808,8 @@ async function newPageWithinDeadline(
     {
       diagnosticCode: "BROWSER_OPERATION_TIMEOUT",
       dispatchAttempted: false,
+      semanticGroup: "context",
+      semanticOperation: "context.newPage",
     },
     cause === undefined ? undefined : { cause },
   );
