@@ -3,15 +3,24 @@ import test from "node:test";
 
 import type { Browser, BrowserContext, Frame, Locator, Page } from "playwright-core";
 
+import { CopilotBrowserAdapter } from "../../src/browser/copilot-browser-adapter.js";
 import {
   classifyCopilotPage,
   observeCopilotReadinessPage,
 } from "../../src/browser/classifier.js";
+import {
+  createBaselineCopilotUiContract,
+  type CopilotBrowserAdapterConfig,
+} from "../../src/browser/config.js";
 import { ContextSemanticPage } from "../../src/browser/context-semantic-page.js";
 import type {
   CopilotSignal,
   CopilotUiContract,
+  GroupSnapshot,
   LocatorGroup,
+  SemanticActionGuard,
+  SemanticObservationCompletion,
+  SemanticPage,
 } from "../../src/browser/contracts.js";
 import { AgentError } from "../../src/shared/errors.js";
 
@@ -121,6 +130,67 @@ test("a second configured page appearing during readiness is ambiguous", async (
   );
 });
 
+test("overlapping adapter operations cannot launder a same-URL navigation", async () => {
+  const page = new ObservationPage(`${entryUrl}/conversation/one`);
+  const browser = new ObservationBrowser();
+  const context = new ObservationContext([page], browser);
+  const tracked = new ContextSemanticPage(
+    context.asContext(),
+    {
+      entryUrl,
+      approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
+      manualAuthenticationHosts: [{ hostname: "login.microsoftonline.com" }],
+    },
+    page.asPage(),
+    100,
+  );
+  const composerStarted = deferred<void>();
+  const composerRelease = deferred<void>();
+  const translated = new TranslatingContextPage(
+    tracked,
+    composerStarted,
+    composerRelease.promise,
+  );
+  const adapter = new CopilotBrowserAdapter(translated, baselineConfig());
+  const first = settleWithin(adapter.inspectState(), 500);
+  let overlappingInspection: Readonly<Record<string, unknown>> | undefined;
+  let overlappingSubmission: Readonly<Record<string, unknown>> | undefined;
+  try {
+    await settleWithin(Promise.all([
+      composerStarted.promise,
+      translated.oldEvidenceCaptured.promise,
+    ]), 500);
+
+    page.matchedSignals = new Set(["composer"]);
+    page.navigate(page.currentUrl);
+    overlappingInspection = await settleWithin(adapter.inspectState(), 500);
+    overlappingSubmission = await settleWithin(adapter.submit({
+      taskId: "task-context-overlap",
+      turnId: "turn-1",
+      submissionId: "submission-context-overlap",
+      content: "must-not-disclose",
+    }), 500);
+  } finally {
+    composerRelease.resolve();
+  }
+  const firstInspection = await first;
+
+  assert.deepEqual(overlappingInspection, {
+    status: "rejected",
+    diagnosticCode: "CONCURRENT_BROWSER_OPERATION",
+  });
+  assert.deepEqual(overlappingSubmission, {
+    status: "rejected",
+    diagnosticCode: "CONCURRENT_BROWSER_OPERATION",
+  });
+  assert.deepEqual(firstInspection, {
+    status: "rejected",
+    diagnosticCode: "ACTIVE_PAGE_CHANGED_DURING_OBSERVATION",
+  });
+  assert.equal(translated.currentUrlCalls, 1);
+  assert.equal(translated.fillCalls, 0);
+});
+
 function createHarness(): {
   readonly semantic: ContextSemanticPage;
   readonly page: ObservationPage;
@@ -157,7 +227,7 @@ class ObservationLocator {
 
   public async count(): Promise<number> {
     this.page.runProbeHook();
-    return matchedSignals.has(this.signal) ||
+    return this.page.matchedSignals.has(this.signal) ||
         (this.signal === "modal" && this.page.modalVisible)
       ? 1
       : 0;
@@ -178,6 +248,7 @@ class ObservationLocator {
 class ObservationPage {
   public closed = false;
   public modalVisible = false;
+  public matchedSignals = new Set(matchedSignals);
   public probeHook: (() => void) | undefined;
   readonly #navigationListeners: Array<(frame: Frame) => void> = [];
   readonly #dialogListeners: Array<() => void> = [];
@@ -216,6 +287,56 @@ class ObservationPage {
     hook?.();
   }
   public asPage(): Page { return this as unknown as Page; }
+}
+
+class TranslatingContextPage implements SemanticPage {
+  public currentUrlCalls = 0;
+  public fillCalls = 0;
+  public readonly oldEvidenceCaptured = deferred<void>();
+  readonly #capturedOldSignals = new Set<CopilotSignal>();
+  #composerBlocked = false;
+
+  public constructor(
+    private readonly tracked: ContextSemanticPage,
+    private readonly composerStarted: Deferred<void>,
+    private readonly composerRelease: Promise<void>,
+  ) {}
+
+  public async currentUrl(): Promise<string> {
+    this.currentUrlCalls += 1;
+    return this.tracked.currentUrl();
+  }
+
+  public async snapshot(group: LocatorGroup): Promise<GroupSnapshot> {
+    if (group.signal === "composer" && !this.#composerBlocked) {
+      this.#composerBlocked = true;
+      this.composerStarted.resolve();
+      await this.composerRelease;
+    }
+    const result = await this.tracked.snapshot(groups[group.signal]);
+    if (group.signal === "conversation" || group.signal === "identity") {
+      this.#capturedOldSignals.add(group.signal);
+      if (this.#capturedOldSignals.size === 2) this.oldEvidenceCaptured.resolve();
+    }
+    return result;
+  }
+
+  public completeObservation(): Promise<SemanticObservationCompletion> {
+    return this.tracked.completeObservation();
+  }
+
+  public async fill(
+    group: LocatorGroup,
+    value: string,
+    guard: SemanticActionGuard,
+  ): Promise<void> {
+    this.fillCalls += 1;
+    await this.tracked.fill(groups[group.signal], value, guard);
+  }
+
+  public click(group: LocatorGroup, guard: SemanticActionGuard): Promise<void> {
+    return this.tracked.click(groups[group.signal], guard);
+  }
 }
 
 class ObservationBrowser {
@@ -272,4 +393,70 @@ async function inspect(page: ContextSemanticPage) {
 function changedObservation(error: unknown): boolean {
   return error instanceof AgentError &&
     error.details.diagnosticCode === "ACTIVE_PAGE_CHANGED_DURING_OBSERVATION";
+}
+
+interface Deferred<T> {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((accept) => { resolve = accept; });
+  return { promise, resolve };
+}
+
+async function settleWithin(
+  promise: Promise<unknown>,
+  milliseconds: number,
+): Promise<Readonly<Record<string, unknown>>> {
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then(
+        (value) => ({
+          status: "fulfilled",
+          state: typeof value === "object" && value !== null && "classification" in value
+            ? (value as { readonly classification: { readonly state: string } }).classification.state
+            : "completed",
+        }),
+        (error: unknown) => ({
+          status: "rejected",
+          diagnosticCode: error instanceof AgentError
+            ? error.details.diagnosticCode
+            : "UNEXPECTED_ERROR",
+        }),
+      ),
+      new Promise<never>((_resolve, reject) => {
+        watchdog = setTimeout(
+          () => reject(new Error(`operation did not settle within ${milliseconds} ms`)),
+          milliseconds,
+        );
+      }),
+    ]);
+  } finally {
+    if (watchdog !== undefined) clearTimeout(watchdog);
+  }
+}
+
+function baselineConfig(): CopilotBrowserAdapterConfig {
+  return {
+    entryUrl,
+    approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
+    manualAuthenticationHosts: [{ hostname: "login.microsoftonline.com" }],
+    uiContract: createBaselineCopilotUiContract(expectedIdentity),
+    expectedIdentity,
+    requireProtectionIndicator: false,
+    maxMessageChars: 200_000,
+    maxResponseChars: 1_000_000,
+    waits: {
+      actionMs: 100,
+      submissionConfirmationMs: 100,
+      responseMs: 100,
+      manualReadinessMs: 500,
+      pollMs: 10,
+      stableSamples: 2,
+      minimumStableMs: 20,
+    },
+  };
 }

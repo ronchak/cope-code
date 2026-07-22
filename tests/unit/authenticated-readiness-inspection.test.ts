@@ -19,7 +19,6 @@ class AuthenticatedReadinessPage implements SemanticPage {
   public readonly inspectedSignals: CopilotSignal[] = [];
   public fillCalls = 0;
   public terminationCalls = 0;
-  public currentUrlCalls = 0;
   readonly #transcriptDelegate: PlaywrightSemanticPage;
 
   public constructor() {
@@ -32,7 +31,6 @@ class AuthenticatedReadinessPage implements SemanticPage {
   }
 
   public async currentUrl(): Promise<string> {
-    this.currentUrlCalls += 1;
     return "https://m365.cloud.microsoft/chat/conversation/ready";
   }
 
@@ -59,23 +57,6 @@ class AuthenticatedReadinessPage implements SemanticPage {
 
   public async click(_group: LocatorGroup, _guard: SemanticActionGuard): Promise<void> {
     throw new Error("click is outside this readiness regression");
-  }
-}
-
-class BlockingReadinessPage extends AuthenticatedReadinessPage {
-  public constructor(
-    private readonly composerStarted: Deferred<void>,
-    private readonly composerRelease: Promise<void>,
-  ) {
-    super();
-  }
-
-  public override async snapshot(group: LocatorGroup): Promise<GroupSnapshot> {
-    if (group.signal === "composer") {
-      this.composerStarted.resolve();
-      await this.composerRelease;
-    }
-    return super.snapshot(group);
   }
 }
 
@@ -140,40 +121,6 @@ test("submission still uses full transcript observation and fails before prompt 
   assert.equal(page.fillCalls, 0);
 });
 
-test("overlapping readiness and submission operations are rejected before a second observation", async () => {
-  const composerStarted = deferred<void>();
-  const composerRelease = deferred<void>();
-  const page = new BlockingReadinessPage(composerStarted, composerRelease.promise);
-  const adapter = new CopilotBrowserAdapter(page, config());
-  const firstInspection = adapter.inspectState();
-  await composerStarted.promise;
-
-  for (const overlapping of [
-    adapter.inspectState(),
-    adapter.submit({
-      taskId: "task-concurrent-observation",
-      turnId: "turn-1",
-      submissionId: "submission-concurrent-observation",
-      content: "must-not-disclose",
-    }),
-  ]) {
-    await assert.rejects(
-      overlapping,
-      (error: unknown) =>
-        error instanceof Error &&
-        "details" in error &&
-        (error as { readonly details: Readonly<Record<string, unknown>> }).details.diagnosticCode ===
-          "CONCURRENT_BROWSER_OPERATION",
-    );
-  }
-  assert.equal(page.currentUrlCalls, 1);
-  assert.equal(page.fillCalls, 0);
-
-  composerRelease.resolve();
-  const inspection = await firstInspection;
-  assert.equal(inspection.classification.state, "ready");
-});
-
 class StalledTranscriptPage {
   public on(): this { return this; }
   public locator(): Locator { return new StalledTranscriptLocator() as unknown as Locator; }
@@ -189,17 +136,6 @@ class StalledTranscriptLocator {
   public async isEnabled(): Promise<boolean> { return true; }
   public async getAttribute(): Promise<string | null> { return null; }
   public async innerText(): Promise<string> { return new Promise<string>(() => {}); }
-}
-
-interface Deferred<T> {
-  readonly promise: Promise<T>;
-  readonly resolve: (value: T) => void;
-}
-
-function deferred<T>(): Deferred<T> {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((accept) => { resolve = accept; });
-  return { promise, resolve };
 }
 
 function isTranscriptTimeout(error: unknown): boolean {
