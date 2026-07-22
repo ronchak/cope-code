@@ -6,6 +6,7 @@ import test from "node:test";
 import { AuditLog } from "../../src/audit/audit-log.js";
 import { sha256, stableJson } from "../../src/shared/crypto.js";
 import { AgentRuntime } from "../../src/orchestrator/agent-runtime.js";
+import { ProtocolParseError } from "../../src/protocol/parser.js";
 import type {
   NormalizedModelMessage,
   ParsedModelTurn,
@@ -26,6 +27,7 @@ import {
 import {
   MODEL_TRANSPORT_CONTRACT_VERSION,
   type ModelTransport,
+  type ReceiveResult,
   type ReceiveRequest,
   type SubmissionRequest,
 } from "../../src/transport/model-transport.js";
@@ -61,7 +63,7 @@ class QueueTransport implements ModelTransport {
       conversationId: "conversation_1",
     };
   }
-  public async receive(request: ReceiveRequest) {
+  public async receive(request: ReceiveRequest): Promise<ReceiveResult> {
     const content = this.responses[this.index++];
     if (content === undefined) throw new Error("response queue exhausted");
     return {
@@ -80,6 +82,36 @@ class QueueTransport implements ModelTransport {
   public async close() {}
 }
 
+class CancelledOnStopTransport extends QueueTransport {
+  private markReceiveStarted!: () => void;
+  private cancelReceive!: () => void;
+  public readonly receiveStarted = new Promise<void>((resolve) => { this.markReceiveStarted = resolve; });
+  private readonly stopped = new Promise<void>((resolve) => { this.cancelReceive = resolve; });
+
+  public constructor() {
+    super([]);
+  }
+
+  public override async receive(request: ReceiveRequest) {
+    this.markReceiveStarted();
+    await this.stopped;
+    return {
+      contractVersion: MODEL_TRANSPORT_CONTRACT_VERSION,
+      taskId: request.taskId,
+      turnId: request.turnId,
+      submissionId: request.submissionId,
+      observedAt: "2026-01-01T00:00:00.000Z",
+      conversationId: "conversation_1",
+      status: "cancelled" as const,
+      diagnosticCode: "ABORTED" as const,
+    };
+  }
+
+  public override async emergencyStop() {
+    this.cancelReceive();
+  }
+}
+
 const protocol: ProtocolAdapter = {
   renderBootstrap: () => "bootstrap",
   parseModelTurn: (raw, expected): ParsedModelTurn => ({
@@ -87,6 +119,7 @@ const protocol: ProtocolAdapter = {
     ...expected,
     messages: JSON.parse(raw) as NormalizedModelMessage[],
   }),
+  isRepairableParseError: (error) => !(error instanceof ProtocolParseError) || error.repairable,
   renderToolOutcomes: ({ outcomes }) => JSON.stringify(outcomes),
   renderProtocolError: (input) => JSON.stringify(input),
   renderUserDecision: (input) => JSON.stringify(input),
@@ -265,6 +298,85 @@ test("runtime sends protocol repair feedback and continues", async () => {
   const result = await runtime.run();
   assert.equal(result.status, "completed");
   assert.equal(localState.budgetUsage.protocolRepairs, 1);
+});
+
+test("runtime fails closed without retrying a non-repairable protocol violation", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-non-repairable-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new QueueTransport(["untrusted response"]);
+  const nonRepairableProtocol: ProtocolAdapter = {
+    ...protocol,
+    parseModelTurn: () => {
+      throw new ProtocolParseError("TASK_MISMATCH", "response belongs to another task", {}, false);
+    },
+  };
+  const runtime = new AgentRuntime({
+    state: localState,
+    store,
+    journal: new OperationJournal(path.join(root, "operations"), localState.sessionId),
+    audit: new AuditLog(path.join(root, "audit.jsonl"), localState.sessionId),
+    protocol: nonRepairableProtocol,
+    policy: {
+      summarize: () => ({}),
+      authorize: () => ({ outcome: "allow", reasonCode: "OK", explanation: "ok" }),
+      expandSessionGrant: async () => false,
+    },
+    tools: {
+      execute: async () => { throw new Error("unused"); },
+      inspectCompletionState: async () => ({ pathKey: completionPathKey, known: false, fingerprint: "x", excludedStateFingerprint: "0".repeat(64), hasConflicts: false, changedPaths: [], outOfScopePaths: [], gitStatusSummary: "unknown" }),
+    },
+    transport,
+    disclosure: { inspectAndSerialize: async (message) => message },
+    user: { requestInput: async () => ({}), requestCapability: async () => ({ decision: "deny" }) },
+    completionRequirements: { requiredCommandIds: [], requireValidationAfterLastMutation: true, requireCleanPendingOperations: true },
+    clock: { now: () => new Date("2026-01-01T00:01:00.000Z") },
+    idFactory: () => "submission_1",
+  });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "failed");
+  assert.match(result.reason ?? "", /Non-repairable protocol violation/u);
+  assert.equal(transport.submittedContents.length, 1, "must not submit repair feedback");
+  assert.equal(localState.budgetUsage.protocolRepairs, 0);
+});
+
+test("user-requested pause wins when transport reports cancellation", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-pause-race-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new CancelledOnStopTransport();
+  const runtime = new AgentRuntime({
+    state: localState,
+    store,
+    journal: new OperationJournal(path.join(root, "operations"), localState.sessionId),
+    audit: new AuditLog(path.join(root, "audit.jsonl"), localState.sessionId),
+    protocol,
+    policy: {
+      summarize: () => ({}),
+      authorize: () => ({ outcome: "allow", reasonCode: "OK", explanation: "ok" }),
+      expandSessionGrant: async () => false,
+    },
+    tools: {
+      execute: async () => { throw new Error("unused"); },
+      inspectCompletionState: async () => ({ pathKey: completionPathKey, known: false, fingerprint: "x", excludedStateFingerprint: "0".repeat(64), hasConflicts: false, changedPaths: [], outOfScopePaths: [], gitStatusSummary: "unknown" }),
+    },
+    transport,
+    disclosure: { inspectAndSerialize: async (message) => message },
+    user: { requestInput: async () => ({}), requestCapability: async () => ({ decision: "deny" }) },
+    completionRequirements: { requiredCommandIds: [], requireValidationAfterLastMutation: true, requireCleanPendingOperations: true },
+    clock: { now: () => new Date("2026-01-01T00:01:00.000Z") },
+    idFactory: () => "submission_1",
+  });
+
+  const run = runtime.run();
+  await transport.receiveStarted;
+  await runtime.requestPause("operator pause");
+  const result = await run;
+  assert.equal(result.status, "paused");
+  assert.equal(result.reason, "operator pause");
 });
 
 test("runtime resumes from an integrity-checked cached model response without resubmitting", async () => {

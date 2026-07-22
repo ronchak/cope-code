@@ -180,14 +180,29 @@ export class AgentRuntime {
           }).messages;
           this.state.protocolRepairStreak = 0;
         } catch (error) {
-          this.meter.consume("protocolRepairs");
-          this.state.protocolRepairStreak += 1;
+          const repairable = this.dependencies.protocol.isRepairableParseError(error);
+          if (repairable) {
+            this.meter.consume("protocolRepairs");
+            this.state.protocolRepairStreak += 1;
+          }
           await this.dependencies.audit.append({
             type: "protocol.error",
             taskId: this.state.taskId,
             turnId,
-            data: { error: errorMessage(error), repairAttempt: this.state.protocolRepairStreak },
+            data: {
+              error: errorMessage(error),
+              repairable,
+              ...(repairable ? { repairAttempt: this.state.protocolRepairStreak } : {}),
+            },
           });
+          if (!repairable) {
+            throw new AgentError(
+              "PROTOCOL_INVALID",
+              `Non-repairable protocol violation: ${errorMessage(error)}`,
+              {},
+              { cause: error },
+            );
+          }
           if (this.state.protocolRepairStreak > this.state.budgetLimits.maxProtocolRepairs) {
             throw new AgentError("PROTOCOL_INVALID", "Copilot exceeded the consecutive protocol-repair limit");
           }
@@ -1141,6 +1156,7 @@ export class AgentRuntime {
   }
 
   private async handleTransportResult(result: Exclude<ReceiveResult, { status: "completed" }>): Promise<AgentRunResult | undefined> {
+    if (this.interruption !== undefined) return this.finishInterruption();
     if (result.status === "cancelled") return this.abort(result.diagnosticCode);
     if (result.status === "blocked" && !result.retryable) {
       await this.move("blocked", result.reason);
