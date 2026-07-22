@@ -4,6 +4,8 @@ Cope turns Microsoft 365 Copilot Chat into a local coding agent through a visibl
 
 The deterministic harness remains responsible for repository boundaries, permissions, local tools, checkpoints, validation, recovery, and audit records. Copilot supplies the coding judgment through its normal browser UI. Cope does not use private Copilot endpoints, token extraction, network interception, or automated sign-in.
 
+Runtime integrators may opt into [source-free OpenTelemetry-compatible observability](docs/OBSERVABILITY.md). It is bounded and failure-isolated, and never replaces the local hash-chained audit.
+
 ## Install on Windows
 
 Extract the release zip, then double-click:
