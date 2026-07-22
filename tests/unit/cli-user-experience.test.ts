@@ -71,6 +71,7 @@ test("package and installer expose a durable global cope command", async () => {
   assert.match(installer, /npm\.cmd install --global/u);
   assert.doesNotMatch(installer, /npm\.cmd link/u);
   assert.match(installer, /cope\.cmd/u);
+  assert.match(installer, /SetEnvironmentVariable\("COPE_SOURCE_DIR", \$ProjectRoot, "User"\)/u);
 });
 
 test("normal help stays compact while advanced operations remain discoverable", async () => {

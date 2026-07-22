@@ -14,6 +14,8 @@ install.cmd
 
 The installer performs a locked dependency install, builds the TypeScript release, creates a packed npm artifact, installs the global `cope` command, and offers to run guided browser setup. It is browser-neutral: it neither chooses nor downloads a browser. The packed install is deliberate. Moving or deleting the extracted release folder later will not break the global command.
 
+The installer also remembers the extracted source folder for local updates. From that checkout, pull or apply the changes you want, then run `cope update` to rebuild and reinstall Cope. Moving or deleting the source folder does not break the installed command, but you must rerun `install.cmd` from the folder's new location before using `cope update` again.
+
 Open a new PowerShell window after installation and run:
 
 ```powershell
