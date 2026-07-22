@@ -6,6 +6,20 @@ The repository contains an offline-testable runtime and a shared visible Edge/Ch
 
 No live tuple is certified by this source tree. Windows x64 remains the primary blocking candidate. The two exact Mac candidates are experimental home-test preview lanes only: MacBook Air `Mac14,2`/M2/macOS `26.4.1`, and MacBook Pro `MacBookPro16,3`/Intel/macOS `15.7.7`. Hosted/offline success is not a live claim. See [MACOS-TARGET.md](MACOS-TARGET.md) and use the [live-pilot acceptance matrix](LIVE-PILOT-ACCEPTANCE.md) on each exact machine.
 
+## Command containment
+
+The command catalog, argument validation, environment filtering, timeouts, and
+post-command repository checks are not an OS security boundary. Cope now has an
+opt-in `command-containment/1` foundation that fails closed when required, but
+the default runtime has not yet migrated every validation command onto it.
+Linux uses bubblewrap only when its fixed system launcher is present. macOS can
+use the deprecated system `sandbox-exec`/Seatbelt interface, which is useful as
+defense in depth but is not a forward compatibility guarantee. Windows has no
+containment backend. Host-scoped network allow-lists and CPU, memory, and process
+limits are not implemented and are rejected when requested. No platform should
+be described as contained unless the exact profile was required and its backend
+successfully launched that command.
+
 | Tier | Scope | Current evidence |
 | --- | --- | --- |
 | Primary | Exact Windows x64 candidate in `WINDOWS-TARGET.md` | Offline implementation; target/live and performance gates pending |
