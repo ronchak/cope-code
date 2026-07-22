@@ -12,6 +12,7 @@ import { BUDGET_METRICS, TOOL_NAMES } from "../protocol/index.js";
 import type { RepositoryBoundary } from "../repository/boundary.js";
 import type { RepositoryReadOperation } from "../repository/repository-tools.js";
 import { AgentError, errorMessage } from "../shared/errors.js";
+import { sha256 } from "../shared/crypto.js";
 import type { CommandCatalog } from "../tools/command-catalog.js";
 import type {
   AuthorizationDecision,
@@ -69,7 +70,7 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
     try {
       const operation = await this.buildOperation(call, false);
       const preliminary = this.engineValue.evaluate(operation);
-      if (preliminary.decision !== "allow" || call.name !== "apply_patch") {
+      if (preliminary.decision !== "allow" || (call.name !== "apply_patch" && call.name !== "edit_text")) {
         return decisionFor(preliminary, call, this.options.commandCatalog, operation);
       }
       // Exact line accounting requires local before-images. It is performed
@@ -203,6 +204,19 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
       };
       usage.changed_files += changes.length;
       usage.changed_lines += changedLines;
+    } else if (call.name === "edit_text") {
+      const edit = editTextInput(call.arguments);
+      const changedLines = exactPatchLines ? await this.countExactEditLines(edit) : 0;
+      change = {
+        files_changed: 1,
+        changed_lines: changedLines,
+        creates: 0,
+        deletes: 0,
+        dependency_manifest: isDependencyManifest(edit.path),
+        local_commit: false,
+      };
+      usage.changed_files += 1;
+      usage.changed_lines += changedLines;
     }
 
     return {
@@ -229,6 +243,32 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
     }
     return total;
   }
+
+  private async countExactEditLines(edit: EditTextInput): Promise<number> {
+    const existing = await this.options.boundary.resolveExistingFile(edit.path);
+    const bytes = await readFile(existing.absolutePath);
+    if (sha256(bytes) !== edit.base_sha256) {
+      throw new AgentError("STALE_STATE", "Edit base hash does not match current file state", { path: edit.path });
+    }
+    const before = bytes.toString("utf8");
+    const occurrences = countOccurrences(before, edit.old_text);
+    if (occurrences !== edit.expected_occurrences) {
+      throw new AgentError("STALE_STATE", "Edit occurrence count does not match current file state", {
+        path: edit.path,
+        expectedOccurrences: edit.expected_occurrences,
+        actualOccurrences: occurrences,
+      });
+    }
+    return countChangedLines(before, before.split(edit.old_text).join(edit.new_text));
+  }
+}
+
+interface EditTextInput {
+  readonly path: string;
+  readonly base_sha256: string;
+  readonly old_text: string;
+  readonly new_text: string;
+  readonly expected_occurrences: number;
 }
 
 type PatchInput =
@@ -254,7 +294,33 @@ function pathFacts(call: NormalizedToolCall): NonNullable<PolicyOperation["paths
       access: change.kind === "create" ? "create" : change.kind === "delete" ? "delete" : "write",
     }));
   }
+  if (call.name === "edit_text") {
+    return [{ path: requiredString(call.arguments.path, "path"), access: "write" }];
+  }
   return [];
+}
+
+function editTextInput(value: Readonly<Record<string, unknown>>): EditTextInput {
+  const expected = positiveInteger(value.expected_occurrences);
+  if (expected === undefined) throw new AgentError("PROTOCOL_INVALID", "expected_occurrences must be positive");
+  return {
+    path: requiredString(value.path, "path"),
+    base_sha256: requiredString(value.base_sha256, "base_sha256"),
+    old_text: requiredString(value.old_text, "old_text"),
+    new_text: requiredString(value.new_text, "new_text"),
+    expected_occurrences: expected,
+  };
+}
+
+function countOccurrences(content: string, search: string): number {
+  if (search.length === 0) return 0;
+  let count = 0;
+  let offset = 0;
+  while ((offset = content.indexOf(search, offset)) !== -1) {
+    count += 1;
+    offset += search.length;
+  }
+  return count;
 }
 
 function decisionFor(

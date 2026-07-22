@@ -26,6 +26,16 @@ export interface ApplyPatchRequest {
   readonly operationId?: string;
 }
 
+export interface EditTextRequest {
+  readonly path: string;
+  readonly base_sha256: string;
+  readonly old_text: string;
+  readonly new_text: string;
+  readonly expected_occurrences: number;
+  /** Journal operation associated with the pre-mutation checkpoint. */
+  readonly operationId?: string;
+}
+
 export interface PatchBudgets {
   readonly maxFiles?: number;
   readonly maxFileBytes?: number;
@@ -85,6 +95,59 @@ export class PatchEngine {
     this.maxChangedLines = budgets.maxChangedLines ?? 2_000;
     this.allowCreate = budgets.allowCreate ?? true;
     this.allowDelete = budgets.allowDelete ?? false;
+  }
+
+  /**
+   * Builds a targeted update from an exact, hash-guarded before-image, then
+   * delegates commit/checkpoint/rollback/post-state verification to applyPatch.
+   */
+  public async editText(request: EditTextRequest): Promise<ApplyPatchResult> {
+    if (request.old_text.length === 0) {
+      throw new AgentError("PROTOCOL_INVALID", "edit_text old_text must not be empty");
+    }
+    if (!Number.isSafeInteger(request.expected_occurrences) || request.expected_occurrences < 1 || request.expected_occurrences > 10_000) {
+      throw new AgentError("PROTOCOL_INVALID", "edit_text expected_occurrences must be an integer from 1 through 10000");
+    }
+    const normalizedPath = normalizeRepositoryPath(request.path);
+    assertSupportedMutationPath(normalizedPath);
+    this.protectedPaths.assertAllowed(normalizedPath, "update");
+    const existing = await this.boundary.resolveExistingFile(normalizedPath);
+    const existingStat = await stat(existing.absolutePath);
+    if (existingStat.size > this.maxFileBytes) {
+      throw new AgentError("BUDGET_EXCEEDED", "Existing file exceeds the mutation size limit", {
+        path: normalizedPath,
+        sizeBytes: existingStat.size,
+      });
+    }
+    const mode = existingStat.mode & 0o777;
+    if (CURRENT_HOST_PLATFORM.supportsPosixModes && (mode & 0o111) !== 0) {
+      throw new AgentError("UNSUPPORTED_FILE", "Executable files cannot be modified", { path: normalizedPath });
+    }
+    const bytes = await readFile(existing.absolutePath);
+    if (!/^[0-9a-f]{64}$/u.test(request.base_sha256) || sha256(bytes) !== request.base_sha256) {
+      throw new AgentError("STALE_STATE", "Edit base hash does not match current file state", {
+        path: normalizedPath,
+        expectedSha256: request.base_sha256,
+        actualSha256: sha256(bytes),
+      });
+    }
+    if (looksBinary(bytes)) {
+      throw new AgentError("UNSUPPORTED_FILE", "Binary files cannot be modified", { path: normalizedPath });
+    }
+    const before = bytes.toString("utf8");
+    const occurrences = countOccurrences(before, request.old_text);
+    if (occurrences !== request.expected_occurrences) {
+      throw new AgentError("STALE_STATE", "Edit occurrence count does not match current file state", {
+        path: normalizedPath,
+        expectedOccurrences: request.expected_occurrences,
+        actualOccurrences: occurrences,
+      });
+    }
+    const content = before.split(request.old_text).join(request.new_text);
+    return this.applyPatch({
+      changes: [{ kind: "update", path: normalizedPath, base_sha256: request.base_sha256, content }],
+      ...(request.operationId === undefined ? {} : { operationId: request.operationId }),
+    });
   }
 
   public async applyPatch(request: ApplyPatchRequest): Promise<ApplyPatchResult> {
@@ -382,6 +445,17 @@ export class PatchEngine {
       throw new Error(restorationErrors.join("; "));
     }
   }
+}
+
+export function countOccurrences(content: string, search: string): number {
+  if (search.length === 0) return 0;
+  let count = 0;
+  let offset = 0;
+  while ((offset = content.indexOf(search, offset)) !== -1) {
+    count += 1;
+    offset += search.length;
+  }
+  return count;
 }
 
 function validateChangeShape(change: PatchChange): void {

@@ -131,7 +131,7 @@ export class PolicyEngine {
 
   private evaluateMode(operation: PolicyOperation, checks: PolicyCheck[]): void {
     if (this.session.mode === "inspect") {
-      if (operation.tool === "apply_patch" || operation.paths?.some((path) => path.access !== "read") === true) {
+      if (operation.tool === "apply_patch" || operation.tool === "edit_text" || operation.paths?.some((path) => path.access !== "read") === true) {
         checks.push({
           layer: "session",
           dimension: "mode",
@@ -185,7 +185,7 @@ export class PolicyEngine {
   }
 
   private evaluateRequiredContext(operation: PolicyOperation, checks: PolicyCheck[]): void {
-    const needsPath = ["list_files", "search_text", "read_file", "apply_patch"].includes(operation.tool);
+    const needsPath = ["list_files", "search_text", "read_file", "edit_text", "apply_patch"].includes(operation.tool);
     if (needsPath && (operation.paths?.length ?? 0) === 0) {
       checks.push({
         layer: "organization",
@@ -213,13 +213,13 @@ export class PolicyEngine {
         message: "run_command policy evaluation requires catalog-resolved network metadata.",
       });
     }
-    if (operation.tool === "apply_patch" && operation.change === undefined) {
+    if ((operation.tool === "apply_patch" || operation.tool === "edit_text") && operation.change === undefined) {
       checks.push({
         layer: "organization",
         dimension: "change",
         decision: "deny",
         reason_code: "OPERATION_CONTEXT_MISSING",
-        message: "apply_patch policy evaluation requires deterministic change counts and kinds.",
+        message: `${operation.tool} policy evaluation requires deterministic change counts and kinds.`,
       });
     }
   }
@@ -271,7 +271,7 @@ export class PolicyEngine {
         invalid("change", "Change counts must be non-negative safe integers.");
       }
     }
-    if (operation.tool === "apply_patch" && operation.change !== undefined) {
+    if ((operation.tool === "apply_patch" || operation.tool === "edit_text") && operation.change !== undefined) {
       const mutationPaths = operation.paths?.filter((path) => path.access !== "read") ?? [];
       const uniquePaths = new Set(
         mutationPaths.map((path) => {
@@ -288,7 +288,7 @@ export class PolicyEngine {
         operation.change.creates !== creates ||
         operation.change.deletes !== deletes
       ) {
-        invalid("change", "apply_patch path inventory and deterministic change counts do not agree.");
+        invalid("change", `${operation.tool} path inventory and deterministic change counts do not agree.`);
       }
     }
   }

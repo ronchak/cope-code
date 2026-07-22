@@ -131,7 +131,21 @@ test("ToolHost dispatches the cba/1 wire arguments, applies policy, and never re
   assert.equal(stale.status, "conflict");
   assert.equal(stale.data.code, "STALE_STATE");
 
-  await writeFile(path.join(root, "src", "main.ts"), "export const value = 2;\n");
+  const edit = await host.dispatch({
+    operationId: "edit_exact",
+    name: "edit_text",
+    arguments: {
+      path: "src/main.ts",
+      base_sha256: sha256("export const value = 1;\n"),
+      old_text: "value = 1",
+      new_text: "value = 2",
+      expected_occurrences: 1,
+    },
+  });
+  assert.equal(edit.status, "success");
+  assert.equal(edit.safeMetadata.changedFileCount, 1);
+  assert.equal(await readFile(path.join(root, "src", "main.ts"), "utf8"), "export const value = 2;\n");
+
   const command = await host.dispatch({
     operationId: "command_validate",
     name: "run_command",

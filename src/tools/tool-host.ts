@@ -18,6 +18,7 @@ export type ToolHostToolName =
   | "read_file"
   | "git_status"
   | "git_diff"
+  | "edit_text"
   | "apply_patch"
   | "run_command";
 
@@ -386,6 +387,39 @@ export class ToolHost {
           repositoryHasConflicts,
         });
       }
+      case "edit_text": {
+        const args = checkedObject(call.arguments, [
+          "path", "base_sha256", "old_text", "new_text", "expected_occurrences",
+        ]);
+        const result = await this.patchEngine.editText({
+          path: requiredString(args, "path"),
+          base_sha256: requiredString(args, "base_sha256"),
+          old_text: requiredString(args, "old_text"),
+          new_text: requiredString(args, "new_text"),
+          expected_occurrences: requiredNumber(args, "expected_occurrences"),
+          operationId: call.operationId,
+        });
+        let repositoryFingerprint = "unknown";
+        let repositoryStateKnown = false;
+        let repositoryHasConflicts = true;
+        try {
+          const repositoryStatus = await this.git.status();
+          repositoryFingerprint = repositoryStatus.snapshotSha256;
+          repositoryStateKnown = true;
+          repositoryHasConflicts = repositoryStatus.hasConflicts;
+        } catch {
+          // The edit remains committed and recoverable; completion fails closed.
+        }
+        return successOutcome(call, asRecord(result), {
+          checkpointId: result.checkpointId,
+          changedFileCount: result.changedPaths.length,
+          changedPaths: result.changedPaths.map((entry) => entry.path),
+          changedLines: result.changedLines,
+          repositoryFingerprint,
+          repositoryStateKnown,
+          repositoryHasConflicts,
+        });
+      }
       case "run_command": {
         const args = checkedObject(call.arguments, ["command_id", "parameters", "timeout_ms"]);
         const parameters = optionalParameters(args, "parameters");
@@ -548,6 +582,7 @@ function validateCall(call: ToolHostCall): void {
       "read_file",
       "git_status",
       "git_diff",
+      "edit_text",
       "apply_patch",
       "run_command",
     ].includes(call.name)
@@ -575,6 +610,14 @@ function requiredString(value: Readonly<Record<string, unknown>>, key: string): 
   const entry = value[key];
   if (typeof entry !== "string") {
     throw new AgentError("PROTOCOL_INVALID", `${key} must be a string`);
+  }
+  return entry;
+}
+
+function requiredNumber(value: Readonly<Record<string, unknown>>, key: string): number {
+  const entry = value[key];
+  if (typeof entry !== "number") {
+    throw new AgentError("PROTOCOL_INVALID", `${key} must be a number`);
   }
   return entry;
 }

@@ -128,6 +128,17 @@ const applyPatchSchema = strictObject(
   ["changes"],
 );
 
+const editTextSchema = strictObject(
+  {
+    path: pathString,
+    base_sha256: sha256,
+    old_text: { type: "string", minLength: 1, maxLength: 1_048_576 },
+    new_text: { type: "string", maxLength: 1_048_576 },
+    expected_occurrences: { type: "integer", minimum: 1, maximum: 10_000 },
+  },
+  ["path", "base_sha256", "old_text", "new_text", "expected_occurrences"],
+);
+
 const commandParameterValue: JsonSchema = {
   oneOf: [
     { type: "string", maxLength: 4_096 },
@@ -248,6 +259,7 @@ export const TOOL_ARGUMENT_SCHEMAS: Readonly<Record<ToolName, JsonSchema>> = {
   read_file: readFileSchema,
   git_status: gitStatusSchema,
   git_diff: gitDiffSchema,
+  edit_text: editTextSchema,
   apply_patch: applyPatchSchema,
   run_command: runCommandSchema,
   request_user_input: requestUserInputSchema,
