@@ -122,7 +122,10 @@ try {
   if ($LASTEXITCODE -ne 0 -or $installedVersion -ne "0.1.2") {
     Fail "Cope did not pass its launch check. Reported version: $installedVersion"
   }
+  [Environment]::SetEnvironmentVariable("COPE_SOURCE_DIR", $ProjectRoot, "User")
+  $env:COPE_SOURCE_DIR = $ProjectRoot
   Write-Ok "cope $installedVersion installed"
+  Write-Ok "Local update source saved: $ProjectRoot"
   Write-Host ""
   Write-Host "You can now run:" -ForegroundColor White
   Write-Host "  cope" -ForegroundColor Cyan
