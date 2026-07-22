@@ -43,6 +43,8 @@ Before a task begins, Cope shows a compact access screen with the project, mode,
 
 Use `cope -c` to continue the latest resumable session for the selected project. Use `/sessions` or `cope sessions` to inspect recent work. The complete recovery command set remains available under `cope help advanced`.
 
+For a source-free view of model-context traffic, run `cope context <session-id>`. Add `--prepare-rollover` to create and audit an integrity-bound continuation capsule; this prepares evidence for a future explicit conversation handoff but does not start one.
+
 ## Diagnostics
 
 ```powershell

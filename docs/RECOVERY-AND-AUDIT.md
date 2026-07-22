@@ -1,5 +1,11 @@
 # Recovery, checkpoints, and audit
 
+## Context ledger and continuation capsules
+
+Each new runtime exchange appends source-free metadata to `context-ledger.jsonl`: direction, kind, byte count, content hash, turn identity, and a hash-chain link. Run `cope context <session-id>` to verify the chain and report deterministic inbound/outbound totals. The ledger deliberately does not retain prompt, response, source, diff, or command-output bodies.
+
+`cope context <session-id> --prepare-rollover` writes an integrity-bound `cope-continuation-capsule/1` beneath the protected session directory and appends `context.capsule_created` to the audit log. The capsule binds session progress, authority, budgets, policy hashes, context-ledger head, and a hash of the source conversation identifier. It neither submits data nor opens or authorizes a replacement conversation; a future transport capability can consume this primitive only after explicit rollover policy and UI checks are defined.
+
 ## Recovery objective
 
 Recovery preserves safety and local truth; it does not maximize automatic continuation. After a crash the runtime may retry only an action proven side-effect-free or not submitted. Uncertain browser sends and mutations are not replayed.

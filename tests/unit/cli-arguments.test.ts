@@ -111,6 +111,13 @@ test("CLI parses review-package export and validates its arguments", () => {
   );
 });
 
+test("CLI parses context reporting and explicit rollover preparation", () => {
+  assert.deepEqual(parseCliArguments(["context", "session_12345678", "--prepare-rollover", "--json"]), {
+    command: "context", sessionId: "session_12345678", prepareRollover: true, json: true,
+  });
+  assert.throws(() => parseCliArguments(["context"]), /requires a session identifier/);
+});
+
 test("CLI requires an explicit force flag for divergent rollback override", () => {
   assert.deepEqual(
     parseCliArguments(["rollback", "session_12345678", "--checkpoint", "checkpoint_123", "--force"]),

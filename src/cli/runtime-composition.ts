@@ -33,6 +33,7 @@ import { sha256, stableJson } from "../shared/crypto.js";
 import { AgentError } from "../shared/errors.js";
 import { SessionArtifactStore } from "../session/artifact-store.js";
 import { CompletionHandoffStore } from "../session/completion-handoff-store.js";
+import { ContextLedger } from "../session/context-ledger.js";
 import { OperationJournal } from "../session/operation-journal.js";
 import type { SessionStore } from "../session/store.js";
 import {
@@ -239,6 +240,9 @@ export async function composeRuntime(options: ComposeRuntimeOptions): Promise<Co
       path.join(sessionDirectory, "handoff"),
       state.sessionId,
       new SecretScanner(fingerprintKey),
+    ),
+    contextLedger: new ContextLedger(
+      path.join(sessionDirectory, "context-ledger.jsonl"), state.sessionId, state.taskId,
     ),
     retainSourceArtifactsOnCompletion:
       configuration.repository.retention.retain_source_artifacts_on_completion,
