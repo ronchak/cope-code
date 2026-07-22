@@ -27,6 +27,12 @@ jobs:
           cache: npm
       - run: npm ci --no-audit --no-fund
       - run: npm run check
+      - name: Build and verify unsigned preview release evidence
+        shell: bash
+        run: |
+          export SOURCE_DATE_EPOCH=1767225600
+          npm run release:build -- "$RUNNER_TEMP/cope-release" preview
+          npm run release:verify -- "$RUNNER_TEMP/cope-release"
       - if: runner.os == 'macOS'
         run: sh -n scripts/install-macos.sh scripts/uninstall-macos.sh
       - if: runner.os == 'macOS'
