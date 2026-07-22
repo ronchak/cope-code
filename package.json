@@ -28,6 +28,7 @@
     "test": "npm run build && node --test --test-concurrency=1 dist/tests/**/*.test.js",
     "test:unit": "npm run build && node --test --test-concurrency=1 dist/tests/unit/**/*.test.js",
     "test:e2e": "npm run build && node --test --test-concurrency=1 dist/tests/e2e/**/*.test.js",
+    "test:chromium-safety": "npm run build && node scripts/run-tests-without-skips.mjs dist/tests/unit/playwright-identity-ambiguity.test.js dist/tests/unit/playwright-native-dialog-race.test.js",
     "check": "npm run build && npm test",
     "start": "node dist/src/cli/main.js",
     "dev": "npm run build --silent && node dist/src/cli/main.js",

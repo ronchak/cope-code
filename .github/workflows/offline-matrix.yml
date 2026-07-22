@@ -26,6 +26,10 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci --no-audit --no-fund
+      - name: Install pinned Chromium for browser safety tests
+        run: npx --no-install playwright-core install chromium
+      - name: Run Chromium safety tests with zero skips
+        run: npm run test:chromium-safety
       - run: npm run check
       - if: runner.os == 'macOS'
         run: sh -n scripts/install-macos.sh scripts/uninstall-macos.sh
