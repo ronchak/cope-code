@@ -103,29 +103,31 @@ test("demo mode previews the terminal interface without live setup", async () =>
   assert.match(output.value, /no browser will open/u);
 });
 
-test("only interactive human commands request terminal takeover", () => {
-  assert.equal(commandUsesTerminalTakeover("interactive", false), true);
-  assert.equal(commandUsesTerminalTakeover("demo", false), true);
+test("terminal takeover requires an explicit fullscreen opt-in", () => {
+  assert.equal(commandUsesTerminalTakeover("interactive", false, false), false);
+  assert.equal(commandUsesTerminalTakeover("interactive", false, true), true);
+  assert.equal(commandUsesTerminalTakeover("demo", false, true), true);
   assert.equal(commandUsesTerminalTakeover("run", false), false);
-  assert.equal(commandUsesTerminalTakeover("demo", true), false);
+  assert.equal(commandUsesTerminalTakeover("demo", true, true), false);
 });
 
-test("terminal takeover clears the viewport and restores terminal presentation once", () => {
+test("fullscreen takeover uses an alternate buffer without clearing scrollback", () => {
   const output = new MemoryOutput();
   const end = beginTerminalTakeover(output, {
     inputIsTTY: true,
     outputIsTTY: true,
     term: "xterm-256color",
+    fullscreen: true,
   });
 
-  assert.match(output.value, /\x1b\[2J/u);
-  assert.match(output.value, /\x1b\[3J/u);
+  assert.match(output.value, /\x1b\[\?1049h/u);
+  assert.doesNotMatch(output.value, /\x1b\[2J|\x1b\[3J/u);
   assert.match(output.value, /\x1b\[H/u);
   const afterStart = output.value;
   end();
-  assert.equal(output.value, `${afterStart}\x1b[0m\x1b[?25h`);
+  assert.equal(output.value, `${afterStart}\x1b[0m\x1b[?25h\x1b[?1049l`);
   end();
-  assert.equal(output.value, `${afterStart}\x1b[0m\x1b[?25h`);
+  assert.equal(output.value, `${afterStart}\x1b[0m\x1b[?25h\x1b[?1049l`);
 });
 
 test("terminal takeover leaves redirected and plain-terminal output untouched", () => {
@@ -140,6 +142,9 @@ test("terminal takeover leaves redirected and plain-terminal output untouched", 
     end();
     assert.equal(output.value, "");
   }
+  const defaultOutput = new MemoryOutput();
+  beginTerminalTakeover(defaultOutput, { inputIsTTY: true, outputIsTTY: true, term: "xterm-256color", fullscreen: false })();
+  assert.equal(defaultOutput.value, "");
 });
 
 test("startup panel is responsive and preserves Cope workspace information", () => {

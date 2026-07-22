@@ -91,20 +91,21 @@ export interface TerminalTakeoverOptions {
   readonly inputIsTTY?: boolean;
   readonly outputIsTTY?: boolean;
   readonly term?: string;
+  readonly fullscreen?: boolean;
 }
 
 export interface TerminalOutput {
   write(value: string): unknown;
 }
 
-const TERMINAL_TAKEOVER_START = "\x1b[0m\x1b[?25h\x1b[2J\x1b[3J\x1b[H";
-const TERMINAL_TAKEOVER_END = "\x1b[0m\x1b[?25h";
+const TERMINAL_TAKEOVER_START = "\x1b[?1049h\x1b[0m\x1b[?25h\x1b[H";
+const TERMINAL_TAKEOVER_END = "\x1b[0m\x1b[?25h\x1b[?1049l";
 
-export function commandUsesTerminalTakeover(command: string, json: boolean): boolean {
-  return !json && (command === "interactive" || command === "demo");
+export function commandUsesTerminalTakeover(command: string, json: boolean, fullscreen = process.env.COPE_FULLSCREEN === "1"): boolean {
+  return fullscreen && !json && (command === "interactive" || command === "demo");
 }
 
-/** Clears the interactive viewport while leaving redirected and plain-terminal output untouched. */
+/** Uses the terminal's alternate screen only after an explicit fullscreen opt-in. */
 export function beginTerminalTakeover(
   output: TerminalOutput,
   options: TerminalTakeoverOptions = {},
@@ -112,7 +113,8 @@ export function beginTerminalTakeover(
   const inputIsTTY = options.inputIsTTY ?? process.stdin.isTTY === true;
   const outputIsTTY = options.outputIsTTY ?? process.stdout.isTTY === true;
   const term = options.term ?? process.env.TERM;
-  if (!inputIsTTY || !outputIsTTY || term === "dumb") return () => undefined;
+  const fullscreen = options.fullscreen ?? process.env.COPE_FULLSCREEN === "1";
+  if (!fullscreen || !inputIsTTY || !outputIsTTY || term === "dumb") return () => undefined;
 
   output.write(TERMINAL_TAKEOVER_START);
   let ended = false;

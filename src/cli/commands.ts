@@ -317,6 +317,7 @@ async function runNewSession(
       protocolRepairStreak: 0,
     };
     await store.create(state);
+    announceSession(state, command.json, io);
     const sessionDirectory = store.sessionDirectory(sessionId);
     audit = new AuditLog(path.join(sessionDirectory, "audit.jsonl"), sessionId);
     await audit.append({
@@ -1132,6 +1133,14 @@ function sessionResult(
     failure: state.failure ?? null,
     ...(message === undefined ? {} : { message }),
   };
+}
+
+function announceSession(state: SessionState, json: boolean, io: CliIo): void {
+  if (json) {
+    io.stderr.write(`${JSON.stringify({ event: "session.created", sessionId: state.sessionId, taskId: state.taskId, status: state.status })}\n`);
+    return;
+  }
+  io.stdout.write(`${dim(`Session ${state.sessionId}`)}\n`);
 }
 
 function disclosureSummary(records: readonly DisclosureRecord[]): Readonly<Record<string, unknown>> {
