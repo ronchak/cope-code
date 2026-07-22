@@ -29,3 +29,20 @@ test("audit verification detects tampering and partial records", async () => {
   await writeFile(filename, raw.trimEnd(), "utf8");
   await assert.rejects(() => AuditLog.verify(filename, "session_12345678"), /partial/);
 });
+
+test("concurrent appends remain a valid ordered hash chain", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-audit-concurrent-"));
+  const filename = path.join(root, "audit.jsonl");
+  const log = new AuditLog(filename, "session_12345678");
+
+  await Promise.all(Array.from({ length: 16 }, (_, index) => log.append({
+    type: "tool.requested",
+    taskId: "task_12345678",
+    operationId: `op_${index}`,
+    data: { index },
+  })));
+
+  const events = await AuditLog.verify(filename, "session_12345678");
+  assert.equal(events.length, 16);
+  assert.deepEqual(events.map((event) => event.sequence), Array.from({ length: 16 }, (_, index) => index + 1));
+});
