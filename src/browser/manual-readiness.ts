@@ -1,5 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 
+import { AgentError } from "../shared/errors.js";
 import type { BrowserStateInspection } from "./copilot-browser-adapter.js";
 import type { BrowserWaitConfig } from "./config.js";
 
@@ -34,6 +35,7 @@ export async function waitForStableManualReadiness(
       isTerminalManualReadinessState(inspection.classification.state));
   const deadline = monotonicNow() + maxWaitMs;
   let lastInspection: BrowserStateInspection | undefined;
+  let lastRecoverableObservationError: unknown;
   let terminalPeriodSince = 0;
   let terminalPeriodSamples = 0;
   let stableKey: string | undefined;
@@ -43,12 +45,52 @@ export async function waitForStableManualReadiness(
   let unsafeSamples = 0;
   let lastUnsafeInspection: BrowserStateInspection | undefined;
 
+  const resetObservationEvidence = (): void => {
+    // A page transition invalidates every sample collected from the previous
+    // document. Never carry stability or unsafe-state quorum across it.
+    lastInspection = undefined;
+    terminalPeriodSince = 0;
+    terminalPeriodSamples = 0;
+    stableKey = undefined;
+    stableKeySince = 0;
+    stableKeySamples = 0;
+    unsafePeriodSince = 0;
+    unsafeSamples = 0;
+    lastUnsafeInspection = undefined;
+  };
+
   for (;;) {
     const beforeObservation = monotonicNow();
     const remaining = deadline - beforeObservation;
-    if (remaining <= 0 && lastInspection !== undefined) return lastInspection;
+    if (remaining <= 0) {
+      if (lastInspection !== undefined) return lastInspection;
+      if (lastRecoverableObservationError !== undefined) throw lastRecoverableObservationError;
+    }
     const observationWindow = Math.max(1, Math.min(Math.max(remaining, 1), waits.pollMs));
-    const inspection = await observe(observationWindow, signal);
+    let inspection: BrowserStateInspection;
+    try {
+      inspection = await observe(observationWindow, signal);
+      lastRecoverableObservationError = undefined;
+    } catch (error) {
+      if (!isRecoverableManualReadinessObservationError(error)) throw error;
+
+      // The consistency barrier proved that this sample crossed a page change,
+      // but no browser action was dispatched. Discard it and take a fresh sample
+      // inside the existing manual-readiness deadline. Submission and ordinary
+      // one-shot inspection remain strict and do not use this retry loop.
+      resetObservationEvidence();
+      lastRecoverableObservationError = error;
+      const observedAt = monotonicNow();
+      const remainingAfterObservation = deadline - observedAt;
+      if (remainingAfterObservation <= 0) throw error;
+      const observationElapsed = Math.max(0, observedAt - beforeObservation);
+      const pause = Math.min(
+        Math.max(0, waits.pollMs - observationElapsed),
+        remainingAfterObservation,
+      );
+      if (pause > 0) await sleep(pause, signal);
+      continue;
+    }
     lastInspection = inspection;
     if (inspection.classification.state === "ready") return inspection;
 
@@ -131,6 +173,18 @@ export async function waitForStableManualReadiness(
     );
     if (pause > 0) await sleep(pause, signal);
   }
+}
+
+/**
+ * A readiness observation invalidated by a page transition is safely repeatable
+ * only when the consistency barrier proves that no browser action was sent.
+ * Every other exception remains fatal, including renderer timeouts, ambiguous
+ * page ownership, native-dialog teardown, cancellation, and transport failure.
+ */
+export function isRecoverableManualReadinessObservationError(error: unknown): boolean {
+  return error instanceof AgentError &&
+    error.details.dispatchAttempted === false &&
+    error.details.diagnosticCode === "ACTIVE_PAGE_CHANGED_DURING_OBSERVATION";
 }
 
 /**
