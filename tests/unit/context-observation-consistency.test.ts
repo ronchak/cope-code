@@ -122,7 +122,10 @@ test("same-URL navigation during readiness invalidates the observation", async (
   const harness = createHarness();
   harness.page.probeHook = () => harness.page.navigate(harness.page.currentUrl);
 
-  await assert.rejects(inspect(harness.semantic), changedObservation);
+  await assert.rejects(
+    inspect(harness.semantic),
+    (error: unknown) => changedObservationWithReason(error, "navigation-epoch"),
+  );
 });
 
 test("a same-URL replacement page during readiness invalidates ownership", async () => {
@@ -526,6 +529,11 @@ async function inspect(page: ContextSemanticPage) {
 function changedObservation(error: unknown): boolean {
   return error instanceof AgentError &&
     error.details.diagnosticCode === "ACTIVE_PAGE_CHANGED_DURING_OBSERVATION";
+}
+
+function changedObservationWithReason(error: unknown, reason: string): boolean {
+  return changedObservation(error) &&
+    (error as AgentError).details.observationChangeReason === reason;
 }
 
 interface Deferred<T> {

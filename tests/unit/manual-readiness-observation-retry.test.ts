@@ -138,6 +138,64 @@ test("manual readiness does not retry other browser failures", async () => {
   }
 });
 
+test("manual readiness never retries ambiguous page ownership", async () => {
+  const ambiguity = new AgentError(
+    "TRANSPORT_INDETERMINATE",
+    "Multiple configured Copilot pages are open",
+    { diagnosticCode: "AMBIGUOUS_COPILOT_PAGE", dispatchAttempted: false },
+  );
+  let calls = 0;
+  let sleeps = 0;
+
+  await assert.rejects(
+    waitForStableManualReadiness(
+      async () => {
+        calls += 1;
+        throw ambiguity;
+      },
+      waits,
+      waits.manualReadinessMs,
+      undefined,
+      {
+        monotonicNow: () => 0,
+        sleep: async () => { sleeps += 1; },
+      },
+    ),
+    (error: unknown) => error === ambiguity,
+  );
+
+  assert.equal(calls, 1);
+  assert.equal(sleeps, 0);
+});
+
+test("cancellation racing a page-change invalidation wins without another retry", async () => {
+  const controller = new AbortController();
+  const cancellation = new Error("operator cancelled readiness");
+  let calls = 0;
+  let sleeps = 0;
+
+  await assert.rejects(
+    waitForStableManualReadiness(
+      async () => {
+        calls += 1;
+        controller.abort(cancellation);
+        throw changedObservation();
+      },
+      waits,
+      waits.manualReadinessMs,
+      controller.signal,
+      {
+        monotonicNow: () => 0,
+        sleep: async () => { sleeps += 1; },
+      },
+    ),
+    (error: unknown) => error === cancellation,
+  );
+
+  assert.equal(calls, 1);
+  assert.equal(sleeps, 0);
+});
+
 function changedObservation(): AgentError {
   return new AgentError(
     "TRANSPORT_INDETERMINATE",

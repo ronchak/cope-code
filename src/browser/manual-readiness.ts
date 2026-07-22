@@ -60,6 +60,7 @@ export async function waitForStableManualReadiness(
   };
 
   for (;;) {
+    signal?.throwIfAborted();
     const beforeObservation = monotonicNow();
     const remaining = deadline - beforeObservation;
     if (remaining <= 0) {
@@ -72,6 +73,9 @@ export async function waitForStableManualReadiness(
       inspection = await observe(observationWindow, signal);
       lastRecoverableObservationError = undefined;
     } catch (error) {
+      // Cancellation always outranks a recoverable page transition, including
+      // the race where both become observable as the inspection settles.
+      signal?.throwIfAborted();
       if (!isRecoverableManualReadinessObservationError(error)) throw error;
 
       // The consistency barrier proved that this sample crossed a page change,
