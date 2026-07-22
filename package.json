@@ -28,6 +28,8 @@
     "test": "npm run build && node --test --test-concurrency=1 dist/tests/**/*.test.js",
     "test:unit": "npm run build && node --test --test-concurrency=1 dist/tests/unit/**/*.test.js",
     "test:e2e": "npm run build && node --test --test-concurrency=1 dist/tests/e2e/**/*.test.js",
+    "release:build": "node scripts/release/build.mjs",
+    "release:verify": "node scripts/release/verify.mjs",
     "check": "npm run build && npm test",
     "start": "node dist/src/cli/main.js",
     "dev": "npm run build --silent && node dist/src/cli/main.js",
