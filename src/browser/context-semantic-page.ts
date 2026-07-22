@@ -101,6 +101,7 @@ export class ContextSemanticPage implements SemanticPage {
   #observedUrl: string | undefined;
   #observedEpoch: number | undefined;
   #observedDialogEpoch: number | undefined;
+  #observationDeadline: number | undefined;
   #filledPage: Page | undefined;
   #filledUrl: string | undefined;
   #filledEpoch: number | undefined;
@@ -167,6 +168,7 @@ export class ContextSemanticPage implements SemanticPage {
       this.#observedUrl = undefined;
       this.#observedEpoch = undefined;
       this.#observedDialogEpoch = undefined;
+      this.#observationDeadline = undefined;
     }
     this.#configurePage(selected);
     if (force || changed) await this.#delegate(selected).bringToFront(deadline);
@@ -200,6 +202,7 @@ export class ContextSemanticPage implements SemanticPage {
       this.#observedUrl = currentUrl;
       this.#observedEpoch = this.#navigationEpochs.get(this.#activePage) ?? 0;
       this.#observedDialogEpoch = this.#nativeDialogEpoch;
+      this.#observationDeadline = performance.now() + this.#actionMs;
       return currentUrl;
     }
     // The first observation after composer fill is part of the same submission
@@ -212,6 +215,7 @@ export class ContextSemanticPage implements SemanticPage {
       this.#observedUrl = currentUrl;
       this.#observedEpoch = this.#navigationEpochs.get(page) ?? 0;
       this.#observedDialogEpoch = this.#nativeDialogEpoch;
+      this.#observationDeadline = performance.now() + this.#actionMs;
       this.#postFillObservationSeen = true;
       return currentUrl;
     }
@@ -225,6 +229,7 @@ export class ContextSemanticPage implements SemanticPage {
     this.#observedUrl = currentUrl;
     this.#observedEpoch = this.#navigationEpochs.get(page) ?? 0;
     this.#observedDialogEpoch = this.#nativeDialogEpoch;
+    this.#observationDeadline = performance.now() + this.#actionMs;
     return currentUrl;
   }
 
@@ -233,7 +238,11 @@ export class ContextSemanticPage implements SemanticPage {
     if (this.#nativeDialogEpoch > 0) return nativeDialogSnapshot(group);
     const page = this.#activePage;
     const dialogEpoch = this.#nativeDialogEpoch;
-    const snapshot = await this.#delegate(page).snapshot(group);
+    // currentUrl() opens an observation window. Concurrent signal probes and
+    // the deliberately last modal probe must consume one absolute action
+    // deadline instead of each receiving a fresh actionMs allowance.
+    const deadline = this.#observationDeadline ?? performance.now() + this.#actionMs;
+    const snapshot = await this.#delegate(page).snapshot(group, deadline);
     // A native dialog is sticky and outranks any snapshot that was already in
     // flight when the listener revoked the browser context.
     if (this.#nativeDialogEpoch !== dialogEpoch) return nativeDialogSnapshot(group);
@@ -244,12 +253,16 @@ export class ContextSemanticPage implements SemanticPage {
   }
 
   public async completeObservation(): Promise<SemanticObservationCompletion> {
-    this.#assertOperationAvailable();
-    if (this.#nativeDialogEpoch > 0) {
-      return { nativeDialogDetected: true };
+    try {
+      this.#assertOperationAvailable();
+      if (this.#nativeDialogEpoch > 0) {
+        return { nativeDialogDetected: true };
+      }
+      this.#verifiedObservationPage();
+      return { nativeDialogDetected: false };
+    } finally {
+      this.#observationDeadline = undefined;
     }
-    this.#verifiedObservationPage();
-    return { nativeDialogDetected: false };
   }
 
   /**

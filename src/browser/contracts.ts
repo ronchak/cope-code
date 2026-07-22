@@ -87,6 +87,7 @@ export interface SemanticObservationCompletion {
 
 /** Minimal page surface used by the adapter and implemented by Playwright or tests. */
 export interface SemanticPage {
+  /** Starts one observation whose snapshots share the configured action deadline. */
   currentUrl(): Promise<string>;
   snapshot(group: LocatorGroup): Promise<GroupSnapshot>;
   /**

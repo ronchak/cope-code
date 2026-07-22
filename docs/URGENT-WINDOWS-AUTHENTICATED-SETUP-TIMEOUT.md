@@ -5,7 +5,9 @@
 The authoritative root cause is not yet identified. PR #25 contains source-free
 operation diagnostics, a candidate readiness-scope fix, and observation-race
 hardening, but the original Windows report predates the new diagnostic fields.
-The live authenticated Windows reproduction remains a mandatory merge gate.
+The live authenticated Windows reproduction is explicitly deferred until after
+merge because the target is not available before then. It remains mandatory
+post-merge validation, and this document does not claim live certification.
 
 ## Confirmed architectural fault and remaining root-cause question
 
@@ -52,6 +54,15 @@ snapshots. Modal inspection runs last, and a dialog arriving during any
 snapshot remains sticky. Navigation, replacement-page, authentication-popup,
 second-configured-page, and native-dialog races therefore cannot certify a
 mixed-time `READY` state.
+
+All snapshots in one observation now share the same absolute `actionMs`
+deadline established after page selection. The final modal snapshot receives
+only the time remaining after the concurrent readiness probes instead of a new
+full timeout window. A focused regression spends most of the observation
+budget in the concurrent probes and then stalls `modal / locator.count`; the
+old behavior consumes roughly two cumulative timeout windows, while the fixed
+path terminates at the original observation deadline with source-free
+attribution.
 
 The adapter also rejects overlapping inspect, readiness, submit, resolve, and
 receive operations before a second operation can sample or act. This keeps the
@@ -164,12 +175,16 @@ not an acceptable fix.
 - Never dismiss, accept, fill, click, or submit through an unknown browser dialog during setup.
 - Add source-free diagnostics that identify the stalled semantic group and operation type.
 - Add deterministic regression coverage for an authenticated ready page whose individual semantic probe is delayed or temporarily blocked.
-- Re-run the exact final commit on the live Windows target.
+- Re-run the exact merged commit on the live Windows target as soon as that
+  target becomes available.
 - Re-run the full Windows and macOS test suites and confirm no regression in dialog safety or timeout revocation.
 
 ## Acceptance criteria
 
-Setup is not considered fixed until all of the following are true:
+Automated merge validation is complete only when items 3–5 are green on the
+exact commit and all review and CI gates pass. Because the Windows target is
+unavailable before merge, items 1, 2, and 6 are explicitly deferred
+post-merge; the incident must remain open until all of the following are true:
 
 1. The exact Windows reproduction completes and persists configuration.
 2. `cope doctor` verifies the selected browser and dedicated profile afterward.

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 
 import type { Browser, BrowserContext, Frame, Locator, Page } from "playwright-core";
@@ -78,6 +79,34 @@ test("a DOM modal appearing during another readiness probe is inspected last", a
 
   assert.equal(inspection.state, "blocking-modal");
   assert.equal(inspection.diagnosticCode, "UNEXPECTED_BLOCKING_MODAL");
+});
+
+test("the final modal probe shares the observation action deadline", async () => {
+  const harness = createHarness(100);
+  harness.page.probeDelayMs = 70;
+  harness.page.stallModalProbe = true;
+  const startedAt = performance.now();
+  let observedError: unknown;
+
+  try {
+    await inspect(harness.semantic);
+  } catch (error) {
+    observedError = error;
+  }
+
+  const elapsedMs = performance.now() - startedAt;
+  assert.equal(observedError instanceof AgentError, true);
+  assert.equal(
+    (observedError as AgentError).details.diagnosticCode,
+    "BROWSER_OPERATION_TIMEOUT",
+  );
+  assert.equal((observedError as AgentError).details.semanticGroup, "modal");
+  assert.equal((observedError as AgentError).details.semanticOperation, "locator.count");
+  assert.ok(
+    elapsedMs < 145,
+    `observation exceeded its shared action deadline (${String(elapsedMs)} ms)`,
+  );
+  assert.equal(harness.browser.closeCalls, 1);
 });
 
 test("an unapproved navigation during readiness invalidates the observation", async () => {
@@ -191,7 +220,7 @@ test("overlapping adapter operations cannot launder a same-URL navigation", asyn
   assert.equal(translated.fillCalls, 0);
 });
 
-function createHarness(): {
+function createHarness(actionMs = 100): {
   readonly semantic: ContextSemanticPage;
   readonly page: ObservationPage;
   readonly context: ObservationContext;
@@ -209,7 +238,7 @@ function createHarness(): {
       uiContract: contract,
     },
     page.asPage(),
-    100,
+    actionMs,
   );
   return {
     semantic,
@@ -226,6 +255,10 @@ class ObservationLocator {
   ) {}
 
   public async count(): Promise<number> {
+    if (this.signal === "modal" && this.page.stallModalProbe) {
+      return new Promise<number>(() => {});
+    }
+    if (this.page.probeDelayMs > 0) await delay(this.page.probeDelayMs);
     this.page.runProbeHook();
     return this.page.matchedSignals.has(this.signal) ||
         (this.signal === "modal" && this.page.modalVisible)
@@ -248,6 +281,8 @@ class ObservationLocator {
 class ObservationPage {
   public closed = false;
   public modalVisible = false;
+  public probeDelayMs = 0;
+  public stallModalProbe = false;
   public matchedSignals = new Set(matchedSignals);
   public probeHook: (() => void) | undefined;
   readonly #navigationListeners: Array<(frame: Frame) => void> = [];

@@ -41,6 +41,7 @@ export class PlaywrightSemanticPage implements SemanticPage {
   #operationTimedOut = false;
   #nativeDialogDetected = false;
   #nativeDialogEpoch = 0;
+  #observationDeadline: number | undefined;
 
   public constructor(
     page: Page,
@@ -82,11 +83,16 @@ export class PlaywrightSemanticPage implements SemanticPage {
   }
 
   public async currentUrl(): Promise<string> {
+    this.#observationDeadline = performance.now() + this.#actionMs;
     return this.#page.url();
   }
 
   public async completeObservation(): Promise<SemanticObservationCompletion> {
-    return { nativeDialogDetected: this.#nativeDialogDetected };
+    try {
+      return { nativeDialogDetected: this.#nativeDialogDetected };
+    } finally {
+      this.#observationDeadline = undefined;
+    }
   }
 
   public async bringToFront(
@@ -105,7 +111,7 @@ export class PlaywrightSemanticPage implements SemanticPage {
 
   public async snapshot(
     group: LocatorGroup,
-    deadline = performance.now() + this.#actionMs,
+    deadline = this.#observationDeadline ?? performance.now() + this.#actionMs,
   ): Promise<GroupSnapshot> {
     const trace = operationTrace(group.signal, "snapshot.aggregate");
     return this.#runBounded(async () => {
