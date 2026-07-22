@@ -93,6 +93,7 @@ import {
   type HostPlatform,
 } from "../platform/index.js";
 import { verifyPrivateStateHome } from "../platform/private-storage.js";
+import { CopeEventStream } from "./event-stream.js";
 
 export const CLI_VERSION = "0.1.2";
 
@@ -1320,9 +1321,10 @@ function terminalUser(json: boolean, io: CliIo): TerminalUserInteraction {
 
 function progressReporter(json: boolean, io: CliIo): (event: RuntimeProgressEvent) => void {
   const destination = json ? io.stderr : io.stdout;
+  const eventStream = json ? new CopeEventStream(destination) : undefined;
   return (event) => {
     if (json) {
-      destination.write(`${JSON.stringify({ event: "runtime.progress", ...event })}\n`);
+      eventStream?.runtimeProgress(event);
       return;
     }
     let detail = "";

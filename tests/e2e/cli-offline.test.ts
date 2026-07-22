@@ -115,6 +115,12 @@ test("runnable CLI completes a policy-loaded offline fixture session", async (co
   }, { host: createStandardUserHost() });
 
   assert.equal(exitCode, 0, stderr || stdout);
+  const events = stderr.trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+  assert.equal(events.length >= 2, true);
+  assert.equal(events.every((event) => event.schema_version === "cope-events/1"), true);
+  assert.equal(events[0]?.event, "stream.started");
+  assert.equal((events[0]?.capabilities as Record<string, unknown>).stdout_legacy_result, true);
+  assert.deepEqual(events.map((event) => event.sequence), events.map((_, index) => index + 1));
   const lines = stdout.trim().split("\n");
   const result = JSON.parse(lines.at(-1) ?? "{}") as {
     status?: string;
