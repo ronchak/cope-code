@@ -36,7 +36,7 @@ The normal model request is:
 {"protocol":"cba/1","message_type":"tool_request","message_id":"m_17","task_id":"task_example","turn_id":1,"operations":[{"operation_id":"op_17_list","tool":"list_files","arguments":{"path":"src","max_depth":2,"max_results":100}}]}
 ```
 
-Only independent read-only operations may be batched: `list_files`, `search_text`, `read_file`, `git_status`, and `git_diff`. `apply_patch`, `run_command`, `request_user_input`, `request_capability`, and `complete_task` must be alone so Copilot observes each material outcome before planning a dependent action.
+Only independent read-only operations may be batched: `list_files`, `search_text`, `read_file`, `git_status`, `git_diff`, and `lsp_query`. `apply_patch`, `run_command`, `request_user_input`, `request_capability`, and `complete_task` must be alone so Copilot observes each material outcome before planning a dependent action.
 
 ## V1 tools
 
@@ -47,6 +47,7 @@ Only independent read-only operations may be batched: `list_files`, `search_text
 | `read_file` | bounded text/file-range read with state metadata | read-only; content enters the disclosure ledger |
 | `git_status` | branch, revision, conflicts, and working-tree facts | read-only; distinguishes pre-existing state |
 | `git_diff` | bounded approved diff against a local scope/baseline | read-only; exclusions and truncation are explicit |
+| `lsp_query` | bounded hover, definition, references, or document-symbol query | read-only; explicit tool, path, and backend-operation grants are required |
 | `apply_patch` | one atomic create/update/delete transaction | exact hashes, policy, checkpoint, rollback, and post-state verification |
 | `run_command` | invoke one catalog ID with typed parameters | no shell; controlled cwd, environment, time, output, cancellation; repository integrity is checked before and after every command |
 | `request_user_input` | ask for unavailable information or judgment | pauses; not routine confirmation |

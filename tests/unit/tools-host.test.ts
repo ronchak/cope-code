@@ -105,6 +105,14 @@ test("ToolHost dispatches the cba/1 wire arguments, applies policy, and never re
   assert.equal(denied.status, "denied");
   assert.equal(denied.data.code, "DIFF_DISABLED");
 
+  const unavailableLsp = await host.dispatch({
+    operationId: "lsp_unconfigured",
+    name: "lsp_query",
+    arguments: { operation: "hover", path: "src/main.ts", line: 0, character: 0 },
+  });
+  assert.equal(unavailableLsp.status, "denied");
+  assert.equal(unavailableLsp.data.code, "POLICY_DENIED");
+
   const statusOutcome = await host.dispatch({
     operationId: "git_status_safe",
     name: "git_status",

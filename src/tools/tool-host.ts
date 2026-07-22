@@ -11,6 +11,7 @@ import type {
 } from "../repository/snapshot-diff.js";
 import type { ContentProcessor } from "../repository/types.js";
 import type { ProcessRunner } from "./process-runner.js";
+import type { ReadOnlyLspOperation, ReadOnlyLspService } from "./read-only-lsp.js";
 
 export type ToolHostToolName =
   | "list_files"
@@ -18,6 +19,7 @@ export type ToolHostToolName =
   | "read_file"
   | "git_status"
   | "git_diff"
+  | "lsp_query"
   | "apply_patch"
   | "run_command";
 
@@ -57,6 +59,7 @@ interface ToolHostCommonDependencies {
   readonly completionPathScope?: CompletionPathScope;
   readonly snapshotDiff?: SnapshotDiffInspector;
   readonly sessionDiffState?: () => SessionDiffState;
+  readonly lsp?: ReadOnlyLspService;
 }
 
 export type ToolHostDependencies = ToolHostCommonDependencies &
@@ -355,6 +358,32 @@ export class ToolHost {
           redactionCount: processed?.redactionCount ?? 0,
         });
       }
+      case "lsp_query": {
+        const lsp = this.dependencies.lsp;
+        if (lsp === undefined) {
+          throw new AgentError("POLICY_DENIED", "No read-only LSP backend is configured for this session");
+        }
+        const args = checkedObject(call.arguments, [
+          "operation", "path", "line", "character", "include_declaration", "max_results", "timeout_ms", "max_bytes",
+        ]);
+        const operation = requiredString(args, "operation") as ReadOnlyLspOperation;
+        const result = await lsp.query({
+          operation,
+          path: requiredString(args, "path"),
+          ...optionalNumberAs(args, "line", "line"),
+          ...optionalNumberAs(args, "character", "character"),
+          ...optionalBooleanAs(args, "include_declaration", "includeDeclaration"),
+          maxResults: optionalNumberValue(args, "max_results") ?? 100,
+          ...optionalNumberAs(args, "timeout_ms", "timeoutMs"),
+          ...optionalNumberAs(args, "max_bytes", "maxBytes"),
+        }, signal);
+        return successOutcome(call, asRecord(result), {
+          operation: result.operation,
+          resultCount: result.items.length,
+          outputBytes: result.outputBytes,
+          truncated: result.truncated,
+        });
+      }
       case "apply_patch": {
         const args = checkedObject(call.arguments, ["changes"]);
         if (!Array.isArray(args.changes)) {
@@ -548,6 +577,7 @@ function validateCall(call: ToolHostCall): void {
       "read_file",
       "git_status",
       "git_diff",
+      "lsp_query",
       "apply_patch",
       "run_command",
     ].includes(call.name)
@@ -611,6 +641,24 @@ function optionalBoolean(value: Readonly<Record<string, unknown>>, key: string):
   }
   if (typeof entry !== "boolean") {
     throw new AgentError("PROTOCOL_INVALID", `${key} must be a boolean`);
+  }
+  return entry;
+}
+
+function optionalBooleanAs<K extends string>(
+  value: Readonly<Record<string, unknown>>,
+  key: string,
+  outputKey: K,
+): { readonly [P in K]?: boolean } {
+  const entry = optionalBoolean(value, key);
+  return entry === undefined ? {} : { [outputKey]: entry } as { readonly [P in K]?: boolean };
+}
+
+function optionalNumberValue(value: Readonly<Record<string, unknown>>, key: string): number | undefined {
+  const entry = value[key];
+  if (entry === undefined) return undefined;
+  if (typeof entry !== "number" || !Number.isSafeInteger(entry)) {
+    throw new AgentError("PROTOCOL_INVALID", `${key} must be an integer`);
   }
   return entry;
 }

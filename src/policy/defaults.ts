@@ -46,6 +46,10 @@ const EXCLUDED_DISCLOSURE_PATHS = [
   "**/*.key",
 ] as const;
 
+// LSP requires an explicitly configured read-only backend and is therefore
+// opt-in at every policy layer rather than silently enabled by defaults.
+const DEFAULT_TOOL_NAMES = TOOL_NAMES.filter((tool) => tool !== "lsp_query");
+
 export const DEFAULT_POLICY_BUDGETS: Readonly<Record<BudgetMetric, number>> = {
   elapsed_ms: 3_600_000,
   turns: 40,
@@ -66,7 +70,7 @@ export const DEFAULT_ORGANIZATION_POLICY: PolicyDocument = {
   layer: "organization",
   default_decision: "allow",
   capabilities: {
-    tools: { allow: TOOL_NAMES },
+    tools: { allow: DEFAULT_TOOL_NAMES, unmatched: "deny" },
     paths: { excluded: EXCLUDED_DISCLOSURE_PATHS, protected: PROTECTED_MUTATION_PATHS },
     commands: {
       risks: { low: "allow", medium: "allow", high: "ask" },
@@ -106,7 +110,7 @@ export const DEFAULT_REPOSITORY_POLICY: PolicyDocument = {
   layer: "repository",
   default_decision: "allow",
   capabilities: {
-    tools: { allow: TOOL_NAMES },
+    tools: { allow: DEFAULT_TOOL_NAMES, unmatched: "deny" },
     paths: { excluded: EXCLUDED_DISCLOSURE_PATHS, protected: PROTECTED_MUTATION_PATHS },
     commands: { risks: { low: "allow", medium: "allow", high: "ask" }, side_effects: "allow" },
     disclosure: { secrets: "deny" },
@@ -148,7 +152,7 @@ export function createDefaultSessionGrant(options: DefaultSessionGrantOptions): 
     mode: options.mode,
     default_decision: "ask",
     capabilities: {
-      tools: { allow: options.tools ?? TOOL_NAMES, unmatched: "ask" },
+      tools: { allow: options.tools ?? DEFAULT_TOOL_NAMES, unmatched: "ask" },
       paths: {
         read: { allow: options.readable_paths ?? ["**"], unmatched: "ask" },
         write: { allow: options.writable_paths ?? [], unmatched: "ask" },

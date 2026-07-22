@@ -63,6 +63,15 @@ test("strict tool argument schemas reject additions and accept the catalog shape
     }).valid,
     true,
   );
+  assert.equal(validateToolArguments("lsp_query", {
+    operation: "definition", path: "src/a.ts", line: 0, character: 4, max_results: 20,
+  }).valid, true);
+  assert.equal(validateToolArguments("lsp_query", {
+    operation: "definition", path: "src/a.ts",
+  }).valid, false, "position-based operations require a position");
+  assert.equal(validateToolArguments("lsp_query", {
+    operation: "document_symbols", path: "src/a.ts", line: 0,
+  }).valid, false, "document symbols cannot smuggle irrelevant position fields");
 });
 
 test("git_diff enforces scope-specific baseline semantics", () => {

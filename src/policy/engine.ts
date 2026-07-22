@@ -185,7 +185,7 @@ export class PolicyEngine {
   }
 
   private evaluateRequiredContext(operation: PolicyOperation, checks: PolicyCheck[]): void {
-    const needsPath = ["list_files", "search_text", "read_file", "apply_patch"].includes(operation.tool);
+    const needsPath = ["list_files", "search_text", "read_file", "lsp_query", "apply_patch"].includes(operation.tool);
     if (needsPath && (operation.paths?.length ?? 0) === 0) {
       checks.push({
         layer: "organization",

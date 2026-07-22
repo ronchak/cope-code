@@ -8,6 +8,7 @@ export const TOOL_NAMES = [
   "read_file",
   "git_status",
   "git_diff",
+  "lsp_query",
   "apply_patch",
   "run_command",
   "request_user_input",
@@ -23,6 +24,7 @@ export const READ_ONLY_TOOL_NAMES = [
   "read_file",
   "git_status",
   "git_diff",
+  "lsp_query",
 ] as const satisfies readonly ToolName[];
 
 export type ReadOnlyToolName = (typeof READ_ONLY_TOOL_NAMES)[number];
@@ -57,6 +59,19 @@ export interface GitDiffArguments {
   readonly scope?: "session" | "working_tree" | "staged" | "checkpoint";
   readonly paths?: readonly string[];
   readonly baseline?: string;
+  readonly max_bytes?: number;
+}
+
+export interface LspQueryArguments {
+  readonly operation: "hover" | "definition" | "references" | "document_symbols";
+  readonly path: string;
+  /** Zero-based; required except for document_symbols. */
+  readonly line?: number;
+  /** Zero-based; required except for document_symbols. */
+  readonly character?: number;
+  readonly include_declaration?: boolean;
+  readonly max_results?: number;
+  readonly timeout_ms?: number;
   readonly max_bytes?: number;
 }
 
@@ -206,6 +221,7 @@ export interface ToolArgumentsByName {
   readonly read_file: ReadFileArguments;
   readonly git_status: GitStatusArguments;
   readonly git_diff: GitDiffArguments;
+  readonly lsp_query: LspQueryArguments;
   readonly apply_patch: ApplyPatchArguments;
   readonly run_command: RunCommandArguments;
   readonly request_user_input: RequestUserInputArguments;
