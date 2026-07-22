@@ -12,6 +12,7 @@ The Windows default state root is `%LOCALAPPDATA%\CopilotBrowserAgent`. The expe
 | --- | --- | --- |
 | `session.json` | state, objective/criteria, repository root/baseline, policy hashes, budgets, pending IDs, mutations, validations, submission phase | sensitive task/path metadata; no file bodies by design |
 | `grant.json` | exact task-scoped session grant and session approvals | sensitive repository/path/authority metadata |
+| `session.json` plan record | exact reviewed plan, hash, decision, and timestamps | may reveal filenames and implementation intent; no file contents |
 | `runtime.json` | transport kind, pinned offline-source path/hash or browser config hash | sensitive local path/config metadata |
 | audit JSONL | hash-chained event metadata/outcomes | no raw file bodies by design; may contain paths/reasons |
 | disclosure JSONL | hash-chained classification, byte/hash/path/redaction metadata | no disclosed content; paths/findings are sensitive |

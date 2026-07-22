@@ -377,6 +377,21 @@ const progressUpdateMessageSchema = strictObject(
   [...baseRequired, "phase", "summary"],
 );
 
+const planSubmissionMessageSchema = strictObject(
+  {
+    ...baseProperties,
+    message_type: { const: "plan_submission" },
+    operation_id: operationIdentifier,
+    plan: strictObject({
+      summary: shortString,
+      steps: { type: "array", minItems: 1, maxItems: 256, items: shortString },
+      anticipated_mutations: optionalStringArray(shortString),
+      validation: optionalStringArray(shortString),
+    }, ["summary", "steps", "anticipated_mutations", "validation"]),
+  },
+  [...baseRequired, "operation_id", "plan"],
+);
+
 const completionMessageSchema = strictObject(
   {
     ...baseProperties,
@@ -410,6 +425,7 @@ export const PROTOCOL_MESSAGE_SCHEMA: JsonSchema = {
     userInputRequestMessageSchema,
     capabilityRequestMessageSchema,
     progressUpdateMessageSchema,
+    planSubmissionMessageSchema,
     completionMessageSchema,
     blockedMessageSchema,
   ],

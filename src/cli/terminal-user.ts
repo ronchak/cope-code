@@ -44,6 +44,26 @@ export class TerminalUserInteraction implements UserInteraction {
     return { answer };
   }
 
+  public async requestPlanApproval(request: {
+    readonly summary: string;
+    readonly steps: readonly string[];
+    readonly anticipatedMutations: readonly string[];
+    readonly validation: readonly string[];
+  }): Promise<boolean> {
+    section("Implementation plan", this.output);
+    this.output.write(`${request.summary}\n\n`);
+    request.steps.forEach((step, index) => this.output.write(`  ${cyan(String(index + 1))}  ${step}\n`));
+    if (request.anticipatedMutations.length > 0) {
+      this.output.write(`\n${bold("Anticipated mutations")}\n`);
+      request.anticipatedMutations.forEach((item) => this.output.write(`  - ${item}\n`));
+    }
+    if (request.validation.length > 0) {
+      this.output.write(`\n${bold("Validation")}\n`);
+      request.validation.forEach((item) => this.output.write(`  - ${item}\n`));
+    }
+    return this.askYesNo(`\n${cyan("?")} Approve this plan before mutation? [y/N] `);
+  }
+
   public async requestCapability(request: {
     readonly capability: Readonly<Record<string, unknown>>;
     readonly reason: string;

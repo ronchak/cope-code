@@ -1100,6 +1100,17 @@ function sessionResult(
     validations: state.validations.length,
     pendingOperations: state.pendingOperations.length,
     checkpointId: state.lastCheckpointId ?? null,
+    plan: state.plan === undefined ? null : {
+      planId: state.plan.planId,
+      summary: state.plan.summary,
+      steps: state.plan.steps,
+      anticipatedMutations: state.plan.anticipatedMutations,
+      validation: state.plan.validation,
+      planHash: state.plan.planHash,
+      status: state.plan.status,
+      submittedAt: state.plan.submittedAt,
+      decidedAt: state.plan.decidedAt,
+    },
     effectiveGrant: grant === undefined ? null : {
       grantId: grant.grant_id,
       mode: grant.mode,

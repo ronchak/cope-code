@@ -97,6 +97,18 @@ export interface ValidationRecord {
   readonly repositoryFingerprint?: string;
 }
 
+export interface SessionPlan {
+  readonly planId: string;
+  readonly summary: string;
+  readonly steps: readonly string[];
+  readonly anticipatedMutations: readonly string[];
+  readonly validation: readonly string[];
+  readonly planHash: string;
+  readonly status: "approved" | "rejected";
+  readonly submittedAt: string;
+  readonly decidedAt: string;
+}
+
 export interface SessionState {
   readonly schemaVersion: typeof SESSION_SCHEMA_VERSION;
   readonly protocolVersion: "cba/1";
@@ -138,6 +150,8 @@ export interface SessionState {
   validations: ValidationRecord[];
   lastCheckpointId?: string;
   lastModelSummaryHash?: string;
+  /** The exact model-authored plan most recently reviewed by the user. */
+  plan?: SessionPlan;
   completionHandoff?: import("./completion-handoff-store.js").CompletionHandoffReference;
   protocolRepairStreak: number;
 }

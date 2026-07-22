@@ -323,6 +323,16 @@ export interface ProgressUpdateMessage extends ProtocolMessageBase<"progress_upd
   readonly next_steps?: readonly string[];
 }
 
+export interface PlanSubmissionMessage extends ProtocolMessageBase<"plan_submission"> {
+  readonly operation_id: string;
+  readonly plan: {
+    readonly summary: string;
+    readonly steps: readonly string[];
+    readonly anticipated_mutations: readonly string[];
+    readonly validation: readonly string[];
+  };
+}
+
 export interface CompletionMessage extends ProtocolMessageBase<"completion"> {
   readonly operation_id: string;
   readonly report: CompleteTaskArguments;
@@ -345,6 +355,7 @@ export const PROTOCOL_MESSAGE_TYPES = [
   "user_input_request",
   "capability_request",
   "progress_update",
+  "plan_submission",
   "completion",
   "blocked",
 ] as const;
@@ -359,6 +370,7 @@ export type ProtocolMessage =
   | UserInputRequestMessage
   | CapabilityRequestMessage
   | ProgressUpdateMessage
+  | PlanSubmissionMessage
   | CompletionMessage
   | BlockedMessage;
 

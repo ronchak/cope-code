@@ -54,6 +54,22 @@ test("parses one exact cba/1 envelope with prose and CRLF", () => {
   }
 });
 
+test("accepts a bounded first-class plan submission", () => {
+  const parsed = parseProtocolEnvelope(wire({
+    protocol: PROTOCOL_VERSION,
+    message_type: "plan_submission",
+    ...correlation,
+    operation_id: "op_plan_1",
+    plan: {
+      summary: "Update the parser safely",
+      steps: ["Inspect callers", "Apply the focused edit"],
+      anticipated_mutations: ["src/parser.ts"],
+      validation: ["npm test"],
+    },
+  }), { expected_task_id: "task_1", expected_turn_id: 7 });
+  assert.equal(parsed.message_type, "plan_submission");
+});
+
 test("strict tool argument schemas reject additions and accept the catalog shape", () => {
   assert.equal(validateToolArguments("read_file", { path: "src/a.ts", start_line: 1, end_line: 2 }).valid, true);
   assert.equal(validateToolArguments("read_file", { path: "src/a.ts", shell: "oops" }).valid, false);
