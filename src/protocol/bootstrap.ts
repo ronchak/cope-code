@@ -1,19 +1,6 @@
 import { stableJson } from "../shared/crypto.js";
 import { TOOL_ARGUMENT_SCHEMAS } from "./schemas.js";
-import { PROTOCOL_VERSION, TOOL_NAMES, type BudgetMetric, type ToolName } from "./types.js";
-
-const TOOL_DESCRIPTIONS: Readonly<Record<ToolName, string>> = {
-  list_files: "List a bounded repository-relative directory view.",
-  search_text: "Search approved text and return bounded, located excerpts.",
-  read_file: "Read an approved text file or bounded line range with file-state metadata.",
-  git_status: "Inspect branch, revision, working-tree, conflict, and pre-existing-change state.",
-  git_diff: "Inspect a bounded diff against an approved local baseline.",
-  apply_patch: "Atomically create, hash-guardedly update, or hash-guardedly delete approved text files.",
-  run_command: "Run one policy-catalog command with only its approved typed parameters.",
-  request_user_input: "Pause for genuinely missing information or a necessary development decision.",
-  request_capability: "Request one specific, bounded expansion of the active session grant.",
-  complete_task: "Submit an advisory completion report for independent harness verification.",
-};
+import { PROTOCOL_VERSION, TOOL_NAMES, TOOL_REGISTRY, type BudgetMetric, type ToolName } from "./types.js";
 
 export interface BootstrapPolicySummary {
   readonly mode: "inspect" | "edit" | "auto";
@@ -53,7 +40,7 @@ export function getBootstrapToolDefinitions(
   return tools.map((tool) => {
     if (unique.has(tool)) throw new TypeError(`Duplicate bootstrap tool '${tool}'`);
     unique.add(tool);
-    const base = { name: tool, purpose: TOOL_DESCRIPTIONS[tool] } as const;
+    const base = { name: tool, purpose: TOOL_REGISTRY[tool].purpose } as const;
     return includeArgumentSchemas ? { ...base, arguments_schema: TOOL_ARGUMENT_SCHEMAS[tool] } : base;
   });
 }
@@ -91,7 +78,7 @@ export function renderBootstrapContract(options: BootstrapContractOptions): stri
     }),
     "```",
     "",
-    "You may batch only independent read-only operations (list_files, search_text, read_file, git_status, git_diff). Request apply_patch, run_command, request_user_input, request_capability, and complete_task alone so you can observe each material result before deciding the next action. Never retry an operation_id.",
+    `You may batch only independent operations marked batchable in the tool catalog (${TOOL_NAMES.filter((tool) => TOOL_REGISTRY[tool].batchable).join(", ")}). Request all other tools alone so you can observe each material result before deciding the next action. Never retry an operation_id.`,
     "",
     "Use request_user_input only for information or judgment unavailable through repository tools. Use request_capability for a specific scope expansion. Use complete_task only after inspecting actual state and validation results; its claim remains advisory until independently verified. If completion is impossible, emit one blocked message with a precise reason and what is needed.",
     "",

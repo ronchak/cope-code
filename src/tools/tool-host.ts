@@ -11,15 +11,9 @@ import type {
 } from "../repository/snapshot-diff.js";
 import type { ContentProcessor } from "../repository/types.js";
 import type { ProcessRunner } from "./process-runner.js";
+import { LOCAL_TOOL_NAMES, type LocalToolName } from "../protocol/types.js";
 
-export type ToolHostToolName =
-  | "list_files"
-  | "search_text"
-  | "read_file"
-  | "git_status"
-  | "git_diff"
-  | "apply_patch"
-  | "run_command";
+export type ToolHostToolName = LocalToolName;
 
 export interface ToolHostCall {
   readonly operationId: string;
@@ -541,17 +535,7 @@ function validateCall(call: ToolHostCall): void {
   if (!isOperationId(call.operationId)) {
     throw new AgentError("PROTOCOL_INVALID", "Tool operation identifier is invalid");
   }
-  if (
-    ![
-      "list_files",
-      "search_text",
-      "read_file",
-      "git_status",
-      "git_diff",
-      "apply_patch",
-      "run_command",
-    ].includes(call.name)
-  ) {
+  if (!(LOCAL_TOOL_NAMES as readonly string[]).includes(call.name)) {
     throw new AgentError("PROTOCOL_INVALID", "Tool name is not supported", { tool: call.name });
   }
   checkedObject(call.arguments, Object.keys(call.arguments));

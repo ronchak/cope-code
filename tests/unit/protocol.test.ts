@@ -3,6 +3,11 @@ import test from "node:test";
 
 import {
   PROTOCOL_VERSION,
+  LOCAL_TOOL_NAMES,
+  READ_ONLY_TOOL_NAMES,
+  TOOL_ARGUMENT_SCHEMAS,
+  TOOL_NAMES,
+  TOOL_REGISTRY,
   ProtocolParseError,
   ProtocolParser,
   createProtocolErrorMessage,
@@ -10,6 +15,7 @@ import {
   createToolResultMessage,
   parseProtocolEnvelope,
   renderBootstrapContract,
+  getBootstrapToolDefinitions,
   serializeProtocolEnvelope,
   tryParseProtocolEnvelope,
   validateToolArguments,
@@ -18,6 +24,23 @@ import {
 } from "../../src/protocol/index.js";
 
 const correlation: ProtocolCorrelation = { message_id: "msg_1", task_id: "task_1", turn_id: 7 };
+
+test("canonical tool registry drives names, capabilities, schemas, and bootstrap definitions", () => {
+  assert.deepEqual(TOOL_NAMES, Object.keys(TOOL_REGISTRY));
+  assert.deepEqual(
+    READ_ONLY_TOOL_NAMES,
+    TOOL_NAMES.filter((tool) => TOOL_REGISTRY[tool].read_only),
+  );
+  assert.deepEqual(
+    LOCAL_TOOL_NAMES,
+    TOOL_NAMES.filter((tool) => TOOL_REGISTRY[tool].execution === "local"),
+  );
+  assert.deepEqual(Object.keys(TOOL_ARGUMENT_SCHEMAS), TOOL_NAMES);
+  assert.deepEqual(
+    getBootstrapToolDefinitions(undefined, false),
+    TOOL_NAMES.map((name) => ({ name, purpose: TOOL_REGISTRY[name].purpose })),
+  );
+});
 
 function request(operations: readonly unknown[] = [
   { operation_id: "op_1", tool: "list_files", arguments: { path: ".", max_depth: 2 } },

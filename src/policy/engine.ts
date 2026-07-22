@@ -1,4 +1,4 @@
-import { BUDGET_METRICS, TOOL_NAMES, type BudgetMetric, type ToolName } from "../protocol/types.js";
+import { BUDGET_METRICS, TOOL_NAMES, isToolName, toolRequiresContext, type BudgetMetric, type ToolName } from "../protocol/types.js";
 import { assertValidPolicyDocument, assertValidSessionGrant } from "./schemas.js";
 import { matchPolicyPattern, normalizeRepositoryPath } from "./patterns.js";
 import {
@@ -68,7 +68,7 @@ export class PolicyEngine {
     const checks: PolicyCheck[] = [];
     const layers = this.layers();
 
-    if (!(TOOL_NAMES as readonly string[]).includes(operation.tool)) {
+    if (!isToolName(operation.tool)) {
       checks.push({
         layer: "organization",
         dimension: "tool",
@@ -185,7 +185,9 @@ export class PolicyEngine {
   }
 
   private evaluateRequiredContext(operation: PolicyOperation, checks: PolicyCheck[]): void {
-    const needsPath = ["list_files", "search_text", "read_file", "apply_patch"].includes(operation.tool);
+    const requires = (context: "path" | "command" | "network" | "change"): boolean =>
+      isToolName(operation.tool) && toolRequiresContext(operation.tool, context);
+    const needsPath = requires("path");
     if (needsPath && (operation.paths?.length ?? 0) === 0) {
       checks.push({
         layer: "organization",
@@ -195,7 +197,7 @@ export class PolicyEngine {
         message: `Policy evaluation for '${operation.tool}' requires resolved path context.`,
       });
     }
-    if (operation.tool === "run_command" && operation.command === undefined) {
+    if (requires("command") && operation.command === undefined) {
       checks.push({
         layer: "organization",
         dimension: "command",
@@ -204,7 +206,7 @@ export class PolicyEngine {
         message: "run_command policy evaluation requires catalog-resolved command metadata.",
       });
     }
-    if (operation.tool === "run_command" && operation.network === undefined) {
+    if (requires("network") && operation.network === undefined) {
       checks.push({
         layer: "organization",
         dimension: "network",
@@ -213,7 +215,7 @@ export class PolicyEngine {
         message: "run_command policy evaluation requires catalog-resolved network metadata.",
       });
     }
-    if (operation.tool === "apply_patch" && operation.change === undefined) {
+    if (requires("change") && operation.change === undefined) {
       checks.push({
         layer: "organization",
         dimension: "change",
@@ -713,7 +715,7 @@ function expandGrant(
   ];
 
   const expansionInvalid =
-    (expansion.kind === "tool" && !(TOOL_NAMES as readonly string[]).includes(expansion.tool)) ||
+    (expansion.kind === "tool" && !isToolName(expansion.tool)) ||
     (expansion.kind === "command" &&
       (expansion.command_id.trim().length === 0 || expansion.category.trim().length === 0)) ||
     (expansion.kind === "disclosure" && expansion.classification.trim().length === 0) ||
