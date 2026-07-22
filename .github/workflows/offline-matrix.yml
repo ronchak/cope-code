@@ -5,6 +5,32 @@ on:
   pull_request:
 
 jobs:
+  reliability:
+    name: deterministic-reliability
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      COPE_RELIABILITY_SEED: "1129271365"
+      COPE_RELIABILITY_ITERATIONS: "24"
+      COPE_RELIABILITY_ARTIFACT_DIR: reliability-artifacts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run test:reliability
+      - name: Critical-boundary coverage
+        run: mkdir -p reliability-artifacts && npm run test:coverage > reliability-artifacts/coverage.txt 2>&1
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reliability-${{ github.run_id }}-${{ github.run_attempt }}
+          path: reliability-artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
   offline:
     name: offline-${{ matrix.tuple }}
     strategy:

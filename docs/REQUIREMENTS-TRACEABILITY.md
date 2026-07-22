@@ -21,7 +21,7 @@ Legend:
 | FR-004 | CLI abort control channel, `AgentRuntime.emergencyStop`, browser kill switch, `ProcessRunner.cancelAll`; control/runtime/browser/command tests | Automated core; CLI-to-Windows browser/process-tree game day remains. |
 | FR-005 | policy modes, CLI parser; policy/CLI tests | Automated. |
 | FR-006 | `cba-effective-grant/1` terminal approval envelope; persisted status grant/mode/budget output | Automated: start displays the complete path/command/disclosure/network/change/budget/checkpoint/escalation envelope and hashes; status redisplays the full stored grant, mode, and budget snapshot. Status is deliberately not fresh Git evidence. |
-| FR-007 | session/artifact/journal/runtime recovery; agent-runtime tests | Automated for modeled crash states; full fault-injection matrix remains. |
+| FR-007 | session/artifact/journal/runtime recovery; agent-runtime tests; seeded reliability harness | Automated for modeled crash states with a bounded deterministic commit-boundary matrix; exhaustive process-kill injection remains. |
 | FR-008 | scripted fixture and transcript replay; transport and e2e tests | Automated. |
 
 ## Repository boundary and state
@@ -157,7 +157,7 @@ Legend:
 | Area | Evidence | Remaining gate |
 | --- | --- | --- |
 | Security | strict protocol/policy/path/catalog/content/browser tests; threat model | Windows adversarial corpus, tenant live tests, endpoint controls, governance, supply-chain approval |
-| Reliability | explicit state machine, intent/journal/artifact ordering, fault-specific tests | systematic crash injection at every commit point and live browser recovery |
+| Reliability | explicit state machine, intent/journal/artifact ordering, fault-specific tests, seeded fuzz/soak/coverage harness | exhaustive process-kill injection at every commit point and live browser recovery |
 | Maintainability | separated modules, central contracts/versions, fixture/replay transport | architecture dependency enforcement and UI-owner recertification process |
 | Performance | bounded reads/output/context and state-based waits | measured large-repository and live-turn thresholds on target |
 | Usability/accessibility | non-color CLI structures, responsive browser selection, plain numbered fallback, explicit pause/status controls, and specific policy reasons | operator UAT, screen-reader review, and target terminal matrix |
