@@ -71,6 +71,14 @@ later caller from laundering a same-URL navigation into an earlier snapshot.
 The rejection is pre-dispatch and source-free; emergency stop remains
 immediately available.
 
+Failed observations also drain every already-started bounded snapshot and run
+the completion barrier before releasing that exclusive-operation lock. The
+first failure is preserved for diagnostics, but no stale locator probe can
+continue behind a later inspect or submit and then revoke the shared browser
+session. A deterministic regression blocks one sibling probe after an
+ownership failure and proves a second inspection remains rejected until the
+first observation is fully drained.
+
 The action, manual-readiness, and polling bounds are unchanged. Timeout
 revocation and owner teardown remain fail-closed. The first timed-out operation
 now supplies one sanitized origin to every concurrently revoked probe, so

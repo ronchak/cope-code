@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { setTimeout as delay } from "node:timers/promises";
+import { setImmediate as immediate, setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 
 import type { Browser, BrowserContext, Frame, Locator, Page } from "playwright-core";
@@ -220,6 +220,43 @@ test("overlapping adapter operations cannot launder a same-URL navigation", asyn
   assert.equal(translated.fillCalls, 0);
 });
 
+test("a failed observation drains sibling probes before releasing the adapter lock", async () => {
+  const page = new DrainingFailurePage();
+  const adapter = new CopilotBrowserAdapter(page, baselineConfig());
+  let firstSettled = false;
+  const first = settleWithin(
+    adapter.inspectState().finally(() => { firstSettled = true; }),
+    500,
+  );
+  let overlappingInspection: Readonly<Record<string, unknown>> | undefined;
+
+  try {
+    await page.composerStarted.promise;
+    page.failureRelease.resolve();
+    await page.failureThrown.promise;
+    await immediate();
+    overlappingInspection = await settleWithin(adapter.inspectState(), 500);
+  } finally {
+    page.composerRelease.resolve();
+  }
+  const firstInspection = await first;
+
+  assert.equal(firstSettled, true);
+  assert.deepEqual(overlappingInspection, {
+    status: "rejected",
+    diagnosticCode: "CONCURRENT_BROWSER_OPERATION",
+  });
+  assert.deepEqual(firstInspection, {
+    status: "rejected",
+    diagnosticCode: "ACTIVE_PAGE_CHANGED_DURING_OBSERVATION",
+  });
+  assert.equal(page.completeObservationCalls, 1);
+
+  const recovered = await adapter.inspectState();
+  assert.equal(recovered.classification.state, "ready");
+  assert.equal(page.completeObservationCalls, 2);
+});
+
 function createHarness(actionMs = 100): {
   readonly semantic: ContextSemanticPage;
   readonly page: ObservationPage;
@@ -371,6 +408,67 @@ class TranslatingContextPage implements SemanticPage {
 
   public click(group: LocatorGroup, guard: SemanticActionGuard): Promise<void> {
     return this.tracked.click(groups[group.signal], guard);
+  }
+}
+
+class DrainingFailurePage implements SemanticPage {
+  public readonly composerStarted = deferred<void>();
+  public readonly composerRelease = deferred<void>();
+  public readonly failureRelease = deferred<void>();
+  public readonly failureThrown = deferred<void>();
+  public completeObservationCalls = 0;
+  #observation = 0;
+
+  public async currentUrl(): Promise<string> {
+    this.#observation += 1;
+    return `${entryUrl}/conversation/drain`;
+  }
+
+  public async snapshot(group: LocatorGroup): Promise<GroupSnapshot> {
+    if (this.#observation === 1 && group.signal === "composer") {
+      this.composerStarted.resolve();
+      await this.composerRelease.promise;
+    }
+    if (this.#observation === 1 && group.signal === "conversation") {
+      await this.failureRelease.promise;
+      this.failureThrown.resolve();
+      throw new AgentError(
+        "TRANSPORT_INDETERMINATE",
+        "The observed page changed while semantic probes were in flight",
+        { diagnosticCode: "ACTIVE_PAGE_CHANGED_DURING_OBSERVATION" },
+      );
+    }
+
+    const matched = this.#observation > 1 && (
+      group.signal === "conversation" ||
+      group.signal === "composer" ||
+      group.signal === "identity"
+    );
+    const actionable = group.signal === "composer";
+    const text = group.signal === "identity" ? expectedIdentity : "";
+    const elements = matched
+      ? [{ visible: true, enabled: actionable, text, value: "", accessibleLabel: text }]
+      : [];
+    return {
+      signal: group.signal,
+      matchedCandidates: matched ? group.minimumCandidateMatches : 0,
+      visibleElements: elements.length,
+      enabledElements: matched && actionable ? 1 : 0,
+      elements,
+    };
+  }
+
+  public async completeObservation(): Promise<SemanticObservationCompletion> {
+    this.completeObservationCalls += 1;
+    return { nativeDialogDetected: false };
+  }
+
+  public async fill(): Promise<void> {
+    throw new Error("fill is outside this observation-drain regression");
+  }
+
+  public async click(): Promise<void> {
+    throw new Error("click is outside this observation-drain regression");
   }
 }
 
