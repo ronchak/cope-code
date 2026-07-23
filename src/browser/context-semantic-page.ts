@@ -1,6 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 
-import type { BrowserContext, Page } from "playwright-core";
+import type { BrowserContext, Page, Request } from "playwright-core";
 
 import { AgentError } from "../shared/errors.js";
 import {
@@ -30,6 +30,18 @@ export interface CopilotPageSelectionConfig {
 
 interface ConfirmedAuthenticationHandoff {
   readonly configuredPage: Page;
+}
+
+type ManualReadinessPageCategory =
+  | "configured"
+  | "external-sso"
+  | "genuine-authentication";
+
+interface ManualReadinessPageSample {
+  readonly page: Page;
+  readonly url: string;
+  readonly navigationEpoch: number;
+  readonly category: ManualReadinessPageCategory;
 }
 
 const DEDICATED_MICROSOFT_LOGIN_HOSTS = new Set([
@@ -97,6 +109,8 @@ export class ContextSemanticPage implements SemanticPage {
   readonly #configuredPages = new WeakSet<Page>();
   readonly #manualHandoffPages = new WeakSet<Page>();
   readonly #manualHandoffPopupPages = new WeakSet<Page>();
+  readonly #externalSsoEvidencePages = new WeakSet<Page>();
+  readonly #manualHandoffPopupOpeners = new WeakMap<Page, Page>();
   readonly #navigationEpochs = new WeakMap<Page, number>();
   #nativeDialogEpoch = 0;
   #activePage: Page;
@@ -106,6 +120,8 @@ export class ContextSemanticPage implements SemanticPage {
   #observationDeadline: number | undefined;
   #manualReadinessPageOverride: Page | undefined;
   #manualReadinessObservationPage: Page | undefined;
+  #manualReadinessConfiguredPages: readonly ManualReadinessPageSample[] | undefined;
+  #manualReadinessAuthenticationPages: readonly ManualReadinessPageSample[] | undefined;
   #manualReadinessProbeActive = false;
   #filledPage: Page | undefined;
   #filledUrl: string | undefined;
@@ -145,6 +161,9 @@ export class ContextSemanticPage implements SemanticPage {
         // provenance is granted only by an exact opener relationship or when
         // this page itself reaches the configured/strict-auth waypoint.
         this.#configurePage(page);
+      });
+      context.on("request", (request) => {
+        this.#recordExternalSsoNavigationRequest(request);
       });
     }
   }
@@ -236,24 +255,34 @@ export class ContextSemanticPage implements SemanticPage {
     const externalHandoff = this.#externalManualHandoffPage(pages);
     const configuredPages = pages.filter((page) =>
       !page.isClosed() && isConfiguredCopilotUrl(page.url(), this.#config.entryUrl));
+    const configuredCallbackHandoff = this.#configuredCallbackHandoffPage(pages);
 
-    // A popup may linger on an external success page after its opener has
-    // already returned to Copilot. The adapter may inspect this exact unique
-    // configured page in a readiness-only scope, without reading the IdP.
-    if (
-      allowConfiguredPageProbe &&
-      externalHandoff !== undefined &&
-      configuredPages.length === 1
-    ) {
-      const configuredPage = configuredPages[0]!;
-      this.#manualReadinessPageOverride = configuredPage;
-      await this.#adoptManualReadinessPage(configuredPage, false, false);
+    // A popup may linger either on an external success page after its opener
+    // returned, or on the configured callback after authentication completed.
+    // Setup may inspect the exact provenance-bound return page in a
+    // readiness-only scope. Ordinary inspection and actions remain blocked.
+    const setupProbePage = allowConfiguredPageProbe
+      ? externalHandoff !== undefined && configuredPages.length === 1
+        ? configuredPages[0]
+        : externalHandoff === undefined && configuredCallbackHandoff !== undefined
+          ? configuredCallbackHandoff
+          : undefined
+      : undefined;
+    if (setupProbePage !== undefined) {
+      this.#manualReadinessPageOverride = setupProbePage;
+      this.#manualReadinessConfiguredPages =
+        this.#configuredReadinessSamples(pages);
+      this.#manualReadinessAuthenticationPages =
+        this.#authenticationPrecedenceSamples(pages);
+      await this.#adoptManualReadinessPage(setupProbePage, false, false);
       return false;
     }
 
-    const page = externalHandoff ?? this.#configuredCallbackHandoffPage(pages);
+    const page = externalHandoff ?? configuredCallbackHandoff;
     if (page === undefined) return false;
     this.#manualReadinessPageOverride = undefined;
+    this.#manualReadinessConfiguredPages = undefined;
+    this.#manualReadinessAuthenticationPages = undefined;
     await this.#adoptManualReadinessPage(page, force);
     return true;
   }
@@ -270,6 +299,8 @@ export class ContextSemanticPage implements SemanticPage {
     } finally {
       this.#manualReadinessPageOverride = undefined;
       this.#manualReadinessObservationPage = undefined;
+      this.#manualReadinessConfiguredPages = undefined;
+      this.#manualReadinessAuthenticationPages = undefined;
       this.#manualReadinessProbeActive = priorProbeState;
     }
   }
@@ -320,17 +351,30 @@ export class ContextSemanticPage implements SemanticPage {
     if (this.#manualReadinessPageOverride !== undefined) {
       const page = this.#manualReadinessPageOverride;
       this.#manualReadinessPageOverride = undefined;
-      const configuredPages = this.#context.pages().filter((candidate) =>
-        !candidate.isClosed() &&
-        isConfiguredCopilotUrl(candidate.url(), this.#config.entryUrl));
-      if (page.isClosed() || configuredPages.length !== 1 || configuredPages[0] !== page) {
+      const currentPages = this.#context.pages();
+      const configuredSamples = this.#configuredReadinessSamples(currentPages);
+      const configuredPages = configuredSamples.map((sample) => sample.page);
+      const authenticationSamples =
+        this.#authenticationPrecedenceSamples(currentPages);
+      const authenticationPrecedenceChanged = !samePageSamples(
+        authenticationSamples,
+        this.#manualReadinessAuthenticationPages,
+      );
+      if (
+        page.isClosed() ||
+        authenticationPrecedenceChanged ||
+        !samePageSamples(configuredSamples, this.#manualReadinessConfiguredPages) ||
+        !configuredPages.includes(page)
+      ) {
         throw new AgentError(
           "TRANSPORT_INDETERMINATE",
           "The configured Copilot page changed before manual readiness inspection",
           {
             diagnosticCode: "ACTIVE_PAGE_CHANGED_DURING_OBSERVATION",
             dispatchAttempted: false,
-            observationChangeReason: "page-replaced",
+            observationChangeReason: authenticationPrecedenceChanged
+              ? "authentication-precedence"
+              : "page-replaced",
           },
         );
       }
@@ -405,6 +449,8 @@ export class ContextSemanticPage implements SemanticPage {
     } finally {
       this.#observationDeadline = undefined;
       this.#manualReadinessObservationPage = undefined;
+      this.#manualReadinessConfiguredPages = undefined;
+      this.#manualReadinessAuthenticationPages = undefined;
     }
   }
 
@@ -548,19 +594,32 @@ export class ContextSemanticPage implements SemanticPage {
   #assertObservedPageCurrent(diagnosticCode: string, message: string): Page {
     const pages = this.#context.pages();
     const manualReadinessObservation = this.#manualReadinessObservationPage;
-    const configuredPages = manualReadinessObservation === undefined
+    const expectedConfiguredPages = this.#manualReadinessConfiguredPages;
+    const expectedAuthenticationPages = this.#manualReadinessAuthenticationPages;
+    const configuredSamples = manualReadinessObservation === undefined
       ? []
-      : pages.filter((page) =>
-        !page.isClosed() && isConfiguredCopilotUrl(page.url(), this.#config.entryUrl));
+      : this.#configuredReadinessSamples(pages);
+    const configuredPages = configuredSamples.map((sample) => sample.page);
+    const authenticationSamples = manualReadinessObservation === undefined
+      ? []
+      : this.#authenticationPrecedenceSamples(pages);
+    const manualReadinessAuthenticationChanged =
+      manualReadinessObservation !== undefined &&
+      !samePageSamples(authenticationSamples, expectedAuthenticationPages);
     const manualReadinessOwnershipChanged =
       manualReadinessObservation !== undefined &&
-      (configuredPages.length !== 1 || configuredPages[0] !== this.#activePage);
+      (
+        !samePageSamples(configuredSamples, expectedConfiguredPages) ||
+        !configuredPages.includes(this.#activePage)
+      );
     const selected = manualReadinessObservation === undefined
       ? this.#selectCurrentPage(pages, this.#activePage)
       : this.#activePage;
     const currentUrl = this.#activePage.url();
     const currentNavigationEpoch = this.#navigationEpochs.get(this.#activePage) ?? 0;
-    const observationChangeReason = manualReadinessOwnershipChanged
+    const observationChangeReason = manualReadinessAuthenticationChanged
+      ? "authentication-precedence"
+      : manualReadinessOwnershipChanged
       ? "page-replaced"
       : selected !== this.#activePage
       ? isGenuineManualAuthenticationUrl(selected.url(), this.#config)
@@ -738,6 +797,45 @@ export class ContextSemanticPage implements SemanticPage {
     ).at(-1);
   }
 
+  #configuredReadinessSamples(
+    pages: readonly Page[],
+  ): readonly ManualReadinessPageSample[] {
+    return pages
+      .filter((page) =>
+        !page.isClosed() && isConfiguredCopilotUrl(page.url(), this.#config.entryUrl))
+      .map((page) => this.#manualReadinessPageSample(page, "configured"));
+  }
+
+  #authenticationPrecedenceSamples(
+    pages: readonly Page[],
+  ): readonly ManualReadinessPageSample[] {
+    const samples: ManualReadinessPageSample[] = [];
+    for (const page of pages) {
+      if (page.isClosed()) continue;
+      if (isGenuineManualAuthenticationUrl(page.url(), this.#config)) {
+        samples.push(this.#manualReadinessPageSample(page, "genuine-authentication"));
+      } else if (
+        this.#manualHandoffPages.has(page) &&
+        isProvenanceBoundExternalSsoUrl(page.url(), this.#config.entryUrl)
+      ) {
+        samples.push(this.#manualReadinessPageSample(page, "external-sso"));
+      }
+    }
+    return samples;
+  }
+
+  #manualReadinessPageSample(
+    page: Page,
+    category: ManualReadinessPageCategory,
+  ): ManualReadinessPageSample {
+    return {
+      page,
+      url: page.url(),
+      navigationEpoch: this.#navigationEpochs.get(page) ?? 0,
+      category,
+    };
+  }
+
   #configuredCallbackHandoffPage(pages: readonly Page[]): Page | undefined {
     const openPages = pages.filter((page) => !page.isClosed());
     // A popup can return to the configured Copilot origin just before closing.
@@ -747,8 +845,15 @@ export class ContextSemanticPage implements SemanticPage {
       isConfiguredCopilotUrl(page.url(), this.#config.entryUrl));
     if (configuredPages.length !== 2) return undefined;
     const callbackPopups = configuredPages.filter((page) =>
-      this.#manualHandoffPopupPages.has(page));
-    return callbackPopups.length === 1 ? callbackPopups[0] : undefined;
+      this.#manualHandoffPopupPages.has(page) &&
+      this.#externalSsoEvidencePages.has(page));
+    if (callbackPopups.length !== 1) return undefined;
+    const callbackPopup = callbackPopups.at(0);
+    if (callbackPopup === undefined) return undefined;
+    const opener = this.#manualHandoffPopupOpeners.get(callbackPopup);
+    return opener !== undefined && configuredPages.includes(opener)
+      ? callbackPopup
+      : undefined;
   }
 
   async #returnedConfiguredPage(
@@ -834,6 +939,7 @@ export class ContextSemanticPage implements SemanticPage {
         ) {
           this.#manualHandoffPages.add(popup);
           this.#manualHandoffPopupPages.add(popup);
+          this.#manualHandoffPopupOpeners.set(popup, page);
         }
         this.#configurePage(popup);
       });
@@ -851,10 +957,50 @@ export class ContextSemanticPage implements SemanticPage {
 
   #grantManualHandoffAnchor(page: Page): void {
     if (
+      this.#manualHandoffPages.has(page) &&
+      this.#manualHandoffPopupPages.has(page) &&
+      isProvenanceBoundExternalSsoUrl(page.url(), this.#config.entryUrl)
+    ) {
+      // A configured popup is a completed SSO callback only after this exact
+      // popup was observed on an external tenant IdP. Opener provenance alone
+      // is insufficient: ordinary app- or user-opened Copilot tabs must remain
+      // ambiguous during setup just as they are during normal operations.
+      this.#externalSsoEvidencePages.add(page);
+    }
+    if (
       isConfiguredCopilotUrl(page.url(), this.#config.entryUrl) ||
       isGenuineManualAuthenticationUrl(page.url(), this.#config)
     ) {
       this.#manualHandoffPages.add(page);
+    }
+  }
+
+  #recordExternalSsoNavigationRequest(request: Request): void {
+    if (!request.isNavigationRequest()) return;
+    try {
+      let redirect: Request | null = request;
+      const seen = new Set<Request>();
+      let externalSsoRedirect = false;
+      for (let depth = 0; redirect !== null && depth < 32; depth += 1) {
+        if (seen.has(redirect)) break;
+        seen.add(redirect);
+        if (isProvenanceBoundExternalSsoUrl(redirect.url(), this.#config.entryUrl)) {
+          externalSsoRedirect = true;
+          break;
+        }
+        redirect = redirect.redirectedFrom();
+      }
+      if (!externalSsoRedirect) return;
+
+      const frame = request.frame();
+      const page = frame.page();
+      if (typeof page.mainFrame === "function" && frame !== page.mainFrame()) return;
+      // The initial external request may precede Frame creation. The later
+      // callback request has a page-bound frame and retains that external hop
+      // through redirectedFrom(), even if no external document committed.
+      this.#externalSsoEvidencePages.add(page);
+    } catch {
+      // Wait for a later page-bound request in the same redirect chain.
     }
   }
 
@@ -932,6 +1078,21 @@ function nativeDialogSnapshot(group: LocatorGroup): GroupSnapshot {
     enabledElements: 0,
     elements,
   };
+}
+
+function samePageSamples(
+  actual: readonly ManualReadinessPageSample[],
+  expected: readonly ManualReadinessPageSample[] | undefined,
+): boolean {
+  return expected !== undefined &&
+    actual.length === expected.length &&
+    actual.every((sample) => {
+      const expectedSample = expected.find((candidate) => candidate.page === sample.page);
+      return expectedSample !== undefined &&
+        expectedSample.url === sample.url &&
+        expectedSample.navigationEpoch === sample.navigationEpoch &&
+        expectedSample.category === sample.category;
+    });
 }
 
 function uniqueConfiguredCopilotPage(

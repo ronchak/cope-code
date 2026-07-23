@@ -20,7 +20,7 @@ class DelayedPage {
   public popupListener?: (value: unknown) => void;
   public frameNavigationListener?: (value: unknown) => void;
   public bringToFrontCalls = 0;
-  readonly #mainFrame = {};
+  readonly #mainFrame = { page: () => this.asPage() };
 
   public constructor(public currentUrl: string) {}
 
@@ -57,6 +57,7 @@ class DelayedContext {
   public readonly pageList: DelayedPage[] = [new DelayedPage("about:blank")];
   public navigationPage = new DelayedPage("about:blank");
   public pageListener?: (page: Page) => void;
+  public requestListener?: (request: unknown) => void;
   public onPages?: (call: number) => void;
   public pageCalls = 0;
 
@@ -65,13 +66,32 @@ class DelayedContext {
     this.onPages?.(this.pageCalls);
     return this.pageList.map((page) => page.asPage());
   }
-  public on(event: string, listener: (page: Page) => void): this {
-    if (event === "page") this.pageListener = listener;
+  public on(event: string, listener: (value: unknown) => void): this {
+    if (event === "page") this.pageListener = listener as (page: Page) => void;
+    if (event === "request") this.requestListener = listener;
     return this;
   }
   public addPage(page: DelayedPage): void {
     this.pageList.push(page);
     this.pageListener?.(page.asPage());
+  }
+  public emitNavigationRequest(
+    page: DelayedPage,
+    url: string,
+    redirectedFrom: unknown = null,
+    frameAvailable = true,
+  ): unknown {
+    const request = {
+      frame: () => {
+        if (!frameAvailable) throw new Error("Frame is not available yet");
+        return page.mainFrame();
+      },
+      isNavigationRequest: () => true,
+      redirectedFrom: () => redirectedFrom,
+      url: () => url,
+    };
+    this.requestListener?.(request);
+    return request;
   }
   public async newPage(): Promise<Page> {
     this.pageList.push(this.navigationPage);
@@ -228,7 +248,7 @@ test("an unrelated context page without a tracked popup opener never receives SS
   assert.equal(tracked.isManualAuthenticationRedirect(), false);
 });
 
-test("a configured popup callback overlap stays manual until the popup closes", async () => {
+test("setup can inspect a configured popup callback while ordinary operations stay blocked", async () => {
   const context = new DelayedContext();
   const sso = new DelayedPage("https://identity.example.test/sso/login");
   context.navigationPage.onGoto = async () => {
@@ -242,6 +262,15 @@ test("a configured popup callback overlap stays manual until the popup closes", 
 
   sso.currentUrl = "https://m365.cloud.microsoft/chat/callback";
   assert.equal(await tracked.holdForManualAuthenticationHandoff(), true);
+  await tracked.withManualReadinessProbe(async () => {
+    assert.equal(
+      await tracked.holdForManualAuthenticationHandoff(false, true),
+      false,
+      "setup must inspect the provenance-bound callback page instead of waiting for it to close",
+    );
+    assert.equal(await tracked.currentUrl(), sso.currentUrl);
+    assert.deepEqual(await tracked.completeObservation(), { nativeDialogDetected: false });
+  });
   await assert.rejects(
     tracked.currentUrl(),
     /Multiple approved Copilot pages/u,
@@ -251,6 +280,102 @@ test("a configured popup callback overlap stays manual until the popup closes", 
   sso.closed = true;
   assert.equal(await tracked.holdForManualAuthenticationHandoff(), false);
   assert.equal(await tracked.currentUrl(), context.navigationPage.currentUrl);
+});
+
+test("setup recognizes an SSO callback first surfaced after the external redirect", async () => {
+  const context = new DelayedContext();
+  const callback = new DelayedPage("https://m365.cloud.microsoft/chat/callback");
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    context.addPage(callback);
+    const externalRequest = context.emitNavigationRequest(
+      callback,
+      "https://identity.example.test/sso/login",
+      null,
+      false,
+    );
+    context.emitNavigationRequest(callback, callback.currentUrl, externalRequest);
+    context.navigationPage.emitPopup(callback);
+    return null;
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+
+  assert.equal(await tracked.holdForManualAuthenticationHandoff(), true);
+  await tracked.withManualReadinessProbe(async () => {
+    assert.equal(
+      await tracked.holdForManualAuthenticationHandoff(false, true),
+      false,
+      "the callback redirect chain must preserve an external request without a Frame",
+    );
+    assert.equal(await tracked.currentUrl(), callback.currentUrl);
+    assert.deepEqual(await tracked.completeObservation(), { nativeDialogDetected: false });
+  });
+});
+
+test("setup never treats an ordinary configured popup as a completed SSO callback", async () => {
+  const context = new DelayedContext();
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    return null;
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+  const ordinaryPopup = new DelayedPage(
+    "https://m365.cloud.microsoft/chat/conversation/ordinary-popup",
+  );
+  context.addPage(ordinaryPopup);
+  context.navigationPage.emitPopup(ordinaryPopup);
+
+  assert.equal(
+    await tracked.holdForManualAuthenticationHandoff(),
+    false,
+    "opener provenance alone must not create an SSO callback handoff",
+  );
+  await tracked.withManualReadinessProbe(async () => {
+    assert.equal(
+      await tracked.holdForManualAuthenticationHandoff(false, true),
+      false,
+    );
+    await assert.rejects(
+      tracked.currentUrl(),
+      /Multiple approved Copilot pages/u,
+      "setup must preserve ordinary configured-page ambiguity",
+    );
+  });
+});
+
+test("setup requires a returned SSO popup to overlap its original configured opener", async () => {
+  const context = new DelayedContext();
+  const sso = new DelayedPage("https://identity.example.test/sso/login");
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    context.addPage(sso);
+    context.navigationPage.emitPopup(sso);
+    return null;
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+  sso.emitMainFrameNavigation("https://m365.cloud.microsoft/chat/callback");
+  context.navigationPage.closed = true;
+  const unrelatedConfiguredPage = new DelayedPage(
+    "https://m365.cloud.microsoft/chat/conversation/unrelated",
+  );
+  context.addPage(unrelatedConfiguredPage);
+
+  assert.equal(
+    await tracked.holdForManualAuthenticationHandoff(),
+    false,
+    "an unrelated configured page cannot replace the callback popup's opener",
+  );
+  await tracked.withManualReadinessProbe(async () => {
+    assert.equal(
+      await tracked.holdForManualAuthenticationHandoff(false, true),
+      false,
+    );
+    await assert.rejects(
+      tracked.currentUrl(),
+      /Multiple approved Copilot pages/u,
+      "setup must preserve ambiguity when the original opener is gone",
+    );
+  });
 });
 
 test("an external SSO success popup retains manual ownership until it closes", async () => {
@@ -347,6 +472,126 @@ test("a callback overlap during setup observation is a retryable page transition
     await assert.rejects(
       tracked.completeObservation(),
       retryableReadinessTransition,
+    );
+  });
+});
+
+test("a configured callback pair changing during setup invalidates the readiness sample", async () => {
+  const context = new DelayedContext();
+  const callback = new DelayedPage("https://identity.example.test/sso/login");
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    context.addPage(callback);
+    context.navigationPage.emitPopup(callback);
+    return null;
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+  callback.currentUrl = "https://m365.cloud.microsoft/chat/callback";
+
+  await tracked.withManualReadinessProbe(async () => {
+    assert.equal(await tracked.holdForManualAuthenticationHandoff(false, true), false);
+    assert.equal(await tracked.currentUrl(), callback.currentUrl);
+    context.navigationPage.closed = true;
+    await assert.rejects(
+      tracked.completeObservation(),
+      retryableReadinessTransition,
+    );
+  });
+});
+
+test("same-page configured navigation invalidates a callback readiness sample", async () => {
+  const context = new DelayedContext();
+  const callback = new DelayedPage("https://identity.example.test/sso/login");
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    context.addPage(callback);
+    context.navigationPage.emitPopup(callback);
+    return null;
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+  callback.emitMainFrameNavigation("https://m365.cloud.microsoft/chat/callback");
+
+  await tracked.withManualReadinessProbe(async () => {
+    assert.equal(await tracked.holdForManualAuthenticationHandoff(false, true), false);
+    assert.equal(await tracked.currentUrl(), callback.currentUrl);
+    context.navigationPage.emitMainFrameNavigation(context.navigationPage.currentUrl);
+    await assert.rejects(
+      tracked.completeObservation(),
+      retryableReadinessTransition,
+    );
+  });
+});
+
+test("same-page external SSO navigation invalidates a readiness sample", async () => {
+  const context = new DelayedContext();
+  const sso = new DelayedPage("https://identity.example.test/sso/login");
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    context.addPage(sso);
+    context.navigationPage.emitPopup(sso);
+    return null;
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+
+  await tracked.withManualReadinessProbe(async () => {
+    assert.equal(await tracked.holdForManualAuthenticationHandoff(false, true), false);
+    assert.equal(await tracked.currentUrl(), context.navigationPage.currentUrl);
+    sso.emitMainFrameNavigation(sso.currentUrl);
+    await assert.rejects(
+      tracked.completeObservation(),
+      authenticationPrecedenceTransition,
+    );
+  });
+});
+
+test("new authentication before a callback probe DOM read invalidates the sample", async () => {
+  const context = new DelayedContext();
+  const callback = new DelayedPage("https://identity.example.test/sso/login");
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    context.addPage(callback);
+    context.navigationPage.emitPopup(callback);
+    return null;
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+  callback.currentUrl = "https://m365.cloud.microsoft/chat/callback";
+
+  await tracked.withManualReadinessProbe(async () => {
+    assert.equal(await tracked.holdForManualAuthenticationHandoff(false, true), false);
+    const nextAuth = new DelayedPage("https://identity.example.test/sso/continue");
+    context.addPage(nextAuth);
+    callback.emitPopup(nextAuth);
+    await assert.rejects(
+      tracked.currentUrl(),
+      authenticationPrecedenceTransition,
+    );
+  });
+});
+
+test("an existing page navigating to authentication during a callback probe invalidates the sample", async () => {
+  const context = new DelayedContext();
+  const callback = new DelayedPage("https://identity.example.test/sso/login");
+  const nextAuth = new DelayedPage("about:blank");
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    context.addPage(callback);
+    context.navigationPage.emitPopup(callback);
+    context.addPage(nextAuth);
+    callback.emitPopup(nextAuth);
+    return null;
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+  callback.currentUrl = "https://m365.cloud.microsoft/chat/callback";
+
+  await tracked.withManualReadinessProbe(async () => {
+    assert.equal(await tracked.holdForManualAuthenticationHandoff(false, true), false);
+    assert.equal(await tracked.currentUrl(), callback.currentUrl);
+    nextAuth.emitMainFrameNavigation(
+      "https://login.microsoftonline.com/common/oauth2/authorize",
+    );
+    await assert.rejects(
+      tracked.completeObservation(),
+      authenticationPrecedenceTransition,
     );
   });
 });
@@ -559,6 +804,12 @@ function retryableReadinessTransition(error: unknown): boolean {
     (error as { details?: Record<string, unknown> }).details?.diagnosticCode ===
       "ACTIVE_PAGE_CHANGED_DURING_OBSERVATION" &&
     (error as { details?: Record<string, unknown> }).details?.dispatchAttempted === false;
+}
+
+function authenticationPrecedenceTransition(error: unknown): boolean {
+  return retryableReadinessTransition(error) &&
+    (error as { details?: Record<string, unknown> }).details?.observationChangeReason ===
+      "authentication-precedence";
 }
 
 function manualSsoHandoffError(error: unknown): boolean {
