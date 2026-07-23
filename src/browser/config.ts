@@ -457,6 +457,27 @@ export function isApprovedUrl(url: URL | string, hosts: readonly ApprovedHost[])
   });
 }
 
+/** Compare one observed URL to the configured entry route after harmless slash normalization. */
+export function isConfiguredCopilotEntryRoute(
+  value: string,
+  entryValue: string,
+): boolean {
+  try {
+    const actual = new URL(value);
+    const entry = new URL(entryValue);
+    return actual.origin === entry.origin &&
+      normalizedUrlPath(actual.pathname) === normalizedUrlPath(entry.pathname) &&
+      actual.search === entry.search;
+  } catch {
+    return false;
+  }
+}
+
+function normalizedUrlPath(value: string): string {
+  const withoutTrailingSlash = value.replace(/\/+$/u, "");
+  return withoutTrailingSlash === "" ? "/" : withoutTrailingSlash;
+}
+
 /** Local-only identifier; diagnostics must not expose it. */
 export function conversationIdFromUrl(value: string): string {
   const url = new URL(value);

@@ -359,6 +359,18 @@ test("launch reuses a pre-existing external Microsoft authentication page", asyn
   assert.equal(authentication.defaultNavigationTimeout, config.waits.actionMs);
 });
 
+test("launch reuses a query-distinguished conversation on the configured path", async () => {
+  const conversation = new FakePage(`${entryUrl}?conversation=existing`);
+  const context = new FakeContext([conversation]);
+  const config = browserConfig();
+
+  const tracked = await openTrackedCopilotPage(context.asContext(), config);
+
+  assert.equal(context.newPageCalls, 0);
+  assert.equal(await tracked.currentUrl(), conversation.currentUrl);
+  assert.ok(conversation.frontCount >= 1);
+});
+
 test("launch gives external authentication ownership over ambiguous chats", async () => {
   const first = new FakePage(`${entryUrl}/conversation/first`);
   const olderAuthentication = new FakePage(`${authUrl}?step=older`);

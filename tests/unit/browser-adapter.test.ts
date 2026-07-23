@@ -37,6 +37,7 @@ class DynamicFakePage implements SemanticPage {
   public snapshotCalls = 0;
   public stallSnapshots = false;
   public onCurrentUrl: (() => void) | undefined = undefined;
+  public onActivation: (() => void) | undefined = undefined;
 
   public async currentUrl(): Promise<string> {
     this.currentUrlCalls += 1;
@@ -87,6 +88,7 @@ class DynamicFakePage implements SemanticPage {
       this.userMessages.push(this.composer);
       this.composer = "";
       this.responses.push("completed response envelope");
+      this.onActivation?.();
       return;
     }
     if (this.activationMode === "indeterminate") {
@@ -139,10 +141,11 @@ function makeHarness(
   page = new DynamicFakePage(),
   killSwitch = new MutableBrowserKillSwitch(),
   onSleep?: () => void,
+  entryUrl = "https://copilot.example.test/chat",
 ) {
   let monotonic = 0;
   const config: CopilotBrowserAdapterConfig = {
-    entryUrl: "https://copilot.example.test/chat",
+    entryUrl,
     approvedHosts: [{ hostname: "copilot.example.test" }],
     manualAuthenticationHosts: [{ hostname: "login.example.test" }],
     uiContract: createBaselineCopilotUiContract("Synthetic Work Account"),
@@ -215,6 +218,35 @@ test("first submission adopts an M365 conversation URL only after exact marker p
   const response = await adapter.receive(request);
   assert.equal(response.status, "completed");
   assert.equal(response.conversationId, receipt.conversationId);
+});
+
+test("first submission normalizes a trailing slash before materializing its conversation", async () => {
+  const page = new DynamicFakePage();
+  page.url = "https://copilot.example.test/chat";
+  const materializedUrl = "https://copilot.example.test/chat/conversation-materialized";
+  const { adapter } = makeHarness(
+    page,
+    new MutableBrowserKillSwitch(),
+    () => { page.url = materializedUrl; },
+    "https://copilot.example.test/chat/",
+  );
+
+  const receipt = await adapter.submit(request);
+  assert.equal(receipt.status, "submitted");
+  assert.equal(receipt.conversationId, conversationIdFromUrl(materializedUrl));
+});
+
+test("a query-distinguished conversation cannot claim first-send materialization", async () => {
+  const page = new DynamicFakePage();
+  page.url = "https://copilot.example.test/chat?conversation=existing";
+  page.onActivation = () => {
+    page.url = "https://copilot.example.test/chat/conversation-other";
+  };
+  const { adapter } = makeHarness(page);
+
+  const receipt = await adapter.submit(request);
+  assert.equal(receipt.status, "indeterminate");
+  assert.equal(receipt.diagnosticCode, "CONVERSATION_CHANGED_AFTER_ACTIVATION");
 });
 
 test("entry marker proof cannot survive a materialized URL with missing marker evidence", async () => {

@@ -25,6 +25,7 @@ import {
 import {
   conversationIdFromUrl,
   isApprovedUrl,
+  isConfiguredCopilotEntryRoute,
   validateBrowserConfig,
   type CopilotBrowserAdapterConfig,
 } from "./config.js";
@@ -970,7 +971,7 @@ export class CopilotBrowserAdapter implements ModelTransport {
       conversationMayMaterialize:
         request.expectedConversationId === undefined &&
         this.#taskConversations.get(request.taskId) === undefined &&
-        conversationId === conversationIdFromUrl(this.#config.entryUrl),
+        isConfiguredCopilotEntryRoute(observation.url, this.#config.entryUrl),
       baselineResponseCount: recoveredBaseline?.responseCount ?? responses.length,
       baselineResponseSequenceSha256: recoveredBaseline?.responseSequenceSha256 ??
         responseSequenceSha256(responses),

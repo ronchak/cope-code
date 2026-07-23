@@ -120,6 +120,10 @@ same M365 release:
     `lastChatMessage`. A remount between `isVisible()` and the meaningless
     `isEnabled()` probe on one such presence-only node exhausted the shared
     action deadline and revoked an otherwise healthy second live session.
+11. First-send eligibility compared the observed conversation hash with a hash
+    of the raw configured entry URL. The harmless `/chat/` versus canonical
+    `/chat` slash difference therefore disabled materialization before exact
+    marker proof could adopt `/chat/conversation/<id>`.
 
 The stable failure consumed the normal 15-second UI hydration allowance, then
 returned `identity-unverified`. It was not a browser discovery, profile,
@@ -196,7 +200,9 @@ two distinct identity strings belong to one person.
 - Adopt a first-send materialized conversation only when the exact unique task
   marker is observed on the new URL. Retry a mixed-document observation only
   inside that bounded first-send window; never carry entry-route proof across a
-  markerless URL change.
+  markerless URL change. Determine entry-route eligibility with the same exact
+  origin and trailing-slash-normalized path boundary used by page selection,
+  while preserving exact query state as part of conversation identity.
 - Treat a temporarily absent marker as pending on the same pinned conversation.
   Reset response stability across the gap and require the exact marker to
   return before accepting any response.

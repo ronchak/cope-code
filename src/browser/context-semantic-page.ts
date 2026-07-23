@@ -1319,7 +1319,9 @@ function isConfiguredCopilotUrl(value: string, entryValue: string): boolean {
     if (actual.origin !== entry.origin) return false;
     const basePath = normalizedPath(entry.pathname);
     const actualPath = normalizedPath(actual.pathname);
-    return basePath === "/" || actualPath === basePath || actualPath.startsWith(`${basePath}/`);
+    return basePath === "/" ||
+      actualPath === basePath ||
+      actualPath.startsWith(`${basePath}/`);
   } catch {
     return false;
   }
