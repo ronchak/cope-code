@@ -335,6 +335,46 @@ test("a late Chromium overlay cannot receive or redirect trusted send activation
   assert.deepEqual(activations, []);
 });
 
+test("a synchronously replaced Chromium send control cannot retain click guards", {
+  skip: !existsSync(chromiumExecutable),
+}, async (t) => {
+  const browser = await chromium.launch({ headless: true, executablePath: chromiumExecutable });
+  t.after(async () => browser.close().catch(() => undefined));
+  const context = await browser.newContext();
+  await context.route("**/*", async (route) => {
+    await route.fulfill({
+      contentType: "text/html",
+      body: `
+        <meta charset="utf-8">
+        <button id="send" aria-label="Send message">Send</button>
+        <script>
+          let sends = 0;
+          const bind = (button) => {
+            button.addEventListener("click", (event) => {
+              if (!event.isTrusted) return;
+              sends += 1;
+              document.body.dataset.sends = String(sends);
+              const replacement = button.cloneNode(true);
+              button.replaceWith(replacement);
+              bind(replacement);
+            });
+          };
+          bind(document.querySelector("#send"));
+        </script>
+      `,
+    });
+  });
+  const page = await context.newPage();
+  await page.goto(`${entryUrl}/conversation/replaced-send`);
+  const semanticPage = new PlaywrightSemanticPage(page, undefined, 1_000);
+  const sendGroup = createBaselineCopilotUiContract("Chakraborty, Ronak").groups.send;
+
+  await semanticPage.click(sendGroup, () => undefined);
+  await semanticPage.click(sendGroup, () => undefined);
+
+  assert.equal(await page.getAttribute("body", "data-sends"), "2");
+});
+
 for (const variant of ["json", "unlabeled"] as const) {
   test(`a ${variant} Chromium code editor containing CBA-shaped JSON remains inert`, {
     skip: !existsSync(chromiumExecutable),

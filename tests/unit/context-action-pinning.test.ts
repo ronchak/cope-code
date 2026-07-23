@@ -60,9 +60,6 @@ class ActionLocator {
 }
 
 class BoundActionElement {
-  #trustedClickGuardInstalled = false;
-  #trustedClickCompleted = false;
-
   public constructor(
     private readonly page: ActionPage,
     private readonly documentEpoch: number,
@@ -76,7 +73,7 @@ class BoundActionElement {
   public async click(): Promise<void> {
     this.#beforeDispatch();
     this.page.actions.push("click");
-    this.#trustedClickCompleted = true;
+    this.page.trustedClickCompleted = true;
   }
   public async evaluate(
     _callback: (...args: readonly unknown[]) => unknown,
@@ -92,14 +89,11 @@ class BoundActionElement {
     if (value === undefined) {
       return !this.page.boundClickPreDispatchFailure;
     }
-    if (!this.#trustedClickGuardInstalled) {
-      this.#trustedClickGuardInstalled = true;
+    if (!this.page.trustedClickGuardInstalled) {
+      this.page.trustedClickGuardInstalled = true;
       return true;
     }
-    return {
-      matchedClicks: this.#trustedClickCompleted ? 1 : 0,
-      mismatchedActivation: false,
-    };
+    throw new Error("Click proof must be read through the page");
   }
 
   #beforeDispatch(): void {
@@ -116,6 +110,8 @@ class ActionPage {
   public documentEpoch = 0;
   public sendAvailable = true;
   public boundClickPreDispatchFailure = false;
+  public trustedClickGuardInstalled = false;
+  public trustedClickCompleted = false;
   public readonly actions: string[] = [];
   public locatorProbeHook: (() => void) | undefined = undefined;
   public boundActionHook: (() => void) | undefined = undefined;
@@ -129,6 +125,18 @@ class ActionPage {
   public setDefaultTimeout(_milliseconds: number): void {}
   public setDefaultNavigationTimeout(_milliseconds: number): void {}
   public async bringToFront(): Promise<void> {}
+  public async evaluate(): Promise<{
+    readonly matchedClicks: number;
+    readonly mismatchedActivation: boolean;
+  }> {
+    const proof = {
+      matchedClicks: this.trustedClickCompleted ? 1 : 0,
+      mismatchedActivation: false,
+    };
+    this.trustedClickGuardInstalled = false;
+    this.trustedClickCompleted = false;
+    return proof;
+  }
   public on(event: string, listener: (...args: readonly unknown[]) => void): this {
     if (event === "framenavigated") {
       this.#navigationListeners.push(listener as (frame: Frame) => void);

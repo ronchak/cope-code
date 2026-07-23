@@ -411,7 +411,8 @@ export class PlaywrightSemanticPage implements SemanticPage {
         { operation: "element.evaluate.install-click-guard" },
         () => element.evaluate((node, token): boolean => {
           if (!(node instanceof HTMLElement) || !node.isConnected) return false;
-          if (Object.prototype.hasOwnProperty.call(node, token)) return false;
+          const view = node.ownerDocument.defaultView;
+          if (view === null || Object.prototype.hasOwnProperty.call(view, token)) return false;
           const state = {
             matchedClicks: 0,
             mismatchedActivation: false,
@@ -437,13 +438,17 @@ export class PlaywrightSemanticPage implements SemanticPage {
           };
           state.cleanup = () => {
             for (const type of activationTypes) {
-              node.ownerDocument.defaultView?.removeEventListener(type, listener, true);
+              view.removeEventListener(type, listener, true);
             }
           };
           for (const type of activationTypes) {
-            node.ownerDocument.defaultView?.addEventListener(type, listener, true);
+            view.addEventListener(type, listener, true);
           }
-          Object.defineProperty(node, token, {
+          // Store cleanup on the Window rather than the bound element. M365
+          // may synchronously replace Send inside its click handler, but the
+          // document-level guard must still be removable after that node has
+          // detached.
+          Object.defineProperty(view, token, {
             configurable: true,
             enumerable: false,
             value: state,
@@ -479,12 +484,12 @@ export class PlaywrightSemanticPage implements SemanticPage {
       const clickProof = await traceOperation(
         trace,
         "dispatch-proof",
-        { operation: "element.evaluate.verify-click-target" },
-        () => element.evaluate((node, token): {
+        { operation: "page.evaluate.verify-click-target" },
+        () => this.#page.evaluate((token): {
           readonly matchedClicks: number;
           readonly mismatchedActivation: boolean;
         } => {
-          const state = (node as unknown as Record<string, {
+          const state = (window as unknown as Record<string, {
             matchedClicks: number;
             mismatchedActivation: boolean;
             cleanup: () => void;
@@ -493,7 +498,7 @@ export class PlaywrightSemanticPage implements SemanticPage {
             return { matchedClicks: 0, mismatchedActivation: true };
           }
           state.cleanup();
-          delete (node as unknown as Record<string, unknown>)[token];
+          delete (window as unknown as Record<string, unknown>)[token];
           return {
             matchedClicks: state.matchedClicks,
             mismatchedActivation: state.mismatchedActivation,

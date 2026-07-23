@@ -124,6 +124,10 @@ same M365 release:
     of the raw configured entry URL. The harmless `/chat/` versus canonical
     `/chat` slash difference therefore disabled materialization before exact
     marker proof could adopt `/chat/conversation/<id>`.
+12. The trusted-click capture guard stored its cleanup state on the bound Send
+    node. If M365 synchronously replaced that node in its click handler, the
+    post-click proof could no longer reach cleanup, leaving old window-level
+    listeners able to block the next turn.
 
 The stable failure consumed the normal 15-second UI hydration allowance, then
 returned `identity-unverified`. It was not a browser discovery, profile,
@@ -193,8 +197,10 @@ two distinct identity strings belong to one person.
   bound and hit-tested by the post-fill transaction. Preserve Playwright's
   receives-events enforcement and install a bounded capture guard that cancels
   off-target trusted activation and proves exactly one trusted click reached
-  the bound element. Never force a coordinate click or return to a locator that
-  can resolve to a replacement node.
+  the bound element. Store and verify guard state through the owning window so
+  synchronous Send-node replacement cannot strand listeners. Never force a
+  coordinate click or return to a locator that can resolve to a replacement
+  node.
 - Permit only trailing U+200B/U+200C Lexical sentinels during exact composer
   ownership verification.
 - Adopt a first-send materialized conversation only when the exact unique task
