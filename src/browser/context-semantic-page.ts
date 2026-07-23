@@ -976,22 +976,31 @@ export class ContextSemanticPage implements SemanticPage {
   }
 
   #recordExternalSsoNavigationRequest(request: Request): void {
-    if (
-      !request.isNavigationRequest() ||
-      !isProvenanceBoundExternalSsoUrl(request.url(), this.#config.entryUrl)
-    ) {
-      return;
-    }
+    if (!request.isNavigationRequest()) return;
     try {
+      let redirect: Request | null = request;
+      const seen = new Set<Request>();
+      let externalSsoRedirect = false;
+      for (let depth = 0; redirect !== null && depth < 32; depth += 1) {
+        if (seen.has(redirect)) break;
+        seen.add(redirect);
+        if (isProvenanceBoundExternalSsoUrl(redirect.url(), this.#config.entryUrl)) {
+          externalSsoRedirect = true;
+          break;
+        }
+        redirect = redirect.redirectedFrom();
+      }
+      if (!externalSsoRedirect) return;
+
       const frame = request.frame();
       const page = frame.page();
       if (typeof page.mainFrame === "function" && frame !== page.mainFrame()) return;
-      // BrowserContext request events can precede the popup event and retain
-      // the redirect evidence even when the first committed popup document
-      // Playwright exposes is already the configured callback.
+      // The initial external request may precede Frame creation. The later
+      // callback request has a page-bound frame and retains that external hop
+      // through redirectedFrom(), even if no external document committed.
       this.#externalSsoEvidencePages.add(page);
     } catch {
-      // Requests without an attachable page/frame cannot prove popup history.
+      // Wait for a later page-bound request in the same redirect chain.
     }
   }
 

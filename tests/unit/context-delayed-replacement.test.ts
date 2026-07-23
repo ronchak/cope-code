@@ -75,12 +75,23 @@ class DelayedContext {
     this.pageList.push(page);
     this.pageListener?.(page.asPage());
   }
-  public emitNavigationRequest(page: DelayedPage, url: string): void {
-    this.requestListener?.({
-      frame: () => page.mainFrame(),
+  public emitNavigationRequest(
+    page: DelayedPage,
+    url: string,
+    redirectedFrom: unknown = null,
+    frameAvailable = true,
+  ): unknown {
+    const request = {
+      frame: () => {
+        if (!frameAvailable) throw new Error("Frame is not available yet");
+        return page.mainFrame();
+      },
       isNavigationRequest: () => true,
+      redirectedFrom: () => redirectedFrom,
       url: () => url,
-    });
+    };
+    this.requestListener?.(request);
+    return request;
   }
   public async newPage(): Promise<Page> {
     this.pageList.push(this.navigationPage);
@@ -277,10 +288,13 @@ test("setup recognizes an SSO callback first surfaced after the external redirec
   context.navigationPage.onGoto = async () => {
     context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
     context.addPage(callback);
-    context.emitNavigationRequest(
+    const externalRequest = context.emitNavigationRequest(
       callback,
       "https://identity.example.test/sso/login",
+      null,
+      false,
     );
+    context.emitNavigationRequest(callback, callback.currentUrl, externalRequest);
     context.navigationPage.emitPopup(callback);
     return null;
   };
@@ -291,7 +305,7 @@ test("setup recognizes an SSO callback first surfaced after the external redirec
     assert.equal(
       await tracked.holdForManualAuthenticationHandoff(false, true),
       false,
-      "request evidence must preserve a fast external redirect before the popup event",
+      "the callback redirect chain must preserve an external request without a Frame",
     );
     assert.equal(await tracked.currentUrl(), callback.currentUrl);
     assert.deepEqual(await tracked.completeObservation(), { nativeDialogDetected: false });
