@@ -293,6 +293,41 @@ test("setup never treats an ordinary configured popup as a completed SSO callbac
   });
 });
 
+test("setup requires a returned SSO popup to overlap its original configured opener", async () => {
+  const context = new DelayedContext();
+  const sso = new DelayedPage("https://identity.example.test/sso/login");
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    context.addPage(sso);
+    context.navigationPage.emitPopup(sso);
+    return null;
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+  sso.emitMainFrameNavigation("https://m365.cloud.microsoft/chat/callback");
+  context.navigationPage.closed = true;
+  const unrelatedConfiguredPage = new DelayedPage(
+    "https://m365.cloud.microsoft/chat/conversation/unrelated",
+  );
+  context.addPage(unrelatedConfiguredPage);
+
+  assert.equal(
+    await tracked.holdForManualAuthenticationHandoff(),
+    false,
+    "an unrelated configured page cannot replace the callback popup's opener",
+  );
+  await tracked.withManualReadinessProbe(async () => {
+    assert.equal(
+      await tracked.holdForManualAuthenticationHandoff(false, true),
+      false,
+    );
+    await assert.rejects(
+      tracked.currentUrl(),
+      /Multiple approved Copilot pages/u,
+      "setup must preserve ambiguity when the original opener is gone",
+    );
+  });
+});
+
 test("an external SSO success popup retains manual ownership until it closes", async () => {
   const context = new DelayedContext();
   const sso = new DelayedPage("https://identity.example.test/sso/login");

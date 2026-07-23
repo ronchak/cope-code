@@ -98,6 +98,7 @@ export class ContextSemanticPage implements SemanticPage {
   readonly #manualHandoffPages = new WeakSet<Page>();
   readonly #manualHandoffPopupPages = new WeakSet<Page>();
   readonly #externalSsoHandoffPopupPages = new WeakSet<Page>();
+  readonly #manualHandoffPopupOpeners = new WeakMap<Page, Page>();
   readonly #navigationEpochs = new WeakMap<Page, number>();
   #nativeDialogEpoch = 0;
   #activePage: Page;
@@ -803,7 +804,13 @@ export class ContextSemanticPage implements SemanticPage {
     const callbackPopups = configuredPages.filter((page) =>
       this.#manualHandoffPopupPages.has(page) &&
       this.#externalSsoHandoffPopupPages.has(page));
-    return callbackPopups.length === 1 ? callbackPopups[0] : undefined;
+    if (callbackPopups.length !== 1) return undefined;
+    const callbackPopup = callbackPopups.at(0);
+    if (callbackPopup === undefined) return undefined;
+    const opener = this.#manualHandoffPopupOpeners.get(callbackPopup);
+    return opener !== undefined && configuredPages.includes(opener)
+      ? callbackPopup
+      : undefined;
   }
 
   async #returnedConfiguredPage(
@@ -889,6 +896,7 @@ export class ContextSemanticPage implements SemanticPage {
         ) {
           this.#manualHandoffPages.add(popup);
           this.#manualHandoffPopupPages.add(popup);
+          this.#manualHandoffPopupOpeners.set(popup, page);
         }
         this.#configurePage(popup);
       });
