@@ -4,6 +4,12 @@ Cope turns Microsoft 365 Copilot Chat into a local coding agent through a visibl
 
 The deterministic harness remains responsible for repository boundaries, permissions, local tools, checkpoints, validation, recovery, and audit records. Copilot supplies the coding judgment through its normal browser UI. Cope does not use private Copilot endpoints, token extraction, network interception, or automated sign-in.
 
+## Current release
+
+The current package version is **0.1.5**. See the
+[Cope 0.1.5 release notes](docs/RELEASE-NOTES-0.1.5.md) for the complete
+Microsoft 365 Copilot readiness and live-browser compatibility fixes.
+
 ## Install on Windows
 
 Extract the release zip, then double-click:
@@ -180,6 +186,7 @@ Architecture and controls remain documented under `docs`:
 - `docs/WINDOWS-TARGET.md`
 - `docs/MACOS-TARGET.md`
 - `docs/LIVE-PILOT-ACCEPTANCE.md`
+- `docs/RELEASE-NOTES-0.1.5.md`
 
 ## Uninstall
 
