@@ -485,6 +485,51 @@ test("a configured callback pair changing during setup invalidates the readiness
   });
 });
 
+test("same-page configured navigation invalidates a callback readiness sample", async () => {
+  const context = new DelayedContext();
+  const callback = new DelayedPage("https://identity.example.test/sso/login");
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    context.addPage(callback);
+    context.navigationPage.emitPopup(callback);
+    return null;
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+  callback.emitMainFrameNavigation("https://m365.cloud.microsoft/chat/callback");
+
+  await tracked.withManualReadinessProbe(async () => {
+    assert.equal(await tracked.holdForManualAuthenticationHandoff(false, true), false);
+    assert.equal(await tracked.currentUrl(), callback.currentUrl);
+    context.navigationPage.emitMainFrameNavigation(context.navigationPage.currentUrl);
+    await assert.rejects(
+      tracked.completeObservation(),
+      retryableReadinessTransition,
+    );
+  });
+});
+
+test("same-page external SSO navigation invalidates a readiness sample", async () => {
+  const context = new DelayedContext();
+  const sso = new DelayedPage("https://identity.example.test/sso/login");
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    context.addPage(sso);
+    context.navigationPage.emitPopup(sso);
+    return null;
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+
+  await tracked.withManualReadinessProbe(async () => {
+    assert.equal(await tracked.holdForManualAuthenticationHandoff(false, true), false);
+    assert.equal(await tracked.currentUrl(), context.navigationPage.currentUrl);
+    sso.emitMainFrameNavigation(sso.currentUrl);
+    await assert.rejects(
+      tracked.completeObservation(),
+      authenticationPrecedenceTransition,
+    );
+  });
+});
+
 test("new authentication before a callback probe DOM read invalidates the sample", async () => {
   const context = new DelayedContext();
   const callback = new DelayedPage("https://identity.example.test/sso/login");
