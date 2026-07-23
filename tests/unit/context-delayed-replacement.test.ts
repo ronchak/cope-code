@@ -20,7 +20,7 @@ class DelayedPage {
   public popupListener?: (value: unknown) => void;
   public frameNavigationListener?: (value: unknown) => void;
   public bringToFrontCalls = 0;
-  readonly #mainFrame = {};
+  readonly #mainFrame = { page: () => this.asPage() };
 
   public constructor(public currentUrl: string) {}
 
@@ -57,6 +57,7 @@ class DelayedContext {
   public readonly pageList: DelayedPage[] = [new DelayedPage("about:blank")];
   public navigationPage = new DelayedPage("about:blank");
   public pageListener?: (page: Page) => void;
+  public requestListener?: (request: unknown) => void;
   public onPages?: (call: number) => void;
   public pageCalls = 0;
 
@@ -65,13 +66,21 @@ class DelayedContext {
     this.onPages?.(this.pageCalls);
     return this.pageList.map((page) => page.asPage());
   }
-  public on(event: string, listener: (page: Page) => void): this {
-    if (event === "page") this.pageListener = listener;
+  public on(event: string, listener: (value: unknown) => void): this {
+    if (event === "page") this.pageListener = listener as (page: Page) => void;
+    if (event === "request") this.requestListener = listener;
     return this;
   }
   public addPage(page: DelayedPage): void {
     this.pageList.push(page);
     this.pageListener?.(page.asPage());
+  }
+  public emitNavigationRequest(page: DelayedPage, url: string): void {
+    this.requestListener?.({
+      frame: () => page.mainFrame(),
+      isNavigationRequest: () => true,
+      url: () => url,
+    });
   }
   public async newPage(): Promise<Page> {
     this.pageList.push(this.navigationPage);
@@ -260,6 +269,33 @@ test("setup can inspect a configured popup callback while ordinary operations st
   sso.closed = true;
   assert.equal(await tracked.holdForManualAuthenticationHandoff(), false);
   assert.equal(await tracked.currentUrl(), context.navigationPage.currentUrl);
+});
+
+test("setup recognizes an SSO callback first surfaced after the external redirect", async () => {
+  const context = new DelayedContext();
+  const callback = new DelayedPage("https://m365.cloud.microsoft/chat/callback");
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    context.addPage(callback);
+    context.emitNavigationRequest(
+      callback,
+      "https://identity.example.test/sso/login",
+    );
+    context.navigationPage.emitPopup(callback);
+    return null;
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+
+  assert.equal(await tracked.holdForManualAuthenticationHandoff(), true);
+  await tracked.withManualReadinessProbe(async () => {
+    assert.equal(
+      await tracked.holdForManualAuthenticationHandoff(false, true),
+      false,
+      "request evidence must preserve a fast external redirect before the popup event",
+    );
+    assert.equal(await tracked.currentUrl(), callback.currentUrl);
+    assert.deepEqual(await tracked.completeObservation(), { nativeDialogDetected: false });
+  });
 });
 
 test("setup never treats an ordinary configured popup as a completed SSO callback", async () => {

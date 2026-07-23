@@ -1,6 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 
-import type { BrowserContext, Page } from "playwright-core";
+import type { BrowserContext, Page, Request } from "playwright-core";
 
 import { AgentError } from "../shared/errors.js";
 import {
@@ -97,7 +97,7 @@ export class ContextSemanticPage implements SemanticPage {
   readonly #configuredPages = new WeakSet<Page>();
   readonly #manualHandoffPages = new WeakSet<Page>();
   readonly #manualHandoffPopupPages = new WeakSet<Page>();
-  readonly #externalSsoHandoffPopupPages = new WeakSet<Page>();
+  readonly #externalSsoEvidencePages = new WeakSet<Page>();
   readonly #manualHandoffPopupOpeners = new WeakMap<Page, Page>();
   readonly #navigationEpochs = new WeakMap<Page, number>();
   #nativeDialogEpoch = 0;
@@ -149,6 +149,9 @@ export class ContextSemanticPage implements SemanticPage {
         // provenance is granted only by an exact opener relationship or when
         // this page itself reaches the configured/strict-auth waypoint.
         this.#configurePage(page);
+      });
+      context.on("request", (request) => {
+        this.#recordExternalSsoNavigationRequest(request);
       });
     }
   }
@@ -803,7 +806,7 @@ export class ContextSemanticPage implements SemanticPage {
     if (configuredPages.length !== 2) return undefined;
     const callbackPopups = configuredPages.filter((page) =>
       this.#manualHandoffPopupPages.has(page) &&
-      this.#externalSsoHandoffPopupPages.has(page));
+      this.#externalSsoEvidencePages.has(page));
     if (callbackPopups.length !== 1) return undefined;
     const callbackPopup = callbackPopups.at(0);
     if (callbackPopup === undefined) return undefined;
@@ -922,13 +925,33 @@ export class ContextSemanticPage implements SemanticPage {
       // popup was observed on an external tenant IdP. Opener provenance alone
       // is insufficient: ordinary app- or user-opened Copilot tabs must remain
       // ambiguous during setup just as they are during normal operations.
-      this.#externalSsoHandoffPopupPages.add(page);
+      this.#externalSsoEvidencePages.add(page);
     }
     if (
       isConfiguredCopilotUrl(page.url(), this.#config.entryUrl) ||
       isGenuineManualAuthenticationUrl(page.url(), this.#config)
     ) {
       this.#manualHandoffPages.add(page);
+    }
+  }
+
+  #recordExternalSsoNavigationRequest(request: Request): void {
+    if (
+      !request.isNavigationRequest() ||
+      !isProvenanceBoundExternalSsoUrl(request.url(), this.#config.entryUrl)
+    ) {
+      return;
+    }
+    try {
+      const frame = request.frame();
+      const page = frame.page();
+      if (typeof page.mainFrame === "function" && frame !== page.mainFrame()) return;
+      // BrowserContext request events can precede the popup event and retain
+      // the redirect evidence even when the first committed popup document
+      // Playwright exposes is already the configured callback.
+      this.#externalSsoEvidencePages.add(page);
+    } catch {
+      // Requests without an attachable page/frame cannot prove popup history.
     }
   }
 
