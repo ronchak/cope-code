@@ -95,6 +95,7 @@ export class ContextSemanticPage implements SemanticPage {
   readonly #actionMs: number;
   readonly #delegates = new WeakMap<Page, PlaywrightSemanticPage>();
   readonly #configuredPages = new WeakSet<Page>();
+  readonly #manualHandoffPages = new WeakSet<Page>();
   readonly #navigationEpochs = new WeakMap<Page, number>();
   #nativeDialogEpoch = 0;
   #activePage: Page;
@@ -127,11 +128,19 @@ export class ContextSemanticPage implements SemanticPage {
     this.#context = context;
     this.#config = config;
     this.#activePage = initialPage;
+    // This exact page is the provenance anchor for the explicit navigation to
+    // entryUrl. If that navigation crosses a tenant SSO domain, setup may wait
+    // for it to return without approving that domain for semantic actions.
+    this.#manualHandoffPages.add(initialPage);
     this.#actionMs = actionMs;
     for (const page of context.pages()) this.#configurePage(page);
     this.#configurePage(initialPage);
     if (typeof context.on === "function") {
       context.on("page", (page) => {
+        // A page opened by the dedicated setup context may be an SSO popup.
+        // It inherits only manual-wait ownership. Host/path approval is still
+        // required independently before any semantic action can be dispatched.
+        this.#manualHandoffPages.add(page);
         this.#configurePage(page);
       });
     }
@@ -190,9 +199,19 @@ export class ContextSemanticPage implements SemanticPage {
     await this.#delegate(page).bringToFront(deadline);
   }
 
-  /** External Microsoft authentication hosts retain the long manual window. */
+  /**
+   * Known Microsoft authentication hosts and provenance-bound external HTTPS
+   * SSO pages retain the long manual window. This never approves either kind
+   * of page for submission.
+   */
   public isManualAuthenticationRedirect(): boolean {
-    return isReusableExternalAuthenticationUrl(this.#activePage.url(), this.#config);
+    if (isReusableExternalAuthenticationUrl(this.#activePage.url(), this.#config)) {
+      return true;
+    }
+    return this.#context.pages().some((page) =>
+      !page.isClosed() &&
+      this.#manualHandoffPages.has(page) &&
+      isProvenanceBoundExternalSsoUrl(page.url(), this.#config.entryUrl));
   }
 
   public async currentUrl(): Promise<string> {
@@ -530,6 +549,16 @@ export class ContextSemanticPage implements SemanticPage {
     pages: readonly Page[],
     preferred: Page = this.#activePage,
   ): Page {
+    const genuineAuthenticationPage = pages.some((page) =>
+      !page.isClosed() && isGenuineManualAuthenticationUrl(page.url(), this.#config));
+    if (!genuineAuthenticationPage) {
+      const provenanceBoundSsoPage = pages.filter((page) =>
+        !page.isClosed() &&
+        this.#manualHandoffPages.has(page) &&
+        isProvenanceBoundExternalSsoUrl(page.url(), this.#config.entryUrl)
+      ).at(-1);
+      if (provenanceBoundSsoPage !== undefined) return provenanceBoundSsoPage;
+    }
     return selectActiveCopilotPage(pages, this.#config, preferred);
   }
 
@@ -785,11 +814,12 @@ export async function openTrackedCopilotPage(
     } catch (error) {
       navigationError = error;
     }
-    if (!hasAllowedPage(context, config)) {
+    if (!hasAllowedPage(context, config) && !tracked.isManualAuthenticationRedirect()) {
       const replacementFound = await waitForAllowedReplacementPage(
         context,
         config,
         navigationDeadline,
+        tracked,
       );
       if (!replacementFound) {
         if (navigationError !== undefined) throw navigationError;
@@ -970,6 +1000,29 @@ function normalizedPath(value: string): string {
   return withoutTrailingSlash === "" ? "/" : withoutTrailingSlash;
 }
 
+/**
+ * A tenant identity provider is not an approved application host. It may keep
+ * setup alive only when the exact page belongs to the explicit entry navigation
+ * or was opened by that dedicated context, and only while it is on a
+ * credential-free external HTTPS origin.
+ */
+function isProvenanceBoundExternalSsoUrl(
+  value: string,
+  entryValue: string,
+): boolean {
+  try {
+    const actual = new URL(value);
+    const entry = new URL(entryValue);
+    return actual.protocol === "https:" &&
+      actual.username === "" &&
+      actual.password === "" &&
+      (actual.port === "" || actual.port === "443") &&
+      actual.origin !== entry.origin;
+  } catch {
+    return false;
+  }
+}
+
 function hasAllowedPage(
   context: BrowserContext,
   config: EdgeLaunchConfig,
@@ -985,9 +1038,12 @@ async function waitForAllowedReplacementPage(
   context: BrowserContext,
   config: EdgeLaunchConfig,
   deadline: number,
+  tracked: ContextSemanticPage,
 ): Promise<boolean> {
   for (;;) {
-    if (hasAllowedPage(context, config)) return true;
+    if (hasAllowedPage(context, config) || tracked.isManualAuthenticationRedirect()) {
+      return true;
+    }
     const remaining = deadline - performance.now();
     if (remaining <= 0) return false;
     await delay(Math.min(config.waits.pollMs, remaining));

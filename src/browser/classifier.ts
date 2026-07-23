@@ -187,7 +187,7 @@ export function classifyCopilotPage(
     isSameOriginAuthenticationUrl(observation.url, requirements.entryUrl);
 
   // Generic sign-in, MFA, and consent text on an unrelated approved-host page
-  // must not buy the ten-minute manual window. Outside the configured chat path,
+  // must not buy the full manual window. Outside the configured chat path,
   // the URL itself must also have a genuine authentication shape.
   if (!withinConfiguredSurface && !sameOriginAuthentication) {
     return result("unapproved-host", false, "COPILOT_SURFACE_NOT_APPROVED");

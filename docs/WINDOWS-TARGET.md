@@ -58,7 +58,7 @@ The profile is credential-equivalent local state.
 - Never record passwords, MFA codes, cookies, tokens, storage state, authentication headers, or private network captures.
 - Protect the profile with Windows ACLs and include it in incident-response and decommissioning procedures.
 
-The launcher uses a persistent, headful context, disables downloads, and navigates only to the configured HTTPS entry URL. It launches the canonical executable whose requested product identity, version, and SHA-256 were verified; it does not fall back to another Playwright channel. Authentication redirect hosts are allowed only while waiting for the user; they are never valid submission hosts.
+The launcher uses a persistent, headful context, disables downloads, and navigates only to the configured HTTPS entry URL. It launches the canonical executable whose requested product identity, version, and SHA-256 were verified; it does not fall back to another Playwright channel. Setup allows up to 15 minutes for manual sign-in, MFA, consent, and tenant SSO. Known Microsoft authentication hosts and external credential-free HTTPS pages reached through the exact setup navigation may remain visible during that wait, but they are never valid submission hosts.
 
 ## Configure the target
 

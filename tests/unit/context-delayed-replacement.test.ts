@@ -32,8 +32,17 @@ class DelayedPage {
 class DelayedContext {
   public readonly pageList: DelayedPage[] = [new DelayedPage("about:blank")];
   public navigationPage = new DelayedPage("about:blank");
+  public pageListener?: (page: Page) => void;
 
   public pages(): Page[] { return this.pageList.map((page) => page.asPage()); }
+  public on(event: string, listener: (page: Page) => void): this {
+    if (event === "page") this.pageListener = listener;
+    return this;
+  }
+  public addPage(page: DelayedPage): void {
+    this.pageList.push(page);
+    this.pageListener?.(page.asPage());
+  }
   public async newPage(): Promise<Page> {
     this.pageList.push(this.navigationPage);
     return this.navigationPage.asPage();
@@ -54,6 +63,35 @@ test("a replacement Copilot tab arriving just after navigation abort is still ad
   const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
 
   assert.equal(await tracked.currentUrl(), replacement.currentUrl);
+});
+
+test("an external tenant SSO redirect on the tracked setup page remains open for manual sign-in", async () => {
+  const context = new DelayedContext();
+  const ssoUrl = "https://identity.example.test/sso/login";
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = ssoUrl;
+    return null;
+  };
+
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+
+  assert.equal(await tracked.currentUrl(), ssoUrl);
+  assert.equal(tracked.isManualAuthenticationRedirect(), true);
+});
+
+test("an external tenant SSO popup opened by the tracked setup context receives manual ownership", async () => {
+  const context = new DelayedContext();
+  const sso = new DelayedPage("https://identity.example.test/sso/login");
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    context.addPage(sso);
+    return null;
+  };
+
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+
+  assert.equal(await tracked.currentUrl(), sso.currentUrl);
+  assert.equal(tracked.isManualAuthenticationRedirect(), true);
 });
 
 function browserConfig(): EdgeLaunchConfig {
