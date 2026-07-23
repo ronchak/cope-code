@@ -4,6 +4,29 @@
 
 Live sessions require three explicit inputs: an organization policy, a repository configuration with embedded repository policy, and a browser/UI configuration. Each JSON object has a version discriminator and rejects unknown fields, including nested command, browser-host, UI-contract, signal-group, locator, and text-pattern fields. Configuration bytes are bounded, UTF-8 BOMs are refused, schemas are validated, policy patterns are safety-checked, duplicate rules are rejected, and file hashes are persisted with the session.
 
+## Managed policy delivery foundation
+
+An optional local managed-policy pair may be installed beside the machine configuration:
+
+```text
+managed-policy-bundle.json
+managed-policy-trust.json
+```
+
+Both files must be present or neither may be present. `cba-managed-policy-bundle/1` contains an organization-layer policy, an issuance time, expiry, publisher sequence, key ID, explicit kill-switch state, SHA-256 payload digest, and Ed25519 signature. `cba-managed-policy-trust/1` pins the allowed Ed25519 public keys by key ID. The signed bytes are the canonical JSON serialization of every authoritative payload field; changing policy, validity, sequence, or kill-switch state invalidates both the digest and signature.
+
+At every configuration load Cope verifies bounded strict JSON, the pinned key, Ed25519 signature, payload digest, canonical timestamps, future-clock tolerance, expiry, and a default seven-day maximum age. A present but unreadable, partial, untrusted, stale, expired, or invalid bundle fails closed. The managed organization policy replaces the locally editable organization policy for that load, so its decisions remain above repository policy and session grants under the existing most-restrictive policy engine. Repository or session configuration cannot weaken it.
+
+If the verified bundle has `kill_switch.enabled=false`, configuration loading stops with `TRANSPORT_UNAVAILABLE` before repository configuration or browser startup. The signed diagnostic code, key ID, sequence, and bundle hash are returned as source-free operational evidence. The initial effective-grant review displays bundle version, key ID, sequence, validity window, hashes, source, and kill-switch state.
+
+This is an offline delivery and verification primitive, not a control service. Administrators must deliver the two files atomically using their existing MDM/software-distribution channel, protect the trust store with OS access controls, rotate keys deliberately, refresh bundles before the maximum age/expiry, and retain an emergency path for distributing a signed disable bundle. The sequence is signed provenance but this foundation does not persist a fleet-issued sequence floor, so endpoint management must prevent rollback to another still-fresh signed bundle. Absence of both files preserves the existing local organization-policy behavior; deployments that require managed enforcement must separately ensure the pair cannot be removed by the Cope user.
+
+Example authoritative payload (digest and signature fields are added outside this signed object):
+
+```json
+{"schema_version":"cba-managed-policy-bundle/1","key_id":"enterprise-policy-2026","sequence":42,"issued_at":"2026-07-21T12:00:00.000Z","expires_at":"2026-07-22T12:00:00.000Z","kill_switch":{"enabled":true},"organization_policy":{"schema_version":"cba-policy/1","policy_id":"enterprise-managed","revision":"42","layer":"organization","default_decision":"deny","capabilities":{}}}
+```
+
 Changing a policy file does not silently expand a running session. Resume requires the persisted organization/repository/browser hashes and grant hash to match; a change is refused and requires a new session/grant.
 
 Default Windows locations:

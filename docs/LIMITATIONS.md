@@ -92,7 +92,7 @@ No live tuple is certified by this source tree. Windows x64 remains the primary 
 - `abort` is terminal. An active-owner pause/abort request waits up to 15 seconds for acknowledgement; timeout means the request was queued but must not be assumed effective.
 - Successful explicit rollback makes the session terminal `rolled_back` and invalidates any prior completion; it is not resumable continuation.
 - Recovery deliberately requires human reconciliation for uncertain mutation, corrupt state, identity ambiguity, and incompatible UI.
-- There is no autonomous update, central policy distribution, code signing, adapter fleet kill switch, telemetry dashboard, or service desk integration in this source tree. Deployments must supply those operational controls or limit scope accordingly.
+- There is no autonomous update, hosted policy service, release code signing, telemetry dashboard, or service desk integration in this source tree. The local managed-policy foundation verifies offline Ed25519-signed organization policy and kill-switch bundles with freshness/expiry controls, but deployments must supply atomic distribution, trust-store protection, removal prevention, refresh monitoring, and fleet response through their endpoint-management system.
 
 ## Out of scope
 

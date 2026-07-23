@@ -1,6 +1,7 @@
 import type { BrowserLaunchConfig, BrowserProduct, CopilotUiContract } from "../browser/index.js";
 import type { PolicyDocument } from "../policy/index.js";
 import type { CommandDefinition } from "../tools/index.js";
+import type { ManagedPolicyProvenance } from "./managed-policy.js";
 
 export const REPOSITORY_CONFIG_VERSION = "cba-repository-config/1" as const;
 export const LEGACY_BROWSER_CONFIG_VERSION = "cba-browser-config/1" as const;
@@ -66,15 +67,22 @@ export interface LoadedRuntimeConfiguration {
   readonly organizationPolicy: PolicyDocument;
   readonly repository: RepositoryAgentConfig;
   readonly browser?: BrowserLaunchConfig & { readonly browserExecutable: string };
+  readonly managedPolicy?: {
+    readonly provenance: ManagedPolicyProvenance;
+    readonly killSwitch: { readonly enabled: boolean; readonly diagnosticCode?: string };
+  };
   readonly hashes: {
     readonly organization: string;
     readonly repository: string;
     readonly browser?: string;
     readonly browserIdentity?: string;
+    readonly managedPolicy?: string;
   };
   readonly files: {
     readonly organization: string;
     readonly repository: string;
     readonly browser?: string;
+    readonly managedPolicyBundle?: string;
+    readonly managedPolicyTrust?: string;
   };
 }

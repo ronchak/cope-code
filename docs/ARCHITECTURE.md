@@ -41,7 +41,7 @@ The tool layer cannot import Copilot DOM assumptions. The browser adapter cannot
 
 ## Authoritative control flow
 
-1. The CLI resolves the canonical Git repository, rejects index gitlinks and descendant Git boundaries, loads versioned configuration, records policy-visible pre-existing changes plus a keyed aggregate of hidden state, performs host preflight, and acquires the per-workspace lock.
+1. The CLI first verifies any installed signed managed-policy bundle and stops immediately on invalid/stale/expired material or an active managed kill switch. It then resolves the canonical Git repository, rejects index gitlinks and descendant Git boundaries, loads the remaining versioned configuration, records policy-visible pre-existing changes plus a keyed aggregate of hidden state, performs host preflight, and acquires the per-workspace lock.
 2. The user approves one task-scoped session grant. No repository content is sent before the applicable disclosure capability exists.
 3. The runtime serializes the objective, acceptance criteria, active tools, scope, and budgets into the `cba/1` bootstrap contract.
 4. The disclosure guard scans the final serialized outbound message.

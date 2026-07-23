@@ -1,4 +1,4 @@
-import { readFile, realpath } from "node:fs/promises";
+import { access, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import {
   BROWSER_CONTRACT_VERSION,
@@ -25,6 +25,7 @@ import {
   type LoadedRuntimeConfiguration,
   type RepositoryAgentConfig,
 } from "./types.js";
+import { loadManagedPolicyBundle } from "./managed-policy.js";
 
 const MAX_CONFIG_BYTES = 2 * 1024 * 1024;
 
@@ -37,6 +38,10 @@ export interface LoadRuntimeConfigurationOptions {
   readonly browserConfigFile?: string;
   readonly host?: HostPlatform;
   readonly browserIdentityVerifier?: BrowserIdentityVerifier;
+  readonly managedPolicyBundleFile?: string;
+  readonly managedPolicyTrustFile?: string;
+  readonly now?: Date;
+  readonly managedPolicyMaxAgeMs?: number;
 }
 
 export async function loadRuntimeConfiguration(
@@ -47,8 +52,36 @@ export async function loadRuntimeConfiguration(
   const repositoryFile = options.repositoryConfigFile ??
     path.join(options.repositoryRoot, ".cba", "repository.json");
   const browserFile = options.browserConfigFile ?? path.join(options.stateHome, "config", "browser.json");
+  const managedPolicyBundleFile = options.managedPolicyBundleFile ??
+    path.join(options.stateHome, "config", "managed-policy-bundle.json");
+  const managedPolicyTrustFile = options.managedPolicyTrustFile ??
+    path.join(options.stateHome, "config", "managed-policy-trust.json");
 
-  const organizationRaw = await readJson(organizationFile, "organization policy");
+  const bundleExists = await exists(managedPolicyBundleFile);
+  const trustExists = await exists(managedPolicyTrustFile);
+  if (bundleExists !== trustExists) {
+    throw new AgentError("CONFIG_INVALID", "Managed policy bundle and trust store must be installed together", {
+      diagnosticCode: "MANAGED_POLICY_INCOMPLETE",
+    });
+  }
+  const managed = bundleExists
+    ? await loadManagedPolicyBundle({
+        bundleFile: managedPolicyBundleFile,
+        trustFile: managedPolicyTrustFile,
+        ...(options.now === undefined ? {} : { now: options.now }),
+        ...(options.managedPolicyMaxAgeMs === undefined ? {} : { maxAgeMs: options.managedPolicyMaxAgeMs }),
+      })
+    : undefined;
+  if (managed !== undefined && !managed.killSwitch.enabled) {
+    throw new AgentError("TRANSPORT_UNAVAILABLE", "Managed policy kill switch is active", {
+      diagnosticCode: managed.killSwitch.diagnosticCode ?? "MANAGED_KILL_SWITCH",
+      keyId: managed.provenance.keyId,
+      sequence: managed.provenance.sequence,
+      bundleHash: managed.provenance.bundleHash,
+    });
+  }
+
+  const organizationRaw = managed?.organizationPolicy ?? await readJson(organizationFile, "organization policy");
   assertValidPolicyDocument(organizationRaw);
   if (organizationRaw.layer !== "organization") {
     throw new AgentError("CONFIG_INVALID", "Organization policy file has the wrong layer", { organizationFile });
@@ -120,18 +153,28 @@ export async function loadRuntimeConfiguration(
     organizationPolicy: organizationRaw,
     repository,
     ...(browser === undefined ? {} : { browser }),
+    ...(managed === undefined ? {} : { managedPolicy: { provenance: managed.provenance, killSwitch: managed.killSwitch } }),
     hashes: {
-      organization: sha256(stableJson(organizationRaw)),
+      organization: managed?.provenance.bundleHash ?? sha256(stableJson(organizationRaw)),
       repository: sha256(stableJson(repositoryRaw)),
       ...(browserHash === undefined ? {} : { browser: browserHash }),
       ...(browserIdentityHash === undefined ? {} : { browserIdentity: browserIdentityHash }),
+      ...(managed === undefined ? {} : { managedPolicy: managed.provenance.bundleHash }),
     },
     files: {
       organization: await canonicalOrResolved(organizationFile),
       repository: await canonicalOrResolved(repositoryFile),
       ...(options.requireBrowser ? { browser: await canonicalOrResolved(browserFile) } : {}),
+      ...(managed === undefined ? {} : {
+        managedPolicyBundle: await canonicalOrResolved(managedPolicyBundleFile),
+        managedPolicyTrust: await canonicalOrResolved(managedPolicyTrustFile),
+      }),
     },
   };
+}
+
+async function exists(filename: string): Promise<boolean> {
+  try { await access(filename); return true; } catch { return false; }
 }
 
 export function parseRepositoryConfig(value: unknown): RepositoryAgentConfig {
