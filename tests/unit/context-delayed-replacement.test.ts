@@ -6,10 +6,12 @@ import type { BrowserContext, Page, Response } from "playwright-core";
 
 import { CopilotBrowserAdapter } from "../../src/browser/copilot-browser-adapter.js";
 import { openTrackedCopilotPage } from "../../src/browser/context-semantic-page.js";
+import { waitForStableManualReadiness } from "../../src/browser/manual-readiness.js";
 import {
   createBaselineCopilotUiContract,
   type EdgeLaunchConfig,
 } from "../../src/browser/config.js";
+import { AgentError } from "../../src/shared/errors.js";
 
 class DelayedPage {
   public closed = false;
@@ -55,8 +57,14 @@ class DelayedContext {
   public readonly pageList: DelayedPage[] = [new DelayedPage("about:blank")];
   public navigationPage = new DelayedPage("about:blank");
   public pageListener?: (page: Page) => void;
+  public onPages?: (call: number) => void;
+  public pageCalls = 0;
 
-  public pages(): Page[] { return this.pageList.map((page) => page.asPage()); }
+  public pages(): Page[] {
+    this.pageCalls += 1;
+    this.onPages?.(this.pageCalls);
+    return this.pageList.map((page) => page.asPage());
+  }
   public on(event: string, listener: (page: Page) => void): this {
     if (event === "page") this.pageListener = listener;
     return this;
@@ -102,7 +110,7 @@ test("an adopted replacement Copilot tab can anchor its tenant SSO popup", async
   replacement.emitPopup(sso);
 
   assert.equal(await tracked.holdForManualAuthenticationHandoff(), true);
-  assert.equal(await tracked.currentUrl(), sso.currentUrl);
+  await assert.rejects(tracked.currentUrl(), manualSsoHandoffError);
   assert.equal(tracked.isManualAuthenticationRedirect(), true);
 });
 
@@ -119,7 +127,7 @@ test("an adopted replacement Copilot tab retains same-tab tenant SSO ownership",
 
   replacement.currentUrl = "https://identity.example.test/sso/login";
   assert.equal(await tracked.holdForManualAuthenticationHandoff(), true);
-  assert.equal(await tracked.currentUrl(), replacement.currentUrl);
+  await assert.rejects(tracked.currentUrl(), manualSsoHandoffError);
   assert.equal(tracked.isManualAuthenticationRedirect(), true);
 
   replacement.currentUrl = "https://m365.cloud.microsoft/chat/conversation/returned";
@@ -140,7 +148,7 @@ test("an adopted Microsoft auth replacement retains federated tenant SSO ownersh
 
   replacement.currentUrl = "https://identity.example.test/sso/login";
   assert.equal(await tracked.holdForManualAuthenticationHandoff(), true);
-  assert.equal(await tracked.currentUrl(), replacement.currentUrl);
+  await assert.rejects(tracked.currentUrl(), manualSsoHandoffError);
   assert.equal(tracked.isManualAuthenticationRedirect(), true);
 
   replacement.currentUrl = "https://m365.cloud.microsoft/chat/conversation/returned";
@@ -164,7 +172,7 @@ test("a fast replacement federation records its trusted waypoint before final se
 
     const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
     assert.equal(await tracked.holdForManualAuthenticationHandoff(), true);
-    assert.equal(await tracked.currentUrl(), replacement.currentUrl);
+    await assert.rejects(tracked.currentUrl(), manualSsoHandoffError);
     assert.equal(tracked.isManualAuthenticationRedirect(), true);
 
     replacement.emitMainFrameNavigation(
@@ -185,7 +193,7 @@ test("an external tenant SSO redirect on the tracked setup page remains open for
 
   const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
 
-  assert.equal(await tracked.currentUrl(), ssoUrl);
+  await assert.rejects(tracked.currentUrl(), manualSsoHandoffError);
   assert.equal(tracked.isManualAuthenticationRedirect(), true);
 });
 
@@ -201,7 +209,7 @@ test("an external tenant SSO popup opened by the tracked setup context receives 
 
   const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
 
-  assert.equal(await tracked.currentUrl(), sso.currentUrl);
+  await assert.rejects(tracked.currentUrl(), manualSsoHandoffError);
   assert.equal(tracked.isManualAuthenticationRedirect(), true);
 });
 
@@ -361,10 +369,10 @@ test("a cancelled setup probe cannot affect the next ordinary inspection", async
     }),
     /synthetic cancellation/u,
   );
-  assert.equal(
-    await tracked.currentUrl(),
-    sso.currentUrl,
-    "ordinary inspection must return to strict external-popup ownership",
+  await assert.rejects(
+    tracked.currentUrl(),
+    manualSsoHandoffError,
+    "ordinary inspection must remain source-free during external-popup ownership",
   );
 });
 
@@ -403,6 +411,120 @@ test("an SSO popup appearing after the setup precheck is rejected before IdP ins
   );
 });
 
+test("ordinary inspect and submit stop before reading a provenance-bound IdP page", async () => {
+  const context = new DelayedContext();
+  const sso = new DelayedPage("https://identity.example.test/sso/login");
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    context.addPage(sso);
+    context.navigationPage.emitPopup(sso);
+    return null;
+  };
+  const config = browserConfig();
+  const tracked = await openTrackedCopilotPage(context.asContext(), config);
+  const {
+    product: _product,
+    browserContractVersion: _browserContractVersion,
+    browserExecutable: _browserExecutable,
+    profileDirectory: _profileDirectory,
+    ...adapterConfig
+  } = config;
+  const adapter = new CopilotBrowserAdapter(tracked, adapterConfig);
+  const priorForegrounds = sso.bringToFrontCalls;
+
+  await assert.rejects(adapter.inspectState(), manualSsoHandoffError);
+  await assert.rejects(
+    adapter.submit({
+      taskId: "task-external-idp",
+      turnId: "turn-external-idp",
+      submissionId: "submission-external-idp",
+      content: "must not be disclosed",
+    }),
+    manualSsoHandoffError,
+  );
+  assert.equal(
+    sso.bringToFrontCalls,
+    priorForegrounds,
+    "ordinary semantic operations must stop before IdP focus or DOM access",
+  );
+});
+
+test("ordinary inspection stops if an SSO popup appears during page selection", async () => {
+  const context = new DelayedContext();
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    return null;
+  };
+  const config = browserConfig();
+  const tracked = await openTrackedCopilotPage(context.asContext(), config);
+  const {
+    product: _product,
+    browserContractVersion: _browserContractVersion,
+    browserExecutable: _browserExecutable,
+    profileDirectory: _profileDirectory,
+    ...adapterConfig
+  } = config;
+  const adapter = new CopilotBrowserAdapter(tracked, adapterConfig);
+  const sso = new DelayedPage("https://identity.example.test/sso/login");
+  const injectOnPageCall = context.pageCalls + 3;
+  context.onPages = (call) => {
+    if (call !== injectOnPageCall) return;
+    context.addPage(sso);
+    context.navigationPage.emitPopup(sso);
+  };
+
+  await assert.rejects(adapter.inspectState(), manualSsoHandoffError);
+  assert.equal(sso.bringToFrontCalls, 0);
+});
+
+test("runtime manual readiness retries an SSO popup racing its precheck", async () => {
+  const context = new DelayedContext();
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    return null;
+  };
+  const config = browserConfig();
+  const tracked = await openTrackedCopilotPage(context.asContext(), config);
+  const {
+    product: _product,
+    browserContractVersion: _browserContractVersion,
+    browserExecutable: _browserExecutable,
+    profileDirectory: _profileDirectory,
+    ...adapterConfig
+  } = config;
+  const adapter = new CopilotBrowserAdapter(tracked, adapterConfig);
+  const sso = new DelayedPage("https://identity.example.test/sso/login");
+  let injectAfterFirstPrecheck = true;
+  let monotonicNow = 0;
+
+  const inspection = await waitForStableManualReadiness(
+    () => tracked.withManualReadinessProbe(() =>
+      adapter.inspectManualReadinessState(async () => {
+        const held = await tracked.holdForManualAuthenticationHandoff();
+        if (injectAfterFirstPrecheck) {
+          injectAfterFirstPrecheck = false;
+          context.addPage(sso);
+          context.navigationPage.emitPopup(sso);
+        }
+        return held;
+      })),
+    config.waits,
+    100,
+    undefined,
+    {
+      monotonicNow: () => monotonicNow,
+      sleep: async (milliseconds) => { monotonicNow += milliseconds; },
+    },
+  );
+
+  assert.equal(inspection.classification.diagnosticCode, "MANUAL_SSO_HANDOFF");
+  assert.equal(
+    sso.bringToFrontCalls,
+    1,
+    "the retried manual wait may foreground the IdP without snapshotting it",
+  );
+});
+
 test("a configured replacement adopted behind SSO retains later same-tab handoff ownership", async () => {
   const context = new DelayedContext();
   const sso = new DelayedPage("https://identity.example.test/sso/login");
@@ -428,7 +550,7 @@ test("a configured replacement adopted behind SSO retains later same-tab handoff
   sso.closed = true;
   replacement.currentUrl = "https://identity.example.test/sso/continue";
   assert.equal(await tracked.holdForManualAuthenticationHandoff(), true);
-  assert.equal(await tracked.currentUrl(), replacement.currentUrl);
+  await assert.rejects(tracked.currentUrl(), manualSsoHandoffError);
 });
 
 function retryableReadinessTransition(error: unknown): boolean {
@@ -437,6 +559,12 @@ function retryableReadinessTransition(error: unknown): boolean {
     (error as { details?: Record<string, unknown> }).details?.diagnosticCode ===
       "ACTIVE_PAGE_CHANGED_DURING_OBSERVATION" &&
     (error as { details?: Record<string, unknown> }).details?.dispatchAttempted === false;
+}
+
+function manualSsoHandoffError(error: unknown): boolean {
+  return error instanceof AgentError &&
+    error.details.diagnosticCode === "MANUAL_SSO_HANDOFF" &&
+    error.details.dispatchAttempted === false;
 }
 
 function browserConfig(): EdgeLaunchConfig {

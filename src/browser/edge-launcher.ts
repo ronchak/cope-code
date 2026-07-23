@@ -243,9 +243,7 @@ export class EdgeCopilotTransport implements ModelTransport {
         : undefined,
       signal,
     );
-    return allowConfiguredPageProbe
-      ? this.#semanticPage.withManualReadinessProbe(inspect)
-      : inspect();
+    return this.#semanticPage.withManualReadinessProbe(inspect);
   }
 
   public async submit(

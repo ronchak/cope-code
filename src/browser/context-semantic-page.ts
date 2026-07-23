@@ -167,7 +167,7 @@ export class ContextSemanticPage implements SemanticPage {
     }
 
     const selected = returnedConfiguredPage ?? this.#selectCurrentPage(pages);
-    this.#assertNoNewManualReadinessHandoff(pages);
+    this.#assertManualReadinessHandoffSafe(pages);
 
     if (isGenuineManualAuthenticationUrl(selected.url(), this.#config)) {
       // Strict auth selection also proves this exact replacement page belongs
@@ -259,8 +259,8 @@ export class ContextSemanticPage implements SemanticPage {
   }
 
   /**
-   * Scope the setup-only page-selection exception so cancellation or an early
-   * observation failure cannot leak it into an ordinary browser operation.
+   * Scope one manual-readiness observation so page races are retryable and any
+   * setup-only selection override cannot leak into an ordinary operation.
    */
   public async withManualReadinessProbe<T>(operation: () => Promise<T>): Promise<T> {
     const priorProbeState = this.#manualReadinessProbeActive;
@@ -343,9 +343,10 @@ export class ContextSemanticPage implements SemanticPage {
       this.#manualReadinessObservationPage = page;
       return currentUrl;
     }
+    const currentPages = this.#context.pages();
     // A provenance-bound external handoff may appear after the setup precheck
     // but before currentUrl(). Retry before focus or any semantic DOM read.
-    this.#assertNoNewManualReadinessHandoff(this.#context.pages());
+    this.#assertManualReadinessHandoffSafe(currentPages);
     // The first observation after composer fill is part of the same submission
     // transaction. It must inspect the exact page that received the prompt, not
     // silently adopt a replacement tab with the same conversation URL.
@@ -700,10 +701,21 @@ export class ContextSemanticPage implements SemanticPage {
       this.#configuredCallbackHandoffPage(pages);
   }
 
-  #assertNoNewManualReadinessHandoff(pages: readonly Page[]): void {
-    if (
+  #assertManualReadinessHandoffSafe(pages: readonly Page[]): void {
+    if (this.#externalManualHandoffPage(pages) !== undefined) {
+      if (!this.#manualReadinessProbeActive) {
+        throw new AgentError(
+          "TRANSPORT_UNAVAILABLE",
+          "Manual tenant authentication is still active in the visible browser",
+          {
+            diagnosticCode: "MANUAL_SSO_HANDOFF",
+            dispatchAttempted: false,
+          },
+        );
+      }
+    } else if (
       !this.#manualReadinessProbeActive ||
-      this.#manualReadinessHandoffPage(pages) === undefined
+      this.#configuredCallbackHandoffPage(pages) === undefined
     ) {
       return;
     }

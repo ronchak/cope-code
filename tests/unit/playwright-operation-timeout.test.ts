@@ -604,11 +604,12 @@ test("replacement-page foregrounding is bounded and permanently revokes the sess
   const terminationRelease = deferred<void>();
   const browser = new SharedDeadlineBrowser(terminationRelease.promise);
   const chat = new SharedDeadlinePage("https://m365.cloud.microsoft/chat/conversation/foreground");
-  const authentication = new StalledForegroundPage(
-    "https://login.microsoftonline.com/common/oauth2/authorize",
+  chat.closed = true;
+  const replacement = new StalledForegroundPage(
+    "https://m365.cloud.microsoft/chat/conversation/replacement",
     foregroundRelease.promise,
   );
-  const context = new MultiPageDeadlineContext([chat, authentication], browser);
+  const context = new MultiPageDeadlineContext([chat, replacement], browser);
   const semantic = new ContextSemanticPage(
     context as unknown as BrowserContext,
     {
@@ -637,10 +638,11 @@ test("replacement-page foregrounding is bounded and permanently revokes the sess
 test("an expired focus deadline prevents foreground dispatch", async () => {
   const browser = new SharedDeadlineBrowser();
   const chat = new SharedDeadlinePage("https://m365.cloud.microsoft/chat/conversation/focus-budget");
-  const authentication = new StalledForegroundPage(
-    "https://login.microsoftonline.com/common/oauth2/authorize",
+  chat.closed = true;
+  const replacement = new StalledForegroundPage(
+    "https://m365.cloud.microsoft/chat/conversation/replacement",
   );
-  const context = new BudgetBurningContext([chat, authentication], browser);
+  const context = new BudgetBurningContext([chat, replacement], browser);
   const semantic = new ContextSemanticPage(
     context as unknown as BrowserContext,
     {
@@ -654,7 +656,7 @@ test("an expired focus deadline prevents foreground dispatch", async () => {
 
   const observedError = await rejectionWithin(semantic.currentUrl(), 100);
   assert.equal(timeoutError(observedError).details.dispatchAttempted, false);
-  assert.equal(authentication.bringToFrontCalls, 0);
+  assert.equal(replacement.bringToFrontCalls, 0);
   assert.equal(browser.closeCalls, 1);
 });
 
