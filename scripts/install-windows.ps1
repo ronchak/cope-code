@@ -29,6 +29,22 @@ function Read-MajorVersion([string]$Value) {
   return [int]$match.Groups[1].Value
 }
 
+function Read-PackageVersion([string]$PackageFile) {
+  if (-not (Test-Path -LiteralPath $PackageFile -PathType Leaf)) {
+    Fail "Release metadata is missing: $PackageFile"
+  }
+  try {
+    $metadata = Get-Content -LiteralPath $PackageFile -Raw | ConvertFrom-Json
+  } catch {
+    Fail "Release metadata is not valid JSON: $PackageFile"
+  }
+  $versionProperty = $metadata.PSObject.Properties["version"]
+  if ($null -eq $versionProperty -or $versionProperty.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($versionProperty.Value)) {
+    Fail "Release metadata does not contain a version: $PackageFile"
+  }
+  return [string]$versionProperty.Value
+}
+
 function Ensure-UserPath([string]$Directory) {
   $normalized = [IO.Path]::GetFullPath($Directory).TrimEnd('\')
   $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -54,9 +70,10 @@ function Ensure-UserPath([string]$Directory) {
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $ProjectRoot
+$ExpectedVersion = Read-PackageVersion (Join-Path $ProjectRoot "package.json")
 
 Write-Host ""
-Write-Host "COPE 0.1.3 installer" -ForegroundColor Magenta
+Write-Host "COPE $ExpectedVersion installer" -ForegroundColor Magenta
 Write-Host "Installs the global 'cope' command for this Windows account." -ForegroundColor DarkGray
 
 $nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
@@ -96,8 +113,12 @@ try {
   $packOutput = ((& npm.cmd pack --json --ignore-scripts --pack-destination $tempDirectory) -join [Environment]::NewLine)
   if ($LASTEXITCODE -ne 0) { Fail "npm pack failed." }
   $packResult = $packOutput | ConvertFrom-Json
-  if ($packResult -is [Array]) { $packageName = $packResult[0].filename } else { $packageName = $packResult.filename }
+  if ($packResult -is [Array]) { $packedRelease = $packResult[0] } else { $packedRelease = $packResult }
+  $packageName = $packedRelease.filename
   if ([string]::IsNullOrWhiteSpace($packageName)) { Fail "npm pack did not return a package filename." }
+  if ($packedRelease.version -ne $ExpectedVersion) {
+    Fail "The packed release version did not match package.json. Expected $ExpectedVersion, found $($packedRelease.version)."
+  }
   $packageFile = Join-Path $tempDirectory $packageName
   if (-not (Test-Path -LiteralPath $packageFile -PathType Leaf)) { Fail "The packed release could not be found at $packageFile." }
 
@@ -119,7 +140,7 @@ try {
   }
 
   $installedVersion = (& $copeCommand --version).Trim()
-  if ($LASTEXITCODE -ne 0 -or $installedVersion -ne "0.1.3") {
+  if ($LASTEXITCODE -ne 0 -or $installedVersion -ne $ExpectedVersion) {
     Fail "Cope did not pass its launch check. Reported version: $installedVersion"
   }
   [Environment]::SetEnvironmentVariable("COPE_SOURCE_DIR", $ProjectRoot, "User")

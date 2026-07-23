@@ -37,6 +37,7 @@ import {
 } from "../security/index.js";
 import { newId, sha256, stableJson } from "../shared/crypto.js";
 import { AgentError, errorMessage } from "../shared/errors.js";
+import { RELEASE_VERSION } from "../shared/release-metadata.js";
 import { CommandCatalog } from "../tools/command-catalog.js";
 import { resolveStateHome } from "../session/paths.js";
 import {
@@ -94,7 +95,7 @@ import {
 } from "../platform/index.js";
 import { verifyPrivateStateHome } from "../platform/private-storage.js";
 
-export const CLI_VERSION = "0.1.3";
+export const CLI_VERSION = RELEASE_VERSION;
 
 export interface CliIo {
   readonly stdout: { write(value: string): unknown };
