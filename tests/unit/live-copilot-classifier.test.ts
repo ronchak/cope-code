@@ -110,6 +110,70 @@ test("surname-first matching preserves first and middle name order", async () =>
   assert.equal(classification.state, "ready");
 });
 
+test("Microsoft account-manager wrapper verifies the configured display name", async () => {
+  const expectedIdentity = "Ronak Chakraborty";
+  const contract = createBaselineCopilotUiContract(expectedIdentity);
+  const observation = await observeCopilotPage(
+    new LiveShapePage([{
+      text: "Ronak Chakraborty",
+      accessibleLabel: "Account manager for Ronak Chakraborty",
+    }]),
+    contract,
+  );
+
+  const classification = classifyCopilotPage(
+    observation,
+    contract,
+    requirements(expectedIdentity),
+  );
+
+  assert.equal(classification.state, "ready");
+});
+
+test("a visible display name cannot be treated as proof of a configured email", async () => {
+  const expectedIdentity = "ronak@example.com";
+  const contract = createBaselineCopilotUiContract(expectedIdentity);
+  const observation = await observeCopilotPage(
+    new LiveShapePage([{
+      text: "Ronak Chakraborty",
+      accessibleLabel: "Account manager for Ronak Chakraborty",
+    }]),
+    contract,
+  );
+
+  const classification = classifyCopilotPage(
+    observation,
+    contract,
+    requirements(expectedIdentity),
+  );
+
+  assert.equal(classification.state, "identity-unverified");
+  assert.equal(classification.diagnosticCode, "IDENTITY_NOT_VERIFIED");
+});
+
+test("an alternate-profile action cannot verify the configured display name", async () => {
+  const expectedIdentity = "Ronak Chakraborty";
+  const contract = createBaselineCopilotUiContract(expectedIdentity);
+  for (const alternate of [
+    "Switch account Ronak Chakraborty",
+    "Switch to Ronak Chakraborty",
+    "Work account Ronak Chakraborty",
+  ]) {
+    const observation = await observeCopilotPage(
+      new LiveShapePage(alternate),
+      contract,
+    );
+    const classification = classifyCopilotPage(
+      observation,
+      contract,
+      requirements(expectedIdentity),
+    );
+
+    assert.equal(classification.state, "identity-unverified", alternate);
+    assert.equal(classification.diagnosticCode, "IDENTITY_NOT_VERIFIED", alternate);
+  }
+});
+
 test("an email wrapped in account-button text still verifies the exact configured address", async () => {
   const expectedIdentity = "ronak@example.com";
   const contract = createBaselineCopilotUiContract(expectedIdentity);

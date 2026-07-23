@@ -340,8 +340,14 @@ function identityElementIdentity(
 
   if (typeof expected === "string") {
     // Every explicit text/ARIA channel must independently verify the literal
-    // identity. One matching channel can never override another person's name.
-    if (!explicit.every((entry) => identityStringMatches(entry.channel, expected))) {
+    // identity. Microsoft 365's current-owner control may wrap the subject as
+    // "Account manager for Jane Doe"; unwrap only that owned-control phrase.
+    // Broad profile actions such as "Switch account Jane Doe" must not become
+    // current-account proof. One matching channel can never override another
+    // person's name.
+    if (!explicit.every((entry) =>
+      identityStringMatches(entry.channel, expected) ||
+      identityStringMatches(accountManagerSubject(entry.channel), expected))) {
       return undefined;
     }
     const expectedComparable = expected.normalize("NFKC").trim().toLowerCase();
@@ -383,6 +389,7 @@ const GENERIC_IDENTITY_LABELS = new Set([
 
 const IDENTITY_PREFIX_PHRASES: readonly (readonly string[])[] = [
   ["current", "account"],
+  ["account", "manager", "for"],
   ["account", "manager"],
   ["manage", "account"],
   ["microsoft", "account"],
@@ -460,6 +467,10 @@ function stripBoundaryWrapperPhrases(tokens: readonly string[]): readonly string
     equalTokenSequence(lower.slice(end - phrase.length, end), phrase));
   if (suffix !== undefined) end -= suffix.length;
   return tokens.slice(start, end);
+}
+
+function accountManagerSubject(value: string): string {
+  return value.replace(/^\s*account\s+manager\s+for\s+/iu, "");
 }
 
 /**

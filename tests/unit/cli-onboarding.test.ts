@@ -167,6 +167,67 @@ test("guided machine setup preselects the only detected browser and commits only
   assert.ok(await readFile(paths.organizationPolicy, "utf8"));
 });
 
+test("final setup readiness preserves identity diagnostics and commits nothing", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-machine-final-readiness-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const stateHome = path.join(root, "state");
+  await mkdir(stateHome, { mode: 0o700 });
+  const host = createStandardUserHost();
+  const paths = configurationPaths(stateHome, host);
+  const chrome = discoveredBrowser("chrome");
+  let closed = false;
+  const identityFailure = {
+    classification: {
+      state: "identity-unverified" as const,
+      retryable: false,
+      diagnosticCode: "IDENTITY_NOT_VERIFIED",
+    },
+    diagnostic: {
+      uiContractVersion: "copilot-ui/v1:m365-2026-07",
+      state: "identity-unverified" as const,
+      diagnosticCode: "IDENTITY_NOT_VERIFIED",
+      locatorQuorum: {},
+      summary: "Copilot loaded, but Cope could not verify the configured work account.",
+      next: "Run cope setup --force and enter the exact visible account.",
+      missingSignals: ["identity"] as const,
+    },
+  };
+
+  await assert.rejects(configureMachine({
+    paths,
+    force: false,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+    browser: "chrome",
+    identity: "Ronak Chakraborty",
+    entryUrl: "https://m365.cloud.microsoft/chat",
+    requireProtectionIndicator: false,
+  }, {
+    discoverBrowsers: async () => [chrome],
+    verifyManualBrowser: async (product, executablePath) => ({
+      ...discoveredBrowser(product, executablePath),
+      source: "manual",
+    }),
+    launchBrowser: async () => ({
+      waitForSetupReadiness: async () => ({ classification: { state: "ready" } }),
+      inspectSetupReadiness: async () => identityFailure,
+      close: async () => { closed = true; },
+    } as unknown as EdgeCopilotTransport),
+  }), (error: unknown) => {
+    assert.ok(error instanceof AgentError);
+    assert.match(error.message, /stopped being ready/iu);
+    assert.equal(error.details.diagnosticCode, "IDENTITY_NOT_VERIFIED");
+    assert.equal(error.details.state, "identity-unverified");
+    assert.deepEqual(error.details.missingSignals, ["identity"]);
+    return true;
+  });
+
+  assert.equal(closed, true);
+  await assert.rejects(readFile(paths.browser), { code: "ENOENT" });
+  await assert.rejects(readFile(paths.organizationPolicy), { code: "ENOENT" });
+});
+
 test("two-browser setup defaults to Edge and explicit automation can choose Chrome without UI", async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), "cope-machine-two-browser-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
@@ -968,10 +1029,33 @@ test("no-browser setup offers manual installation selection and never saves befo
       source: "manual",
     }),
     launchBrowser: async () => ({
-      waitForSetupReadiness: async () => ({ classification: { state: "signed-out" } }),
+      waitForSetupReadiness: async () => ({
+        classification: {
+          state: "identity-unverified",
+          retryable: false,
+          diagnosticCode: "IDENTITY_NOT_VERIFIED",
+        },
+        diagnostic: {
+          uiContractVersion: "copilot-ui/v1:m365-2026-07",
+          state: "identity-unverified",
+          diagnosticCode: "IDENTITY_NOT_VERIFIED",
+          locatorQuorum: {},
+          summary: "Copilot loaded, but Cope could not verify the configured work account.",
+          next: "Run cope setup --force and enter the exact visible account.",
+          missingSignals: ["identity"],
+        },
+      }),
       close: async () => { closed = true; },
     } as unknown as EdgeCopilotTransport),
-  }), (error: unknown) => error instanceof Error && /did not reach/iu.test(error.message));
+  }), (error: unknown) => {
+    assert.ok(error instanceof AgentError);
+    assert.match(error.message, /did not reach/iu);
+    assert.equal(error.details.diagnosticCode, "IDENTITY_NOT_VERIFIED");
+    assert.equal(error.details.state, "identity-unverified");
+    assert.deepEqual(error.details.missingSignals, ["identity"]);
+    assert.match(String(error.details.next), /exact visible account/u);
+    return true;
+  });
   assert.deepEqual(screens, ["none", "manual-product"]);
   assert.equal(closed, true);
   await assert.rejects(readFile(paths.browser), { code: "ENOENT" });
