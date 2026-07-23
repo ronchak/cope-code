@@ -65,6 +65,10 @@ export function renderHumanError(error: unknown): string {
       const stateSuffix = typeof state === "string" && state.length > 0 ? ` (${state})` : "";
       lines.push(`\n${dim(`Diagnostic: ${diagnosticCode}${stateSuffix}`)}`);
     }
+    const observationChangeReason = error.details.observationChangeReason;
+    if (typeof observationChangeReason === "string" && observationChangeReason.length > 0) {
+      lines.push(`${dim(`Page-change reason: ${observationChangeReason}`)}`);
+    }
     const semanticGroup = error.details.semanticGroup;
     const semanticOperation = error.details.semanticOperation;
     if (

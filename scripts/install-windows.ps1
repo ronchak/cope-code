@@ -56,7 +56,7 @@ $ProjectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $ProjectRoot
 
 Write-Host ""
-Write-Host "COPE 0.1.2 installer" -ForegroundColor Magenta
+Write-Host "COPE 0.1.3 installer" -ForegroundColor Magenta
 Write-Host "Installs the global 'cope' command for this Windows account." -ForegroundColor DarkGray
 
 $nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
@@ -119,7 +119,7 @@ try {
   }
 
   $installedVersion = (& $copeCommand --version).Trim()
-  if ($LASTEXITCODE -ne 0 -or $installedVersion -ne "0.1.2") {
+  if ($LASTEXITCODE -ne 0 -or $installedVersion -ne "0.1.3") {
     Fail "Cope did not pass its launch check. Reported version: $installedVersion"
   }
   [Environment]::SetEnvironmentVariable("COPE_SOURCE_DIR", $ProjectRoot, "User")

@@ -58,7 +58,7 @@ test("package and installer expose a durable global cope command", async () => {
     bin: Record<string, string>;
     scripts: Record<string, string>;
   };
-  assert.equal(packageJson.version, "0.1.2");
+  assert.equal(packageJson.version, "0.1.3");
   assert.equal(packageJson.bin.cope, "dist/src/cli/main.js");
   assert.equal(packageJson.bin["copilot-agent"], "dist/src/cli/main.js");
   const devScript = packageJson.scripts.dev;
@@ -146,7 +146,7 @@ test("terminal takeover leaves redirected and plain-terminal output untouched", 
 test("startup panel is responsive and preserves Cope workspace information", () => {
   const wide = new MemoryOutput();
   startupPanel({
-    version: "0.1.2",
+    version: "0.1.3",
     repositoryRoot: "/Users/example/projects/copilot-browser-agent",
     mode: "edit",
     transport: "demo (offline)",
@@ -160,7 +160,7 @@ test("startup panel is responsive and preserves Cope workspace information", () 
 
   const compact = new MemoryOutput();
   startupPanel({
-    version: "0.1.2",
+    version: "0.1.3",
     repositoryRoot: "/Users/example/projects/copilot-browser-agent",
     mode: "inspect",
     transport: "visible Edge",
@@ -176,7 +176,7 @@ test("startup panel credits Ronak Chakraborty in the responsive top bar", () => 
   for (const columns of [36, 100]) {
     const output = new MemoryOutput();
     startupPanel({
-      version: "0.1.2",
+      version: "0.1.3",
       repositoryRoot: "/Users/example/projects/copilot-browser-agent",
       mode: "edit",
       transport: "visible Edge",
@@ -186,8 +186,8 @@ test("startup panel credits Ronak Chakraborty in the responsive top bar", () => 
     const lines = stripAnsi(output.value).split("\n").filter((line) => line.length > 0);
     assert.match(lines[0] ?? "", /COPE.*by Ronak Chakraborty/u);
     assert.ok(lines.every((line) => displayWidth(line) === columns));
-    if (columns === 36) assert.doesNotMatch(lines[0] ?? "", /v0\.1\.2/u);
-    else assert.match(lines[0] ?? "", /v0\.1\.2/u);
+    if (columns === 36) assert.doesNotMatch(lines[0] ?? "", /v0\.1\.3/u);
+    else assert.match(lines[0] ?? "", /v0\.1\.3/u);
   }
 });
 

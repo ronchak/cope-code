@@ -33,7 +33,7 @@ The draft had the right overall direction, but it was not safe to execute unchan
   - `install-cope.cmd`: `3ab30bf64882799b88f9e95883be507b7be325072d2a66f701a44b79f2a14794`
   - `uninstall.cmd`: `79af0b5fbb73ef97274737f367b456006f3dff9b33785a76698ee3620bb5abbb`
   - `uninstall-cope.cmd`: `28ef4abdc66216ea2ddb02f730e084f21179d7842a42a391ceb60d6468d02fdc`
-- Current release-preservation hashes are authoritative in `tests/unit/windows-preservation.test.ts`. For Cope 0.1.2, `scripts/install-windows.ps1` is `cb80f751cd167d842847cbb861da2ed42a22783da83f7bbf9c357c2f7933f5d0` after adding the per-user local-update source registration.
+- Current release-preservation hashes are authoritative in `tests/unit/windows-preservation.test.ts`. For Cope 0.1.3, `scripts/install-windows.ps1` is `08a965a240840082270a65b6d13947a07a25d3385b15db79ae7533118285001b` after updating the release banner and exact installed-version assertion.
 - Baseline build: passes under system Node 22.
 - Baseline test: 181 passed, 4 failed; every failure is the expected Node 24 floor in preflight/E2E.
 - Verification runtime: bundled Node 24.14.0, used by prepending its directory to `PATH`; no system runtime is installed or changed.

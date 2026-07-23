@@ -23,7 +23,7 @@ Some inventory probes failed or were inconsistent: CPU/memory/disk collection fa
 
 ## Install as a standard user
 
-For the 0.1.2 personal-preview release, extract the zip and run `install.cmd` from a non-elevated Windows account. The installer performs `npm ci`, builds the release, packs it, installs the global `cope` command, adds the npm global command directory to the user PATH when needed, verifies `cope --version`, and offers guided setup. Reopen PowerShell after installation, then run `cope`.
+For the 0.1.3 personal-preview release, extract the zip and run `install.cmd` from a non-elevated Windows account. The installer performs `npm ci`, builds the release, packs it, installs the global `cope` command, adds the npm global command directory to the user PATH when needed, verifies `cope --version`, and offers guided setup. Reopen PowerShell after installation, then run `cope`.
 
 The packed global installation is intentional. It does not remain linked to the extracted source folder, so moving or deleting that folder later does not break `cope`. No administrator rights, Windows service, or browser extension is required.
 

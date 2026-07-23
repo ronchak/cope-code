@@ -296,6 +296,20 @@ test("human errors surface the safe browser diagnostic and remediation", () => {
   assert.match(output, /cope setup --force/u);
 });
 
+test("human errors expose only the controlled page-change reason", () => {
+  const output = renderHumanError(new AgentError(
+    "TRANSPORT_INDETERMINATE",
+    "The Copilot page changed during semantic readiness inspection",
+    {
+      diagnosticCode: "ACTIVE_PAGE_CHANGED_DURING_OBSERVATION",
+      dispatchAttempted: false,
+      observationChangeReason: "navigation-epoch",
+    },
+  ));
+
+  assert.match(output, /Page-change reason: navigation-epoch/u);
+});
+
 function inspection(state: CopilotPageState, diagnosticCode: string): BrowserStateInspection {
   return {
     classification: { state, retryable: state === "ready", diagnosticCode },

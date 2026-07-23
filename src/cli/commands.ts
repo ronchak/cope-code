@@ -94,7 +94,7 @@ import {
 } from "../platform/index.js";
 import { verifyPrivateStateHome } from "../platform/private-storage.js";
 
-export const CLI_VERSION = "0.1.2";
+export const CLI_VERSION = "0.1.3";
 
 export interface CliIo {
   readonly stdout: { write(value: string): unknown };

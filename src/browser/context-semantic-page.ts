@@ -408,23 +408,33 @@ export class ContextSemanticPage implements SemanticPage {
       this.#activePage,
     );
     const currentUrl = this.#activePage.url();
-    if (
-      selected !== this.#activePage ||
-      this.#activePage.isClosed() ||
-      this.#observedUrl === undefined ||
-      this.#observedEpoch === undefined ||
-      this.#observedDialogEpoch === undefined ||
-      this.#observedDialogEpoch !== 0 ||
-      currentUrl !== this.#observedUrl ||
-      (this.#navigationEpochs.get(this.#activePage) ?? 0) !== this.#observedEpoch ||
-      this.#nativeDialogEpoch !== this.#observedDialogEpoch
-    ) {
+    const currentNavigationEpoch = this.#navigationEpochs.get(this.#activePage) ?? 0;
+    const observationChangeReason = selected !== this.#activePage
+      ? isGenuineManualAuthenticationUrl(selected.url(), this.#config)
+        ? "authentication-precedence"
+        : "page-replaced"
+      : this.#activePage.isClosed()
+        ? "page-closed"
+        : this.#observedUrl === undefined ||
+            this.#observedEpoch === undefined ||
+            this.#observedDialogEpoch === undefined
+          ? "observation-uninitialized"
+          : this.#observedDialogEpoch !== 0 ||
+              this.#nativeDialogEpoch !== this.#observedDialogEpoch
+            ? "dialog-epoch"
+            : currentUrl !== this.#observedUrl
+              ? "url-changed"
+              : currentNavigationEpoch !== this.#observedEpoch
+                ? "navigation-epoch"
+                : undefined;
+    if (observationChangeReason !== undefined) {
       throw new AgentError(
         "TRANSPORT_INDETERMINATE",
         message,
         {
           diagnosticCode,
           dispatchAttempted: false,
+          observationChangeReason,
         },
       );
     }
