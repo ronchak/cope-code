@@ -49,6 +49,11 @@ import {
 import type { ModelTransport } from "../transport/index.js";
 import { writeSessionGrant } from "./session-files.js";
 import { resolveDefaultGitExecutable, type HostPlatform } from "../platform/index.js";
+import {
+  ObservabilityReporter,
+  type ObservabilityExporter,
+  type ObservabilityOptions,
+} from "../observability/index.js";
 
 export interface ComposeRuntimeOptions {
   readonly state: SessionState;
@@ -60,6 +65,8 @@ export interface ComposeRuntimeOptions {
   readonly idFactory?: (prefix: string) => string;
   readonly signal?: AbortSignal;
   readonly onProgress?: (event: RuntimeProgressEvent) => void;
+  readonly observabilityExporter?: ObservabilityExporter;
+  readonly observabilityOptions?: ObservabilityOptions;
   readonly host: HostPlatform;
 }
 
@@ -68,6 +75,7 @@ export interface ComposedRuntime {
   readonly audit: AuditLog;
   readonly repository: RepositoryContext;
   readonly disclosureLedger: DisclosureLedger;
+  readonly observability?: ObservabilityReporter;
 }
 
 export async function composeRuntime(options: ComposeRuntimeOptions): Promise<ComposedRuntime> {
@@ -80,6 +88,9 @@ export async function composeRuntime(options: ComposeRuntimeOptions): Promise<Co
     outputFile: path.join(sessionDirectory, "disclosures.jsonl"),
   });
   await disclosureLedger.initialize();
+  const observability = options.observabilityExporter === undefined
+    ? undefined
+    : new ObservabilityReporter(options.observabilityExporter, options.observabilityOptions);
   const fingerprintKeyFile = path.join(sessionDirectory, "fingerprint.key");
   const hasDurableRepositoryBaseline =
     Object.hasOwn(state, "repositoryBranchAtStart") && state.preExistingChangeStates !== undefined;
@@ -242,9 +253,22 @@ export async function composeRuntime(options: ComposeRuntimeOptions): Promise<Co
     ),
     retainSourceArtifactsOnCompletion:
       configuration.repository.retention.retain_source_artifacts_on_completion,
-    ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
+    ...(options.onProgress === undefined && observability === undefined
+      ? {}
+      : {
+          onProgress: (event: RuntimeProgressEvent) => {
+            try { options.onProgress?.(event); } catch { /* presentation is observational */ }
+            observability?.observe(event);
+          },
+        }),
   });
-  return { runtime, audit, repository, disclosureLedger };
+  return {
+    runtime,
+    audit,
+    repository,
+    disclosureLedger,
+    ...(observability === undefined ? {} : { observability }),
+  };
 }
 
 export function sessionBudgetLimits(effective: PolicyBudgetLimits): BudgetLimits {
