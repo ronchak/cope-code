@@ -106,6 +106,7 @@ export class ContextSemanticPage implements SemanticPage {
   #observationDeadline: number | undefined;
   #manualReadinessPageOverride: Page | undefined;
   #manualReadinessObservationPage: Page | undefined;
+  #manualReadinessProbeActive = false;
   #filledPage: Page | undefined;
   #filledUrl: string | undefined;
   #filledEpoch: number | undefined;
@@ -140,9 +141,9 @@ export class ContextSemanticPage implements SemanticPage {
     this.#configurePage(initialPage);
     if (typeof context.on === "function") {
       context.on("page", (page) => {
-        // Configure every context page for dialog safety, but do not grant it
-        // manual-handoff provenance. Only the tracked page's popup event can
-        // establish that exact opener relationship.
+        // Configure every context page for dialog safety. Manual-wait
+        // provenance is granted only by an exact opener relationship or when
+        // this page itself reaches the configured/strict-auth waypoint.
         this.#configurePage(page);
       });
     }
@@ -166,10 +167,19 @@ export class ContextSemanticPage implements SemanticPage {
     }
 
     const selected = returnedConfiguredPage ?? this.#selectCurrentPage(pages);
+    this.#assertNoNewManualReadinessHandoff(pages);
 
     if (isGenuineManualAuthenticationUrl(selected.url(), this.#config)) {
+      // Strict auth selection also proves this exact replacement page belongs
+      // to the sign-in chain. Preserve manual-wait provenance if Microsoft
+      // federates it in-place to the tenant's external identity provider.
+      this.#manualHandoffPages.add(selected);
       await this.#trackAuthenticationSelection(pages, selected);
     } else if (isConfiguredCopilotUrl(selected.url(), this.#config.entryUrl)) {
+      // Strict selection proved this exact configured replacement is the
+      // unique Copilot surface. It may subsequently navigate in-place through
+      // a tenant IdP, so grant only manual-wait provenance before that redirect.
+      this.#manualHandoffPages.add(selected);
       this.#clearAuthenticationTracking();
     }
 
@@ -253,11 +263,14 @@ export class ContextSemanticPage implements SemanticPage {
    * observation failure cannot leak it into an ordinary browser operation.
    */
   public async withManualReadinessProbe<T>(operation: () => Promise<T>): Promise<T> {
+    const priorProbeState = this.#manualReadinessProbeActive;
+    this.#manualReadinessProbeActive = true;
     try {
       return await operation();
     } finally {
       this.#manualReadinessPageOverride = undefined;
       this.#manualReadinessObservationPage = undefined;
+      this.#manualReadinessProbeActive = priorProbeState;
     }
   }
 
@@ -277,6 +290,12 @@ export class ContextSemanticPage implements SemanticPage {
       this.#observedEpoch = undefined;
       this.#observedDialogEpoch = undefined;
       this.#observationDeadline = undefined;
+    }
+    if (isConfiguredCopilotUrl(page.url(), this.#config.entryUrl)) {
+      // The setup-only override also proves one exact configured replacement.
+      // Preserve manual-wait provenance if that replacement later redirects
+      // in-place through the tenant IdP.
+      this.#manualHandoffPages.add(page);
     }
     this.#configurePage(page);
     if (force || changed && focusWhenChanged) {
@@ -324,6 +343,9 @@ export class ContextSemanticPage implements SemanticPage {
       this.#manualReadinessObservationPage = page;
       return currentUrl;
     }
+    // A provenance-bound external handoff may appear after the setup precheck
+    // but before currentUrl(). Retry before focus or any semantic DOM read.
+    this.#assertNoNewManualReadinessHandoff(this.#context.pages());
     // The first observation after composer fill is part of the same submission
     // transaction. It must inspect the exact page that received the prompt, not
     // silently adopt a replacement tab with the same conversation URL.
@@ -678,6 +700,24 @@ export class ContextSemanticPage implements SemanticPage {
       this.#configuredCallbackHandoffPage(pages);
   }
 
+  #assertNoNewManualReadinessHandoff(pages: readonly Page[]): void {
+    if (
+      !this.#manualReadinessProbeActive ||
+      this.#manualReadinessHandoffPage(pages) === undefined
+    ) {
+      return;
+    }
+    throw new AgentError(
+      "TRANSPORT_INDETERMINATE",
+      "The authentication handoff changed before manual readiness inspection",
+      {
+        diagnosticCode: "ACTIVE_PAGE_CHANGED_DURING_OBSERVATION",
+        dispatchAttempted: false,
+        observationChangeReason: "authentication-precedence",
+      },
+    );
+  }
+
   #externalManualHandoffPage(pages: readonly Page[]): Page | undefined {
     const openPages = pages.filter((page) => !page.isClosed());
     return openPages.filter((page) =>
@@ -763,6 +803,7 @@ export class ContextSemanticPage implements SemanticPage {
   }
 
   #configurePage(page: Page): void {
+    this.#grantManualHandoffAnchor(page);
     if (this.#configuredPages.has(page)) return;
     // Construct the delegate first so its native-dialog listener is active
     // before navigation, foregrounding, or the first semantic snapshot.
@@ -788,11 +829,21 @@ export class ContextSemanticPage implements SemanticPage {
         const mainFrame = typeof page.mainFrame === "function" ? page.mainFrame() : undefined;
         if (mainFrame !== undefined && frame !== mainFrame) return;
         this.#navigationEpochs.set(page, (this.#navigationEpochs.get(page) ?? 0) + 1);
+        this.#grantManualHandoffAnchor(page);
       });
     }
     page.setDefaultTimeout(this.#actionMs);
     page.setDefaultNavigationTimeout(this.#actionMs);
     this.#configuredPages.add(page);
+  }
+
+  #grantManualHandoffAnchor(page: Page): void {
+    if (
+      isConfiguredCopilotUrl(page.url(), this.#config.entryUrl) ||
+      isGenuineManualAuthenticationUrl(page.url(), this.#config)
+    ) {
+      this.#manualHandoffPages.add(page);
+    }
   }
 
   #delegate(page: Page): PlaywrightSemanticPage {
@@ -1156,9 +1207,9 @@ function normalizedPath(value: string): string {
 
 /**
  * A tenant identity provider is not an approved application host. It may keep
- * setup alive only when the exact page belongs to the explicit entry navigation
- * or was opened by that dedicated context, and only while it is on a
- * credential-free external HTTPS origin.
+ * setup alive only when the exact page belongs to the setup target/popup chain
+ * or was observed at the exact configured Copilot or strict Microsoft-auth
+ * waypoint, and only while its external HTTPS URL has no embedded credentials.
  */
 function isProvenanceBoundExternalSsoUrl(
   value: string,

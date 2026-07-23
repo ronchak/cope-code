@@ -4,6 +4,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import type { BrowserContext, Page, Response } from "playwright-core";
 
+import { CopilotBrowserAdapter } from "../../src/browser/copilot-browser-adapter.js";
 import { openTrackedCopilotPage } from "../../src/browser/context-semantic-page.js";
 import {
   createBaselineCopilotUiContract,
@@ -14,8 +15,10 @@ class DelayedPage {
   public closed = false;
   public onGoto?: () => Promise<Response | null>;
   public onBringToFront?: () => void;
-  public popupListener?: (page: Page) => void;
+  public popupListener?: (value: unknown) => void;
+  public frameNavigationListener?: (value: unknown) => void;
   public bringToFrontCalls = 0;
+  readonly #mainFrame = {};
 
   public constructor(public currentUrl: string) {}
 
@@ -27,12 +30,18 @@ class DelayedPage {
   }
   public setDefaultTimeout(_milliseconds: number): void {}
   public setDefaultNavigationTimeout(_milliseconds: number): void {}
-  public on(event: string, listener: (page: Page) => void): this {
+  public mainFrame(): object { return this.#mainFrame; }
+  public on(event: string, listener: (value: unknown) => void): this {
     if (event === "popup") this.popupListener = listener;
+    if (event === "framenavigated") this.frameNavigationListener = listener;
     return this;
   }
   public emitPopup(page: DelayedPage): void {
     this.popupListener?.(page.asPage());
+  }
+  public emitMainFrameNavigation(url: string): void {
+    this.currentUrl = url;
+    this.frameNavigationListener?.(this.#mainFrame);
   }
   public async goto(url: string): Promise<Response | null> {
     if (this.onGoto !== undefined) return this.onGoto();
@@ -95,6 +104,75 @@ test("an adopted replacement Copilot tab can anchor its tenant SSO popup", async
   assert.equal(await tracked.holdForManualAuthenticationHandoff(), true);
   assert.equal(await tracked.currentUrl(), sso.currentUrl);
   assert.equal(tracked.isManualAuthenticationRedirect(), true);
+});
+
+test("an adopted replacement Copilot tab retains same-tab tenant SSO ownership", async () => {
+  const context = new DelayedContext();
+  const replacement = new DelayedPage(
+    "https://m365.cloud.microsoft/chat/conversation/replacement",
+  );
+  context.navigationPage.onGoto = async () => {
+    context.addPage(replacement);
+    throw new Error("net::ERR_ABORTED");
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+
+  replacement.currentUrl = "https://identity.example.test/sso/login";
+  assert.equal(await tracked.holdForManualAuthenticationHandoff(), true);
+  assert.equal(await tracked.currentUrl(), replacement.currentUrl);
+  assert.equal(tracked.isManualAuthenticationRedirect(), true);
+
+  replacement.currentUrl = "https://m365.cloud.microsoft/chat/conversation/returned";
+  assert.equal(await tracked.holdForManualAuthenticationHandoff(), false);
+  assert.equal(await tracked.currentUrl(), replacement.currentUrl);
+});
+
+test("an adopted Microsoft auth replacement retains federated tenant SSO ownership", async () => {
+  const context = new DelayedContext();
+  const replacement = new DelayedPage(
+    "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+  );
+  context.navigationPage.onGoto = async () => {
+    context.addPage(replacement);
+    throw new Error("net::ERR_ABORTED");
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+
+  replacement.currentUrl = "https://identity.example.test/sso/login";
+  assert.equal(await tracked.holdForManualAuthenticationHandoff(), true);
+  assert.equal(await tracked.currentUrl(), replacement.currentUrl);
+  assert.equal(tracked.isManualAuthenticationRedirect(), true);
+
+  replacement.currentUrl = "https://m365.cloud.microsoft/chat/conversation/returned";
+  assert.equal(await tracked.holdForManualAuthenticationHandoff(), false);
+  assert.equal(await tracked.currentUrl(), replacement.currentUrl);
+});
+
+test("a fast replacement federation records its trusted waypoint before final selection", async () => {
+  for (const trustedUrl of [
+    "https://m365.cloud.microsoft/chat/conversation/replacement",
+    "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+  ]) {
+    const context = new DelayedContext();
+    const replacement = new DelayedPage("about:blank");
+    context.navigationPage.onGoto = async () => {
+      context.addPage(replacement);
+      replacement.emitMainFrameNavigation(trustedUrl);
+      replacement.emitMainFrameNavigation("https://identity.example.test/sso/login");
+      throw new Error("net::ERR_ABORTED");
+    };
+
+    const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+    assert.equal(await tracked.holdForManualAuthenticationHandoff(), true);
+    assert.equal(await tracked.currentUrl(), replacement.currentUrl);
+    assert.equal(tracked.isManualAuthenticationRedirect(), true);
+
+    replacement.emitMainFrameNavigation(
+      "https://m365.cloud.microsoft/chat/conversation/returned",
+    );
+    assert.equal(await tracked.holdForManualAuthenticationHandoff(), false);
+    assert.equal(await tracked.currentUrl(), replacement.currentUrl);
+  }
 });
 
 test("an external tenant SSO redirect on the tracked setup page remains open for manual sign-in", async () => {
@@ -288,6 +366,69 @@ test("a cancelled setup probe cannot affect the next ordinary inspection", async
     sso.currentUrl,
     "ordinary inspection must return to strict external-popup ownership",
   );
+});
+
+test("an SSO popup appearing after the setup precheck is rejected before IdP inspection", async () => {
+  const context = new DelayedContext();
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    return null;
+  };
+  const config = browserConfig();
+  const tracked = await openTrackedCopilotPage(context.asContext(), config);
+  const {
+    product: _product,
+    browserContractVersion: _browserContractVersion,
+    browserExecutable: _browserExecutable,
+    profileDirectory: _profileDirectory,
+    ...adapterConfig
+  } = config;
+  const adapter = new CopilotBrowserAdapter(tracked, adapterConfig);
+  const sso = new DelayedPage("https://identity.example.test/sso/login");
+
+  await assert.rejects(
+    tracked.withManualReadinessProbe(() =>
+      adapter.inspectManualReadinessState(async () => {
+        assert.equal(await tracked.holdForManualAuthenticationHandoff(false, true), false);
+        context.addPage(sso);
+        context.navigationPage.emitPopup(sso);
+        return false;
+      })),
+    retryableReadinessTransition,
+  );
+  assert.equal(
+    sso.bringToFrontCalls,
+    0,
+    "the raced IdP must not be foregrounded or reach semantic inspection",
+  );
+});
+
+test("a configured replacement adopted behind SSO retains later same-tab handoff ownership", async () => {
+  const context = new DelayedContext();
+  const sso = new DelayedPage("https://identity.example.test/sso/login");
+  const replacement = new DelayedPage(
+    "https://m365.cloud.microsoft/chat/conversation/replacement",
+  );
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    context.addPage(sso);
+    context.navigationPage.emitPopup(sso);
+    return null;
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+
+  context.navigationPage.closed = true;
+  context.addPage(replacement);
+  await tracked.withManualReadinessProbe(async () => {
+    assert.equal(await tracked.holdForManualAuthenticationHandoff(false, true), false);
+    assert.equal(await tracked.currentUrl(), replacement.currentUrl);
+    assert.deepEqual(await tracked.completeObservation(), { nativeDialogDetected: false });
+  });
+
+  sso.closed = true;
+  replacement.currentUrl = "https://identity.example.test/sso/continue";
+  assert.equal(await tracked.holdForManualAuthenticationHandoff(), true);
+  assert.equal(await tracked.currentUrl(), replacement.currentUrl);
 });
 
 function retryableReadinessTransition(error: unknown): boolean {
