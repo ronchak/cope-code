@@ -330,12 +330,14 @@ export async function configureMachine(options: {
     ? current.config.expectedIdentity
     : undefined;
   const identity = options.identity ?? (options.interactive
-    ? await promptText("Work account email (as shown in Copilot)", {
+    ? await promptText("Work account name or email (exactly as shown in Copilot)", {
         ...(currentIdentity === undefined ? {} : { defaultValue: currentIdentity }),
       })
     : currentIdentity);
   if (identity === undefined || identity.trim().length === 0) {
-    throw new AgentError("CONFIG_INVALID", "Setup requires the visible work-account name or email", { next: "Use cope setup --identity you@example.com" });
+    throw new AgentError("CONFIG_INVALID", "Setup requires the visible work-account name or email", {
+      next: "Use cope setup --identity \"Exact Visible Account\" (or the exact email when Copilot shows it).",
+    });
   }
   const identityChanged = current === undefined || identity.trim() !== current.config.expectedIdentity;
   const entryText = options.entryUrl ?? current?.config.entryUrl ?? (options.interactive
@@ -436,7 +438,7 @@ export async function configureMachine(options: {
       throw new AgentError("TRANSPORT_UNAVAILABLE", "The selected browser did not reach a verified Copilot-ready state", {
         product: selected.product,
         browserState: readiness.classification.state,
-        next: "Finish sign-in in the visible browser, confirm the approved account and protection state, then retry setup.",
+        ...readiness.diagnostic,
       });
     }
     cancellationPhase = "committing";
@@ -467,6 +469,7 @@ export async function configureMachine(options: {
         if (finalReadiness.classification.state !== "ready") {
           throw new AgentError("TRANSPORT_UNAVAILABLE", "The Copilot page stopped being ready before setup could be saved", {
             browserState: finalReadiness.classification.state,
+            ...finalReadiness.diagnostic,
           });
         }
       },

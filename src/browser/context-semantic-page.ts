@@ -675,7 +675,15 @@ export class ContextSemanticPage implements SemanticPage {
       (element) =>
         element.visible &&
         element.enabled &&
-        (element.value === filledValue || element.text === filledValue),
+        (
+          element.value === filledValue ||
+          element.text === filledValue ||
+          // M365's current Lexical editor appends a zero-width space and
+          // non-joiner sentinel after an otherwise unchanged programmatic
+          // fill. Permit only those trailing editor sentinels; never normalize
+          // visible text or zero-width characters inside the prompt.
+          element.text.replace(/[\u200B\u200C]+$/u, "") === filledValue
+        ),
     );
     if (!contentStillPresent) {
       this.#clearFilledPagePin();
@@ -1311,7 +1319,9 @@ function isConfiguredCopilotUrl(value: string, entryValue: string): boolean {
     if (actual.origin !== entry.origin) return false;
     const basePath = normalizedPath(entry.pathname);
     const actualPath = normalizedPath(actual.pathname);
-    return basePath === "/" || actualPath === basePath || actualPath.startsWith(`${basePath}/`);
+    return basePath === "/" ||
+      actualPath === basePath ||
+      actualPath.startsWith(`${basePath}/`);
   } catch {
     return false;
   }

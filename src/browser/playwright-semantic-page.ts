@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import type { ElementHandle, Locator, Page } from "playwright-core";
 
 import { AgentError } from "../shared/errors.js";
@@ -271,6 +273,7 @@ export class PlaywrightSemanticPage implements SemanticPage {
     deadline = performance.now() + this.#actionMs,
   ): Promise<void> {
     let dispatchAttempted = false;
+    const clickGuardToken = `__cope_trusted_click_${randomUUID().replaceAll("-", "")}`;
     const trace = operationTrace(group.signal, "actionable-locator.search");
     await this.#runBounded(async (assertWithinDeadline) => {
       this.#assertNoNativeDialog();
@@ -279,14 +282,13 @@ export class PlaywrightSemanticPage implements SemanticPage {
       guard();
       this.#assertNoNativeDialog();
       assertWithinDeadline();
-      dispatchAttempted = true;
-      const dispatchStatus = await traceOperation(
+      const actionable = await traceOperation(
         trace,
-        "dispatch",
-        { operation: "element.evaluate.click" },
-        () => element.evaluate((node): "pre-dispatch" | "dispatched" => {
+        "dispatch-preflight",
+        { operation: "element.evaluate.click-preflight" },
+        () => element.evaluate((node): boolean => {
       if (!(node instanceof HTMLElement) || !node.isConnected) {
-        return "pre-dispatch";
+        return false;
       }
       const actionable = (() => {
         try {
@@ -307,9 +309,9 @@ export class PlaywrightSemanticPage implements SemanticPage {
           ) {
             throw new Error("The bound send element is disabled");
           }
-          // Keep the dispatch bound to this node while preserving the essential
-          // Playwright click actionability checks. These checks and click execute
-          // in one page task, so no Locator can auto-wait into a replacement DOM.
+          // Perform a fail-closed hit-test before the protocol-bound click.
+          // The later ElementHandle dispatch cannot re-resolve into replacement
+          // DOM, unlike a Locator.
           node.scrollIntoView({ block: "center", inline: "center" });
           if (!node.isConnected) {
             throw new Error("The bound send element detached while becoming actionable");
@@ -374,15 +376,12 @@ export class PlaywrightSemanticPage implements SemanticPage {
           return false;
         }
       })();
-      if (!actionable) return "pre-dispatch";
-      // Keep this outside the preflight catch: an exception at the click
-      // boundary cannot prove whether page code observed a dispatch.
-      node.click();
-      return "dispatched";
+      return actionable;
         }),
       );
       this.#assertNoNativeDialog(true);
-      if (dispatchStatus === "pre-dispatch") {
+      if (!actionable) {
+        dispatchAttempted = false;
         throw new AgentError(
           "TRANSPORT_INDETERMINATE",
           "The bound send element changed before browser dispatch",
@@ -392,6 +391,132 @@ export class PlaywrightSemanticPage implements SemanticPage {
           },
         );
       }
+      // M365's current Fluent send control ignores HTMLElement.click(), which
+      // emits only an untrusted synthetic click. Dispatch through Playwright's
+      // protocol on the already-bound ElementHandle so pointer events are
+      // trusted without allowing a Locator to re-resolve into replacement DOM.
+      //
+      // Keep Playwright's receives-events enforcement enabled. A forced click
+      // is still coordinate-targeted and can activate an overlay that appears
+      // after preflight (including one mounted by mousemove). The capture guard
+      // is a second fail-closed boundary: it cancels any trusted activation
+      // event whose composed path does not contain this exact bound element,
+      // and proves that exactly one trusted click reached it.
+      guard();
+      this.#assertNoNativeDialog();
+      assertWithinDeadline();
+      const clickGuardInstalled = await traceOperation(
+        trace,
+        "dispatch-guard",
+        { operation: "element.evaluate.install-click-guard" },
+        () => element.evaluate((node, token): boolean => {
+          if (!(node instanceof HTMLElement) || !node.isConnected) return false;
+          const view = node.ownerDocument.defaultView;
+          if (view === null || Object.prototype.hasOwnProperty.call(view, token)) return false;
+          const state = {
+            matchedClicks: 0,
+            mismatchedActivation: false,
+            cleanup: (): void => undefined,
+          };
+          const activationTypes = [
+            "pointerdown",
+            "mousedown",
+            "pointerup",
+            "mouseup",
+            "click",
+          ];
+          const listener = (event: Event): void => {
+            if (!event.isTrusted) return;
+            const targetsBoundElement = event.composedPath().includes(node);
+            if (targetsBoundElement) {
+              if (event.type === "click") state.matchedClicks += 1;
+              return;
+            }
+            state.mismatchedActivation = true;
+            event.preventDefault();
+            event.stopImmediatePropagation();
+          };
+          state.cleanup = () => {
+            for (const type of activationTypes) {
+              view.removeEventListener(type, listener, true);
+            }
+          };
+          for (const type of activationTypes) {
+            view.addEventListener(type, listener, true);
+          }
+          // Store cleanup on the Window rather than the bound element. M365
+          // may synchronously replace Send inside its click handler, but the
+          // document-level guard must still be removable after that node has
+          // detached.
+          Object.defineProperty(view, token, {
+            configurable: true,
+            enumerable: false,
+            value: state,
+          });
+          return true;
+        }, clickGuardToken),
+      );
+      if (!clickGuardInstalled) {
+        throw new AgentError(
+          "TRANSPORT_INDETERMINATE",
+          "The bound send element changed before trusted-click guarding",
+          {
+            diagnosticCode: "ACTIONABLE_ELEMENT_CHANGED_BEFORE_DISPATCH",
+            dispatchAttempted: false,
+          },
+        );
+      }
+      dispatchAttempted = true;
+      let clickError: unknown;
+      try {
+        await traceOperation(
+          trace,
+          "dispatch",
+          { operation: "element.click" },
+          () => element.click({
+            noWaitAfter: true,
+            timeout: Math.max(1, Math.ceil(deadline - performance.now())),
+          }),
+        );
+      } catch (error) {
+        clickError = error;
+      }
+      const clickProof = await traceOperation(
+        trace,
+        "dispatch-proof",
+        { operation: "page.evaluate.verify-click-target" },
+        () => this.#page.evaluate((token): {
+          readonly matchedClicks: number;
+          readonly mismatchedActivation: boolean;
+        } => {
+          const state = (window as unknown as Record<string, {
+            matchedClicks: number;
+            mismatchedActivation: boolean;
+            cleanup: () => void;
+          }>)[token];
+          if (state === undefined) {
+            return { matchedClicks: 0, mismatchedActivation: true };
+          }
+          state.cleanup();
+          delete (window as unknown as Record<string, unknown>)[token];
+          return {
+            matchedClicks: state.matchedClicks,
+            mismatchedActivation: state.mismatchedActivation,
+          };
+        }, clickGuardToken),
+      );
+      if (clickError !== undefined) throw clickError;
+      if (clickProof.mismatchedActivation || clickProof.matchedClicks !== 1) {
+        throw new AgentError(
+          "TRANSPORT_INDETERMINATE",
+          "Trusted browser activation did not remain pinned to the bound send element",
+          {
+            diagnosticCode: "CLICK_TARGET_CHANGED_DURING_DISPATCH",
+            dispatchAttempted: true,
+          },
+        );
+      }
+      this.#assertNoNativeDialog(true);
     }, () => dispatchAttempted, deadline, trace);
   }
 
@@ -551,7 +676,11 @@ export class PlaywrightSemanticPage implements SemanticPage {
           () => item.isVisible(),
         ));
         if (!visible) continue;
-        const enabled = await safeBoolean(async () => {
+        const requiresActionability =
+          group.signal === "composer" ||
+          group.signal === "send" ||
+          group.signal === "modal";
+        const enabled = !requiresActionability || await safeBoolean(async () => {
           if (!await traceOperation(
             trace,
             traceKey,
@@ -578,7 +707,79 @@ export class PlaywrightSemanticPage implements SemanticPage {
               trace,
               traceKey,
               point("locator.innerText", index),
-              () => item.innerText(),
+              async () => {
+                const renderedText = await item.innerText();
+                if (
+                  group.signal !== "responses" ||
+                  typeof item.evaluate !== "function"
+                ) {
+                  return renderedText;
+                }
+                return item.evaluate((node, fallbackText): string => {
+                    if (!(node instanceof HTMLElement)) return node.textContent ?? "";
+                    const protocolBlocks: string[] = [];
+                    const editors = node.querySelectorAll<HTMLElement>(
+                      '[role="textbox"][aria-readonly="true"][aria-label="Code editor"]',
+                    );
+                    for (const editor of editors) {
+                      const codeBlock = editor.closest<HTMLElement>(
+                        ".scriptor-component-code-block",
+                      );
+                      if (
+                        codeBlock === null ||
+                        !node.contains(codeBlock) ||
+                        codeBlock.querySelectorAll(
+                          '[role="textbox"][aria-readonly="true"][aria-label="Code editor"]',
+                        ).length !== 1
+                      ) {
+                        continue;
+                      }
+                      const languageIndicators = Array.from(
+                        codeBlock.querySelectorAll<HTMLElement>(
+                          '[data-testid="message-bar-body-info"]',
+                        ),
+                      ).filter((indicator) =>
+                        indicator.textContent?.trim() ===
+                          "cba/1 isn’t fully supported. Syntax highlighting is based on Plain Text."
+                      );
+                      // M365's current code-block widget preserves an
+                      // unsupported language tag in this exact, block-owned
+                      // information banner. JSON content alone is never enough:
+                      // an ordinary json/plain-text example can itself contain
+                      // protocol:"cba/1" and must remain inert.
+                      if (languageIndicators.length !== 1) continue;
+                      const lines = Array.from(
+                        editor.querySelectorAll<HTMLElement>("[data-line-index]"),
+                      );
+                      const code = (
+                        lines.length > 0
+                          ? lines.map((line) => line.textContent ?? "").join("\n")
+                          : editor.textContent ?? ""
+                      ).trim();
+                      try {
+                        const parsed: unknown = JSON.parse(code);
+                        if (
+                          typeof parsed === "object" &&
+                          parsed !== null &&
+                          !Array.isArray(parsed) &&
+                          (parsed as Record<string, unknown>).protocol === "cba/1"
+                        ) {
+                          protocolBlocks.push(code);
+                        }
+                      } catch {
+                        // Ordinary code blocks remain part of the rendered
+                        // fallback text. Only a syntactically complete CBA
+                        // object can restore the fence removed by M365.
+                      }
+                    }
+                    if (protocolBlocks.length > 0) {
+                      return protocolBlocks
+                        .map((code) => `\`\`\`cba/1\n${code}\n\`\`\``)
+                        .join("\n\n");
+                    }
+                    return fallbackText;
+                  }, renderedText);
+              },
             ))
           : "";
         const accessibleLabel = captureText

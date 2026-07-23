@@ -25,6 +25,7 @@ import {
 import {
   conversationIdFromUrl,
   isApprovedUrl,
+  isConfiguredCopilotEntryRoute,
   validateBrowserConfig,
   type CopilotBrowserAdapterConfig,
 } from "./config.js";
@@ -52,9 +53,11 @@ interface SubmissionRecord {
   readonly submissionId: string;
   readonly contentSha256: string;
   readonly marker: string;
-  readonly conversationId: string;
+  conversationId: string;
+  conversationMayMaterialize: boolean;
   readonly baselineResponseCount: number;
   readonly baselineResponseSequenceSha256: string;
+  readonly baselineResponseSha256s?: readonly string[];
   readonly baselineKnown: boolean;
   activationAttempted: boolean;
   receipt: SubmissionReceipt;
@@ -452,25 +455,34 @@ export class CopilotBrowserAdapter implements ModelTransport {
     }
     const conversationId = conversationIdFromUrl(state.observation.url);
     if (
-      request.expectedConversationId !== undefined &&
-      request.expectedConversationId !== conversationId
+      record !== undefined &&
+      record.conversationId !== conversationId &&
+      this.#adoptMaterializedConversation(record, conversationId, recoveredMarker)
     ) {
-      return this.#receipt(
-        request,
-        "indeterminate",
-        conversationId,
-        marker,
-        "CONVERSATION_MISMATCH",
-      );
-    }
-    if (record !== undefined && record.conversationId !== conversationId) {
-      return this.#receipt(
-        request,
-        "indeterminate",
-        conversationId,
-        marker,
-        "CONVERSATION_CHANGED_AFTER_ATTEMPT",
-      );
+      // The first send from M365's entry route materialized a conversation URL
+      // and the exact task marker proves that this is the same submission.
+    } else {
+      if (
+        request.expectedConversationId !== undefined &&
+        request.expectedConversationId !== conversationId
+      ) {
+        return this.#receipt(
+          request,
+          "indeterminate",
+          conversationId,
+          marker,
+          "CONVERSATION_MISMATCH",
+        );
+      }
+      if (record !== undefined && record.conversationId !== conversationId) {
+        return this.#receipt(
+          request,
+          "indeterminate",
+          conversationId,
+          marker,
+          "CONVERSATION_CHANGED_AFTER_ATTEMPT",
+        );
+      }
     }
     if (recoveredMarker.status === "unique" && recoveredMarker.marker === marker) {
       const receipt = this.#receipt(request, "submitted", conversationId, marker, "MARKER_CONFIRMED");
@@ -573,6 +585,7 @@ export class CopilotBrowserAdapter implements ModelTransport {
     let stableSamples = 0;
     let stableSince = this.#monotonicNow();
     let sawCandidate = false;
+    let markerCurrentlyProven = true;
 
     while (this.#monotonicNow() < deadline) {
       if (isAborted(options.signal)) return this.#cancelled(request, "ABORTED");
@@ -605,17 +618,35 @@ export class CopilotBrowserAdapter implements ModelTransport {
         return this.#blockedForClassification(request, state.classification, conversationId);
       }
       const markerEvidence = taskMarkerEvidence(state.observation, request);
-      if (
-        markerEvidence.status !== "unique" ||
-        markerEvidence.marker !== activeRecord.marker
-      ) {
+      if (markerEvidence.status === "ambiguous") {
         return this.#receiveBase(request, {
           status: "indeterminate",
-          diagnosticCode: markerEvidence.status === "ambiguous"
-            ? "TASK_MARKER_AMBIGUOUS"
-            : "TASK_MARKER_NOT_OBSERVED",
+          diagnosticCode: "TASK_MARKER_AMBIGUOUS",
         }, conversationId);
       }
+      if (markerEvidence.status === "absent") {
+        // The current M365 client briefly unmounts chatQuestion envelopes while
+        // reconciling a newly appended answer. Do not correlate any response
+        // across that evidence gap, but allow the same pinned conversation to
+        // restore the exact immutable marker before the bounded deadline.
+        markerCurrentlyProven = false;
+        lastCandidateSha = undefined;
+        stableSamples = 0;
+        stableSince = this.#monotonicNow();
+        try {
+          await this.#boundedSleep(deadline, options.signal);
+        } catch {
+          return this.#cancelled(request, "ABORTED");
+        }
+        continue;
+      }
+      if (markerEvidence.marker !== activeRecord.marker) {
+        return this.#receiveBase(request, {
+          status: "indeterminate",
+          diagnosticCode: "TASK_MARKER_NOT_OBSERVED",
+        }, conversationId);
+      }
+      markerCurrentlyProven = true;
 
       const correlation = associatedResponse(state.observation, activeRecord);
       if (correlation.status === "indeterminate") {
@@ -662,6 +693,12 @@ export class CopilotBrowserAdapter implements ModelTransport {
         return this.#cancelled(request, "ABORTED");
       }
     }
+    if (!markerCurrentlyProven) {
+      return this.#receiveBase(request, {
+        status: "indeterminate",
+        diagnosticCode: "TASK_MARKER_NOT_OBSERVED",
+      }, activeRecord.conversationId);
+    }
     return this.#receiveBase(request, {
       status: "timed-out",
       diagnosticCode: sawCandidate ? "RESPONSE_INCOMPLETE" : "NO_RESPONSE",
@@ -700,6 +737,7 @@ export class CopilotBrowserAdapter implements ModelTransport {
 
   async #confirmSubmission(record: SubmissionRecord, signal?: AbortSignal): Promise<SubmissionReceipt> {
     const deadline = this.#monotonicNow() + this.#config.waits.submissionConfirmationMs;
+    let markerConfirmedOnEntry = false;
     while (this.#monotonicNow() < deadline) {
       if (signal?.aborted === true || this.#stopped || !this.#killSwitch.status().enabled) {
         return this.#receipt(
@@ -714,6 +752,14 @@ export class CopilotBrowserAdapter implements ModelTransport {
       try {
         state = await this.#observe();
       } catch {
+        if (record.conversationMayMaterialize && this.#monotonicNow() < deadline) {
+          // The entry route can change documents while the first post-click
+          // observation is in flight. No response is trusted from that mixed
+          // snapshot; retry only within the bounded first-send materialization
+          // window and still require the exact marker on the final URL.
+          await this.#boundedSleep(deadline, signal).catch(() => undefined);
+          continue;
+        }
         return this.#receipt(
           record,
           "indeterminate",
@@ -722,15 +768,7 @@ export class CopilotBrowserAdapter implements ModelTransport {
           "SUBMISSION_CONFIRMATION_INTERRUPTED",
         );
       }
-      if (conversationIdFromUrl(state.observation.url) !== record.conversationId) {
-        return this.#receipt(
-          record,
-          "indeterminate",
-          record.conversationId,
-          record.marker,
-          "CONVERSATION_CHANGED_AFTER_ACTIVATION",
-        );
-      }
+      const conversationId = conversationIdFromUrl(state.observation.url);
       const markerEvidence = taskMarkerEvidence(state.observation, record);
       if (markerEvidence.status === "ambiguous") {
         return this.#receipt(
@@ -741,7 +779,34 @@ export class CopilotBrowserAdapter implements ModelTransport {
           "TASK_MARKER_AMBIGUOUS",
         );
       }
+      if (conversationId !== record.conversationId) {
+        if (this.#adoptMaterializedConversation(record, conversationId, markerEvidence)) {
+          return this.#receipt(
+            record,
+            "submitted",
+            record.conversationId,
+            record.marker,
+            "MARKER_CONFIRMED",
+          );
+        }
+        if (record.conversationMayMaterialize && markerEvidence.status === "absent") {
+          await this.#boundedSleep(deadline, signal).catch(() => undefined);
+          continue;
+        }
+        return this.#receipt(
+          record,
+          "indeterminate",
+          record.conversationId,
+          record.marker,
+          "CONVERSATION_CHANGED_AFTER_ACTIVATION",
+        );
+      }
       if (markerEvidence.status === "unique" && markerEvidence.marker === record.marker) {
+        if (record.conversationMayMaterialize) {
+          markerConfirmedOnEntry = true;
+          await this.#boundedSleep(deadline, signal).catch(() => undefined);
+          continue;
+        }
         return this.#receipt(
           record,
           "submitted",
@@ -760,6 +825,67 @@ export class CopilotBrowserAdapter implements ModelTransport {
         );
       }
       await this.#boundedSleep(deadline, signal).catch(() => undefined);
+    }
+    if (markerConfirmedOnEntry) {
+      let finalState: ObservedPageState;
+      try {
+        finalState = await this.#observe();
+      } catch {
+        return this.#receipt(
+          record,
+          "indeterminate",
+          record.conversationId,
+          record.marker,
+          "SUBMISSION_CONFIRMATION_INTERRUPTED",
+        );
+      }
+      const finalConversationId = conversationIdFromUrl(finalState.observation.url);
+      const finalMarkerEvidence = taskMarkerEvidence(finalState.observation, record);
+      if (finalMarkerEvidence.status === "ambiguous") {
+        return this.#receipt(
+          record,
+          "indeterminate",
+          record.conversationId,
+          record.marker,
+          "TASK_MARKER_AMBIGUOUS",
+        );
+      }
+      if (finalConversationId !== record.conversationId) {
+        if (this.#adoptMaterializedConversation(
+          record,
+          finalConversationId,
+          finalMarkerEvidence,
+        )) {
+          return this.#receipt(
+            record,
+            "submitted",
+            record.conversationId,
+            record.marker,
+            "MARKER_CONFIRMED",
+          );
+        }
+        return this.#receipt(
+          record,
+          "indeterminate",
+          record.conversationId,
+          record.marker,
+          "CONVERSATION_CHANGED_AFTER_ACTIVATION",
+        );
+      }
+      if (
+        finalMarkerEvidence.status === "unique" &&
+        finalMarkerEvidence.marker === record.marker
+      ) {
+        record.conversationMayMaterialize = false;
+        this.#taskConversations.set(record.taskId, record.conversationId);
+        return this.#receipt(
+          record,
+          "submitted",
+          record.conversationId,
+          record.marker,
+          "MARKER_CONFIRMED",
+        );
+      }
     }
     return this.#receipt(
       record,
@@ -842,9 +968,16 @@ export class CopilotBrowserAdapter implements ModelTransport {
       contentSha256: sha256(request.content),
       marker,
       conversationId,
+      conversationMayMaterialize:
+        request.expectedConversationId === undefined &&
+        this.#taskConversations.get(request.taskId) === undefined &&
+        isConfiguredCopilotEntryRoute(observation.url, this.#config.entryUrl),
       baselineResponseCount: recoveredBaseline?.responseCount ?? responses.length,
       baselineResponseSequenceSha256: recoveredBaseline?.responseSequenceSha256 ??
         responseSequenceSha256(responses),
+      ...(recoveredBaseline === undefined
+        ? { baselineResponseSha256s: responses.map((response) => sha256(response)) }
+        : {}),
       baselineKnown,
       activationAttempted: false,
       receipt: this.#receipt(request, "not-submitted", conversationId, marker, "NOT_ACTIVATED"),
@@ -872,14 +1005,34 @@ export class CopilotBrowserAdapter implements ModelTransport {
         contentSha256: sha256(request.content),
         marker,
         conversationId,
+        conversationMayMaterialize: false,
         baselineResponseCount: 0,
         baselineResponseSequenceSha256: responseSequenceSha256([]),
+        baselineResponseSha256s: [],
         baselineKnown: false,
         activationAttempted: false,
         receipt,
       });
     }
     return receipt;
+  }
+
+  #adoptMaterializedConversation(
+    record: SubmissionRecord,
+    conversationId: string,
+    markerEvidence: TaskMarkerEvidence,
+  ): boolean {
+    if (
+      !record.conversationMayMaterialize ||
+      markerEvidence.status !== "unique" ||
+      markerEvidence.marker !== record.marker
+    ) {
+      return false;
+    }
+    record.conversationId = conversationId;
+    record.conversationMayMaterialize = false;
+    this.#taskConversations.set(record.taskId, conversationId);
+    return true;
   }
 
   #receipt(
@@ -1109,25 +1262,63 @@ function associatedResponse(
   | { readonly status: "candidate"; readonly content: string }
   | { readonly status: "indeterminate"; readonly diagnosticCode: string } {
   const responses = responseEnvelopeTexts(observation);
-  if (responses.length < record.baselineResponseCount) {
-    return { status: "indeterminate", diagnosticCode: "RESPONSE_BASELINE_TRUNCATED" };
+  const baselinePrefixMatches =
+    responses.length >= record.baselineResponseCount &&
+    responseSequenceSha256(responses.slice(0, record.baselineResponseCount)) ===
+      record.baselineResponseSequenceSha256;
+  if (baselinePrefixMatches) {
+    if (responses.length === record.baselineResponseCount) {
+      return { status: "pending" };
+    }
+    if (responses.length !== record.baselineResponseCount + 1) {
+      return { status: "indeterminate", diagnosticCode: "RESPONSE_SEQUENCE_AMBIGUOUS" };
+    }
+    const content = responses[record.baselineResponseCount]!;
+    return content.length === 0
+      ? { status: "pending" }
+      : { status: "candidate", content };
   }
+
+  // M365 virtualizes the oldest assistant envelope once its bounded transcript
+  // window is full. Locally retained per-envelope digests can prove the exact
+  // one-position suffix shift without weakening restart recovery, whose marker
+  // intentionally carries only the aggregate baseline and still fails closed.
+  const baselineDigests = record.baselineResponseSha256s;
   if (
-    responseSequenceSha256(responses.slice(0, record.baselineResponseCount)) !==
-    record.baselineResponseSequenceSha256
+    baselineDigests !== undefined &&
+    baselineDigests.length === record.baselineResponseCount &&
+    baselineDigests.length >= 2
   ) {
-    return { status: "indeterminate", diagnosticCode: "RESPONSE_BASELINE_CHANGED" };
+    const currentDigests = responses.map((response) => sha256(response));
+    const retainedBaseline = baselineDigests.slice(1);
+    if (
+      currentDigests.length === retainedBaseline.length &&
+      digestSequencesEqual(currentDigests, retainedBaseline)
+    ) {
+      return { status: "pending" };
+    }
+    if (
+      currentDigests.length === baselineDigests.length &&
+      digestSequencesEqual(currentDigests.slice(0, -1), retainedBaseline)
+    ) {
+      const content = responses.at(-1)!;
+      return content.length === 0
+        ? { status: "pending" }
+        : { status: "candidate", content };
+    }
   }
-  if (responses.length === record.baselineResponseCount) {
-    return { status: "pending" };
-  }
-  if (responses.length !== record.baselineResponseCount + 1) {
-    return { status: "indeterminate", diagnosticCode: "RESPONSE_SEQUENCE_AMBIGUOUS" };
-  }
-  const content = responses[record.baselineResponseCount]!;
-  return content.length === 0
-    ? { status: "pending" }
-    : { status: "candidate", content };
+
+  return {
+    status: "indeterminate",
+    diagnosticCode: responses.length < record.baselineResponseCount
+      ? "RESPONSE_BASELINE_TRUNCATED"
+      : "RESPONSE_BASELINE_CHANGED",
+  };
+}
+
+function digestSequencesEqual(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length &&
+    left.every((digest, index) => digest === right[index]);
 }
 
 function taskMarkerEvidence(

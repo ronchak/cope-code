@@ -13,6 +13,7 @@ import {
   createBaselineCopilotUiContract,
   conversationIdFromUrl,
   isApprovedUrl,
+  isConfiguredCopilotEntryRoute,
   validateBrowserConfig,
 } from "../../src/browser/config.js";
 import type {
@@ -385,4 +386,28 @@ test("conversation identity distinguishes query state without retaining raw URL 
   assert.notEqual(first, second);
   assert.doesNotMatch(first, /synthetic-secret/u);
   assert.match(first, /^browser-conversation:[a-f0-9]{32}$/u);
+});
+
+test("configured entry-route matching normalizes only trailing path slashes", () => {
+  const entry = "https://copilot.example.test/chat/";
+  const cases = [
+    ["https://copilot.example.test/chat", true],
+    ["https://copilot.example.test/chat///", true],
+    ["https://copilot.example.test/chat/conversation-1", false],
+    ["https://copilot.example.test/chat-other", false],
+    ["https://other.example.test/chat", false],
+    ["https://copilot.example.test/chat?conversation=existing", false],
+    ["not a URL", false],
+  ] as const;
+  for (const [value, expected] of cases) {
+    assert.equal(isConfiguredCopilotEntryRoute(value, entry), expected, value);
+  }
+  assert.equal(
+    isConfiguredCopilotEntryRoute(
+      "https://copilot.example.test/chat/?mode=work#observed",
+      "https://copilot.example.test/chat?mode=work#configured",
+    ),
+    true,
+    "matching query state is part of the entry route; fragments are not conversation identity",
+  );
 });
