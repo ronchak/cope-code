@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cope.local/schemas/cope-events-v1.schema.json",
+  "title": "Cope operational event",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "sequence", "timestamp", "event", "capabilities", "data"],
+      "properties": {
+        "schema_version": { "const": "cope-events/1" },
+        "sequence": { "type": "integer", "minimum": 1 },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "event": { "const": "stream.started" },
+        "capabilities": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["runtime_progress", "source_free", "ordered_sequence", "stdout_legacy_result", "interactive_requests"],
+          "properties": {
+            "runtime_progress": { "const": true },
+            "source_free": { "const": true },
+            "ordered_sequence": { "const": true },
+            "stdout_legacy_result": { "const": true },
+            "interactive_requests": { "const": false }
+          }
+        },
+        "data": { "type": "object", "maxProperties": 0 }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "sequence", "timestamp", "event", "data"],
+      "properties": {
+        "schema_version": { "const": "cope-events/1" },
+        "sequence": { "type": "integer", "minimum": 1 },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "event": { "const": "runtime.progress" },
+        "data": {
+          "type": "object",
+          "required": ["kind", "status"],
+          "properties": {
+            "kind": { "enum": ["state", "model", "tool", "completion"] },
+            "status": { "type": "string", "maxLength": 64 },
+            "turn_id": { "type": "string", "maxLength": 256 },
+            "operation_id": { "type": "string", "maxLength": 256 },
+            "from": { "type": ["string", "null"], "maxLength": 256 },
+            "to": { "type": ["string", "null"], "maxLength": 256 },
+            "has_reason": { "type": "boolean" },
+            "response_status": { "type": ["string", "null"], "maxLength": 256 },
+            "response_bytes": { "type": ["integer", "null"], "minimum": 0 },
+            "tool": { "type": ["string", "null"], "maxLength": 256 },
+            "outcome": { "type": ["string", "null"], "maxLength": 256 },
+            "accepted": { "type": "boolean" },
+            "changed_file_count": { "type": ["integer", "null"], "minimum": 0 },
+            "successful_command_count": { "type": ["integer", "null"], "minimum": 0 },
+            "failed_command_count": { "type": ["integer", "null"], "minimum": 0 },
+            "rejection_count": { "type": ["integer", "null"], "minimum": 0 }
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}
