@@ -39,6 +39,17 @@ AgentRuntime --> ProtocolAdapter
 
 The tool layer cannot import Copilot DOM assumptions. The browser adapter cannot read or modify a repository. Selecting Edge or Chrome changes local launch/configuration state only; it does not change the model-transport contract, policy, tools, correlation, classifier, or agent loop.
 
+### Model transport contracts
+
+The shipped browser, fixture, and replay transports implement the stable
+`model-transport/v1` string contract. `model-transport/v2` is an additive
+foundation for future structured transports: it negotiates output mode, model
+selection, and model/usage/stop/context signals, and defines typed streaming
+events. V2 extends the v1 interface, so existing CBA behavior and callers remain
+compatible. Both contracts share the persisted submission ID and the
+`submitted` / `not-submitted` / `indeterminate` exactly-once rule. Streaming
+does not make an indeterminate submission safe to retry.
+
 ## Authoritative control flow
 
 1. The CLI resolves the canonical Git repository, rejects index gitlinks and descendant Git boundaries, loads versioned configuration, records policy-visible pre-existing changes plus a keyed aggregate of hidden state, performs host preflight, and acquires the per-workspace lock.
@@ -154,7 +165,7 @@ The final report distinguishes all working-tree changes, agent-recorded changed 
 
 ## Design rules for extension
 
-- Introduce a new model surface by implementing `ModelTransport`; do not add surface-specific conditionals to the runtime.
+- Introduce a new string model surface by implementing `ModelTransport`; structured or streaming surfaces implement additive `ModelTransportV2`. Do not add surface-specific conditionals to the runtime.
 - Introduce a new tool by versioning its schema and protocol contract, implementing deterministic authorization facts, adding bounded output and audit behavior, and extending offline/adversarial tests.
 - Never add a raw shell, arbitrary path, generic browser-control, credential, or policy-modification tool to `cba/1`.
 - A wire semantic change requires a new protocol version; a compatible UI selector update requires a new certified UI contract suffix.
