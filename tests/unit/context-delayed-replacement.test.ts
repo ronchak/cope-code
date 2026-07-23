@@ -228,7 +228,7 @@ test("an unrelated context page without a tracked popup opener never receives SS
   assert.equal(tracked.isManualAuthenticationRedirect(), false);
 });
 
-test("a configured popup callback overlap stays manual until the popup closes", async () => {
+test("setup can inspect a configured popup callback while ordinary operations stay blocked", async () => {
   const context = new DelayedContext();
   const sso = new DelayedPage("https://identity.example.test/sso/login");
   context.navigationPage.onGoto = async () => {
@@ -242,6 +242,15 @@ test("a configured popup callback overlap stays manual until the popup closes", 
 
   sso.currentUrl = "https://m365.cloud.microsoft/chat/callback";
   assert.equal(await tracked.holdForManualAuthenticationHandoff(), true);
+  await tracked.withManualReadinessProbe(async () => {
+    assert.equal(
+      await tracked.holdForManualAuthenticationHandoff(false, true),
+      false,
+      "setup must inspect the provenance-bound callback page instead of waiting for it to close",
+    );
+    assert.equal(await tracked.currentUrl(), sso.currentUrl);
+    assert.deepEqual(await tracked.completeObservation(), { nativeDialogDetected: false });
+  });
   await assert.rejects(
     tracked.currentUrl(),
     /Multiple approved Copilot pages/u,
@@ -344,6 +353,29 @@ test("a callback overlap during setup observation is a retryable page transition
     assert.equal(await tracked.holdForManualAuthenticationHandoff(false, true), false);
     assert.equal(await tracked.currentUrl(), context.navigationPage.currentUrl);
     sso.currentUrl = "https://m365.cloud.microsoft/chat/callback";
+    await assert.rejects(
+      tracked.completeObservation(),
+      retryableReadinessTransition,
+    );
+  });
+});
+
+test("a configured callback pair changing during setup invalidates the readiness sample", async () => {
+  const context = new DelayedContext();
+  const callback = new DelayedPage("https://identity.example.test/sso/login");
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    context.addPage(callback);
+    context.navigationPage.emitPopup(callback);
+    return null;
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+  callback.currentUrl = "https://m365.cloud.microsoft/chat/callback";
+
+  await tracked.withManualReadinessProbe(async () => {
+    assert.equal(await tracked.holdForManualAuthenticationHandoff(false, true), false);
+    assert.equal(await tracked.currentUrl(), callback.currentUrl);
+    context.navigationPage.closed = true;
     await assert.rejects(
       tracked.completeObservation(),
       retryableReadinessTransition,

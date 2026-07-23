@@ -106,6 +106,7 @@ export class ContextSemanticPage implements SemanticPage {
   #observationDeadline: number | undefined;
   #manualReadinessPageOverride: Page | undefined;
   #manualReadinessObservationPage: Page | undefined;
+  #manualReadinessConfiguredPages: readonly Page[] | undefined;
   #manualReadinessProbeActive = false;
   #filledPage: Page | undefined;
   #filledUrl: string | undefined;
@@ -236,24 +237,30 @@ export class ContextSemanticPage implements SemanticPage {
     const externalHandoff = this.#externalManualHandoffPage(pages);
     const configuredPages = pages.filter((page) =>
       !page.isClosed() && isConfiguredCopilotUrl(page.url(), this.#config.entryUrl));
+    const configuredCallbackHandoff = this.#configuredCallbackHandoffPage(pages);
 
-    // A popup may linger on an external success page after its opener has
-    // already returned to Copilot. The adapter may inspect this exact unique
-    // configured page in a readiness-only scope, without reading the IdP.
-    if (
-      allowConfiguredPageProbe &&
-      externalHandoff !== undefined &&
-      configuredPages.length === 1
-    ) {
-      const configuredPage = configuredPages[0]!;
-      this.#manualReadinessPageOverride = configuredPage;
-      await this.#adoptManualReadinessPage(configuredPage, false, false);
+    // A popup may linger either on an external success page after its opener
+    // returned, or on the configured callback after authentication completed.
+    // Setup may inspect the exact provenance-bound return page in a
+    // readiness-only scope. Ordinary inspection and actions remain blocked.
+    const setupProbePage = allowConfiguredPageProbe
+      ? externalHandoff !== undefined && configuredPages.length === 1
+        ? configuredPages[0]
+        : externalHandoff === undefined && configuredCallbackHandoff !== undefined
+          ? configuredCallbackHandoff
+          : undefined
+      : undefined;
+    if (setupProbePage !== undefined) {
+      this.#manualReadinessPageOverride = setupProbePage;
+      this.#manualReadinessConfiguredPages = configuredPages;
+      await this.#adoptManualReadinessPage(setupProbePage, false, false);
       return false;
     }
 
-    const page = externalHandoff ?? this.#configuredCallbackHandoffPage(pages);
+    const page = externalHandoff ?? configuredCallbackHandoff;
     if (page === undefined) return false;
     this.#manualReadinessPageOverride = undefined;
+    this.#manualReadinessConfiguredPages = undefined;
     await this.#adoptManualReadinessPage(page, force);
     return true;
   }
@@ -270,6 +277,7 @@ export class ContextSemanticPage implements SemanticPage {
     } finally {
       this.#manualReadinessPageOverride = undefined;
       this.#manualReadinessObservationPage = undefined;
+      this.#manualReadinessConfiguredPages = undefined;
       this.#manualReadinessProbeActive = priorProbeState;
     }
   }
@@ -323,7 +331,11 @@ export class ContextSemanticPage implements SemanticPage {
       const configuredPages = this.#context.pages().filter((candidate) =>
         !candidate.isClosed() &&
         isConfiguredCopilotUrl(candidate.url(), this.#config.entryUrl));
-      if (page.isClosed() || configuredPages.length !== 1 || configuredPages[0] !== page) {
+      if (
+        page.isClosed() ||
+        !samePages(configuredPages, this.#manualReadinessConfiguredPages) ||
+        !configuredPages.includes(page)
+      ) {
         throw new AgentError(
           "TRANSPORT_INDETERMINATE",
           "The configured Copilot page changed before manual readiness inspection",
@@ -405,6 +417,7 @@ export class ContextSemanticPage implements SemanticPage {
     } finally {
       this.#observationDeadline = undefined;
       this.#manualReadinessObservationPage = undefined;
+      this.#manualReadinessConfiguredPages = undefined;
     }
   }
 
@@ -548,13 +561,17 @@ export class ContextSemanticPage implements SemanticPage {
   #assertObservedPageCurrent(diagnosticCode: string, message: string): Page {
     const pages = this.#context.pages();
     const manualReadinessObservation = this.#manualReadinessObservationPage;
+    const expectedConfiguredPages = this.#manualReadinessConfiguredPages;
     const configuredPages = manualReadinessObservation === undefined
       ? []
       : pages.filter((page) =>
         !page.isClosed() && isConfiguredCopilotUrl(page.url(), this.#config.entryUrl));
     const manualReadinessOwnershipChanged =
       manualReadinessObservation !== undefined &&
-      (configuredPages.length !== 1 || configuredPages[0] !== this.#activePage);
+      (
+        !samePages(configuredPages, expectedConfiguredPages) ||
+        !configuredPages.includes(this.#activePage)
+      );
     const selected = manualReadinessObservation === undefined
       ? this.#selectCurrentPage(pages, this.#activePage)
       : this.#activePage;
@@ -932,6 +949,15 @@ function nativeDialogSnapshot(group: LocatorGroup): GroupSnapshot {
     enabledElements: 0,
     elements,
   };
+}
+
+function samePages(
+  actual: readonly Page[],
+  expected: readonly Page[] | undefined,
+): boolean {
+  return expected !== undefined &&
+    actual.length === expected.length &&
+    actual.every((page) => expected.includes(page));
 }
 
 function uniqueConfiguredCopilotPage(
