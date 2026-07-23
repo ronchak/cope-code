@@ -427,7 +427,7 @@ export async function configureMachine(options: {
   try {
     transport = await launch(candidate, options.host, dependencies.identityVerifier);
     if (setupAbort.signal.aborted) throw new PromptCancelledError();
-    const readiness = await transport.waitForManualReadiness(
+    const readiness = await transport.waitForSetupReadiness(
       candidate.waits.manualReadinessMs,
       setupAbort.signal,
     );
@@ -463,7 +463,7 @@ export async function configureMachine(options: {
             diagnosticCode: "BROWSER_EXECUTABLE_EVIDENCE_CHANGED",
           });
         }
-        const finalReadiness = await transport!.inspectState();
+        const finalReadiness = await transport!.inspectSetupReadiness();
         if (finalReadiness.classification.state !== "ready") {
           throw new AgentError("TRANSPORT_UNAVAILABLE", "The Copilot page stopped being ready before setup could be saved", {
             browserState: finalReadiness.classification.state,

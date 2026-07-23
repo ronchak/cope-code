@@ -32,6 +32,8 @@ class DynamicFakePage implements SemanticPage {
   public fillCalls = 0;
   public activationCalls = 0;
   public currentUrlCalls = 0;
+  public snapshotCalls = 0;
+  public stallSnapshots = false;
   public onCurrentUrl: (() => void) | undefined = undefined;
 
   public async currentUrl(): Promise<string> {
@@ -41,6 +43,8 @@ class DynamicFakePage implements SemanticPage {
   }
 
   public async snapshot(group: LocatorGroup): Promise<GroupSnapshot> {
+    this.snapshotCalls += 1;
+    if (this.stallSnapshots) return new Promise<GroupSnapshot>(() => {});
     const elements = this.#elements(group.signal);
     return {
       signal: group.signal,
@@ -517,6 +521,50 @@ test("manual readiness waits on explicitly configured auth hosts without interac
   const inspection = await adapter.waitForManualReadiness();
   assert.equal(inspection.classification.state, "ready");
   assert.equal(sleepCount, 1);
+  assert.equal(page.fillCalls, 0);
+  assert.equal(page.activationCalls, 0);
+});
+
+test("provenance-bound SSO readiness never reads IdP DOM and fully reinspects Copilot on return", async () => {
+  const page = new DynamicFakePage();
+  page.url = "https://identity.example.test/sso/login";
+  page.stallSnapshots = true;
+  const { adapter } = makeHarness(page);
+
+  const handoff = await Promise.race([
+    adapter.inspectManualReadinessState(async () => true),
+    new Promise<never>((_resolve, reject) => {
+      setTimeout(() => reject(new Error("manual SSO inspection touched stalled DOM")), 50);
+    }),
+  ]);
+  assert.equal(handoff.classification.diagnosticCode, "MANUAL_SSO_HANDOFF");
+  assert.equal(page.currentUrlCalls, 0);
+  assert.equal(page.snapshotCalls, 0);
+
+  page.url = "https://copilot.example.test/chat/conversation-1";
+  page.stallSnapshots = false;
+  const ready = await adapter.inspectManualReadinessState(
+    async () => false,
+    () => true,
+  );
+  assert.equal(ready.classification.state, "ready");
+  assert.ok(page.currentUrlCalls > 0);
+  assert.ok(page.snapshotCalls > 0);
+});
+
+test("a non-ready configured page cannot end an active external SSO handoff", async () => {
+  const page = new DynamicFakePage();
+  page.identity = "Unexpected Account";
+  const { adapter } = makeHarness(page);
+
+  const inspection = await adapter.inspectManualReadinessState(
+    async () => false,
+    () => true,
+  );
+
+  assert.equal(inspection.classification.diagnosticCode, "MANUAL_SSO_HANDOFF");
+  assert.ok(page.currentUrlCalls > 0);
+  assert.ok(page.snapshotCalls > 0);
   assert.equal(page.fillCalls, 0);
   assert.equal(page.activationCalls, 0);
 });

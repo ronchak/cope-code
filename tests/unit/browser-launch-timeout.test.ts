@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
+import { pathToFileURL } from "node:url";
 
 import type { Browser, BrowserContext, Locator, Page } from "playwright-core";
 
@@ -22,6 +25,8 @@ interface Deferred<T> {
 // emulated CI hosts to deliver that timer and the resulting promise callbacks.
 const ASYNC_DEADLOCK_WATCHDOG_MS = 2_000;
 const CLOSE_DEADLOCK_WATCHDOG_MS = 1_000;
+const CHILD_PROCESS_WATCHDOG_MS = 5_000;
+const execFileAsync = promisify(execFile);
 
 function deferred<T>(): Deferred<T> {
   let resolve!: (value: T) => void;
@@ -256,7 +261,7 @@ test("ownerless launch retains the lock when fallback cleanup rejects", async (t
   await assert.rejects(ExclusiveProfileLock.acquire(profile), lockedProfileError);
 });
 
-test("context-owned persistent launch remains usable and releases its lock on close", async (t) => {
+test("normal transport close is bounded while a stalled owner retains the profile lock", async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), "cope-ownerless-success-"));
   t.after(async () => rm(root, { recursive: true, force: true }));
   const closeRelease = deferred<void>();
@@ -268,15 +273,67 @@ test("context-owned persistent launch remains usable and releases its lock on cl
     launchDependencies(context as unknown as BrowserContext),
   );
   await assert.rejects(ExclusiveProfileLock.acquire(profile), lockedProfileError);
-  const closePromise = transport.close();
+  const firstClose = transport.close();
+  const secondClose = transport.close();
+  assert.equal(firstClose, secondClose, "concurrent close callers must join one cleanup");
+  let secondSettled = false;
+  void secondClose.then(() => { secondSettled = true; });
   await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(secondSettled, false);
+  await Promise.race([
+    Promise.all([firstClose, secondClose]),
+    new Promise<never>((_resolve, reject) => {
+      setTimeout(() => reject(new Error("normal transport close remained unbounded")), CLOSE_DEADLOCK_WATCHDOG_MS);
+    }),
+  ]);
   assert.equal(context.closeCalls, 1);
   await assert.rejects(ExclusiveProfileLock.acquire(profile), lockedProfileError);
   closeRelease.resolve();
-  await closePromise;
+  await new Promise((resolve) => setTimeout(resolve, 20));
 
   const reacquired = await ExclusiveProfileLock.acquire(profile);
   await reacquired.release();
+});
+
+test("normal transport close surfaces rejection and retains the profile lock", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-ownerless-close-rejected-normal-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const closeResult = deferred<void>();
+  const context = new OwnerlessOperationContext(closeResult.promise);
+  const { config, profile } = await launchFixture(root);
+  const transport = await EdgeCopilotTransport.launch(
+    config,
+    launchDependencies(context as unknown as BrowserContext),
+  );
+
+  const closePromise = transport.close();
+  const concurrentClose = transport.close();
+  assert.equal(closePromise, concurrentClose);
+  closeResult.reject(new Error("synthetic normal close failure"));
+  await assert.rejects(closePromise, /synthetic normal close failure/u);
+  await assert.rejects(concurrentClose, /synthetic normal close failure/u);
+  assert.equal(context.closeCalls, 1);
+  await assert.rejects(ExclusiveProfileLock.acquire(profile), lockedProfileError);
+});
+
+test("the normal-close deadline keeps a handle alive without an external watchdog", async () => {
+  const launcherUrl = pathToFileURL(
+    path.resolve("dist/src/browser/edge-launcher.js"),
+  ).href;
+  const source = [
+    `import { browserTerminationSettlesWithin } from ${JSON.stringify(launcherUrl)};`,
+    "const settled = await browserTerminationSettlesWithin(new Promise(() => {}), 20);",
+    "process.stdout.write(String(settled));",
+  ].join("\n");
+
+  const { stdout } = await execFileAsync(
+    process.execPath,
+    ["--input-type=module", "--eval", source],
+    // Cold Windows runners may spend materially longer loading Playwright than
+    // the 20 ms deadline behavior this child verifies.
+    { timeout: CHILD_PROCESS_WATCHDOG_MS },
+  );
+  assert.equal(stdout, "false");
 });
 
 test("ownerless operation timeout shares context teardown and retains the lock until success", async (t) => {

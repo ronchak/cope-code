@@ -13,14 +13,27 @@ import {
 class DelayedPage {
   public closed = false;
   public onGoto?: () => Promise<Response | null>;
+  public onBringToFront?: () => void;
+  public popupListener?: (page: Page) => void;
+  public bringToFrontCalls = 0;
 
   public constructor(public currentUrl: string) {}
 
   public url(): string { return this.currentUrl; }
   public isClosed(): boolean { return this.closed; }
-  public async bringToFront(): Promise<void> {}
+  public async bringToFront(): Promise<void> {
+    this.bringToFrontCalls += 1;
+    this.onBringToFront?.();
+  }
   public setDefaultTimeout(_milliseconds: number): void {}
   public setDefaultNavigationTimeout(_milliseconds: number): void {}
+  public on(event: string, listener: (page: Page) => void): this {
+    if (event === "popup") this.popupListener = listener;
+    return this;
+  }
+  public emitPopup(page: DelayedPage): void {
+    this.popupListener?.(page.asPage());
+  }
   public async goto(url: string): Promise<Response | null> {
     if (this.onGoto !== undefined) return this.onGoto();
     this.currentUrl = url;
@@ -65,6 +78,25 @@ test("a replacement Copilot tab arriving just after navigation abort is still ad
   assert.equal(await tracked.currentUrl(), replacement.currentUrl);
 });
 
+test("an adopted replacement Copilot tab can anchor its tenant SSO popup", async () => {
+  const context = new DelayedContext();
+  const replacement = new DelayedPage(
+    "https://m365.cloud.microsoft/chat/conversation/replacement",
+  );
+  context.navigationPage.onGoto = async () => {
+    context.addPage(replacement);
+    throw new Error("net::ERR_ABORTED");
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+  const sso = new DelayedPage("https://identity.example.test/sso/login");
+  context.addPage(sso);
+  replacement.emitPopup(sso);
+
+  assert.equal(await tracked.holdForManualAuthenticationHandoff(), true);
+  assert.equal(await tracked.currentUrl(), sso.currentUrl);
+  assert.equal(tracked.isManualAuthenticationRedirect(), true);
+});
+
 test("an external tenant SSO redirect on the tracked setup page remains open for manual sign-in", async () => {
   const context = new DelayedContext();
   const ssoUrl = "https://identity.example.test/sso/login";
@@ -85,6 +117,7 @@ test("an external tenant SSO popup opened by the tracked setup context receives 
   context.navigationPage.onGoto = async () => {
     context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
     context.addPage(sso);
+    context.navigationPage.emitPopup(sso);
     return null;
   };
 
@@ -93,6 +126,177 @@ test("an external tenant SSO popup opened by the tracked setup context receives 
   assert.equal(await tracked.currentUrl(), sso.currentUrl);
   assert.equal(tracked.isManualAuthenticationRedirect(), true);
 });
+
+test("an unrelated context page without a tracked popup opener never receives SSO ownership", async () => {
+  const context = new DelayedContext();
+  const unrelated = new DelayedPage("https://unrelated.example.test/");
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    context.addPage(unrelated);
+    return null;
+  };
+
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+
+  assert.equal(await tracked.currentUrl(), context.navigationPage.currentUrl);
+  assert.equal(tracked.isManualAuthenticationRedirect(), false);
+});
+
+test("a configured popup callback overlap stays manual until the popup closes", async () => {
+  const context = new DelayedContext();
+  const sso = new DelayedPage("https://identity.example.test/sso/login");
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    context.addPage(sso);
+    context.navigationPage.emitPopup(sso);
+    return null;
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+  assert.equal(await tracked.holdForManualAuthenticationHandoff(), true);
+
+  sso.currentUrl = "https://m365.cloud.microsoft/chat/callback";
+  assert.equal(await tracked.holdForManualAuthenticationHandoff(), true);
+  await assert.rejects(
+    tracked.currentUrl(),
+    /Multiple approved Copilot pages/u,
+    "ordinary semantic inspection must remain fail-closed during callback overlap",
+  );
+
+  sso.closed = true;
+  assert.equal(await tracked.holdForManualAuthenticationHandoff(), false);
+  assert.equal(await tracked.currentUrl(), context.navigationPage.currentUrl);
+});
+
+test("an external SSO success popup retains manual ownership until it closes", async () => {
+  const context = new DelayedContext();
+  const sso = new DelayedPage("https://identity.example.test/sso/login");
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    context.addPage(sso);
+    context.navigationPage.emitPopup(sso);
+    return null;
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+
+  sso.currentUrl = "https://identity.example.test/sso/success";
+  assert.equal(await tracked.holdForManualAuthenticationHandoff(), true);
+  const configuredForegrounds = context.navigationPage.bringToFrontCalls;
+  assert.equal(
+    await tracked.holdForManualAuthenticationHandoff(false, true),
+    false,
+    "setup may inspect the unique configured page behind a lingering external popup",
+  );
+  assert.equal(
+    context.navigationPage.bringToFrontCalls,
+    configuredForegrounds,
+    "the setup-only probe must not steal focus from the operator's SSO popup",
+  );
+  assert.equal(await tracked.currentUrl(), context.navigationPage.currentUrl);
+  assert.deepEqual(await tracked.completeObservation(), { nativeDialogDetected: false });
+  assert.equal(
+    await tracked.holdForManualAuthenticationHandoff(),
+    true,
+    "ordinary readiness remains blocked while the external popup is open",
+  );
+  sso.closed = true;
+  assert.equal(await tracked.holdForManualAuthenticationHandoff(), false);
+});
+
+test("an SSO popup closing during foreground adoption is treated as completed handoff", async () => {
+  const context = new DelayedContext();
+  const sso = new DelayedPage("https://identity.example.test/sso/login");
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    context.addPage(sso);
+    context.navigationPage.emitPopup(sso);
+    return null;
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+
+  await tracked.holdForManualAuthenticationHandoff(false, true);
+  const priorForegrounds = sso.bringToFrontCalls;
+  sso.onBringToFront = () => { sso.closed = true; };
+  assert.equal(await tracked.holdForManualAuthenticationHandoff(), true);
+  assert.equal(sso.bringToFrontCalls, priorForegrounds + 1);
+  assert.equal(tracked.isManualAuthenticationRedirect(), false);
+  assert.equal(await tracked.holdForManualAuthenticationHandoff(), false);
+});
+
+test("a callback overlap before setup currentUrl is a retryable page transition", async () => {
+  const context = new DelayedContext();
+  const sso = new DelayedPage("https://identity.example.test/sso/login");
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    context.addPage(sso);
+    context.navigationPage.emitPopup(sso);
+    return null;
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+
+  await tracked.withManualReadinessProbe(async () => {
+    assert.equal(await tracked.holdForManualAuthenticationHandoff(false, true), false);
+    sso.currentUrl = "https://m365.cloud.microsoft/chat/callback";
+    await assert.rejects(
+      tracked.currentUrl(),
+      retryableReadinessTransition,
+    );
+  });
+});
+
+test("a callback overlap during setup observation is a retryable page transition", async () => {
+  const context = new DelayedContext();
+  const sso = new DelayedPage("https://identity.example.test/sso/login");
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    context.addPage(sso);
+    context.navigationPage.emitPopup(sso);
+    return null;
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+
+  await tracked.withManualReadinessProbe(async () => {
+    assert.equal(await tracked.holdForManualAuthenticationHandoff(false, true), false);
+    assert.equal(await tracked.currentUrl(), context.navigationPage.currentUrl);
+    sso.currentUrl = "https://m365.cloud.microsoft/chat/callback";
+    await assert.rejects(
+      tracked.completeObservation(),
+      retryableReadinessTransition,
+    );
+  });
+});
+
+test("a cancelled setup probe cannot affect the next ordinary inspection", async () => {
+  const context = new DelayedContext();
+  const sso = new DelayedPage("https://identity.example.test/sso/login");
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    context.addPage(sso);
+    context.navigationPage.emitPopup(sso);
+    return null;
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+
+  await assert.rejects(
+    tracked.withManualReadinessProbe(async () => {
+      assert.equal(await tracked.holdForManualAuthenticationHandoff(false, true), false);
+      throw new Error("synthetic cancellation");
+    }),
+    /synthetic cancellation/u,
+  );
+  assert.equal(
+    await tracked.currentUrl(),
+    sso.currentUrl,
+    "ordinary inspection must return to strict external-popup ownership",
+  );
+});
+
+function retryableReadinessTransition(error: unknown): boolean {
+  return error instanceof Error &&
+    "details" in error &&
+    (error as { details?: Record<string, unknown> }).details?.diagnosticCode ===
+      "ACTIVE_PAGE_CHANGED_DURING_OBSERVATION" &&
+    (error as { details?: Record<string, unknown> }).details?.dispatchAttempted === false;
+}
 
 function browserConfig(): EdgeLaunchConfig {
   const expectedIdentity = "Ronak Chakraborty";

@@ -50,8 +50,8 @@ test("doctor reports Chrome preview identity and privacy concisely while JSON in
     identityVerifier,
     discoverBrowsers: async () => [chrome],
     launchBrowser: async () => ({
-      waitForManualReadiness: async () => ({ classification: { state: "ready" } }),
-      inspectState: async () => ({ classification: { state: "ready" } }),
+      waitForSetupReadiness: async () => ({ classification: { state: "ready" } }),
+      inspectSetupReadiness: async () => ({ classification: { state: "ready" } }),
       close: async () => undefined,
     } as unknown as EdgeCopilotTransport),
   });
