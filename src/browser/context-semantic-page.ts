@@ -107,6 +107,7 @@ export class ContextSemanticPage implements SemanticPage {
   #manualReadinessPageOverride: Page | undefined;
   #manualReadinessObservationPage: Page | undefined;
   #manualReadinessConfiguredPages: readonly Page[] | undefined;
+  #manualReadinessAuthenticationPages: readonly Page[] | undefined;
   #manualReadinessProbeActive = false;
   #filledPage: Page | undefined;
   #filledUrl: string | undefined;
@@ -253,6 +254,8 @@ export class ContextSemanticPage implements SemanticPage {
     if (setupProbePage !== undefined) {
       this.#manualReadinessPageOverride = setupProbePage;
       this.#manualReadinessConfiguredPages = configuredPages;
+      this.#manualReadinessAuthenticationPages =
+        this.#authenticationPrecedencePages(pages);
       await this.#adoptManualReadinessPage(setupProbePage, false, false);
       return false;
     }
@@ -261,6 +264,7 @@ export class ContextSemanticPage implements SemanticPage {
     if (page === undefined) return false;
     this.#manualReadinessPageOverride = undefined;
     this.#manualReadinessConfiguredPages = undefined;
+    this.#manualReadinessAuthenticationPages = undefined;
     await this.#adoptManualReadinessPage(page, force);
     return true;
   }
@@ -278,6 +282,7 @@ export class ContextSemanticPage implements SemanticPage {
       this.#manualReadinessPageOverride = undefined;
       this.#manualReadinessObservationPage = undefined;
       this.#manualReadinessConfiguredPages = undefined;
+      this.#manualReadinessAuthenticationPages = undefined;
       this.#manualReadinessProbeActive = priorProbeState;
     }
   }
@@ -328,11 +333,19 @@ export class ContextSemanticPage implements SemanticPage {
     if (this.#manualReadinessPageOverride !== undefined) {
       const page = this.#manualReadinessPageOverride;
       this.#manualReadinessPageOverride = undefined;
-      const configuredPages = this.#context.pages().filter((candidate) =>
+      const currentPages = this.#context.pages();
+      const configuredPages = currentPages.filter((candidate) =>
         !candidate.isClosed() &&
         isConfiguredCopilotUrl(candidate.url(), this.#config.entryUrl));
+      const authenticationPages =
+        this.#authenticationPrecedencePages(currentPages);
+      const authenticationPrecedenceChanged = !samePages(
+        authenticationPages,
+        this.#manualReadinessAuthenticationPages,
+      );
       if (
         page.isClosed() ||
+        authenticationPrecedenceChanged ||
         !samePages(configuredPages, this.#manualReadinessConfiguredPages) ||
         !configuredPages.includes(page)
       ) {
@@ -342,7 +355,9 @@ export class ContextSemanticPage implements SemanticPage {
           {
             diagnosticCode: "ACTIVE_PAGE_CHANGED_DURING_OBSERVATION",
             dispatchAttempted: false,
-            observationChangeReason: "page-replaced",
+            observationChangeReason: authenticationPrecedenceChanged
+              ? "authentication-precedence"
+              : "page-replaced",
           },
         );
       }
@@ -418,6 +433,7 @@ export class ContextSemanticPage implements SemanticPage {
       this.#observationDeadline = undefined;
       this.#manualReadinessObservationPage = undefined;
       this.#manualReadinessConfiguredPages = undefined;
+      this.#manualReadinessAuthenticationPages = undefined;
     }
   }
 
@@ -562,10 +578,17 @@ export class ContextSemanticPage implements SemanticPage {
     const pages = this.#context.pages();
     const manualReadinessObservation = this.#manualReadinessObservationPage;
     const expectedConfiguredPages = this.#manualReadinessConfiguredPages;
+    const expectedAuthenticationPages = this.#manualReadinessAuthenticationPages;
     const configuredPages = manualReadinessObservation === undefined
       ? []
       : pages.filter((page) =>
         !page.isClosed() && isConfiguredCopilotUrl(page.url(), this.#config.entryUrl));
+    const authenticationPages = manualReadinessObservation === undefined
+      ? []
+      : this.#authenticationPrecedencePages(pages);
+    const manualReadinessAuthenticationChanged =
+      manualReadinessObservation !== undefined &&
+      !samePages(authenticationPages, expectedAuthenticationPages);
     const manualReadinessOwnershipChanged =
       manualReadinessObservation !== undefined &&
       (
@@ -577,7 +600,9 @@ export class ContextSemanticPage implements SemanticPage {
       : this.#activePage;
     const currentUrl = this.#activePage.url();
     const currentNavigationEpoch = this.#navigationEpochs.get(this.#activePage) ?? 0;
-    const observationChangeReason = manualReadinessOwnershipChanged
+    const observationChangeReason = manualReadinessAuthenticationChanged
+      ? "authentication-precedence"
+      : manualReadinessOwnershipChanged
       ? "page-replaced"
       : selected !== this.#activePage
       ? isGenuineManualAuthenticationUrl(selected.url(), this.#config)
@@ -753,6 +778,17 @@ export class ContextSemanticPage implements SemanticPage {
       this.#manualHandoffPages.has(page) &&
       isProvenanceBoundExternalSsoUrl(page.url(), this.#config.entryUrl)
     ).at(-1);
+  }
+
+  #authenticationPrecedencePages(pages: readonly Page[]): readonly Page[] {
+    return pages.filter((page) =>
+      !page.isClosed() && (
+        isGenuineManualAuthenticationUrl(page.url(), this.#config) ||
+        (
+          this.#manualHandoffPages.has(page) &&
+          isProvenanceBoundExternalSsoUrl(page.url(), this.#config.entryUrl)
+        )
+      ));
   }
 
   #configuredCallbackHandoffPage(pages: readonly Page[]): Page | undefined {

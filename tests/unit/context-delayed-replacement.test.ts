@@ -383,6 +383,58 @@ test("a configured callback pair changing during setup invalidates the readiness
   });
 });
 
+test("new authentication before a callback probe DOM read invalidates the sample", async () => {
+  const context = new DelayedContext();
+  const callback = new DelayedPage("https://identity.example.test/sso/login");
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    context.addPage(callback);
+    context.navigationPage.emitPopup(callback);
+    return null;
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+  callback.currentUrl = "https://m365.cloud.microsoft/chat/callback";
+
+  await tracked.withManualReadinessProbe(async () => {
+    assert.equal(await tracked.holdForManualAuthenticationHandoff(false, true), false);
+    const nextAuth = new DelayedPage("https://identity.example.test/sso/continue");
+    context.addPage(nextAuth);
+    callback.emitPopup(nextAuth);
+    await assert.rejects(
+      tracked.currentUrl(),
+      authenticationPrecedenceTransition,
+    );
+  });
+});
+
+test("an existing page navigating to authentication during a callback probe invalidates the sample", async () => {
+  const context = new DelayedContext();
+  const callback = new DelayedPage("https://identity.example.test/sso/login");
+  const nextAuth = new DelayedPage("about:blank");
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    context.addPage(callback);
+    context.navigationPage.emitPopup(callback);
+    context.addPage(nextAuth);
+    callback.emitPopup(nextAuth);
+    return null;
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+  callback.currentUrl = "https://m365.cloud.microsoft/chat/callback";
+
+  await tracked.withManualReadinessProbe(async () => {
+    assert.equal(await tracked.holdForManualAuthenticationHandoff(false, true), false);
+    assert.equal(await tracked.currentUrl(), callback.currentUrl);
+    nextAuth.emitMainFrameNavigation(
+      "https://login.microsoftonline.com/common/oauth2/authorize",
+    );
+    await assert.rejects(
+      tracked.completeObservation(),
+      authenticationPrecedenceTransition,
+    );
+  });
+});
+
 test("a cancelled setup probe cannot affect the next ordinary inspection", async () => {
   const context = new DelayedContext();
   const sso = new DelayedPage("https://identity.example.test/sso/login");
@@ -591,6 +643,12 @@ function retryableReadinessTransition(error: unknown): boolean {
     (error as { details?: Record<string, unknown> }).details?.diagnosticCode ===
       "ACTIVE_PAGE_CHANGED_DURING_OBSERVATION" &&
     (error as { details?: Record<string, unknown> }).details?.dispatchAttempted === false;
+}
+
+function authenticationPrecedenceTransition(error: unknown): boolean {
+  return retryableReadinessTransition(error) &&
+    (error as { details?: Record<string, unknown> }).details?.observationChangeReason ===
+      "authentication-precedence";
 }
 
 function manualSsoHandoffError(error: unknown): boolean {
