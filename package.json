@@ -1,6 +1,6 @@
 {
   "name": "@local/copilot-browser-agent",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "license": "UNLICENSED",
   "description": "Cope: a guided terminal coding harness using Microsoft 365 Copilot Chat through a visible supported browser",

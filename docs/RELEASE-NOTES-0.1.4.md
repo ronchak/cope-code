@@ -1,6 +1,6 @@
-# Cope 0.1.3
+# Cope 0.1.4
 
-Cope 0.1.3 fixes a live Windows setup failure caused by Microsoft 365 Copilot page navigation during semantic readiness inspection.
+Cope 0.1.4 fixes a live Windows setup failure caused by Microsoft 365 Copilot page navigation during semantic readiness inspection.
 
 ## Fixed
 
