@@ -64,7 +64,7 @@ export const DEFAULT_BROWSER_WAITS: BrowserWaitConfig = Object.freeze({
   actionMs: 15_000,
   submissionConfirmationMs: 12_000,
   responseMs: 180_000,
-  manualReadinessMs: 600_000,
+  manualReadinessMs: 900_000,
   pollMs: 250,
   stableSamples: 3,
   minimumStableMs: 750,

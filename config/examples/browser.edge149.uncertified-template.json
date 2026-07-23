@@ -27,7 +27,7 @@
     "actionMs": 15000,
     "submissionConfirmationMs": 12000,
     "responseMs": 180000,
-    "manualReadinessMs": 600000,
+    "manualReadinessMs": 900000,
     "pollMs": 250,
     "stableSamples": 3,
     "minimumStableMs": 750

@@ -107,10 +107,14 @@ function discoveredBrowser(product: BrowserProduct, executablePath = `/verified/
   };
 }
 
-function readyTransport(observed: BrowserLaunchConfig[]): EdgeCopilotTransport {
+function readyTransport(_observed: BrowserLaunchConfig[]): EdgeCopilotTransport {
   return {
+    waitForSetupReadiness: async () => ({ classification: { state: "ready" } }),
+    inspectSetupReadiness: async () => ({ classification: { state: "ready" } }),
     waitForManualReadiness: async () => ({ classification: { state: "ready" } }),
-    inspectState: async () => ({ classification: { state: "ready" } }),
+    inspectState: async () => {
+      throw new Error("machine setup must use its setup-only final readiness path");
+    },
     close: async () => undefined,
   } as unknown as EdgeCopilotTransport;
 }
@@ -508,7 +512,7 @@ test("forced setup replaces only a stale pinned UI contract", async (context) =>
       launchBrowser: async (config) => {
         assert.notEqual(config.uiContract.version, validButStaleContract.version);
         return {
-          waitForManualReadiness: async () => ({
+          waitForSetupReadiness: async () => ({
             classification: {
               state: "changed-selector" as const,
               diagnosticCode: "UI_CONTRACT_QUORUM_FAILED",
@@ -964,7 +968,7 @@ test("no-browser setup offers manual installation selection and never saves befo
       source: "manual",
     }),
     launchBrowser: async () => ({
-      waitForManualReadiness: async () => ({ classification: { state: "signed-out" } }),
+      waitForSetupReadiness: async () => ({ classification: { state: "signed-out" } }),
       close: async () => { closed = true; },
     } as unknown as EdgeCopilotTransport),
   }), (error: unknown) => error instanceof Error && /did not reach/iu.test(error.message));
@@ -1107,7 +1111,7 @@ test("Ctrl+C during manual browser readiness cancels cleanly before persistence"
     discoverBrowsers: async () => [chrome],
     verifyManualBrowser: async (product, executablePath) => ({ ...discoveredBrowser(product, executablePath), source: "manual" }),
     launchBrowser: async () => ({
-      waitForManualReadiness: async (_maxWaitMs?: number, signal?: AbortSignal) => {
+      waitForSetupReadiness: async (_maxWaitMs?: number, signal?: AbortSignal) => {
         process.emit("SIGINT", "SIGINT");
         assert.equal(signal?.aborted, true);
         return { classification: { state: "signed-out" } };

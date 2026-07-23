@@ -26,6 +26,7 @@ import type {
 } from "../../src/browser/contracts.js";
 import { waitForStableManualReadiness } from "../../src/browser/manual-readiness.js";
 import { PlaywrightSemanticPage } from "../../src/browser/playwright-semantic-page.js";
+import { AgentError } from "../../src/shared/errors.js";
 
 const SIGNALS: readonly CopilotSignal[] = [
   "shell",
@@ -133,9 +134,9 @@ test("an open authentication popup retains ownership until it closes", async () 
     1_000,
   );
 
-  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+  await assertManualAuthenticationHeld(tracked, authentication);
   chat.navigate(chat.currentUrl);
-  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+  await assertManualAuthenticationHeld(tracked, authentication);
 
   authentication.closed = true;
   assert.equal(await tracked.currentUrl(), chat.currentUrl);
@@ -156,14 +157,14 @@ test("a tracked authentication popup outranks multiple configured chats", async 
     1_000,
   );
 
-  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+  await assertManualAuthenticationHeld(tracked, authentication);
 
   const replacement = new NavigationPage(
     "https://m365.cloud.microsoft/chat/conversation/replacement",
   );
-  context.pageList.push(replacement);
+  context.addPage(replacement);
 
-  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+  await assertManualAuthenticationHeld(tracked, authentication);
 });
 
 test("new auth aborts handoff before refreshed-page ambiguity", async () => {
@@ -179,7 +180,7 @@ test("new auth aborts handoff before refreshed-page ambiguity", async () => {
     1_000,
   );
 
-  assert.equal(await tracked.currentUrl(), completedAuthentication.currentUrl);
+  await assertManualAuthenticationHeld(tracked, completedAuthentication);
   completedAuthentication.closed = true;
 
   const replacement = new NavigationPage(
@@ -188,14 +189,16 @@ test("new auth aborts handoff before refreshed-page ambiguity", async () => {
   const newAuthentication = new NavigationPage(
     "https://login.microsoftonline.com/common/oauth2/authorize?client_id=refreshed",
   );
-  const injectionRead = context.pageReads + 2;
-  context.onPagesRead = (read) => {
-    if (read !== injectionRead) return;
-    context.pageList.push(replacement, newAuthentication);
-    context.onPagesRead = undefined;
-  };
-
-  assert.equal(await tracked.currentUrl(), newAuthentication.currentUrl);
+  await tracked.withManualReadinessProbe(async () => {
+    assert.equal(await tracked.holdForManualAuthenticationHandoff(), false);
+    const injectionRead = context.pageReads + 2;
+    context.onPagesRead = (read) => {
+      if (read !== injectionRead) return;
+      context.addPage(replacement, newAuthentication);
+      context.onPagesRead = undefined;
+    };
+    await assert.rejects(tracked.currentUrl(), retryableManualReadinessTransition);
+  });
 });
 
 test("new auth aborts handoff at the final context refresh", async () => {
@@ -211,7 +214,7 @@ test("new auth aborts handoff at the final context refresh", async () => {
     1_000,
   );
 
-  assert.equal(await tracked.currentUrl(), completedAuthentication.currentUrl);
+  await assertManualAuthenticationHeld(tracked, completedAuthentication);
   completedAuthentication.closed = true;
 
   const replacement = new NavigationPage(
@@ -220,14 +223,16 @@ test("new auth aborts handoff at the final context refresh", async () => {
   const newAuthentication = new NavigationPage(
     "https://login.microsoftonline.com/common/oauth2/authorize?client_id=final",
   );
-  const injectionRead = context.pageReads + 3;
-  context.onPagesRead = (read) => {
-    if (read !== injectionRead) return;
-    context.pageList.push(replacement, newAuthentication);
-    context.onPagesRead = undefined;
-  };
-
-  assert.equal(await tracked.currentUrl(), newAuthentication.currentUrl);
+  await tracked.withManualReadinessProbe(async () => {
+    assert.equal(await tracked.holdForManualAuthenticationHandoff(), false);
+    const injectionRead = context.pageReads + 3;
+    context.onPagesRead = (read) => {
+      if (read !== injectionRead) return;
+      context.addPage(replacement, newAuthentication);
+      context.onPagesRead = undefined;
+    };
+    await assert.rejects(tracked.currentUrl(), retryableManualReadinessTransition);
+  });
 });
 
 test("in-place chat hydration cannot displace an open authentication popup", async () => {
@@ -249,11 +254,11 @@ test("in-place chat hydration cannot displace an open authentication popup", asy
     1_000,
   );
 
-  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
-  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+  await assertManualAuthenticationHeld(tracked, authentication);
+  await assertManualAuthenticationHeld(tracked, authentication);
 
   chat.composerEnabled = true;
-  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+  await assertManualAuthenticationHeld(tracked, authentication);
 
   authentication.closed = true;
   assert.equal(await tracked.currentUrl(), chat.currentUrl);
@@ -273,8 +278,8 @@ test("an already-actionable chat cannot displace a newer active auth popup", asy
     1_000,
   );
 
-  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
-  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+  await assertManualAuthenticationHeld(tracked, authentication);
+  await assertManualAuthenticationHeld(tracked, authentication);
 });
 
 test("a sticky native dialog prevents retiring the auth popup", async () => {
@@ -290,7 +295,7 @@ test("a sticky native dialog prevents retiring the auth popup", async () => {
     1_000,
   );
 
-  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+  await assertManualAuthenticationHeld(tracked, authentication);
   chat.composerEnabled = true;
   authentication.emitDialog();
 
@@ -310,13 +315,13 @@ test("navigation within an open authentication popup retains ownership", async (
     1_000,
   );
 
-  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+  await assertManualAuthenticationHeld(tracked, authentication);
   chat.composerEnabled = true;
   authentication.navigate(
     "https://login.microsoftonline.com/common/oauth2/authorize?client_id=synthetic&step=mfa",
   );
 
-  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+  await assertManualAuthenticationHeld(tracked, authentication);
   assert.match(authentication.currentUrl, /step=mfa/u);
 });
 
@@ -336,12 +341,12 @@ test("a newer authentication popup supersedes the existing authentication page",
     1_000,
   );
 
-  assert.equal(await tracked.currentUrl(), authenticationA.currentUrl);
+  await assertManualAuthenticationHeld(tracked, authenticationA);
   chat.composerEnabled = true;
-  context.pageList.push(authenticationB);
+  context.addPage(authenticationB);
 
-  assert.equal(await tracked.currentUrl(), authenticationB.currentUrl);
-  assert.equal(await tracked.currentUrl(), authenticationB.currentUrl);
+  await assertManualAuthenticationHeld(tracked, authenticationB);
+  await assertManualAuthenticationHeld(tracked, authenticationB);
 });
 
 test("a newer auth popup recaptures the chat baseline for its own episode", async () => {
@@ -357,17 +362,17 @@ test("a newer auth popup recaptures the chat baseline for its own episode", asyn
     1_000,
   );
 
-  assert.equal(await tracked.currentUrl(), authenticationA.currentUrl);
+  await assertManualAuthenticationHeld(tracked, authenticationA);
 
   const chatB = new NavigationPage("https://m365.cloud.microsoft/chat/conversation/second");
   chatB.composerEnabled = true;
   const authenticationB = new NavigationPage(
     "https://login.microsoftonline.com/common/oauth2/authorize?client_id=synthetic&popup=b",
   );
-  context.pageList.splice(0, context.pageList.length, authenticationA, chatB, authenticationB);
+  context.replacePages(authenticationA, chatB, authenticationB);
 
-  assert.equal(await tracked.currentUrl(), authenticationB.currentUrl);
-  assert.equal(await tracked.currentUrl(), authenticationB.currentUrl);
+  await assertManualAuthenticationHeld(tracked, authenticationB);
+  await assertManualAuthenticationHeld(tracked, authenticationB);
 });
 
 test("an open auth popup with a native dialog blocks disclosure", async () => {
@@ -384,7 +389,7 @@ test("an open auth popup with a native dialog blocks disclosure", async () => {
     1_000,
   );
 
-  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+  await assertManualAuthenticationHeld(tracked, authentication);
   chat.composerEnabled = true;
   authentication.emitDialog();
   assert.equal(await tracked.currentUrl(), authentication.currentUrl);
@@ -422,10 +427,10 @@ test("DOM-only auth controls cannot yield ownership while their popup stays open
     1_000,
   );
 
-  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+  await assertManualAuthenticationHeld(tracked, authentication);
   chat.composerEnabled = true;
   authentication.authenticationControlVisible = true;
-  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+  await assertManualAuthenticationHeld(tracked, authentication);
   assert.equal(chat.composerFillCalls, 0);
 });
 
@@ -451,6 +456,27 @@ function trackedPageConfig() {
     manualAuthenticationHosts: [{ hostname: "login.microsoftonline.com" }],
     uiContract: createBaselineCopilotUiContract("Synthetic Work Account"),
   } as const;
+}
+
+async function assertManualAuthenticationHeld(
+  tracked: ContextSemanticPage,
+  expectedPage: NavigationPage,
+): Promise<void> {
+  const priorForegrounds = expectedPage.bringToFrontCalls;
+  assert.equal(
+    await tracked.withManualReadinessProbe(() =>
+      tracked.holdForManualAuthenticationHandoff(true)),
+    true,
+  );
+  assert.equal(expectedPage.bringToFrontCalls, priorForegrounds + 1);
+  assert.equal(tracked.isManualAuthenticationRedirect(), true);
+}
+
+function retryableManualReadinessTransition(error: unknown): boolean {
+  return error instanceof AgentError &&
+    error.code === "TRANSPORT_INDETERMINATE" &&
+    error.details.diagnosticCode === "ACTIVE_PAGE_CHANGED_DURING_OBSERVATION" &&
+    error.details.dispatchAttempted === false;
 }
 
 test("composer actionability follows the same later candidate that fill will use", async () => {
@@ -577,6 +603,7 @@ class NavigationPage {
   public composerEnabled = false;
   public authenticationControlVisible = false;
   public composerFillCalls = 0;
+  public bringToFrontCalls = 0;
   readonly #listeners = new Map<string, Array<(...args: unknown[]) => void>>();
   readonly #mainFrame = {} as Frame;
 
@@ -586,7 +613,9 @@ class NavigationPage {
   public isClosed(): boolean { return this.closed; }
   public setDefaultTimeout(_milliseconds: number): void {}
   public setDefaultNavigationTimeout(_milliseconds: number): void {}
-  public async bringToFront(): Promise<void> {}
+  public async bringToFront(): Promise<void> {
+    this.bringToFrontCalls += 1;
+  }
   public mainFrame(): Frame { return this.#mainFrame; }
   public getByRole(role: string): Locator {
     if (this.#isAuthenticationPage()) {
@@ -674,6 +703,18 @@ class NavigationContext {
   public on(event: string, listener: (page: Page) => void): this {
     if (event === "page") this.#listeners.push(listener);
     return this;
+  }
+  public addPage(...pages: readonly NavigationPage[]): void {
+    this.pageList.push(...pages);
+    for (const page of pages) {
+      for (const listener of this.#listeners) listener(page.asPage());
+    }
+  }
+  public replacePages(...pages: readonly NavigationPage[]): void {
+    this.pageList.splice(0, this.pageList.length, ...pages);
+    for (const page of pages) {
+      for (const listener of this.#listeners) listener(page.asPage());
+    }
   }
   public asContext(): BrowserContext { return this as unknown as BrowserContext; }
 }

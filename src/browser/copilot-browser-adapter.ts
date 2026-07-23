@@ -28,7 +28,11 @@ import {
   validateBrowserConfig,
   type CopilotBrowserAdapterConfig,
 } from "./config.js";
-import type { CopilotPageObservation, SemanticPage } from "./contracts.js";
+import type {
+  CopilotPageObservation,
+  CopilotSignal,
+  SemanticPage,
+} from "./contracts.js";
 import { minimalBrowserDiagnostic, type MinimalBrowserDiagnostic } from "./diagnostics.js";
 import {
   assertKillSwitchEnabled,
@@ -130,6 +134,34 @@ export class CopilotBrowserAdapter implements ModelTransport {
 
   public async inspectState(): Promise<BrowserStateInspection> {
     return this.#runExclusiveBrowserOperation(() => this.#inspectState());
+  }
+
+  /**
+   * Manual setup can follow a provenance-validated external identity-provider
+   * page without reading its DOM. Once the handoff ends, the normal complete
+   * Copilot readiness observation runs again before setup can be persisted.
+   */
+  public async inspectManualReadinessState(
+    holdForManualHandoff: () => Promise<boolean>,
+    manualHandoffStillActive?: () => boolean,
+    signal?: AbortSignal,
+  ): Promise<BrowserStateInspection> {
+    return this.#runExclusiveBrowserOperation(async () => {
+      this.#assertUsable(signal);
+      if (await holdForManualHandoff()) {
+        this.#assertUsable(signal);
+        return this.#manualHandoffInspection();
+      }
+      this.#assertUsable(signal);
+      const inspection = await this.#inspectState();
+      if (
+        inspection.classification.state !== "ready" &&
+        manualHandoffStillActive?.() === true
+      ) {
+        return this.#manualHandoffInspection();
+      }
+      return inspection;
+    });
   }
 
   async #inspectState(): Promise<BrowserStateInspection> {
@@ -769,6 +801,28 @@ export class CopilotBrowserAdapter implements ModelTransport {
     return {
       classification,
       diagnostic: minimalBrowserDiagnostic(observation, this.#config.uiContract, classification),
+    };
+  }
+
+  #manualHandoffInspection(): BrowserStateInspection {
+    const classification: PageClassification = {
+      state: "sign-in-required",
+      retryable: true,
+      diagnosticCode: "MANUAL_SSO_HANDOFF",
+    };
+    const signals = Object.keys(this.#config.uiContract.groups) as CopilotSignal[];
+    return {
+      classification,
+      diagnostic: {
+        uiContractVersion: this.#config.uiContract.version,
+        state: classification.state,
+        diagnosticCode: classification.diagnosticCode,
+        locatorQuorum: Object.fromEntries(
+          signals.map((signal) => [signal, false] as const),
+        ) as Readonly<Record<CopilotSignal, boolean>>,
+        summary: "The dedicated browser is waiting for manual tenant sign-in.",
+        next: "Complete the visible tenant sign-in and wait for Copilot Chat to return.",
+      },
     };
   }
 
