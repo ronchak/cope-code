@@ -97,6 +97,7 @@ export class ContextSemanticPage implements SemanticPage {
   readonly #configuredPages = new WeakSet<Page>();
   readonly #manualHandoffPages = new WeakSet<Page>();
   readonly #manualHandoffPopupPages = new WeakSet<Page>();
+  readonly #externalSsoHandoffPopupPages = new WeakSet<Page>();
   readonly #navigationEpochs = new WeakMap<Page, number>();
   #nativeDialogEpoch = 0;
   #activePage: Page;
@@ -800,7 +801,8 @@ export class ContextSemanticPage implements SemanticPage {
       isConfiguredCopilotUrl(page.url(), this.#config.entryUrl));
     if (configuredPages.length !== 2) return undefined;
     const callbackPopups = configuredPages.filter((page) =>
-      this.#manualHandoffPopupPages.has(page));
+      this.#manualHandoffPopupPages.has(page) &&
+      this.#externalSsoHandoffPopupPages.has(page));
     return callbackPopups.length === 1 ? callbackPopups[0] : undefined;
   }
 
@@ -903,6 +905,17 @@ export class ContextSemanticPage implements SemanticPage {
   }
 
   #grantManualHandoffAnchor(page: Page): void {
+    if (
+      this.#manualHandoffPages.has(page) &&
+      this.#manualHandoffPopupPages.has(page) &&
+      isProvenanceBoundExternalSsoUrl(page.url(), this.#config.entryUrl)
+    ) {
+      // A configured popup is a completed SSO callback only after this exact
+      // popup was observed on an external tenant IdP. Opener provenance alone
+      // is insufficient: ordinary app- or user-opened Copilot tabs must remain
+      // ambiguous during setup just as they are during normal operations.
+      this.#externalSsoHandoffPopupPages.add(page);
+    }
     if (
       isConfiguredCopilotUrl(page.url(), this.#config.entryUrl) ||
       isGenuineManualAuthenticationUrl(page.url(), this.#config)

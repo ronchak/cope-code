@@ -262,6 +262,37 @@ test("setup can inspect a configured popup callback while ordinary operations st
   assert.equal(await tracked.currentUrl(), context.navigationPage.currentUrl);
 });
 
+test("setup never treats an ordinary configured popup as a completed SSO callback", async () => {
+  const context = new DelayedContext();
+  context.navigationPage.onGoto = async () => {
+    context.navigationPage.currentUrl = "https://m365.cloud.microsoft/chat";
+    return null;
+  };
+  const tracked = await openTrackedCopilotPage(context.asContext(), browserConfig());
+  const ordinaryPopup = new DelayedPage(
+    "https://m365.cloud.microsoft/chat/conversation/ordinary-popup",
+  );
+  context.addPage(ordinaryPopup);
+  context.navigationPage.emitPopup(ordinaryPopup);
+
+  assert.equal(
+    await tracked.holdForManualAuthenticationHandoff(),
+    false,
+    "opener provenance alone must not create an SSO callback handoff",
+  );
+  await tracked.withManualReadinessProbe(async () => {
+    assert.equal(
+      await tracked.holdForManualAuthenticationHandoff(false, true),
+      false,
+    );
+    await assert.rejects(
+      tracked.currentUrl(),
+      /Multiple approved Copilot pages/u,
+      "setup must preserve ordinary configured-page ambiguity",
+    );
+  });
+});
+
 test("an external SSO success popup retains manual ownership until it closes", async () => {
   const context = new DelayedContext();
   const sso = new DelayedPage("https://identity.example.test/sso/login");
