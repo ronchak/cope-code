@@ -443,7 +443,7 @@ test("baseline identity evidence is limited to explicit account and profile cont
   for (const selector of identity.candidates[0].selector.split(",")) {
     assert.match(
       selector,
-      /mectrl|mecontrol|me-control|account-control|account-menu|profile|persona/iu,
+      /user-account-avatar|mectrl|mecontrol|me-control|account-control|account-menu|profile|persona/iu,
       selector,
     );
   }
@@ -571,7 +571,7 @@ function inspection(
   return {
     classification: { state, retryable: state === "ready", diagnosticCode },
     diagnostic: {
-      uiContractVersion: "copilot-ui/v1:m365-2026-07",
+      uiContractVersion: "copilot-ui/v1:m365-2026-07-r3",
       state,
       diagnosticCode,
       locatorQuorum,

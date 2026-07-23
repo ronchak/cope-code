@@ -96,6 +96,22 @@ class BlockedTextLocator {
   public async getAttribute(_name: string): Promise<string | null> { return null; }
 }
 
+class ActionabilityTrackingLocator {
+  public enabledCalls = 0;
+
+  public async count(): Promise<number> { return 1; }
+  public nth(_index: number): Locator { return this as unknown as Locator; }
+  public async isVisible(): Promise<boolean> { return true; }
+  public async isEnabled(): Promise<boolean> {
+    this.enabledCalls += 1;
+    return true;
+  }
+  public async isEditable(): Promise<boolean> { return true; }
+  public async innerText(): Promise<string> { return "stable text"; }
+  public async inputValue(): Promise<string> { return "stable text"; }
+  public async getAttribute(_name: string): Promise<string | null> { return null; }
+}
+
 function timeoutError(error: unknown): AgentError {
   assert.equal(error instanceof AgentError, true);
   assert.equal((error as AgentError).details.diagnosticCode, "BROWSER_OPERATION_TIMEOUT");
@@ -121,6 +137,49 @@ async function rejectionWithin(promise: Promise<unknown>, milliseconds: number):
     if (watchdog !== undefined) clearTimeout(watchdog);
   }
 }
+
+test("only composer, send, and modal snapshots probe element actionability", async () => {
+  const presenceAndTextGroups: readonly LocatorGroup[] = [
+    {
+      signal: "conversation",
+      candidates: [{ kind: "css", selector: "main" }],
+      minimumCandidateMatches: 1,
+      maximumElements: 1,
+      capture: "presence",
+    },
+    responsesGroup,
+  ];
+  for (const group of presenceAndTextGroups) {
+    const locator = new ActionabilityTrackingLocator();
+    const semantic = new PlaywrightSemanticPage(
+      new TimeoutPage(locator) as unknown as Page,
+    );
+    const snapshot = await semantic.snapshot(group);
+    assert.equal(snapshot.visibleElements, 1);
+    assert.equal(snapshot.enabledElements, 1);
+    assert.equal(locator.enabledCalls, 0, `${group.signal} must not probe isEnabled`);
+  }
+
+  const actionableGroups: readonly LocatorGroup[] = [
+    composerGroup,
+    sendGroup,
+    {
+      signal: "modal",
+      candidates: [{ kind: "css", selector: "[role='dialog']" }],
+      minimumCandidateMatches: 1,
+      maximumElements: 1,
+      capture: "presence",
+    },
+  ];
+  for (const group of actionableGroups) {
+    const locator = new ActionabilityTrackingLocator();
+    const semantic = new PlaywrightSemanticPage(
+      new TimeoutPage(locator) as unknown as Page,
+    );
+    await semantic.snapshot(group);
+    assert.equal(locator.enabledCalls, 1, `${group.signal} must probe isEnabled`);
+  }
+});
 
 test("a deadline during locator discovery cannot issue a late fill or click", async () => {
   for (const action of ["fill", "click"] as const) {
@@ -472,7 +531,10 @@ test("clock checks reject operations that settle after starving their deadline t
     } catch (error) {
       observedError = error;
     }
-    assert.equal(timeoutError(observedError).details.dispatchAttempted, true);
+    assert.equal(
+      timeoutError(observedError).details.dispatchAttempted,
+      action === "fill",
+    );
     assert.equal(element.evaluateCalls, 1);
     assert.equal(terminations, 1);
   }
@@ -692,7 +754,9 @@ test("composer recheck and send dispatch share one semantic click deadline", asy
   }
   const elapsedMs = performance.now() - startedAt;
 
-  assert.equal(timeoutError(observedError).details.dispatchAttempted, true);
+  // The shared deadline expires in the bound-element hit-test, before the
+  // protocol click is attempted.
+  assert.equal(timeoutError(observedError).details.dispatchAttempted, false);
   assert.ok(
     elapsedMs < 260,
     `composer recheck and send used more than one 200 ms deadline: ${elapsedMs} ms`,

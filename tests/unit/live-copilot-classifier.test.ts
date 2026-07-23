@@ -535,7 +535,27 @@ test("manual auth evidence still blocks a configured chat without an actionable 
 test("the baseline contract carries the current M365 locator revision and semantic fallbacks", () => {
   const contract = createBaselineCopilotUiContract("Ronak Chakraborty");
 
-  assert.equal(contract.version, "copilot-ui/v1:m365-2026-07");
+  assert.equal(contract.version, "copilot-ui/v1:m365-2026-07-r3");
+  const conversationTestId = contract.groups.conversation.candidates.find(
+    (candidate) => candidate.kind === "test-id",
+  );
+  assert.ok(conversationTestId?.kind === "test-id");
+  assert.equal(typeof conversationTestId.testId, "object");
+  if (typeof conversationTestId.testId !== "string") {
+    const conversationPattern = new RegExp(
+      conversationTestId.testId.source,
+      conversationTestId.testId.flags,
+    );
+    assert.equal(conversationPattern.test("conversation-container"), true);
+    for (const transientMessageId of ["chatQuestion", "chatOutput", "lastChatMessage"]) {
+      assert.equal(conversationPattern.test(transientMessageId), false);
+    }
+  }
+  const conversationCss = contract.groups.conversation.candidates.find(
+    (candidate) => candidate.kind === "css",
+  );
+  assert.ok(conversationCss?.kind === "css");
+  assert.equal(conversationCss.selector.includes("*="), false);
   assert.equal(contract.groups.composer.candidates.some((candidate) => candidate.kind === "label"), true);
   assert.equal(contract.groups.composer.candidates.some((candidate) => candidate.kind === "css"), true);
   assert.deepEqual(
@@ -547,7 +567,7 @@ test("the baseline contract carries the current M365 locator revision and semant
   assert.ok(identityCss?.kind === "css");
   assert.equal(
     identityCss.selector.split(",").every((selector) =>
-      /mectrl|mecontrol|me-control|account-control|account-menu|profile|persona/iu.test(selector)),
+      /user-account-avatar|mectrl|mecontrol|me-control|account-control|account-menu|profile|persona/iu.test(selector)),
     true,
   );
   assert.equal(

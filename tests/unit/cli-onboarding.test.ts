@@ -183,7 +183,7 @@ test("final setup readiness preserves identity diagnostics and commits nothing",
       diagnosticCode: "IDENTITY_NOT_VERIFIED",
     },
     diagnostic: {
-      uiContractVersion: "copilot-ui/v1:m365-2026-07",
+      uiContractVersion: "copilot-ui/v1:m365-2026-07-r3",
       state: "identity-unverified" as const,
       diagnosticCode: "IDENTITY_NOT_VERIFIED",
       locatorQuorum: {},
@@ -1036,7 +1036,7 @@ test("no-browser setup offers manual installation selection and never saves befo
           diagnosticCode: "IDENTITY_NOT_VERIFIED",
         },
         diagnostic: {
-          uiContractVersion: "copilot-ui/v1:m365-2026-07",
+          uiContractVersion: "copilot-ui/v1:m365-2026-07-r3",
           state: "identity-unverified",
           diagnosticCode: "IDENTITY_NOT_VERIFIED",
           locatorQuorum: {},

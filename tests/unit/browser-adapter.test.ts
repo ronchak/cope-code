@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import { CopilotBrowserAdapter } from "../../src/browser/copilot-browser-adapter.js";
 import {
+  conversationIdFromUrl,
   createBaselineCopilotUiContract,
   type CopilotBrowserAdapterConfig,
 } from "../../src/browser/config.js";
@@ -27,6 +28,7 @@ class DynamicFakePage implements SemanticPage {
   public readonly responses: string[] = ["prior response"];
   public streaming = false;
   public sendEnabled = true;
+  public userMessagesVisible = true;
   public activationMode: ActivationMode = "submitted";
   public preActivationDiagnostic: string | undefined = undefined;
   public fillCalls = 0;
@@ -117,7 +119,9 @@ class DynamicFakePage implements SemanticPage {
       case "responses":
         return this.responses.map((response) => element(response));
       case "user-messages":
-        return this.userMessages.map((message) => element(message));
+        return this.userMessagesVisible
+          ? this.userMessages.map((message) => element(message))
+          : [];
       case "streaming":
         return this.streaming ? [element("streaming")] : [];
       case "signed-out":
@@ -186,6 +190,63 @@ test("adapter submits once, confirms its task marker, and captures a stable resp
   const duplicate = await adapter.submit(request);
   assert.equal(duplicate.status, "submitted");
   assert.equal(page.activationCalls, 1, "same idempotency key must never activate twice");
+
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "completed");
+  if (response.status === "completed") {
+    assert.equal(response.content, "completed response envelope");
+  }
+});
+
+test("first submission adopts an M365 conversation URL only after exact marker proof", async () => {
+  const page = new DynamicFakePage();
+  page.url = "https://copilot.example.test/chat";
+  const materializedUrl = "https://copilot.example.test/chat/conversation-materialized";
+  const { adapter } = makeHarness(
+    page,
+    new MutableBrowserKillSwitch(),
+    () => { page.url = materializedUrl; },
+  );
+
+  const receipt = await adapter.submit(request);
+  assert.equal(receipt.status, "submitted");
+  assert.equal(receipt.conversationId, conversationIdFromUrl(materializedUrl));
+
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "completed");
+  assert.equal(response.conversationId, receipt.conversationId);
+});
+
+test("entry marker proof cannot survive a materialized URL with missing marker evidence", async () => {
+  const page = new DynamicFakePage();
+  page.url = "https://copilot.example.test/chat";
+  let sleeps = 0;
+  const { adapter } = makeHarness(
+    page,
+    new MutableBrowserKillSwitch(),
+    () => {
+      sleeps += 1;
+      if (sleeps === 1) {
+        page.url = "https://copilot.example.test/chat/conversation-without-marker";
+        page.userMessagesVisible = false;
+      }
+    },
+  );
+
+  const receipt = await adapter.submit(request);
+  assert.equal(receipt.status, "indeterminate");
+  assert.equal(receipt.diagnosticCode, "CONVERSATION_CHANGED_AFTER_ACTIVATION");
+});
+
+test("receive tolerates a transient M365 user-envelope remount without trusting the gap", async () => {
+  const page = new DynamicFakePage();
+  const { adapter } = makeHarness(
+    page,
+    new MutableBrowserKillSwitch(),
+    () => { page.userMessagesVisible = true; },
+  );
+  assert.equal((await adapter.submit(request)).status, "submitted");
+  page.userMessagesVisible = false;
 
   const response = await adapter.receive(request);
   assert.equal(response.status, "completed");
@@ -272,6 +333,20 @@ test("response correlation rejects more than one appended assistant envelope", a
   assert.equal(response.status, "indeterminate");
   if (response.status === "indeterminate") {
     assert.equal(response.diagnosticCode, "RESPONSE_SEQUENCE_AMBIGUOUS");
+  }
+});
+
+test("response correlation accepts one proven M365 rolling-window shift", async () => {
+  const page = new DynamicFakePage();
+  page.responses.push("prior response 2", "prior response 3", "prior response 4");
+  const { adapter } = makeHarness(page);
+  assert.equal((await adapter.submit(request)).status, "submitted");
+  page.responses.shift();
+
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "completed");
+  if (response.status === "completed") {
+    assert.equal(response.content, "completed response envelope");
   }
 });
 

@@ -73,17 +73,25 @@ export const DEFAULT_BROWSER_WAITS: BrowserWaitConfig = Object.freeze({
 const PROTECTION_ACCESSIBLE_NAME_PATTERN =
   "^(?:enterprise data protection|commercial data protection)$";
 const ASSISTANT_MESSAGE_SELECTORS = [
+  '[data-testid="copilot-message-reply-div"]',
   '[data-content="ai-message"]',
   '[data-author="assistant"]',
   '[data-testid*="assistant" i][data-testid*="message" i]',
   '[data-testid*="response" i][data-testid*="message" i]',
 ] as const;
 const USER_MESSAGE_SELECTORS = [
+  '[data-testid="chatQuestion"]',
   '[data-content="user-message"]',
   '[data-author="user"]',
   '[data-testid*="user" i][data-testid*="message" i]',
 ] as const;
 const IDENTITY_CONTROL_SELECTORS = [
+  // Current M365 Copilot navigation renders the signed-in owner as an
+  // aria-hidden Fluent avatar followed by a labeled overlay button. Anchor the
+  // overlay to the stable owner-avatar id: capturing the avatar itself would
+  // mix its initials text with its full-name aria-label, while a generic
+  // role/button selector would admit unrelated navigation actions.
+  '[role="navigation"] footer div:has(> [id="user-account-avatar"]) + [role="button"][aria-label]',
   'button[id*="mectrl" i]',
   '[role="button"][id*="mectrl" i]',
   'button[id*="mecontrol" i]',
@@ -122,10 +130,20 @@ export function createBaselineCopilotUiContract(
       "conversation",
       [
         { kind: "role", role: "main" },
-        { kind: "test-id", testId: pattern("chat|conversation") },
+        {
+          kind: "test-id",
+          testId: pattern("^(?:chat|conversation)(?:-?(?:container|root|page|surface|view))?$"),
+        },
         {
           kind: "css",
-          selector: 'main, [role="main"], [data-testid*="chat" i], [data-testid*="conversation" i]',
+          selector: [
+            "main",
+            '[role="main"]',
+            '[data-testid="chat"]',
+            '[data-testid="conversation"]',
+            '[data-testid="chat-container"]',
+            '[data-testid="conversation-container"]',
+          ].join(", "),
         },
       ],
       "presence",
@@ -294,7 +312,7 @@ export function createBaselineCopilotUiContract(
     modal: group("modal", [{ kind: "role", role: "dialog" }], "presence"),
   };
   return {
-    version: `${COPILOT_UI_CONTRACT_VERSION}:m365-2026-07`,
+    version: `${COPILOT_UI_CONTRACT_VERSION}:m365-2026-07-r3`,
     certifiedSurface: "Microsoft 365 Copilot Chat web",
     submissionStrategy: "send-control",
     groups,
