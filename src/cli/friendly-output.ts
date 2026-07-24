@@ -26,7 +26,7 @@ export function renderHumanResult(value: Readonly<Record<string, unknown>>): str
   const current = recordValue(repository?.current);
   const entries = Array.isArray(current?.entries) ? current.entries : undefined;
   if (entries !== undefined && entries.length > 0) {
-    lines.push(`\n${bold("Changed files")}`);
+    lines.push(`\n${bold("Current Git-visible changes")}`);
     for (const entry of entries.slice(0, 20)) {
       const record = recordValue(entry);
       const file = stringValue(record?.path);
@@ -45,6 +45,35 @@ export function renderHumanResult(value: Readonly<Record<string, unknown>>): str
       const outcome = stringValue(record?.outcome) ?? "unknown";
       lines.push(`  ${outcome === "success" ? green(symbols.ok) : yellow(symbols.warning)} ${command}: ${outcome}`);
     }
+  }
+
+  if (handoff !== undefined && status === "completed") {
+    const handoffRepository = recordValue(handoff.repository);
+    const agentChanged = stringArray(handoffRepository?.agentChangedPaths);
+    const preExisting = stringArray(handoffRepository?.preExistingChanges);
+    const disclosures = recordValue(handoff.disclosures);
+    lines.push(`\n${bold("Completion evidence")}`);
+    lines.push(`  ${green(symbols.ok)} Agent changes: ${agentChanged.length} file${agentChanged.length === 1 ? "" : "s"}`);
+    lines.push(`  ${cyan(symbols.bullet)} Pre-existing changes left attributable to the operator: ${preExisting.length}`);
+    lines.push(`  ${cyan(symbols.bullet)} Validation records: ${validation?.length ?? 0}`);
+    const disclosedBytes = numberValue(disclosures?.disclosedBytes);
+    const redactionCount = numberValue(disclosures?.redactionCount);
+    if (disclosedBytes !== undefined) lines.push(`  ${cyan(symbols.bullet)} Disclosed bytes: ${disclosedBytes}; redactions: ${redactionCount ?? 0}`);
+    if (sessionId !== undefined) {
+      lines.push(`\n${bold("Review safely")}`);
+      lines.push(`  ${dim(`cope status ${sessionId}`)}`);
+      lines.push(`  ${dim(`cope export-review ${sessionId}`)}`);
+      lines.push(`  ${dim("git diff --stat && git diff")}`);
+    }
+  }
+
+  if (sessionId !== undefined && status !== undefined && ["paused", "blocked", "failed"].includes(status)) {
+    lines.push(`\n${bold("Recovery")}`);
+    if (status === "paused") lines.push(`  ${cyan("Resume:")} cope resume ${sessionId}`);
+    lines.push(`  ${cyan("Inspect:")} cope status ${sessionId}`);
+    lines.push(`  ${cyan("Verify evidence:")} cope verify-audit ${sessionId}`);
+    const checkpointId = stringValue(handoff?.checkpointId) ?? stringValue(value.checkpointId);
+    if (checkpointId !== undefined) lines.push(`  ${yellow("Rollback after inspection:")} cope rollback ${sessionId} --checkpoint ${checkpointId}`);
   }
 
   if (lines.length === 0) return `${JSON.stringify(value, null, 2)}\n`;
@@ -133,3 +162,6 @@ function recordValue(value: unknown): Readonly<Record<string, unknown>> | undefi
 }
 function stringValue(value: unknown): string | undefined { return typeof value === "string" ? value : undefined; }
 function numberValue(value: unknown): number | undefined { return typeof value === "number" ? value : undefined; }
+function stringArray(value: unknown): readonly string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}

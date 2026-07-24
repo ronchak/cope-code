@@ -43,6 +43,8 @@ Before a task begins, Cope shows a compact access screen with the project, mode,
 
 Use `cope -c` to continue the latest resumable session for the selected project. Use `/sessions` or `cope sessions` to inspect recent work. The complete recovery command set remains available under `cope help advanced`.
 
+Cope preserves normal terminal scrollback by default. Set `COPE_FULLSCREEN=1` only when you want the guided interface to use an alternate full-screen buffer. Every new task prints its session ID as soon as durable session state exists; keep that ID for `cope status`, `cope resume`, `cope verify-audit`, `cope export-review`, or an inspected checkpoint rollback.
+
 ## Diagnostics
 
 ```powershell
