@@ -43,6 +43,7 @@ export async function commitBrowserSetup(options: {
     await assertBrowserSetupRecoveryReady(options.stateHome, options.host);
     await options.revalidate();
     await assertBaselineUnchanged(options.browserFile, options.browserBaseline);
+    await assertBrowserSetupRecoveryReady(options.stateHome, options.host);
     if (options.organizationPolicyToCreate !== undefined) {
       const existing = await readBrowserConfigBaseline(options.organizationPolicyFile);
       if (existing.exists) {

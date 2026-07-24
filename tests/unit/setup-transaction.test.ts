@@ -323,3 +323,72 @@ test("browser setup refuses a valid resumable live-browser session", async (cont
   );
   assert.equal(await readFile(browserFile, "utf8"), "original\n");
 });
+
+test("browser setup rechecks recovery after final revalidation", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-setup-revalidation-session-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const configDirectory = path.join(root, "config");
+  const browserFile = path.join(configDirectory, "browser.json");
+  const policyFile = path.join(configDirectory, "organization-policy.json");
+  await mkdir(configDirectory, { recursive: true });
+  await writeFile(browserFile, "original\n", "utf8");
+  const baseline = await readBrowserConfigBaseline(browserFile);
+  const now = "2026-07-19T12:00:00.000Z";
+  const interruptedState: SessionState = {
+    schemaVersion: 1,
+    protocolVersion: "cba/1",
+    sessionId: "session_started_during_revalidation",
+    taskId: "task_started_during_revalidation",
+    repositoryRoot: path.join(root, "repository"),
+    repositoryFingerprintAtStart: "f".repeat(64),
+    repositoryExcludedStateAtStart: "0".repeat(64),
+    preExistingChanges: [],
+    objective: "Remain recoverable if startup is interrupted",
+    acceptanceCriteria: [],
+    mode: "edit",
+    status: "transport_starting",
+    createdAt: now,
+    updatedAt: now,
+    startedAt: now,
+    policyHashes: {
+      organization: "a".repeat(64),
+      repository: "b".repeat(64),
+      grant: "c".repeat(64),
+    },
+    budgetLimits: { ...DEFAULT_BUDGET_LIMITS },
+    budgetUsage: zeroBudgetUsage(),
+    turnSequence: 0,
+    mutationSequence: 0,
+    pendingOperations: [],
+    completedOperationIds: [],
+    mutations: [],
+    validations: [],
+    protocolRepairStreak: 0,
+  };
+  const store = new SessionStore(root);
+
+  await assert.rejects(
+    commitBrowserSetup({
+      stateHome: root,
+      browserFile,
+      browserBaseline: baseline,
+      organizationPolicyFile: policyFile,
+      organizationPolicyToCreate: {
+        ...DEFAULT_ORGANIZATION_POLICY,
+        policy_id: "test",
+        revision: "1",
+      },
+      browserConfig: browserConfig("chrome"),
+      host,
+      revalidate: async () => {
+        await store.create(interruptedState);
+        // Deliberately omit runtime.json to model interruption during session startup.
+      },
+    }),
+    (error: unknown) => error instanceof AgentError &&
+      error.details.diagnosticCode === "BROWSER_CONFIG_RECOVERY_BLOCKED" &&
+      error.details.sessionId === interruptedState.sessionId,
+  );
+  assert.equal(await readFile(browserFile, "utf8"), "original\n");
+  await assert.rejects(readFile(policyFile), { code: "ENOENT" });
+});
