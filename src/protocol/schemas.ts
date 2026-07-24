@@ -99,6 +99,34 @@ const gitDiffSchema = strictObject({
   max_bytes: { type: "integer", minimum: 1, maximum: 16_777_216 },
 });
 
+const lspQuerySchema: JsonSchema = {
+  oneOf: [
+    strictObject(
+      {
+        operation: { enum: ["hover", "definition", "references"] },
+        path: pathString,
+        line: { type: "integer", minimum: 0 },
+        character: { type: "integer", minimum: 0 },
+        include_declaration: { type: "boolean" },
+        max_results: { type: "integer", minimum: 1, maximum: 500 },
+        timeout_ms: { type: "integer", minimum: 1, maximum: 30_000 },
+        max_bytes: { type: "integer", minimum: 4_096, maximum: 262_144 },
+      },
+      ["operation", "path", "line", "character"],
+    ),
+    strictObject(
+      {
+        operation: { const: "document_symbols" },
+        path: pathString,
+        max_results: { type: "integer", minimum: 1, maximum: 500 },
+        timeout_ms: { type: "integer", minimum: 1, maximum: 30_000 },
+        max_bytes: { type: "integer", minimum: 4_096, maximum: 262_144 },
+      },
+      ["operation", "path"],
+    ),
+  ],
+};
+
 const atomicChangeSchema: JsonSchema = {
   oneOf: [
     strictObject({ kind: { const: "create" }, path: pathString, content: { type: "string", maxLength: 1_048_576 } }, [
@@ -248,6 +276,7 @@ export const TOOL_ARGUMENT_SCHEMAS: Readonly<Record<ToolName, JsonSchema>> = {
   read_file: readFileSchema,
   git_status: gitStatusSchema,
   git_diff: gitDiffSchema,
+  lsp_query: lspQuerySchema,
   apply_patch: applyPatchSchema,
   run_command: runCommandSchema,
   request_user_input: requestUserInputSchema,

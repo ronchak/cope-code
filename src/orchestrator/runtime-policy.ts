@@ -149,10 +149,10 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
     let network: PolicyOperation["network"];
     let change: PolicyOperation["change"];
 
-    if (call.name === "read_file") {
+    if (call.name === "read_file" || call.name === "lsp_query") {
       const byteCount = positiveInteger(call.arguments.max_bytes) ?? this.options.defaultReadBytes ?? 128 * 1024;
       disclosure = disclosureFact(this.classification, byteCount, 1);
-      usage.read_files += 1;
+      if (call.name === "read_file") usage.read_files += 1;
       usage.disclosed_bytes += byteCount;
     } else if (call.name === "search_text") {
       const byteCount = this.options.defaultSearchBytes ?? 128 * 1024;
@@ -241,6 +241,9 @@ function pathFacts(call: NormalizedToolCall): NonNullable<PolicyOperation["paths
     return [{ path: optionalString(call.arguments.path) ?? ".", access: "read" }];
   }
   if (call.name === "read_file") {
+    return [{ path: requiredString(call.arguments.path, "path"), access: "read" }];
+  }
+  if (call.name === "lsp_query") {
     return [{ path: requiredString(call.arguments.path, "path"), access: "read" }];
   }
   if (call.name === "git_diff" && Array.isArray(call.arguments.paths)) {

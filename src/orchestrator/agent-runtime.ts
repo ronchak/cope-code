@@ -33,7 +33,7 @@ import type {
   UserInteraction,
 } from "./contracts.js";
 
-const READ_ONLY_TOOLS = new Set(["list_files", "search_text", "read_file", "git_status", "git_diff"]);
+const READ_ONLY_TOOLS = new Set(["list_files", "search_text", "read_file", "git_status", "git_diff", "lsp_query"]);
 
 export interface AgentRuntimeDependencies {
   readonly state: SessionState;
