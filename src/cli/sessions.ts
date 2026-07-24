@@ -124,7 +124,7 @@ export async function executeSessionsCommand(
       : session.recovery.disposition === "terminal" ? " " : "!";
     io.stdout.write(`\n${marker} ${session.objective}\n`);
     keyValue("Status", session.status, io.stdout);
-    if (session.recovery.disposition !== "terminal" && !session.resumable) {
+    if (session.recovery.disposition !== "terminal") {
       keyValue("Recovery", session.recovery.disposition.replaceAll("_", " "), io.stdout);
       keyValue("Why", recoveryReasonSummary(session.recovery.reason), io.stdout);
       if (session.recovery.next !== undefined) keyValue("Next", session.recovery.next, io.stdout);

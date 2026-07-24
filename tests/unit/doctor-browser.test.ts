@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -18,6 +18,8 @@ import {
   zeroBudgetUsage,
   type SessionState,
 } from "../../src/session/types.js";
+import type { BrowserFileConfig } from "../../src/config/types.js";
+import { sha256, stableJson } from "../../src/shared/crypto.js";
 
 const digest = "a".repeat(64);
 
@@ -132,37 +134,7 @@ test("doctor orders stale-session recovery before missing browser setup", async 
   const stateHome = path.join(root, "state");
   await mkdir(stateHome, { mode: 0o700 });
   const now = "2026-07-24T12:00:00.000Z";
-  const state: SessionState = {
-    schemaVersion: 1,
-    protocolVersion: "cba/1",
-    sessionId: "session_doctor_recovery",
-    taskId: "task_doctor_recovery",
-    repositoryRoot: process.cwd(),
-    repositoryFingerprintAtStart: "f".repeat(64),
-    repositoryExcludedStateAtStart: "0".repeat(64),
-    preExistingChanges: [],
-    objective: "Verify browser uptime",
-    acceptanceCriteria: [],
-    mode: "inspect",
-    status: "transport_starting",
-    createdAt: now,
-    updatedAt: now,
-    startedAt: now,
-    policyHashes: {
-      organization: "a".repeat(64),
-      repository: "b".repeat(64),
-      grant: "c".repeat(64),
-    },
-    budgetLimits: { ...DEFAULT_BUDGET_LIMITS },
-    budgetUsage: zeroBudgetUsage(),
-    turnSequence: 0,
-    mutationSequence: 0,
-    pendingOperations: [],
-    completedOperationIds: [],
-    mutations: [],
-    validations: [],
-    protocolRepairStreak: 0,
-  };
+  const state = recoverySessionState("session_doctor_recovery", now);
   const store = new SessionStore(stateHome);
   await store.create(state);
   await writeRuntimeManifest(store.sessionDirectory(state.sessionId), {
@@ -189,3 +161,90 @@ test("doctor orders stale-session recovery before missing browser setup", async 
   assert.match(human, /cope abort session_doctor_recovery/u);
   assert.match(human, /resolve session recovery before setup/iu);
 });
+
+test("doctor reports a resume candidate before an otherwise-required setup retry", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-doctor-resume-candidate-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const stateHome = path.join(root, "state");
+  await mkdir(path.join(stateHome, "config"), { recursive: true, mode: 0o700 });
+  const now = "2026-07-24T12:00:00.000Z";
+  const browser: BrowserFileConfig = {
+    schema_version: "cba-browser-config/2",
+    product: "edge",
+    browser_contract_version: "cope-visible-browser/v1",
+    entry_url: "https://m365.cloud.microsoft/chat",
+    approved_hosts: [{ hostname: "m365.cloud.microsoft", allow_subdomains: false }],
+    expected_identity: "person@example.com",
+    require_protection_indicator: false,
+    profile_directory: "/private/cope/edge",
+    browser_executable: "/verified/edge",
+    browser_version: "149.0.1.2",
+    browser_executable_sha256: digest,
+  };
+  await writeFile(
+    path.join(stateHome, "config", "browser.json"),
+    `${JSON.stringify(browser)}\n`,
+    "utf8",
+  );
+  const state = recoverySessionState("session_doctor_resume", now);
+  const store = new SessionStore(stateHome);
+  await store.create(state);
+  await writeRuntimeManifest(store.sessionDirectory(state.sessionId), {
+    schema_version: SESSION_RUNTIME_MANIFEST_VERSION,
+    transport: "edge",
+    browser_config_sha256: sha256(stableJson(browser)),
+    created_at: now,
+  });
+
+  let human = "";
+  await executeDoctorCommand({
+    command: "doctor",
+    repository: process.cwd(),
+    stateHome,
+    json: false,
+  }, {
+    stdout: { write: (value) => { human += value; } },
+    stderr: { write: () => undefined },
+  }, createStandardUserHost());
+
+  const recoveryIndex = human.indexOf("Session recovery:");
+  const setupIndex = human.indexOf("Browser setup:");
+  assert.ok(recoveryIndex >= 0);
+  assert.ok(setupIndex > recoveryIndex);
+  assert.match(human, /cope resume session_doctor_resume/u);
+  assert.match(human, /resolve session recovery before setup/iu);
+});
+
+function recoverySessionState(sessionId: string, now: string): SessionState {
+  return {
+    schemaVersion: 1,
+    protocolVersion: "cba/1",
+    sessionId,
+    taskId: `task_${sessionId}`,
+    repositoryRoot: process.cwd(),
+    repositoryFingerprintAtStart: "f".repeat(64),
+    repositoryExcludedStateAtStart: "0".repeat(64),
+    preExistingChanges: [],
+    objective: "Verify browser uptime",
+    acceptanceCriteria: [],
+    mode: "inspect",
+    status: "transport_starting",
+    createdAt: now,
+    updatedAt: now,
+    startedAt: now,
+    policyHashes: {
+      organization: "a".repeat(64),
+      repository: "b".repeat(64),
+      grant: "c".repeat(64),
+    },
+    budgetLimits: { ...DEFAULT_BUDGET_LIMITS },
+    budgetUsage: zeroBudgetUsage(),
+    turnSequence: 0,
+    mutationSequence: 0,
+    pendingOperations: [],
+    completedOperationIds: [],
+    mutations: [],
+    validations: [],
+    protocolRepairStreak: 0,
+  };
+}

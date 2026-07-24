@@ -69,7 +69,12 @@ export async function assessSessionRecovery(
     };
   }
   if (manifest.transport !== "edge") {
-    return { ...base, transport: manifest.transport, disposition: "resume_candidate" };
+    return {
+      ...base,
+      transport: manifest.transport,
+      disposition: "resume_candidate",
+      next: `cope resume ${state.sessionId}`,
+    };
   }
 
   const browser = browserEvidence ?? await readBrowserConfigurationEvidence(stateHome);
@@ -85,7 +90,12 @@ export async function assessSessionRecovery(
   ) {
     return recoveryBlocked({ ...base, transport: manifest.transport }, state, "BROWSER_CONFIG_CHANGED");
   }
-  return { ...base, transport: manifest.transport, disposition: "resume_candidate" };
+  return {
+    ...base,
+    transport: manifest.transport,
+    disposition: "resume_candidate",
+    next: `cope resume ${state.sessionId}`,
+  };
 }
 
 export async function scanSessionRecovery(

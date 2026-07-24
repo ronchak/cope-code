@@ -28,6 +28,7 @@ import {
   type BrowserIdentityVerifier,
 } from "../browser/index.js";
 import {
+  liveBrowserSetupBlockers,
   recoveryReasonSummary,
   scanSessionRecovery,
 } from "./session-recovery.js";
@@ -116,11 +117,11 @@ export async function executeDoctorCommand(
   }
   let recoveryBlocksSetup = false;
   try {
-    const recoveryProblems = (await scanSessionRecovery(paths.stateHome)).filter((assessment) =>
-      assessment.disposition === "abort_required" ||
-      assessment.disposition === "reconcile_required");
-    recoveryBlocksSetup = recoveryProblems.length > 0;
-    for (const recovery of recoveryProblems) {
+    const recoveryBlockers = liveBrowserSetupBlockers(
+      await scanSessionRecovery(paths.stateHome),
+    );
+    recoveryBlocksSetup = recoveryBlockers.length > 0;
+    for (const recovery of recoveryBlockers) {
       checks.push({
         name: "Session recovery",
         ok: false,

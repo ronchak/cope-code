@@ -56,6 +56,7 @@ test("live recovery distinguishes matching, missing, invalid, and changed browse
   const matching = await assessSessionRecovery(root, state);
   assert.equal(matching.disposition, "resume_candidate");
   assert.equal(matching.reason, undefined);
+  assert.equal(matching.next, "cope resume session_recovery_static");
 });
 
 test("missing browser configuration requires reconciliation when mutation evidence exists", async (context) => {
