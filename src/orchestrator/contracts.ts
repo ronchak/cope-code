@@ -68,6 +68,8 @@ export interface ProtocolAdapter {
     /** True only while replaying an integrity-checked cached response after interruption. */
     readonly recoveryReplay?: boolean;
   }): ParsedModelTurn;
+  /** Classifies parser failures before the runtime decides whether a repair turn is safe. */
+  isRepairableParseError(error: unknown): boolean;
   renderToolOutcomes(input: {
     readonly taskId: string;
     readonly priorTurnId: string;

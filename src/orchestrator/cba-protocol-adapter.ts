@@ -1,5 +1,6 @@
 import {
   PROTOCOL_ERROR_CODES,
+  ProtocolParseError,
   createProtocolErrorMessage,
   createToolDenialMessage,
   createToolResultMessage,
@@ -92,6 +93,10 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
       turnId: expected.turnId,
       messages: [normalizeMessage(message)],
     };
+  }
+
+  public isRepairableParseError(error: unknown): boolean {
+    return error instanceof ProtocolParseError && error.repairable;
   }
 
   public renderToolOutcomes(input: Parameters<ProtocolAdapter["renderToolOutcomes"]>[0]): string {
