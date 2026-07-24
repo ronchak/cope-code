@@ -216,6 +216,11 @@ test("legacy runtime manifests remain compatible while new manifests pin verifie
     browser: browserConfigHash,
     browserIdentity: originalIdentityHash,
   }));
+  assert.doesNotThrow(() => assertBrowserRuntimeManifestMatches(pinnedManifest, {
+    browser: browserConfigHash,
+    browserIdentity: updatedIdentityHash,
+    browserIdentityAliases: [originalIdentityHash],
+  }));
   assert.throws(
     () => assertBrowserRuntimeManifestMatches(pinnedManifest, {
       browser: browserConfigHash,
