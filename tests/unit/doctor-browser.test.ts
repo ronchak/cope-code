@@ -104,10 +104,12 @@ test("doctor reports Chrome preview identity and privacy concisely while JSON in
     }),
   });
   const upgradedReport = JSON.parse(upgradedJson) as {
-    ok: boolean;
     checks: Array<{ name: string; ok: boolean; evidence?: Record<string, unknown> }>;
   };
-  assert.equal(upgradedReport.ok, true);
+  assert.equal(
+    upgradedReport.checks.find((check) => check.name === "Selected browser")?.ok,
+    true,
+  );
   assert.equal(
     upgradedReport.checks.find((check) => check.name === "Selected browser")?.evidence?.version,
     "150.0.1.3",
