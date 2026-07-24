@@ -335,11 +335,15 @@ async function runNewSession(
       });
       await moveState(newState, "preflight", store, sessionAudit);
       await writeSessionGrant(sessionDirectory, grant);
+      // Persist the earliest resume-supported lifecycle state before exposing
+      // a readable runtime pin. A crash can therefore leave an incomplete
+      // manifest that fails closed, but never a pre-grant state advertised as
+      // resumable.
+      await moveState(newState, "grant_pending", store, sessionAudit);
       await writeRuntimeManifest(
         sessionDirectory,
         createRuntimeManifest(command.transport, source, pinnedConfiguration, now),
       );
-      await moveState(newState, "grant_pending", store, sessionAudit);
     };
     if (command.transport === "edge") {
       const expectedBrowserHash = configuration.hashes.browser;

@@ -16,6 +16,7 @@ export type SessionRecoveryDisposition =
   | "reconcile_required";
 
 export type SessionRecoveryReason =
+  | "SESSION_STARTUP_INCOMPLETE"
   | "BROWSER_CONFIG_MISSING"
   | "BROWSER_CONFIG_INVALID"
   | "BROWSER_CONFIG_CHANGED"
@@ -57,6 +58,15 @@ export async function assessSessionRecovery(
   } as const;
   if (isTerminal(state.status)) {
     return { ...base, disposition: "terminal" };
+  }
+  if (state.status === "created" || state.status === "preflight") {
+    return recoveryBlocked(
+      base,
+      state,
+      stateHome,
+      host,
+      "SESSION_STARTUP_INCOMPLETE",
+    );
   }
 
   let manifest: SessionRuntimeManifest;
@@ -163,6 +173,8 @@ export function liveBrowserSetupBlockers(
 
 export function recoveryReasonSummary(reason: SessionRecoveryReason | undefined): string {
   switch (reason) {
+    case "SESSION_STARTUP_INCOMPLETE":
+      return "session startup stopped before the initial grant became resumable";
     case "BROWSER_CONFIG_MISSING":
       return "the browser configuration required by this session is missing";
     case "BROWSER_CONFIG_INVALID":
@@ -226,7 +238,7 @@ function recoveryBlocked(
   },
   state: SessionState,
   stateHome: string,
-  host: HostPlatform,
+    host: HostPlatform,
   reason: Exclude<SessionRecoveryReason, "MUTATION_EVIDENCE_PRESENT">,
 ): SessionRecoveryAssessment {
   const mutationEvidence =

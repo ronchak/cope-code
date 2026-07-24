@@ -34,6 +34,11 @@ state, runtime pins, browser-configuration integrity, and mutation evidence:
 Passing the static assessment does not bypass the existing audit, repository,
 ownership, runtime, or live-page checks.
 
+Sessions interrupted in `created` or `preflight` are never advertised as
+resumable, even if a legacy startup already wrote a runtime pin. New sessions
+persist `grant_pending` before making that pin readable, eliminating the
+pre-grant resume gap.
+
 This release does not add new Microsoft 365 identity heuristics or automate
 credentials, MFA, consent, or profile import. The product-specific dedicated
 browser profile remains the durable authentication boundary. Cope continues to

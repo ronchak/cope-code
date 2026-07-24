@@ -150,6 +150,28 @@ test("an unreadable nonterminal runtime manifest requires reconciliation", async
   assert.equal(assessment.reason, "RUNTIME_MANIFEST_UNREADABLE");
 });
 
+test("pre-grant startup is never advertised as resumable even with matching runtime pins", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-session-recovery-pre-grant-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const browser = browserConfig();
+  const state = sessionState("session_recovery_pre_grant", "preflight");
+  const store = new SessionStore(root);
+  await store.create(state);
+  await writeRuntimeManifest(store.sessionDirectory(state.sessionId), {
+    schema_version: SESSION_RUNTIME_MANIFEST_VERSION,
+    transport: "edge",
+    browser_config_sha256: sha256(stableJson(browser)),
+    created_at: now,
+  });
+  await mkdir(path.join(root, "config"), { recursive: true });
+  await writeFile(path.join(root, "config", "browser.json"), `${JSON.stringify(browser)}\n`, "utf8");
+
+  const assessment = await assessSessionRecovery(root, state);
+  assert.equal(assessment.disposition, "abort_required");
+  assert.equal(assessment.reason, "SESSION_STARTUP_INCOMPLETE");
+  assert.match(assessment.next ?? "", /cope abort session_recovery_pre_grant/u);
+});
+
 function sessionState(
   sessionId: string,
   status: SessionStatus = "transport_starting",
