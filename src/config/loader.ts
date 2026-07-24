@@ -113,21 +113,31 @@ export async function loadRuntimeConfiguration(
       }),
     };
     browserHash = sha256(stableJson(browserRaw));
-    browserIdentityHash = sha256(stableJson({
-      product: verified.product,
-      executable_path: verified.executablePath,
-      platform: verified.evidence.platform,
-      product_name: verified.evidence.productName,
-      publisher: verified.evidence.publisher,
-      identifier: verified.evidence.identifier,
-      signature_status: verified.evidence.signatureStatus,
-    }));
-    browserIdentityAliases = [sha256(stableJson({
+    const releaseIdentityHash = sha256(stableJson({
       product: verified.product,
       executable_path: verified.executablePath,
       version: configuredVersion ?? verified.version,
       executable_sha256: configuredExecutableSha256 ?? verified.executableSha256,
-    }))];
+    }));
+    if (parsed.file.schema_version === LEGACY_BROWSER_CONFIG_VERSION) {
+      // Legacy configuration has no durable setup-time version/digest pin.
+      // Keep its session identity release-bound so a running session cannot
+      // silently cross any executable replacement.
+      browserIdentityHash = releaseIdentityHash;
+    } else {
+      browserIdentityHash = sha256(stableJson({
+        product: verified.product,
+        executable_path: verified.executablePath,
+        platform: verified.evidence.platform,
+        product_name: verified.evidence.productName,
+        publisher: verified.evidence.publisher,
+        identifier: verified.evidence.identifier,
+        signature_status: verified.evidence.signatureStatus,
+      }));
+      // Sessions created before stable signed-identity hashing used the
+      // setup-pinned release tuple. Accept that exact legacy identity once.
+      browserIdentityAliases = [releaseIdentityHash];
+    }
   }
 
   return {
