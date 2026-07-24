@@ -21,6 +21,7 @@ import {
   DEFAULT_REPOSITORY_POLICY,
 } from "../../src/policy/index.js";
 import { AgentError } from "../../src/shared/errors.js";
+import { sha256, stableJson } from "../../src/shared/crypto.js";
 import { createFilesystemIdentity } from "../../src/shared/filesystem-identity.js";
 
 test("profile configuration rejects UNC, device, and shared path forms", () => {
@@ -328,7 +329,7 @@ test("live configuration canonicalizes the profile and exposes a separate verifi
     }),
   });
   assert.equal(afterUpdate.hashes.browser, loaded.hashes.browser);
-  assert.notEqual(afterUpdate.hashes.browserIdentity, loaded.hashes.browserIdentity);
+  assert.equal(afterUpdate.hashes.browserIdentity, loaded.hashes.browserIdentity);
 });
 
 test("live configuration binds launch to the canonical verified executable and rejects verifier mismatch", async (context) => {
@@ -413,11 +414,52 @@ test("live configuration binds launch to the canonical verified executable and r
     browser_version: "149.0.1.2",
     browser_executable_sha256: "b".repeat(64),
   }));
+  const pinnedLoaded = await loadRuntimeConfiguration({
+    repositoryRoot,
+    stateHome,
+    requireBrowser: true,
+    browserIdentityVerifier: async () => ({
+      ...evidence,
+      executableSha256: "b".repeat(64),
+    }),
+  });
+  const afterSignedUpgrade = await loadRuntimeConfiguration({
+    repositoryRoot,
+    stateHome,
+    requireBrowser: true,
+    browserIdentityVerifier: async () => ({
+      ...evidence,
+      version: "150.0.1.3",
+      executableSha256: "c".repeat(64),
+    }),
+  });
+  assert.equal(afterSignedUpgrade.browser?.browserVersion, "150.0.1.3");
+  assert.equal(afterSignedUpgrade.browser?.browserExecutableSha256, "c".repeat(64));
+  assert.equal(afterSignedUpgrade.hashes.browserIdentity, pinnedLoaded.hashes.browserIdentity);
+  assert.deepEqual(afterSignedUpgrade.hashes.browserIdentityAliases, [
+    sha256(stableJson({
+      product: "edge",
+      executable_path: canonicalExecutable,
+      version: "149.0.1.2",
+      executable_sha256: "b".repeat(64),
+    })),
+  ]);
   await assert.rejects(loadRuntimeConfiguration({
     repositoryRoot,
     stateHome,
     requireBrowser: true,
     browserIdentityVerifier: async () => evidence,
+  }), (error: unknown) =>
+    error instanceof AgentError && error.details.diagnosticCode === "BROWSER_EXECUTABLE_EVIDENCE_CHANGED");
+  await assert.rejects(loadRuntimeConfiguration({
+    repositoryRoot,
+    stateHome,
+    requireBrowser: true,
+    browserIdentityVerifier: async () => ({
+      ...evidence,
+      version: "148.0.9.9",
+      executableSha256: "d".repeat(64),
+    }),
   }), (error: unknown) =>
     error instanceof AgentError && error.details.diagnosticCode === "BROWSER_EXECUTABLE_EVIDENCE_CHANGED");
 });
