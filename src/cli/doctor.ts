@@ -20,6 +20,7 @@ import {
 import { verifyDedicatedProfileRoot, verifyPrivateStateHome } from "../platform/private-storage.js";
 import {
   browserProductPresentation,
+  isCompatibleBrowserExecutableUpgrade,
   otherDedicatedBrowserProfileRoots,
   resolveSafeBrowserProfileDirectory,
   verifyDedicatedProfileMarker,
@@ -133,12 +134,13 @@ export async function executeDoctorCommand(
             : { identityVerifier: dependencies.browserIdentityVerifier }),
         },
       );
-      if (
-        parsed.config.browserVersion !== undefined && parsed.config.browserVersion !== verified.version ||
-        parsed.config.browserExecutableSha256 !== undefined &&
-          parsed.config.browserExecutableSha256 !== verified.executableSha256
-      ) {
-        throw new Error("Configured browser version or executable digest changed after setup; run cope setup to verify the update");
+      if (!isCompatibleBrowserExecutableUpgrade(
+        parsed.config.browserVersion,
+        parsed.config.browserExecutableSha256,
+        verified.version,
+        verified.executableSha256,
+      )) {
+        throw new Error("Configured browser version or executable digest changed incompatibly after setup; run cope setup to verify the browser");
       }
       const presentation = browserProductPresentation(parsed.config.product);
       const support = parsed.config.product === "chrome"
