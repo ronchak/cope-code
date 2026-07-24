@@ -5,11 +5,10 @@ import { formatSchemaErrors, validateProtocolMessage } from "./schemas.js";
 import {
   PROTOCOL_MESSAGE_TYPES,
   PROTOCOL_VERSION,
-  READ_ONLY_TOOL_NAMES,
-  TOOL_NAMES,
+  TOOL_REGISTRY,
+  isToolName,
   type ProtocolErrorCode,
   type ProtocolMessage,
-  type ToolName,
   type ToolRequestMessage,
 } from "./types.js";
 
@@ -266,7 +265,7 @@ function preflightDiscriminators(value: unknown): void {
     );
   }
   for (const candidate of extractToolDiscriminators(object)) {
-    if (!(TOOL_NAMES as readonly string[]).includes(candidate)) {
+    if (!isToolName(candidate)) {
       throw new ProtocolParseError("UNKNOWN_TOOL", `Unknown cba/1 tool '${candidate}'.`, { tool: candidate });
     }
   }
@@ -320,7 +319,7 @@ function validateToolRequestSemantics(
 
   if (message.operations.length > 1) {
     const unsafe = message.operations.find(
-      (operation) => !(READ_ONLY_TOOL_NAMES as readonly ToolName[]).includes(operation.tool),
+      (operation) => !TOOL_REGISTRY[operation.tool].batchable,
     );
     if (unsafe !== undefined) {
       throw new ProtocolParseError(

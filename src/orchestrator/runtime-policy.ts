@@ -8,7 +8,7 @@ import {
   type SessionCapabilityExpansion,
   type SessionGrant,
 } from "../policy/index.js";
-import { BUDGET_METRICS, TOOL_NAMES } from "../protocol/index.js";
+import { BUDGET_METRICS, isToolName } from "../protocol/index.js";
 import type { RepositoryBoundary } from "../repository/boundary.js";
 import type { RepositoryReadOperation } from "../repository/repository-tools.js";
 import { AgentError, errorMessage } from "../shared/errors.js";
@@ -351,9 +351,7 @@ function parseExpansions(
   }
   if (kind === "tool" && Array.isArray(capability.tools)) {
     return capability.tools
-      .filter((tool): tool is NormalizedToolCall["name"] =>
-        typeof tool === "string" && (TOOL_NAMES as readonly string[]).includes(tool),
-      )
+      .filter((tool): tool is NormalizedToolCall["name"] => typeof tool === "string" && isToolName(tool))
       .map((tool) => ({ kind: "tool", tool }));
   }
   if (kind === "disclosure" && Array.isArray(capability.classifications)) {
@@ -377,7 +375,7 @@ function parseExpansions(
 
 function isExpansion(value: unknown): value is SessionCapabilityExpansion {
   if (!isRecord(value) || typeof value.kind !== "string") return false;
-  if (value.kind === "tool") return typeof value.tool === "string" && (TOOL_NAMES as readonly string[]).includes(value.tool);
+  if (value.kind === "tool") return typeof value.tool === "string" && isToolName(value.tool);
   if (value.kind === "path") return isPathAccess(value.access) && typeof value.path === "string";
   if (value.kind === "command") {
     return typeof value.command_id === "string" && typeof value.category === "string" &&

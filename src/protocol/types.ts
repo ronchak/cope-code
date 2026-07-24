@@ -2,30 +2,108 @@
 export const PROTOCOL_VERSION = "cba/1" as const;
 export type ProtocolVersion = typeof PROTOCOL_VERSION;
 
-export const TOOL_NAMES = [
-  "list_files",
-  "search_text",
-  "read_file",
-  "git_status",
-  "git_diff",
-  "apply_patch",
-  "run_command",
-  "request_user_input",
-  "request_capability",
-  "complete_task",
-] as const;
+/**
+ * Canonical cba/1 tool catalog. Protocol, bootstrap, policy, and execution
+ * boundaries derive their tool capabilities from this registry.
+ */
+export const TOOL_REGISTRY = {
+  list_files: {
+    purpose: "List a bounded repository-relative directory view.",
+    execution: "local",
+    read_only: true,
+    batchable: true,
+    required_context: ["path"],
+  },
+  search_text: {
+    purpose: "Search approved text and return bounded, located excerpts.",
+    execution: "local",
+    read_only: true,
+    batchable: true,
+    required_context: ["path"],
+  },
+  read_file: {
+    purpose: "Read an approved text file or bounded line range with file-state metadata.",
+    execution: "local",
+    read_only: true,
+    batchable: true,
+    required_context: ["path"],
+  },
+  git_status: {
+    purpose: "Inspect branch, revision, working-tree, conflict, and pre-existing-change state.",
+    execution: "local",
+    read_only: true,
+    batchable: true,
+    required_context: [],
+  },
+  git_diff: {
+    purpose: "Inspect a bounded diff against an approved local baseline.",
+    execution: "local",
+    read_only: true,
+    batchable: true,
+    required_context: [],
+  },
+  apply_patch: {
+    purpose: "Atomically create, hash-guardedly update, or hash-guardedly delete approved text files.",
+    execution: "local",
+    read_only: false,
+    batchable: false,
+    required_context: ["path", "change"],
+  },
+  run_command: {
+    purpose: "Run one policy-catalog command with only its approved typed parameters.",
+    execution: "local",
+    read_only: false,
+    batchable: false,
+    required_context: ["command", "network"],
+  },
+  request_user_input: {
+    purpose: "Pause for genuinely missing information or a necessary development decision.",
+    execution: "orchestrator",
+    read_only: false,
+    batchable: false,
+    required_context: [],
+  },
+  request_capability: {
+    purpose: "Request one specific, bounded expansion of the active session grant.",
+    execution: "orchestrator",
+    read_only: false,
+    batchable: false,
+    required_context: [],
+  },
+  complete_task: {
+    purpose: "Submit an advisory completion report for independent harness verification.",
+    execution: "orchestrator",
+    read_only: false,
+    batchable: false,
+    required_context: [],
+  },
+} as const;
 
-export type ToolName = (typeof TOOL_NAMES)[number];
+export type ToolName = keyof typeof TOOL_REGISTRY;
+export type ToolDefinition = (typeof TOOL_REGISTRY)[ToolName];
+export type ToolContextRequirement = "path" | "command" | "network" | "change";
 
-export const READ_ONLY_TOOL_NAMES = [
-  "list_files",
-  "search_text",
-  "read_file",
-  "git_status",
-  "git_diff",
-] as const satisfies readonly ToolName[];
+export function toolRequiresContext(tool: ToolName, context: ToolContextRequirement): boolean {
+  return (TOOL_REGISTRY[tool].required_context as readonly ToolContextRequirement[]).includes(context);
+}
+export type ReadOnlyToolName = {
+  [TName in ToolName]: (typeof TOOL_REGISTRY)[TName]["read_only"] extends true ? TName : never;
+}[ToolName];
+export type LocalToolName = {
+  [TName in ToolName]: (typeof TOOL_REGISTRY)[TName]["execution"] extends "local" ? TName : never;
+}[ToolName];
 
-export type ReadOnlyToolName = (typeof READ_ONLY_TOOL_NAMES)[number];
+export const TOOL_NAMES = Object.freeze(Object.keys(TOOL_REGISTRY) as ToolName[]);
+export const READ_ONLY_TOOL_NAMES = Object.freeze(
+  TOOL_NAMES.filter((tool): tool is ReadOnlyToolName => TOOL_REGISTRY[tool].read_only),
+);
+export const LOCAL_TOOL_NAMES = Object.freeze(
+  TOOL_NAMES.filter((tool): tool is LocalToolName => TOOL_REGISTRY[tool].execution === "local"),
+);
+
+export function isToolName(value: string): value is ToolName {
+  return Object.prototype.hasOwnProperty.call(TOOL_REGISTRY, value);
+}
 
 export interface ListFilesArguments {
   readonly path?: string;
