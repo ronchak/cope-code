@@ -318,14 +318,7 @@ test("live configuration canonicalizes the profile and exposes a separate verifi
     loaded.browser?.profileDirectory,
     join(await realpath(safeTarget), "future-profile"),
   );
-  assert.deepEqual(loaded.hashes.browserIdentityAliases, [
-    sha256(stableJson({
-      product: "edge",
-      executable_path: process.execPath,
-      version: "149.0.1.2",
-      executable_sha256: "a".repeat(64),
-    })),
-  ]);
+  assert.equal(loaded.hashes.browserIdentityAliases, undefined);
   const afterUpdate = await loadRuntimeConfiguration({
     repositoryRoot,
     stateHome,
@@ -337,7 +330,7 @@ test("live configuration canonicalizes the profile and exposes a separate verifi
     }),
   });
   assert.equal(afterUpdate.hashes.browser, loaded.hashes.browser);
-  assert.equal(afterUpdate.hashes.browserIdentity, loaded.hashes.browserIdentity);
+  assert.notEqual(afterUpdate.hashes.browserIdentity, loaded.hashes.browserIdentity);
 });
 
 test("live configuration binds launch to the canonical verified executable and rejects verifier mismatch", async (context) => {
