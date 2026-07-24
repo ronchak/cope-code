@@ -35,7 +35,11 @@ import {
 import { ExclusiveProfileLock, prepareDedicatedProfile } from "./profile-lock.js";
 import { CURRENT_HOST_PLATFORM, type HostPlatform } from "../platform/index.js";
 import { verifyDedicatedProfileRoot } from "../platform/private-storage.js";
-import { verifyBrowserExecutable, type BrowserIdentityVerifier } from "./discovery.js";
+import {
+  isCompatibleBrowserExecutableUpgrade,
+  verifyBrowserExecutable,
+  type BrowserIdentityVerifier,
+} from "./discovery.js";
 
 export type PersistentContextLauncher = typeof chromium.launchPersistentContext;
 
@@ -94,9 +98,12 @@ export class EdgeCopilotTransport implements ModelTransport {
     if (
       verified.product !== config.product || configuredCanonical === undefined ||
       verified.executablePath !== configuredCanonical ||
-      config.browserVersion !== undefined && verified.version !== config.browserVersion ||
-      config.browserExecutableSha256 !== undefined &&
-        verified.executableSha256 !== config.browserExecutableSha256
+      !isCompatibleBrowserExecutableUpgrade(
+        config.browserVersion,
+        config.browserExecutableSha256,
+        verified.version,
+        verified.executableSha256,
+      )
     ) {
       throw new AgentError("CONFIG_INVALID", "The selected browser identity changed before launch", {
         diagnosticCode: "BROWSER_EXECUTABLE_EVIDENCE_CHANGED",

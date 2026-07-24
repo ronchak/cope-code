@@ -413,7 +413,58 @@ test("the live launcher cannot bypass executable verification through a Playwrig
   assert.equal(launchCalls, 0);
 });
 
-test("Chrome launch uses exactly the verified executable and Chrome-dedicated persistent profile", async (context) => {
+test("launch-time upgrade recovery still rejects downgrades and same-version byte changes", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-browser-launch-release-guard-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const executable = path.join(root, "Google Chrome");
+  await writeFile(executable, "chrome fixture\n", "utf8");
+  await chmod(executable, 0o700);
+  const config = {
+    product: "chrome",
+    browserContractVersion: "cope-visible-browser/v1",
+    browserExecutable: executable,
+    browserVersion: "149.0.1.2",
+    browserExecutableSha256: digest,
+    profileDirectory: path.join(root, "profile"),
+    entryUrl: "https://m365.cloud.microsoft/chat",
+    approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
+    uiContract: createBaselineCopilotUiContract("user@example.invalid"),
+    expectedIdentity: "user@example.invalid",
+    requireProtectionIndicator: false,
+    maxMessageChars: 10_000,
+    maxResponseChars: 10_000,
+    waits: {
+      actionMs: 100,
+      submissionConfirmationMs: 100,
+      responseMs: 100,
+      manualReadinessMs: 100,
+      pollMs: 10,
+      stableSamples: 2,
+      minimumStableMs: 10,
+    },
+  } as const;
+  let launchCalls = 0;
+  for (const release of [
+    { version: "149.0.1.2", executableSha256: "b".repeat(64) },
+    { version: "148.0.9.9", executableSha256: digest },
+  ]) {
+    await assert.rejects(EdgeCopilotTransport.launch(config, {
+      browserIdentityVerifier: async (product, executablePath) => ({
+        ...verified(product, await realpath(executablePath)),
+        ...release,
+      }),
+      launchPersistentContext: async () => {
+        launchCalls += 1;
+        throw new Error("must not launch");
+      },
+    }), (error: unknown) =>
+      error instanceof AgentError &&
+      error.details.diagnosticCode === "BROWSER_EXECUTABLE_EVIDENCE_CHANGED");
+  }
+  assert.equal(launchCalls, 0);
+});
+
+test("Chrome launch accepts a signed upgrade race and uses exactly the reverified executable", async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), "cope-chrome-launch-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
   const executable = path.join(root, "Google Chrome");
@@ -458,7 +509,11 @@ test("Chrome launch uses exactly the verified executable and Chrome-dedicated pe
       minimumStableMs: 10,
     },
   }, {
-    browserIdentityVerifier: async (product, executablePath) => verified(product, await realpath(executablePath)),
+    browserIdentityVerifier: async (product, executablePath) => ({
+      ...verified(product, await realpath(executablePath)),
+      version: "150.0.1.3",
+      executableSha256: "b".repeat(64),
+    }),
     launchPersistentContext: async (userDataDirectory, options) => {
       observed.push({ profile: userDataDirectory, options: options as Record<string, unknown> });
       return browserContext as never;

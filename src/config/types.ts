@@ -71,6 +71,7 @@ export interface LoadedRuntimeConfiguration {
     readonly repository: string;
     readonly browser?: string;
     readonly browserIdentity?: string;
+    readonly browserIdentityAliases?: readonly string[];
   };
   readonly files: {
     readonly organization: string;
