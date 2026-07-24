@@ -64,6 +64,10 @@ export async function listSessions(options: {
         appendUnreadableSession(summaries, directoryRecovery, canonicalRepository);
         continue;
       }
+      if (raw.sessionId !== entry.name) {
+        appendUnreadableSession(summaries, directoryRecovery, canonicalRepository);
+        continue;
+      }
       if (canonicalRepository !== undefined) {
         const canonical = await realpath(raw.repositoryRoot).catch(() => path.resolve(raw.repositoryRoot!));
         if (canonical !== canonicalRepository) continue;

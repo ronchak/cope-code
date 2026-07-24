@@ -12,8 +12,9 @@ a browser.
   and setup repeats the scan while holding the commit lock.
 - New live sessions use that same lock to publish session state and its pinned
   runtime manifest as one configuration transaction. Concurrent setup either
-  commits first, leaving no partial session, or waits behind a fully
-  recoverable session; it cannot strand the state between those outcomes.
+  commits first, leaving no partial session, observes a fully recoverable
+  session, or deflects with `BROWSER_CONFIG_LOCKED` while publication owns the
+  lock; it cannot strand the state between those outcomes.
 - `cope sessions --all` distinguishes resume candidates (`*`) from blocked
   recovery (`!`) and explains the reason and exact next command.
 - `cope resume <session-id>` checks recovery inputs before loading browser
@@ -25,6 +26,11 @@ a browser.
 - Explicit `cope abort <session-id>` remains configuration-independent.
   `cope abort --all` is rejected because sessions with mutation evidence need
   individual reconciliation rather than bulk disposal.
+- Incompatible browser executable identity drift can no longer produce a
+  misleading resume action during setup. It is classified through the same
+  abort-or-reconcile safety path as invalid browser configuration.
+- A session file whose embedded ID disagrees with its directory is surfaced as
+  unreadable under the directory ID, preserving the exact recovery target.
 
 ## Recovery model
 
@@ -50,6 +56,7 @@ every transient page presentation.
 - Recovery classification covers matching, missing, invalid, changed, and
   unreadable inputs, with and without mutation evidence.
 - CLI regressions cover early setup blocking, session markers and JSON,
-  configuration-independent abort, resume diagnostics, doctor ordering, and
-  unsafe bulk-abort rejection.
+  configuration-independent abort, resume diagnostics, doctor ordering,
+  executable identity drift, mismatched session IDs, and unsafe bulk-abort
+  rejection.
 - The build, complete deterministic unit suite, and end-to-end CLI suite pass.

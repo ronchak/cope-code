@@ -87,6 +87,32 @@ test("sessions --all surfaces an unreadable session that blocks setup", async (c
   assert.match(human, /Updated: unknown/u);
 });
 
+test("sessions --all treats an embedded session id mismatch as unreadable", async (context) => {
+  const stateHome = await mkdtemp(path.join(tmpdir(), "cope-cli-sessions-id-mismatch-"));
+  context.after(async () => rm(stateHome, { recursive: true, force: true }));
+  const state = sessionState();
+  const directoryId = "session_directory_identity";
+  const sessionDirectory = path.join(stateHome, "sessions", directoryId);
+  await mkdir(sessionDirectory, { recursive: true, mode: 0o700 });
+  await writeFile(
+    path.join(sessionDirectory, "session.json"),
+    `${JSON.stringify({ ...state, sessionId: "session_embedded_identity" })}\n`,
+    { encoding: "utf8", mode: 0o600 },
+  );
+
+  let human = "";
+  await executeSessionsCommand(
+    { command: "sessions", all: true, stateHome, json: false },
+    { stdout: { write: (value) => { human += value; } }, stderr: { write: () => undefined } },
+    createStandardUserHost(),
+  );
+
+  assert.match(human, /! Unreadable session/u);
+  assert.match(human, new RegExp(directoryId, "u"));
+  assert.doesNotMatch(human, /session_embedded_identity/u);
+  assert.match(human, /trusted recovery tooling/u);
+});
+
 function sessionState(): SessionState {
   const now = "2026-07-24T12:00:00.000Z";
   return {

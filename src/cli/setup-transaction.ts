@@ -11,6 +11,7 @@ import {
   browserSetupBlockedErrorDetails,
   liveBrowserSetupBlockers,
   scanSessionRecovery,
+  type BrowserConfigurationEvidence,
 } from "./session-recovery.js";
 
 export interface BrowserConfigBaseline {
@@ -100,8 +101,11 @@ async function assertBaselineUnchanged(filename: string, baseline: BrowserConfig
 export async function assertBrowserSetupRecoveryReady(
   stateHome: string,
   host: HostPlatform = CURRENT_HOST_PLATFORM,
+  browserEvidenceOverride?: BrowserConfigurationEvidence,
 ): Promise<void> {
-  const blockers = liveBrowserSetupBlockers(await scanSessionRecovery(stateHome, host));
+  const blockers = liveBrowserSetupBlockers(
+    await scanSessionRecovery(stateHome, host, browserEvidenceOverride),
+  );
   if (blockers.length === 0) return;
   throw new AgentError(
     "RECOVERY_REQUIRED",
@@ -115,6 +119,7 @@ export async function assertBrowserSetupRecoveryReady(
 export async function assertBrowserSetupRecoveryReadyBeforeSetup(
   stateHome: string,
   host: HostPlatform = CURRENT_HOST_PLATFORM,
+  browserEvidenceOverride?: BrowserConfigurationEvidence,
 ): Promise<void> {
   try {
     await access(stateHome);
@@ -124,7 +129,7 @@ export async function assertBrowserSetupRecoveryReadyBeforeSetup(
   }
   const lock = await BrowserConfigTransactionLock.acquire(stateHome);
   try {
-    await assertBrowserSetupRecoveryReady(stateHome, host);
+    await assertBrowserSetupRecoveryReady(stateHome, host, browserEvidenceOverride);
   } finally {
     await lock.release();
   }

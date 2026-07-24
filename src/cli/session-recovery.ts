@@ -34,7 +34,7 @@ export interface SessionRecoveryAssessment {
   readonly next?: string;
 }
 
-interface BrowserConfigurationEvidence {
+export interface BrowserConfigurationEvidence {
   readonly status: "missing" | "invalid" | "valid";
   readonly hash?: string;
 }
@@ -131,6 +131,7 @@ export async function assessSessionRecovery(
 export async function scanSessionRecovery(
   stateHome: string,
   host: HostPlatform = CURRENT_HOST_PLATFORM,
+  browserEvidenceOverride?: BrowserConfigurationEvidence,
 ): Promise<readonly SessionRecoveryAssessment[]> {
   const sessionsDirectory = path.join(stateHome, "sessions");
   let entries;
@@ -140,7 +141,8 @@ export async function scanSessionRecovery(
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
     throw error;
   }
-  const browserEvidence = await readBrowserConfigurationEvidence(stateHome);
+  const browserEvidence = browserEvidenceOverride ??
+    await readBrowserConfigurationEvidence(stateHome);
   const store = new SessionStore(stateHome);
   const assessments: SessionRecoveryAssessment[] = [];
   for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {

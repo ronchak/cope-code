@@ -14,6 +14,7 @@ import {
   BROWSER_CONTRACT_VERSION,
   browserProductPresentation,
   discoverInstalledBrowsers,
+  isCompatibleBrowserExecutableUpgrade,
   launchBrowserCopilotTransport,
   otherDedicatedBrowserProfileRoots,
   resolveSafeBrowserProfileDirectory,
@@ -81,6 +82,7 @@ interface ExistingBrowserSetup {
   readonly config: BrowserLaunchConfig;
   readonly browser?: DiscoveredBrowser;
   readonly evidenceChanged: boolean;
+  readonly browserIdentityInvalid: boolean;
 }
 
 interface MachineSetupSummary {
@@ -305,7 +307,11 @@ export async function configureMachine(options: {
   } catch (error) {
     // Invalid setup inputs cannot take the idempotent path. Prefer the shared
     // session recovery action when that invalid input also strands live work.
-    await assertBrowserSetupRecoveryReadyBeforeSetup(options.paths.stateHome, options.host);
+    await assertBrowserSetupRecoveryReadyBeforeSetup(
+      options.paths.stateHome,
+      options.host,
+      browserIdentityValidationFailed(error) ? { status: "invalid" } : undefined,
+    );
     throw error;
   }
 
@@ -325,7 +331,11 @@ export async function configureMachine(options: {
 
   // Fail before browser selection, prompts, or sign-in. The final transaction
   // repeats this check under the configuration lock to catch later races.
-  await assertBrowserSetupRecoveryReadyBeforeSetup(options.paths.stateHome, options.host);
+  await assertBrowserSetupRecoveryReadyBeforeSetup(
+    options.paths.stateHome,
+    options.host,
+    current?.browserIdentityInvalid === true ? { status: "invalid" } : undefined,
+  );
 
   // Eligibility includes the live GUI session, so defer it until after the
   // read-only idempotent path has decided no browser needs to open.
@@ -602,12 +612,19 @@ async function readExistingBrowserSetup(
         file: parsed.file,
         config: { ...parsed.config, profileDirectory },
         evidenceChanged: false,
+        browserIdentityInvalid: browserIdentityValidationFailed(error),
       };
     }
     const evidenceChanged =
       parsed.config.browserVersion !== undefined && parsed.config.browserVersion !== browser.version ||
       parsed.config.browserExecutableSha256 !== undefined &&
         parsed.config.browserExecutableSha256 !== browser.executableSha256;
+    const browserIdentityInvalid = !isCompatibleBrowserExecutableUpgrade(
+      parsed.config.browserVersion,
+      parsed.config.browserExecutableSha256,
+      browser.version,
+      browser.executableSha256,
+    );
     return {
       file: parsed.file,
       config: {
@@ -619,17 +636,35 @@ async function readExistingBrowserSetup(
       },
       browser,
       evidenceChanged,
+      browserIdentityInvalid,
     };
   } catch (error) {
     if (
       error instanceof AgentError &&
       error.details.next !== undefined
     ) throw error;
-    throw new AgentError("CONFIG_INVALID", "The existing browser configuration is invalid or mismatched and was not replaced", {
-      filename: options.paths.browser,
-      next: "Repair or deliberately remove the invalid browser configuration, then run cope setup again.",
-    }, { cause: error });
+    const diagnosticCode = error instanceof AgentError &&
+      typeof error.details.diagnosticCode === "string"
+      ? error.details.diagnosticCode
+      : undefined;
+    throw new AgentError(
+      "CONFIG_INVALID",
+      "The existing browser configuration is invalid or mismatched and was not replaced",
+      {
+        filename: options.paths.browser,
+        next: "Repair or deliberately remove the invalid browser configuration, then run cope setup again.",
+        ...(diagnosticCode === undefined ? {} : { diagnosticCode }),
+      },
+      { cause: error },
+    );
   }
+}
+
+function browserIdentityValidationFailed(error: unknown): boolean {
+  if (!(error instanceof AgentError)) return false;
+  const diagnosticCode = error.details.diagnosticCode;
+  return typeof diagnosticCode === "string" &&
+    /^BROWSER_(?:EXECUTABLE|IDENTITY)_/u.test(diagnosticCode);
 }
 
 function parseExistingBrowserConfigForSetup(
