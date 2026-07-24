@@ -251,7 +251,8 @@ test("browser setup blocks on unreadable resumable session state and leaves conf
       revalidate: async () => undefined,
     }),
     (error: unknown) => error instanceof AgentError &&
-      error.details.diagnosticCode === "BROWSER_CONFIG_SESSION_SCAN_FAILED",
+      error.details.diagnosticCode === "BROWSER_CONFIG_RECOVERY_BLOCKED" &&
+      error.details.sessionId === "session_unreadable",
   );
   assert.equal(await readFile(browserFile, "utf8"), "original\n");
 });
@@ -317,7 +318,8 @@ test("browser setup refuses a valid resumable live-browser session", async (cont
       revalidate: async () => undefined,
     }),
     (error: unknown) => error instanceof AgentError &&
-      error.details.diagnosticCode === "BROWSER_CONFIG_RESUMABLE_SESSION",
+      error.details.diagnosticCode === "BROWSER_CONFIG_RECOVERY_BLOCKED" &&
+      error.details.sessionId === "session_live_setup",
   );
   assert.equal(await readFile(browserFile, "utf8"), "original\n");
 });

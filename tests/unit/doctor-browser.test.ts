@@ -8,6 +8,16 @@ import type { BrowserIdentityVerifier, DiscoveredBrowser, EdgeCopilotTransport }
 import { executeDoctorCommand } from "../../src/cli/doctor.js";
 import { configurationPaths, configureMachine } from "../../src/cli/onboarding.js";
 import { createStandardUserHost } from "../helpers/standard-user-host.js";
+import {
+  SESSION_RUNTIME_MANIFEST_VERSION,
+  writeRuntimeManifest,
+} from "../../src/cli/session-files.js";
+import { SessionStore } from "../../src/session/store.js";
+import {
+  DEFAULT_BUDGET_LIMITS,
+  zeroBudgetUsage,
+  type SessionState,
+} from "../../src/session/types.js";
 
 const digest = "a".repeat(64);
 
@@ -114,4 +124,68 @@ test("doctor reports Chrome preview identity and privacy concisely while JSON in
     upgradedReport.checks.find((check) => check.name === "Selected browser")?.evidence?.version,
     "150.0.1.3",
   );
+});
+
+test("doctor orders stale-session recovery before missing browser setup", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-doctor-recovery-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const stateHome = path.join(root, "state");
+  await mkdir(stateHome, { mode: 0o700 });
+  const now = "2026-07-24T12:00:00.000Z";
+  const state: SessionState = {
+    schemaVersion: 1,
+    protocolVersion: "cba/1",
+    sessionId: "session_doctor_recovery",
+    taskId: "task_doctor_recovery",
+    repositoryRoot: process.cwd(),
+    repositoryFingerprintAtStart: "f".repeat(64),
+    repositoryExcludedStateAtStart: "0".repeat(64),
+    preExistingChanges: [],
+    objective: "Verify browser uptime",
+    acceptanceCriteria: [],
+    mode: "inspect",
+    status: "transport_starting",
+    createdAt: now,
+    updatedAt: now,
+    startedAt: now,
+    policyHashes: {
+      organization: "a".repeat(64),
+      repository: "b".repeat(64),
+      grant: "c".repeat(64),
+    },
+    budgetLimits: { ...DEFAULT_BUDGET_LIMITS },
+    budgetUsage: zeroBudgetUsage(),
+    turnSequence: 0,
+    mutationSequence: 0,
+    pendingOperations: [],
+    completedOperationIds: [],
+    mutations: [],
+    validations: [],
+    protocolRepairStreak: 0,
+  };
+  const store = new SessionStore(stateHome);
+  await store.create(state);
+  await writeRuntimeManifest(store.sessionDirectory(state.sessionId), {
+    schema_version: SESSION_RUNTIME_MANIFEST_VERSION,
+    transport: "edge",
+    browser_config_sha256: "a".repeat(64),
+    created_at: now,
+  });
+
+  let human = "";
+  await executeDoctorCommand({
+    command: "doctor",
+    repository: process.cwd(),
+    stateHome,
+    json: false,
+  }, {
+    stdout: { write: (value) => { human += value; } },
+    stderr: { write: () => undefined },
+  }, createStandardUserHost());
+  const recoveryIndex = human.indexOf("Session recovery:");
+  const setupIndex = human.indexOf("Browser setup:");
+  assert.ok(recoveryIndex >= 0);
+  assert.ok(setupIndex > recoveryIndex);
+  assert.match(human, /cope abort session_doctor_recovery/u);
+  assert.match(human, /resolve session recovery before setup/iu);
 });

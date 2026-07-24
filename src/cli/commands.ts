@@ -86,6 +86,7 @@ import { renderHumanResult } from "./friendly-output.js";
 import { executeInteractiveCommand } from "./interactive.js";
 import { writeRepositoryConfiguration, executeSetupCommand } from "./onboarding.js";
 import { executeSessionsCommand } from "./sessions.js";
+import { assessSessionRecovery, recoveryReasonSummary } from "./session-recovery.js";
 import { resolveWorkspace } from "./workspace.js";
 import { cyan, dim, green, symbols, yellow } from "./presentation.js";
 import {
@@ -448,6 +449,20 @@ async function resumeSession(
   let state = await store.read(command.sessionId);
   if (isTerminal(state.status)) {
     throw new AgentError("RECOVERY_REQUIRED", `Session is terminal (${state.status}) and cannot be resumed`);
+  }
+  const recovery = await assessSessionRecovery(stateHome, state);
+  if (recovery.disposition !== "resume_candidate") {
+    throw new AgentError(
+      "RECOVERY_REQUIRED",
+      `Session cannot resume because ${recoveryReasonSummary(recovery.reason)}`,
+      {
+        diagnosticCode: recovery.reason ?? "SESSION_RECOVERY_REQUIRED",
+        sessionId: recovery.sessionId,
+        status: recovery.status,
+        disposition: recovery.disposition,
+        ...(recovery.next === undefined ? {} : { next: recovery.next }),
+      },
+    );
   }
   const sessionDirectory = store.sessionDirectory(state.sessionId);
   const manifest = await readRuntimeManifest(sessionDirectory);

@@ -45,7 +45,11 @@ import {
   type BrowserSetupAction,
   type BrowserSetupScreen,
 } from "./browser-setup-ui.js";
-import { commitBrowserSetup, readBrowserConfigBaseline } from "./setup-transaction.js";
+import {
+  assertBrowserSetupRecoveryReady,
+  commitBrowserSetup,
+  readBrowserConfigBaseline,
+} from "./setup-transaction.js";
 
 const DEFAULT_COPILOT_ENTRY_URL = "https://m365.cloud.microsoft/chat";
 const CONFIG_DIRECTORY_NAME = "config";
@@ -303,6 +307,10 @@ export async function configureMachine(options: {
     await verifyPrivateStateHome(options.paths.stateHome, options.host);
     return setupSummary(options.paths, current.config);
   }
+
+  // Fail before browser selection, prompts, or sign-in. The final transaction
+  // repeats this check under the configuration lock to catch later races.
+  await assertBrowserSetupRecoveryReady(options.paths.stateHome);
 
   // Eligibility includes the live GUI session, so defer it until after the
   // read-only idempotent path has decided no browser needs to open.

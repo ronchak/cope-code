@@ -7,6 +7,12 @@ import type { CliCommand } from "./arguments.js";
 import { CURRENT_HOST_PLATFORM, type HostPlatform } from "../platform/index.js";
 import { verifyPrivateStateHome } from "../platform/private-storage.js";
 import { hint, keyValue, section, warning, type Writable } from "./presentation.js";
+import {
+  recoveryReasonSummary,
+  scanSessionRecovery,
+  type SessionRecoveryDisposition,
+  type SessionRecoveryReason,
+} from "./session-recovery.js";
 
 export interface SessionSummary {
   readonly sessionId: string;
@@ -16,6 +22,11 @@ export interface SessionSummary {
   readonly mode: SessionState["mode"];
   readonly updatedAt: string;
   readonly resumable: boolean;
+  readonly recovery: {
+    readonly disposition: SessionRecoveryDisposition;
+    readonly reason?: SessionRecoveryReason;
+    readonly next?: string;
+  };
 }
 
 export async function listSessions(options: {
@@ -36,6 +47,9 @@ export async function listSessions(options: {
     ? undefined
     : await realpath(requestedRepository).catch(() => path.resolve(requestedRepository));
   const summaries: SessionSummary[] = [];
+  const recoveryBySession = new Map(
+    (await scanSessionRecovery(stateHome)).map((assessment) => [assessment.sessionId, assessment] as const),
+  );
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     try {
@@ -49,6 +63,11 @@ export async function listSessions(options: {
         const canonical = await realpath(raw.repositoryRoot).catch(() => path.resolve(raw.repositoryRoot!));
         if (canonical !== canonicalRepository) continue;
       }
+      const recovery = recoveryBySession.get(raw.sessionId);
+      const disposition = recovery?.disposition ??
+        (["completed", "rolled_back", "blocked", "aborted", "failed"].includes(raw.status)
+          ? "terminal"
+          : "reconcile_required");
       summaries.push({
         sessionId: raw.sessionId,
         objective: raw.objective,
@@ -56,7 +75,12 @@ export async function listSessions(options: {
         status: raw.status,
         mode: raw.mode,
         updatedAt: raw.updatedAt,
-        resumable: !["completed", "rolled_back", "blocked", "aborted", "failed"].includes(raw.status),
+        resumable: disposition === "resume_candidate",
+        recovery: {
+          disposition,
+          ...(recovery?.reason === undefined ? {} : { reason: recovery.reason }),
+          ...(recovery?.next === undefined ? {} : { next: recovery.next }),
+        },
       });
     } catch {
       // Ignore corrupt entries here; status/verify-audit remain the recovery tools.
@@ -95,12 +119,20 @@ export async function executeSessionsCommand(
     return 0;
   }
   for (const session of sessions) {
-    io.stdout.write(`\n${session.resumable ? "*" : " "} ${session.objective}\n`);
+    const marker = session.resumable
+      ? "*"
+      : session.recovery.disposition === "terminal" ? " " : "!";
+    io.stdout.write(`\n${marker} ${session.objective}\n`);
     keyValue("Status", session.status, io.stdout);
+    if (session.recovery.disposition !== "terminal" && !session.resumable) {
+      keyValue("Recovery", session.recovery.disposition.replaceAll("_", " "), io.stdout);
+      keyValue("Why", recoveryReasonSummary(session.recovery.reason), io.stdout);
+      if (session.recovery.next !== undefined) keyValue("Next", session.recovery.next, io.stdout);
+    }
     keyValue("Updated", session.updatedAt.replace("T", " ").slice(0, 19), io.stdout);
     keyValue("ID", session.sessionId, io.stdout);
   }
-  hint("A * marks a resumable session. Use cope -c or /resume.", io.stdout);
+  hint("* can resume. ! needs the recovery action shown before setup can change.", io.stdout);
   return 0;
 }
 

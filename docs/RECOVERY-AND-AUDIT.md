@@ -158,6 +158,15 @@ The persisted runtime-manifest value `edge` identifies the legacy live visible-b
 
 `cba-browser-config/1` is interpreted only as legacy Edge. A valid legacy file and its authenticated profile remain usable without a rewrite. A deliberate product change writes version 2 only after explicit confirmation and visible manual readiness, under an exclusive configuration lock and compare-and-swap transaction. Setup refuses the change while a resumable live-browser session exists. Concurrent edits, corrupt session manifests, product/executable mismatch, stale identity/version/hash, wrong-product profile markers, and tampering fail closed with recovery guidance; Cope does not guess, merge, or fall back to another browser.
 
+Session status alone is not proof that browser work can resume. Cope derives a static recovery disposition from the persisted session, runtime manifest, pinned browser-config hash, and mutation evidence:
+
+- `resume_candidate` means a nonterminal live session still has readable, matching browser inputs. Full runtime and live-page verification still occurs on resume.
+- `abort_required` means a required browser input is missing, invalid, or changed and the session contains no recorded or pending mutation evidence.
+- `reconcile_required` means runtime evidence is unreadable or mutation evidence makes automatic discard unsafe.
+- `terminal` means no recovery action is needed.
+
+Setup performs this scan before browser discovery, prompts, or launch, then repeats it under the configuration lock immediately before committing setup. `cope sessions --all`, `cope resume`, and `cope doctor` use the same assessment so their guidance cannot disagree. Recovery classification is intentionally independent of current Copilot-page identity heuristics: the dedicated browser profile remains the durable authentication boundary, while page readiness is verified when live work begins.
+
 After an interrupted setup, inspect `cope doctor --json`, the browser config hash, executable identity evidence, and dedicated-profile marker before retrying. Do not delete or repoint an authenticated profile to force recovery. If a browser update changes its version/hash, rerun guided setup and the applicable product/tuple certification gates. If profile material may have been exposed, stop live use and follow the identity-provider session-revocation and credential incident plan.
 
 ## Incident procedure

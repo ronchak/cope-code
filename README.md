@@ -139,6 +139,8 @@ cope help advanced
 
 Setup creates local machine policy, browser configuration, and a product-specific dedicated profile, then visibly launches the selected browser for manual sign-in readiness. It asks for the account name or email visibly shown in Microsoft 365 Copilot and uses `https://m365.cloud.microsoft/chat` by default. Credentials, MFA, CAPTCHA, consent, and ordinary-profile import are never automated. For managed automation only, `cope setup --browser edge|chrome` and `--browser-executable <path>` are available; normal users do not need them.
 
+Before setup discovers or launches a browser, Cope checks unfinished live-browser sessions against their pinned runtime and browser configuration. `cope sessions --all` marks a session with `*` when it can be resumed and `!` when recovery is blocked, then prints the exact `resume`, `abort`, or reconciliation action. Setup never silently discards a session or repeats the browser flow while unresolved recovery evidence exists.
+
 Per-project setup is guided automatically. Cope detects useful package scripts such as `test`, `check`, `build`, `typecheck`, and `lint`, then creates `.cba\repository.json`. Inspect mode starts read-only. Edit mode allows project changes subject to the layered policy and task grant.
 
 Run the environment checker at any time:
