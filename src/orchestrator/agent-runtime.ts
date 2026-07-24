@@ -12,6 +12,7 @@ import { systemClock } from "../shared/time.js";
 import { BudgetMeter } from "../session/budgets.js";
 import type { SessionArtifactStore } from "../session/artifact-store.js";
 import type { CompletionHandoffStore } from "../session/completion-handoff-store.js";
+import type { ContextLedger } from "../session/context-ledger.js";
 import type { OperationJournal, OperationRecord } from "../session/operation-journal.js";
 import type { SessionStore } from "../session/store.js";
 import { transitionSession } from "../session/state-machine.js";
@@ -52,6 +53,7 @@ export interface AgentRuntimeDependencies {
   readonly idFactory?: (prefix: string) => string;
   readonly artifacts?: SessionArtifactStore;
   readonly completionHandoffs?: CompletionHandoffStore;
+  readonly contextLedger?: ContextLedger;
   readonly retainSourceArtifactsOnCompletion?: boolean;
   /** Deterministic, source-free operational events for an interactive CLI. */
   readonly onProgress?: (event: RuntimeProgressEvent) => void;
@@ -165,6 +167,9 @@ export class AgentRuntime {
           taskId: this.state.taskId,
           turnId,
           data: { responseId: response.responseId, bytes: Buffer.byteLength(response.content), sha256: sha256(response.content) },
+        });
+        await this.dependencies.contextLedger?.append({
+          turnId, direction: "inbound", kind: "model_response", content: response.content,
         });
         this.emitProgress("model", {
           status: "received",
@@ -461,6 +466,12 @@ export class AgentRuntime {
       messageHash: sha256(content),
       createdAt: this.now(),
     };
+    await this.dependencies.contextLedger?.append({
+      turnId,
+      direction: "outbound",
+      kind: turnId === "turn_0001" ? "bootstrap" : "tool_result",
+      content,
+    });
     await this.persist();
   }
 

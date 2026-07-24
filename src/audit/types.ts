@@ -24,6 +24,7 @@ export const AUDIT_EVENT_TYPES = [
   "completion.claimed",
   "completion.verified",
   "session.recovered",
+  "context.capsule_created",
   "session.ended",
 ] as const;
 

@@ -60,6 +60,7 @@ export type CliCommand =
       readonly approveGrant: boolean;
     } & CommonOptions)
   | ({ readonly command: "status"; readonly sessionId: string } & CommonOptions)
+  | ({ readonly command: "context"; readonly sessionId: string; readonly prepareRollover: boolean } & CommonOptions)
   | ({ readonly command: "pause"; readonly sessionId: string; readonly reason?: string } & CommonOptions)
   | ({ readonly command: "abort"; readonly sessionId: string; readonly reason?: string } & CommonOptions)
   | ({ readonly command: "rollback"; readonly sessionId: string; readonly checkpointId?: string; readonly force: boolean } & CommonOptions)
@@ -74,6 +75,7 @@ const EXPLICIT_COMMANDS = new Set([
   "run",
   "resume",
   "status",
+  "context",
   "pause",
   "abort",
   "rollback",
@@ -240,6 +242,12 @@ export function parseCliArguments(argv: readonly string[]): CliCommand {
       const sessionId = requirePositional(args, "status requires a session identifier");
       assertNoUnknown(args);
       return { command, sessionId, ...common };
+    }
+    case "context": {
+      const sessionId = requirePositional(args, "context requires a session identifier");
+      const prepareRollover = takeFlag(args, "--prepare-rollover");
+      assertNoUnknown(args);
+      return { command, sessionId, prepareRollover, ...common };
     }
     case "verify-audit": {
       const sessionId = requirePositional(args, "verify-audit requires a session identifier");

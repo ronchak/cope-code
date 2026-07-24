@@ -44,6 +44,7 @@ import {
   CompletionHandoffStore,
   type CompletionHandoffRecord,
 } from "../session/completion-handoff-store.js";
+import { ContextLedger, createContinuationCapsule, writeContinuationCapsule } from "../session/context-ledger.js";
 import { allowedTransitions, isTerminal, transitionSession } from "../session/state-machine.js";
 import { SessionStore, type WorkspaceLock } from "../session/store.js";
 import {
@@ -112,7 +113,7 @@ export async function executeCommand(
   dependencies: CommandDependencies = { host: CURRENT_HOST_PLATFORM },
 ): Promise<number> {
   const { host } = dependencies;
-  if (isWriteCapableCommand(command.command)) host.assertNonPrivileged();
+  if (isWriteCapableCommand(command)) host.assertNonPrivileged();
   if (command.command === "interactive") {
     await earlyDarwinEligibility(host, command.transport === "edge");
   }
@@ -149,6 +150,8 @@ export async function executeCommand(
       return resumeSession(command, io, host);
     case "status":
       return showStatus(command, io, host);
+    case "context":
+      return showContext(command, io, host);
     case "pause":
       return controlSession(command, "pause", io, host);
     case "abort":
@@ -162,8 +165,9 @@ export async function executeCommand(
   }
 }
 
-function isWriteCapableCommand(command: CliCommand["command"]): boolean {
-  return !["help", "version", "demo", "doctor", "sessions", "status", "verify-audit"].includes(command);
+function isWriteCapableCommand(command: CliCommand): boolean {
+  if (command.command === "context") return command.prepareRollover;
+  return !["help", "version", "demo", "doctor", "sessions", "status", "verify-audit"].includes(command.command);
 }
 
 async function earlyDarwinEligibility(
@@ -615,6 +619,48 @@ async function showStatus(
       completionHandoff,
     ),
   );
+  return 0;
+}
+
+async function showContext(
+  command: Extract<CliCommand, { readonly command: "context" }>,
+  io: CliIo,
+  host: HostPlatform,
+): Promise<number> {
+  const store = new SessionStore(await verifiedStateHome(command.stateHome, host));
+  const state = await store.read(command.sessionId);
+  const sessionDirectory = store.sessionDirectory(state.sessionId);
+  const ledger = new ContextLedger(path.join(sessionDirectory, "context-ledger.jsonl"), state.sessionId, state.taskId);
+  const capsule = await createContinuationCapsule(state, ledger, new Date().toISOString());
+  let capsuleFile: string | null = null;
+  if (command.prepareRollover) {
+    capsuleFile = path.join(sessionDirectory, "context", `continuation-${capsule.capsuleHash}.json`);
+    await writeContinuationCapsule(capsuleFile, capsule);
+    const audit = new AuditLog(path.join(sessionDirectory, "audit.jsonl"), state.sessionId);
+    await audit.append({
+      type: "context.capsule_created",
+      taskId: state.taskId,
+      data: {
+        capsuleHash: capsule.capsuleHash,
+        contextFinalHash: capsule.context.finalHash,
+        sourceConversationIdHash: capsule.sourceConversationIdHash,
+        turnSequence: state.turnSequence,
+      },
+    });
+  }
+  output(command.json, io, {
+    sessionId: state.sessionId,
+    taskId: state.taskId,
+    status: state.status,
+    context: capsule.context,
+    continuation: {
+      capsuleHash: capsule.capsuleHash,
+      sourceConversationIdHash: capsule.sourceConversationIdHash,
+      prepared: command.prepareRollover,
+      file: capsuleFile,
+      note: "The capsule is a source-free, integrity-bound handoff foundation; it does not open or authorize a new conversation.",
+    },
+  });
   return 0;
 }
 
@@ -1357,6 +1403,7 @@ Normal use rarely needs these. Run cope by itself for the guided interface.
            [--fixture FILE | --transcript FILE]
   cope resume <session-id> [--approve-grant]
   cope status <session-id>
+  cope context <session-id> [--prepare-rollover]
   cope pause <session-id> [--reason TEXT]
   cope abort <session-id> [--reason TEXT]
   cope rollback <session-id> [--checkpoint ID] [--force]
