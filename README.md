@@ -6,9 +6,9 @@ The deterministic harness remains responsible for repository boundaries, permiss
 
 ## Current release
 
-The current package version is **0.1.5**. See the
-[Cope 0.1.5 release notes](docs/RELEASE-NOTES-0.1.5.md) for the complete
-Microsoft 365 Copilot readiness and live-browser compatibility fixes.
+The current package version is **0.1.6**. See the
+[Cope 0.1.6 release notes](docs/RELEASE-NOTES-0.1.6.md) for the complete
+interrupted-session recovery and setup/startup concurrency fixes.
 
 ## Install on Windows
 
@@ -139,6 +139,8 @@ cope help advanced
 
 Setup creates local machine policy, browser configuration, and a product-specific dedicated profile, then visibly launches the selected browser for manual sign-in readiness. It asks for the account name or email visibly shown in Microsoft 365 Copilot and uses `https://m365.cloud.microsoft/chat` by default. Credentials, MFA, CAPTCHA, consent, and ordinary-profile import are never automated. For managed automation only, `cope setup --browser edge|chrome` and `--browser-executable <path>` are available; normal users do not need them.
 
+Before setup discovers or launches a browser, Cope checks unfinished live-browser sessions against their pinned runtime and browser configuration. Live session state and its runtime pin are published under the same configuration lock used by setup, so concurrent startup cannot leave setup observing a half-created session. `cope sessions --all` marks a session with `*` when it can be resumed and `!` when recovery is blocked, then prints the exact `resume`, `abort`, or reconciliation action. Setup never silently discards a session or repeats the browser flow while unresolved recovery evidence exists.
+
 Per-project setup is guided automatically. Cope detects useful package scripts such as `test`, `check`, `build`, `typecheck`, and `lint`, then creates `.cba\repository.json`. Inspect mode starts read-only. Edit mode allows project changes subject to the layered policy and task grant.
 
 Run the environment checker at any time:
@@ -186,7 +188,7 @@ Architecture and controls remain documented under `docs`:
 - `docs/WINDOWS-TARGET.md`
 - `docs/MACOS-TARGET.md`
 - `docs/LIVE-PILOT-ACCEPTANCE.md`
-- `docs/RELEASE-NOTES-0.1.5.md`
+- `docs/RELEASE-NOTES-0.1.6.md`
 
 ## Uninstall
 

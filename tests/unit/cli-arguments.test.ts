@@ -85,6 +85,13 @@ test("CLI rejects transport source flags without matching transport", () => {
   );
 });
 
+test("CLI explains why bulk abort is intentionally unsupported", () => {
+  assert.throws(
+    () => parseCliArguments(["abort", "--all"]),
+    /Bulk abort is not supported/iu,
+  );
+});
+
 test("CLI parses review-package export and validates its arguments", () => {
   assert.deepEqual(
     parseCliArguments([

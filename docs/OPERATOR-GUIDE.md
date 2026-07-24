@@ -115,7 +115,9 @@ To make the session terminal, use explicit abort:
 cope abort <session-id> --reason "operator stop"
 ```
 
-Abort uses the same active-owner control channel and cannot be downgraded by a later pause request. An inactive nonterminal session is moved directly to `aborted`; an existing terminal state is not altered. If the process is unresponsive and the request is not acknowledged, follow the incident procedure: isolate the endpoint if necessary, terminate the known agent/child/agent-owned browser processes through approved endpoint tooling, preserve non-source evidence, and reconcile repository/session state before any resume.
+Abort uses the same active-owner control channel and cannot be downgraded by a later pause request. An inactive nonterminal session is moved directly to `aborted`; an existing terminal state is not altered. It reads session state directly and does not require valid browser or project configuration, so it remains available when those files are missing or stale.
+
+Run `cope sessions --all` before recovery. A `*` identifies a resume candidate whose static browser pins still match. A `!` identifies a blocked session and includes the reason plus an exact abort or reconciliation instruction. `cope abort --all` is deliberately rejected: bulk abort could erase the distinction between a clean startup interruption and a session with pending or recorded mutation evidence. If the process is unresponsive and the request is not acknowledged, follow the incident procedure: isolate the endpoint if necessary, terminate the known agent/child/agent-owned browser processes through approved endpoint tooling, preserve non-source evidence, and reconcile repository/session state before any resume.
 
 Never delete a lock merely because work appears slow. Stale local locks are removed only after the owner PID is proven dead; a corrupt or remote-host lock requires investigation.
 
@@ -147,6 +149,8 @@ cope status <session-id>
 cope verify-audit <session-id>
 cope resume <session-id>
 ```
+
+Resume first performs the same static recovery assessment used by setup, sessions, and doctor. Missing, invalid, or changed browser configuration therefore produces a Cope recovery diagnostic and exact next action instead of a raw file-system error. Passing that preflight only means the session is a resume candidate; the existing runtime integrity, repository, ownership, and live-browser checks below still apply.
 
 By default resume uses the recorded transport and, for offline sessions, the recorded canonical fixture/transcript path. An explicit `--transport fixture --fixture <same-file>` or replay equivalent is accepted only when it matches the recorded transport, canonical path, and SHA-256. Transport switching and replacement/modified offline sources are refused. Organization, repository, browser, or grant hash changes require a new session and grant; resume never silently reconciles them.
 

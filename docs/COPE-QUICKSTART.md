@@ -41,7 +41,12 @@ Before a task begins, Cope shows a compact access screen with the project, mode,
 
 ## Recovery
 
-Use `cope -c` to continue the latest resumable session for the selected project. Use `/sessions` or `cope sessions` to inspect recent work. The complete recovery command set remains available under `cope help advanced`.
+Use `cope -c` to continue the latest resumable session for the selected project. Use `/sessions` or `cope sessions --all` to inspect recent work:
+
+- `*` means the session's pinned browser inputs still match and it is a resume candidate.
+- `!` means automatic resume is blocked. Cope prints whether to abort the exact session or preserve it for reconciliation.
+
+If setup reports unresolved recovery, run the exact command shown by `cope sessions --all`; rerunning setup cannot repair or discard that session. Bulk abort is intentionally unsupported because each session may contain different mutation evidence. The complete recovery command set remains available under `cope help advanced`.
 
 ## Diagnostics
 

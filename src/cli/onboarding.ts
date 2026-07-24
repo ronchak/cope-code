@@ -2,7 +2,11 @@ import { constants } from "node:fs";
 import { access, lstat, mkdir, open, readFile, rename } from "node:fs/promises";
 import path from "node:path";
 
-import { parseBrowserConfig, parseRepositoryConfig } from "../config/loader.js";
+import {
+  parseBrowserConfig,
+  parseRepositoryConfig,
+  verifiedBrowserIdentityHashes,
+} from "../config/loader.js";
 import {
   BROWSER_CONFIG_VERSION,
   REPOSITORY_CONFIG_VERSION,
@@ -14,6 +18,7 @@ import {
   BROWSER_CONTRACT_VERSION,
   browserProductPresentation,
   discoverInstalledBrowsers,
+  isCompatibleBrowserExecutableUpgrade,
   launchBrowserCopilotTransport,
   otherDedicatedBrowserProfileRoots,
   resolveSafeBrowserProfileDirectory,
@@ -32,6 +37,7 @@ import {
 } from "../policy/index.js";
 import { resolveStateHome } from "../session/paths.js";
 import { AgentError, errorMessage } from "../shared/errors.js";
+import { sha256, stableJson } from "../shared/crypto.js";
 import { CURRENT_HOST_PLATFORM, type HostPlatform } from "../platform/index.js";
 import { preparePrivateStateHome, verifyPrivateStateHome } from "../platform/private-storage.js";
 import type { CommandDefinition } from "../tools/index.js";
@@ -45,7 +51,12 @@ import {
   type BrowserSetupAction,
   type BrowserSetupScreen,
 } from "./browser-setup-ui.js";
-import { commitBrowserSetup, readBrowserConfigBaseline } from "./setup-transaction.js";
+import {
+  assertBrowserSetupRecoveryReadyBeforeSetup,
+  commitBrowserSetup,
+  readBrowserConfigBaseline,
+} from "./setup-transaction.js";
+import type { BrowserConfigurationEvidence } from "./session-recovery.js";
 
 const DEFAULT_COPILOT_ENTRY_URL = "https://m365.cloud.microsoft/chat";
 const CONFIG_DIRECTORY_NAME = "config";
@@ -77,6 +88,7 @@ interface ExistingBrowserSetup {
   readonly config: BrowserLaunchConfig;
   readonly browser?: DiscoveredBrowser;
   readonly evidenceChanged: boolean;
+  readonly recoveryBrowserEvidence: BrowserConfigurationEvidence;
 }
 
 interface MachineSetupSummary {
@@ -286,9 +298,28 @@ export async function configureMachine(options: {
   const promptConfirm = dependencies.promptConfirm ?? confirmPrompt;
   const discover = dependencies.discoverBrowsers ?? discoverInstalledBrowsers;
   const verifyManual = dependencies.verifyManualBrowser ?? verifyManualBrowserExecutable;
-  const browserBaseline = await readBrowserConfigBaseline(options.paths.browser);
-  const organizationPolicyToCreate = await policyForSetup(options.paths.organizationPolicy);
-  const current = await readExistingBrowserSetup(options, browserBaseline, verifyManual, dependencies.identityVerifier);
+  let browserBaseline: Awaited<ReturnType<typeof readBrowserConfigBaseline>>;
+  let organizationPolicyToCreate: PolicyDocument | undefined;
+  let current: ExistingBrowserSetup | undefined;
+  try {
+    browserBaseline = await readBrowserConfigBaseline(options.paths.browser);
+    organizationPolicyToCreate = await policyForSetup(options.paths.organizationPolicy);
+    current = await readExistingBrowserSetup(
+      options,
+      browserBaseline,
+      verifyManual,
+      dependencies.identityVerifier,
+    );
+  } catch (error) {
+    // Invalid setup inputs cannot take the idempotent path. Prefer the shared
+    // session recovery action when that invalid input also strands live work.
+    await assertBrowserSetupRecoveryReadyBeforeSetup(
+      options.paths.stateHome,
+      options.host,
+      browserIdentityValidationFailed(error) ? { status: "identity_invalid" } : undefined,
+    );
+    throw error;
+  }
 
   // Managed and automation callers can treat an already-valid setup as an
   // idempotent check. Interactive setup always shows the current selection.
@@ -303,6 +334,14 @@ export async function configureMachine(options: {
     await verifyPrivateStateHome(options.paths.stateHome, options.host);
     return setupSummary(options.paths, current.config);
   }
+
+  // Fail before browser selection, prompts, or sign-in. The final transaction
+  // repeats this check under the configuration lock to catch later races.
+  await assertBrowserSetupRecoveryReadyBeforeSetup(
+    options.paths.stateHome,
+    options.host,
+    current?.recoveryBrowserEvidence,
+  );
 
   // Eligibility includes the live GUI session, so defer it until after the
   // read-only idempotent path has decided no browser needs to open.
@@ -579,12 +618,27 @@ async function readExistingBrowserSetup(
         file: parsed.file,
         config: { ...parsed.config, profileDirectory },
         evidenceChanged: false,
+        recoveryBrowserEvidence: {
+          status: browserIdentityValidationFailed(error) ? "identity_invalid" : "invalid",
+          hash: sha256(stableJson(raw)),
+        },
       };
     }
     const evidenceChanged =
       parsed.config.browserVersion !== undefined && parsed.config.browserVersion !== browser.version ||
       parsed.config.browserExecutableSha256 !== undefined &&
         parsed.config.browserExecutableSha256 !== browser.executableSha256;
+    const browserIdentityInvalid = !isCompatibleBrowserExecutableUpgrade(
+      parsed.config.browserVersion,
+      parsed.config.browserExecutableSha256,
+      browser.version,
+      browser.executableSha256,
+    );
+    const browserIdentityHashes = verifiedBrowserIdentityHashes(
+      parsed.file,
+      parsed.config,
+      browser,
+    );
     return {
       file: parsed.file,
       config: {
@@ -596,17 +650,47 @@ async function readExistingBrowserSetup(
       },
       browser,
       evidenceChanged,
+      recoveryBrowserEvidence: browserIdentityInvalid
+        ? {
+            status: "identity_invalid",
+            hash: sha256(stableJson(raw)),
+          }
+        : {
+            status: "valid",
+            hash: sha256(stableJson(raw)),
+            identityHash: browserIdentityHashes.primary,
+            ...(browserIdentityHashes.aliases === undefined
+              ? {}
+              : { identityAliases: browserIdentityHashes.aliases }),
+          },
     };
   } catch (error) {
     if (
       error instanceof AgentError &&
       error.details.next !== undefined
     ) throw error;
-    throw new AgentError("CONFIG_INVALID", "The existing browser configuration is invalid or mismatched and was not replaced", {
-      filename: options.paths.browser,
-      next: "Repair or deliberately remove the invalid browser configuration, then run cope setup again.",
-    }, { cause: error });
+    const diagnosticCode = error instanceof AgentError &&
+      typeof error.details.diagnosticCode === "string"
+      ? error.details.diagnosticCode
+      : undefined;
+    throw new AgentError(
+      "CONFIG_INVALID",
+      "The existing browser configuration is invalid or mismatched and was not replaced",
+      {
+        filename: options.paths.browser,
+        next: "Repair or deliberately remove the invalid browser configuration, then run cope setup again.",
+        ...(diagnosticCode === undefined ? {} : { diagnosticCode }),
+      },
+      { cause: error },
+    );
   }
+}
+
+function browserIdentityValidationFailed(error: unknown): boolean {
+  if (!(error instanceof AgentError)) return false;
+  const diagnosticCode = error.details.diagnosticCode;
+  return typeof diagnosticCode === "string" &&
+    /^BROWSER_(?:EXECUTABLE|IDENTITY)_/u.test(diagnosticCode);
 }
 
 function parseExistingBrowserConfigForSetup(

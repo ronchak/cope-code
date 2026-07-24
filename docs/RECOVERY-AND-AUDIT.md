@@ -158,6 +158,17 @@ The persisted runtime-manifest value `edge` identifies the legacy live visible-b
 
 `cba-browser-config/1` is interpreted only as legacy Edge. A valid legacy file and its authenticated profile remain usable without a rewrite. A deliberate product change writes version 2 only after explicit confirmation and visible manual readiness, under an exclusive configuration lock and compare-and-swap transaction. Setup refuses the change while a resumable live-browser session exists. Concurrent edits, corrupt session manifests, product/executable mismatch, stale identity/version/hash, wrong-product profile markers, and tampering fail closed with recovery guidance; Cope does not guess, merge, or fall back to another browser.
 
+Session status alone is not proof that browser work can resume. Cope derives a static recovery disposition from the persisted session, runtime manifest, pinned browser-config hash, current locally verified browser-executable identity, and mutation evidence:
+
+- `resume_candidate` means a nonterminal live session still has readable, matching browser inputs and compatible verified executable identity. Full runtime and live-page verification still occurs on resume.
+- `abort_required` means a required browser input or executable identity is missing, invalid, or changed and the session contains no recorded or pending mutation evidence.
+- `reconcile_required` means runtime evidence is unreadable or mutation evidence makes automatic discard unsafe.
+- `terminal` means no recovery action is needed.
+
+`created` and `preflight` are not resume-supported states. Recovery offers a clean abort for those incomplete startup states unless mutation evidence requires reconciliation. New session publication persists `grant_pending` before the runtime manifest becomes readable, so a crash cannot create a runtime-pinned pre-grant session that is incorrectly advertised as resumable.
+
+Setup performs this scan under the configuration lock before browser discovery, prompts, or launch, then repeats it while holding the lock immediately before committing setup. If live session publication currently owns that lock, early setup deflects as concurrent configuration use instead of inspecting and misclassifying partial startup evidence. A new live session acquires the same lock before it publishes `session.json` and holds it until the pinned runtime manifest and grant-pending state are durable. Setup and session startup therefore have one ordering boundary: setup commits before any session state is exposed, or a complete recoverable session exists before setup can proceed. `cope sessions --all`, `cope resume`, and `cope doctor` use the same assessment—including local signed-executable verification—so their guidance cannot disagree. Recovery classification remains independent of current Copilot-page identity heuristics: the dedicated browser profile is the durable authentication boundary, while page readiness is verified when live work begins.
+
 After an interrupted setup, inspect `cope doctor --json`, the browser config hash, executable identity evidence, and dedicated-profile marker before retrying. Do not delete or repoint an authenticated profile to force recovery. If a browser update changes its version/hash, rerun guided setup and the applicable product/tuple certification gates. If profile material may have been exposed, stop live use and follow the identity-provider session-revocation and credential incident plan.
 
 ## Incident procedure

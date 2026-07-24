@@ -1,15 +1,18 @@
 import { constants } from "node:fs";
-import { mkdir, open, readFile, readdir, rename } from "node:fs/promises";
+import { access, mkdir, open, readFile, rename } from "node:fs/promises";
 import path from "node:path";
 
 import { BrowserConfigTransactionLock } from "../config/browser-config-lock.js";
 import type { BrowserFileConfig } from "../config/types.js";
 import type { PolicyDocument } from "../policy/index.js";
-import { readRuntimeManifest } from "./session-files.js";
-import { SessionStore } from "../session/store.js";
-import { isTerminal } from "../session/state-machine.js";
 import { AgentError } from "../shared/errors.js";
-import type { HostPlatform } from "../platform/index.js";
+import { CURRENT_HOST_PLATFORM, type HostPlatform } from "../platform/index.js";
+import {
+  browserSetupBlockedErrorDetails,
+  liveBrowserSetupBlockers,
+  scanSessionRecovery,
+  type BrowserConfigurationEvidence,
+} from "./session-recovery.js";
 
 export interface BrowserConfigBaseline {
   readonly exists: boolean;
@@ -38,9 +41,10 @@ export async function commitBrowserSetup(options: {
   const lock = await BrowserConfigTransactionLock.acquire(options.stateHome);
   try {
     await assertBaselineUnchanged(options.browserFile, options.browserBaseline);
-    await assertNoResumableLiveSessions(options.stateHome);
+    await assertBrowserSetupRecoveryReady(options.stateHome, options.host);
     await options.revalidate();
     await assertBaselineUnchanged(options.browserFile, options.browserBaseline);
+    await assertBrowserSetupRecoveryReady(options.stateHome, options.host);
     if (options.organizationPolicyToCreate !== undefined) {
       const existing = await readBrowserConfigBaseline(options.organizationPolicyFile);
       if (existing.exists) {
@@ -62,7 +66,7 @@ export async function pinBrowserConfigurationForSession<T>(options: {
   readonly stateHome: string;
   readonly expectedBrowserHash: string;
   readonly loadCurrent: () => Promise<T & { readonly hashes: { readonly browser?: string } }>;
-  readonly writeManifest: (configuration: T) => Promise<void>;
+  readonly publishSession: (configuration: T) => Promise<void>;
 }): Promise<void> {
   const lock = await BrowserConfigTransactionLock.acquire(options.stateHome);
   try {
@@ -72,7 +76,11 @@ export async function pinBrowserConfigurationForSession<T>(options: {
         diagnosticCode: "BROWSER_CONFIG_START_RACE",
       });
     }
-    await options.writeManifest(current);
+    // Session state and its pinned runtime manifest must become durable while
+    // holding the same lock used by setup. Setup can therefore commit first,
+    // or session publication can commit first, but they cannot strand an
+    // in-between live-browser session.
+    await options.publishSession(current);
   } finally {
     await lock.release();
   }
@@ -90,38 +98,40 @@ async function assertBaselineUnchanged(filename: string, baseline: BrowserConfig
   }
 }
 
-async function assertNoResumableLiveSessions(stateHome: string): Promise<void> {
-  const sessionsDirectory = path.join(stateHome, "sessions");
-  let entries;
+export async function assertBrowserSetupRecoveryReady(
+  stateHome: string,
+  host: HostPlatform = CURRENT_HOST_PLATFORM,
+  browserEvidenceOverride?: BrowserConfigurationEvidence,
+): Promise<void> {
+  const blockers = liveBrowserSetupBlockers(
+    await scanSessionRecovery(stateHome, host, browserEvidenceOverride),
+  );
+  if (blockers.length === 0) return;
+  throw new AgentError(
+    "RECOVERY_REQUIRED",
+    blockers.length === 1
+      ? "Browser setup is blocked by an unfinished live-browser session"
+      : `Browser setup is blocked by ${String(blockers.length)} unfinished live-browser sessions`,
+    browserSetupBlockedErrorDetails(blockers),
+  );
+}
+
+export async function assertBrowserSetupRecoveryReadyBeforeSetup(
+  stateHome: string,
+  host: HostPlatform = CURRENT_HOST_PLATFORM,
+  browserEvidenceOverride?: BrowserConfigurationEvidence,
+): Promise<void> {
   try {
-    entries = await readdir(sessionsDirectory, { withFileTypes: true });
+    await access(stateHome);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw error;
   }
-  const store = new SessionStore(stateHome);
-  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
-    if (!entry.isDirectory()) continue;
-    try {
-      const state = await store.read(entry.name);
-      if (isTerminal(state.status)) continue;
-      const manifest = await readRuntimeManifest(store.sessionDirectory(state.sessionId));
-      if (manifest.transport === "edge") {
-        throw new AgentError("RECOVERY_REQUIRED", "Browser setup cannot change while a live-browser session is resumable", {
-          diagnosticCode: "BROWSER_CONFIG_RESUMABLE_SESSION",
-          sessionId: state.sessionId,
-          next: "Resume, abort, or reconcile the session before changing browser setup.",
-        });
-      }
-    } catch (error) {
-      if (error instanceof AgentError && error.details.diagnosticCode === "BROWSER_CONFIG_RESUMABLE_SESSION") {
-        throw error;
-      }
-      throw new AgentError("RECOVERY_REQUIRED", "Browser setup found unreadable session state and made no changes", {
-        diagnosticCode: "BROWSER_CONFIG_SESSION_SCAN_FAILED",
-        sessionDirectory: entry.name,
-      }, { cause: error });
-    }
+  const lock = await BrowserConfigTransactionLock.acquire(stateHome);
+  try {
+    await assertBrowserSetupRecoveryReady(stateHome, host, browserEvidenceOverride);
+  } finally {
+    await lock.release();
   }
 }
 

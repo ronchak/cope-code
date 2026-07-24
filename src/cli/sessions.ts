@@ -1,21 +1,33 @@
 import { readdir, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 
+import type { BrowserIdentityVerifier } from "../browser/index.js";
 import { resolveStateHome } from "../session/paths.js";
 import type { SessionState, SessionStatus } from "../session/types.js";
 import type { CliCommand } from "./arguments.js";
 import { CURRENT_HOST_PLATFORM, type HostPlatform } from "../platform/index.js";
 import { verifyPrivateStateHome } from "../platform/private-storage.js";
 import { hint, keyValue, section, warning, type Writable } from "./presentation.js";
+import {
+  recoveryReasonSummary,
+  scanSessionRecovery,
+  type SessionRecoveryDisposition,
+  type SessionRecoveryReason,
+} from "./session-recovery.js";
 
 export interface SessionSummary {
   readonly sessionId: string;
   readonly objective: string;
   readonly repositoryRoot: string;
   readonly status: SessionStatus;
-  readonly mode: SessionState["mode"];
+  readonly mode: SessionState["mode"] | "unknown";
   readonly updatedAt: string;
   readonly resumable: boolean;
+  readonly recovery: {
+    readonly disposition: SessionRecoveryDisposition;
+    readonly reason?: SessionRecoveryReason;
+    readonly next?: string;
+  };
 }
 
 export async function listSessions(options: {
@@ -23,6 +35,7 @@ export async function listSessions(options: {
   readonly stateHome?: string;
   readonly limit?: number;
   readonly host?: HostPlatform;
+  readonly browserIdentityVerifier?: BrowserIdentityVerifier;
 }): Promise<readonly SessionSummary[]> {
   const host = options.host ?? CURRENT_HOST_PLATFORM;
   const stateHome = path.resolve(options.stateHome ?? resolveStateHome(process.env, host));
@@ -36,19 +49,41 @@ export async function listSessions(options: {
     ? undefined
     : await realpath(requestedRepository).catch(() => path.resolve(requestedRepository));
   const summaries: SessionSummary[] = [];
+  const recoveryBySession = new Map(
+    (await scanSessionRecovery(
+      stateHome,
+      host,
+      undefined,
+      options.browserIdentityVerifier,
+    ))
+      .map((assessment) => [assessment.sessionId, assessment] as const),
+  );
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
+    const directoryRecovery = recoveryBySession.get(entry.name);
     try {
       const raw = JSON.parse(await readFile(path.join(directory, entry.name, "session.json"), "utf8")) as Partial<SessionState>;
       if (
         typeof raw.sessionId !== "string" || typeof raw.objective !== "string" ||
         typeof raw.repositoryRoot !== "string" || typeof raw.updatedAt !== "string" ||
         !isStatus(raw.status) || (raw.mode !== "inspect" && raw.mode !== "edit" && raw.mode !== "auto")
-      ) continue;
+      ) {
+        appendUnreadableSession(summaries, directoryRecovery, canonicalRepository);
+        continue;
+      }
+      if (raw.sessionId !== entry.name) {
+        appendUnreadableSession(summaries, directoryRecovery, canonicalRepository);
+        continue;
+      }
       if (canonicalRepository !== undefined) {
         const canonical = await realpath(raw.repositoryRoot).catch(() => path.resolve(raw.repositoryRoot!));
         if (canonical !== canonicalRepository) continue;
       }
+      const recovery = recoveryBySession.get(raw.sessionId);
+      const disposition = recovery?.disposition ??
+        (["completed", "rolled_back", "blocked", "aborted", "failed"].includes(raw.status)
+          ? "terminal"
+          : "reconcile_required");
       summaries.push({
         sessionId: raw.sessionId,
         objective: raw.objective,
@@ -56,10 +91,15 @@ export async function listSessions(options: {
         status: raw.status,
         mode: raw.mode,
         updatedAt: raw.updatedAt,
-        resumable: !["completed", "rolled_back", "blocked", "aborted", "failed"].includes(raw.status),
+        resumable: disposition === "resume_candidate",
+        recovery: {
+          disposition,
+          ...(recovery?.reason === undefined ? {} : { reason: recovery.reason }),
+          ...(recovery?.next === undefined ? {} : { next: recovery.next }),
+        },
       });
     } catch {
-      // Ignore corrupt entries here; status/verify-audit remain the recovery tools.
+      appendUnreadableSession(summaries, directoryRecovery, canonicalRepository);
     }
   }
   return summaries.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, options.limit ?? 20);
@@ -77,12 +117,14 @@ export async function executeSessionsCommand(
   command: Extract<CliCommand, { readonly command: "sessions" }>,
   io: { readonly stdout: Writable; readonly stderr: Writable },
   host: HostPlatform = CURRENT_HOST_PLATFORM,
+  browserIdentityVerifier?: BrowserIdentityVerifier,
 ): Promise<number> {
   const sessions = await listSessions({
     ...(command.repository === undefined || command.all ? {} : { repositoryRoot: command.repository }),
     ...(command.stateHome === undefined ? {} : { stateHome: command.stateHome }),
     limit: command.all ? 100 : 20,
     host,
+    ...(browserIdentityVerifier === undefined ? {} : { browserIdentityVerifier }),
   });
   if (command.json) {
     io.stdout.write(`${JSON.stringify({ ok: true, sessions })}\n`);
@@ -95,12 +137,26 @@ export async function executeSessionsCommand(
     return 0;
   }
   for (const session of sessions) {
-    io.stdout.write(`\n${session.resumable ? "*" : " "} ${session.objective}\n`);
+    const marker = session.resumable
+      ? "*"
+      : session.recovery.disposition === "terminal" ? " " : "!";
+    io.stdout.write(`\n${marker} ${session.objective}\n`);
     keyValue("Status", session.status, io.stdout);
-    keyValue("Updated", session.updatedAt.replace("T", " ").slice(0, 19), io.stdout);
+    if (session.recovery.disposition !== "terminal") {
+      keyValue("Recovery", session.recovery.disposition.replaceAll("_", " "), io.stdout);
+      keyValue("Why", recoveryReasonSummary(session.recovery.reason), io.stdout);
+      if (session.recovery.next !== undefined) keyValue("Next", session.recovery.next, io.stdout);
+    }
+    keyValue(
+      "Updated",
+      session.updatedAt === "unknown"
+        ? session.updatedAt
+        : session.updatedAt.replace("T", " ").slice(0, 19),
+      io.stdout,
+    );
     keyValue("ID", session.sessionId, io.stdout);
   }
-  hint("A * marks a resumable session. Use cope -c or /resume.", io.stdout);
+  hint("* can resume. ! needs the recovery action shown before setup can change.", io.stdout);
   return 0;
 }
 
@@ -110,4 +166,29 @@ function isStatus(value: unknown): value is SessionStatus {
     "awaiting_model", "executing_tools", "returning_results", "awaiting_user", "paused",
     "validating_completion", "recovering", "completed", "rolled_back", "blocked", "aborted", "failed",
   ].includes(value);
+}
+
+function appendUnreadableSession(
+  summaries: SessionSummary[],
+  recovery: Awaited<ReturnType<typeof scanSessionRecovery>>[number] | undefined,
+  canonicalRepository: string | undefined,
+): void {
+  // An unreadable session cannot be attributed to a requested repository
+  // safely, but it must remain visible in the unfiltered recovery listing
+  // because the same directory blocks browser setup.
+  if (canonicalRepository !== undefined || recovery === undefined) return;
+  summaries.push({
+    sessionId: recovery.sessionId,
+    objective: recovery.objective,
+    repositoryRoot: recovery.repositoryRoot,
+    status: recovery.status,
+    mode: "unknown",
+    updatedAt: "unknown",
+    resumable: false,
+    recovery: {
+      disposition: recovery.disposition,
+      ...(recovery.reason === undefined ? {} : { reason: recovery.reason }),
+      ...(recovery.next === undefined ? {} : { next: recovery.next }),
+    },
+  });
 }

@@ -19,8 +19,19 @@ import type {
 import { createBaselineCopilotUiContract } from "../../src/browser/index.js";
 import { parseBrowserConfig } from "../../src/config/loader.js";
 import { AgentError } from "../../src/shared/errors.js";
+import { sha256, stableJson } from "../../src/shared/crypto.js";
 import { PromptCancelledError } from "../../src/cli/prompts.js";
 import { createStandardUserHost } from "../helpers/standard-user-host.js";
+import {
+  SESSION_RUNTIME_MANIFEST_VERSION,
+  writeRuntimeManifest,
+} from "../../src/cli/session-files.js";
+import { SessionStore } from "../../src/session/store.js";
+import {
+  DEFAULT_BUDGET_LIMITS,
+  zeroBudgetUsage,
+  type SessionState,
+} from "../../src/session/types.js";
 
 test("guided project setup detects useful package scripts and chooses one completion check", async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), "cope-onboarding-"));
@@ -1207,4 +1218,171 @@ test("Ctrl+C during manual browser readiness cancels cleanly before persistence"
   assert.equal(process.listenerCount("SIGINT"), priorSigintListeners);
   await assert.rejects(readFile(paths.browser), { code: "ENOENT" });
   await assert.rejects(readFile(paths.organizationPolicy), { code: "ENOENT" });
+});
+
+test("setup reports stale recovery before browser discovery, prompts, or launch", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-machine-recovery-preflight-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const stateHome = path.join(root, "state");
+  await mkdir(stateHome, { mode: 0o700 });
+  const host = createStandardUserHost();
+  const paths = configurationPaths(stateHome, host);
+  await mkdir(path.dirname(paths.browser), { recursive: true, mode: 0o700 });
+  await writeFile(paths.browser, "{broken", { encoding: "utf8", mode: 0o600 });
+  const now = "2026-07-24T12:00:00.000Z";
+  const state: SessionState = {
+    schemaVersion: 1,
+    protocolVersion: "cba/1",
+    sessionId: "session_setup_preflight",
+    taskId: "task_setup_preflight",
+    repositoryRoot: path.join(root, "repository"),
+    repositoryFingerprintAtStart: "f".repeat(64),
+    repositoryExcludedStateAtStart: "0".repeat(64),
+    preExistingChanges: [],
+    objective: "Verify browser uptime",
+    acceptanceCriteria: [],
+    mode: "inspect",
+    status: "transport_starting",
+    createdAt: now,
+    updatedAt: now,
+    startedAt: now,
+    policyHashes: {
+      organization: "a".repeat(64),
+      repository: "b".repeat(64),
+      grant: "c".repeat(64),
+    },
+    budgetLimits: { ...DEFAULT_BUDGET_LIMITS },
+    budgetUsage: zeroBudgetUsage(),
+    turnSequence: 0,
+    mutationSequence: 0,
+    pendingOperations: [],
+    completedOperationIds: [],
+    mutations: [],
+    validations: [],
+    protocolRepairStreak: 0,
+  };
+  const store = new SessionStore(stateHome);
+  await store.create(state);
+  await writeRuntimeManifest(store.sessionDirectory(state.sessionId), {
+    schema_version: SESSION_RUNTIME_MANIFEST_VERSION,
+    transport: "edge",
+    browser_config_sha256: "a".repeat(64),
+    created_at: now,
+  });
+
+  let browserWorkStarted = false;
+  await assert.rejects(configureMachine({
+    paths,
+    force: false,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+    browser: "edge",
+    identity: "person@example.com",
+  }, {
+    discoverBrowsers: async () => {
+      browserWorkStarted = true;
+      return [discoveredBrowser("edge")];
+    },
+    promptText: async () => {
+      browserWorkStarted = true;
+      return "person@example.com";
+    },
+    launchBrowser: async () => {
+      browserWorkStarted = true;
+      throw new Error("browser must not launch");
+    },
+  }), (error: unknown) =>
+    error instanceof AgentError &&
+    error.details.diagnosticCode === "BROWSER_CONFIG_RECOVERY_BLOCKED" &&
+    error.details.sessionId === state.sessionId);
+  assert.equal(browserWorkStarted, false);
+  assert.equal(await readFile(paths.browser, "utf8"), "{broken");
+});
+
+test("setup does not advertise resume after incompatible browser identity drift", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-machine-identity-recovery-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const stateHome = path.join(root, "state");
+  await mkdir(stateHome, { mode: 0o700 });
+  const host = createStandardUserHost();
+  const paths = configurationPaths(stateHome, host);
+  const edge = discoveredBrowser("edge");
+  await configureMachine({
+    paths,
+    force: false,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+    browser: "edge",
+    identity: "person@example.com",
+  }, {
+    discoverBrowsers: async () => [edge],
+    verifyManualBrowser: async () => ({ ...edge, source: "manual" }),
+    launchBrowser: async () => readyTransport([]),
+  });
+
+  const browser = JSON.parse(await readFile(paths.browser, "utf8")) as unknown;
+  const now = "2026-07-24T12:00:00.000Z";
+  const state: SessionState = {
+    schemaVersion: 1,
+    protocolVersion: "cba/1",
+    sessionId: "session_browser_identity_drift",
+    taskId: "task_browser_identity_drift",
+    repositoryRoot: path.join(root, "repository"),
+    repositoryFingerprintAtStart: "f".repeat(64),
+    repositoryExcludedStateAtStart: "0".repeat(64),
+    preExistingChanges: [],
+    objective: "Recover after browser replacement",
+    acceptanceCriteria: [],
+    mode: "inspect",
+    status: "transport_starting",
+    createdAt: now,
+    updatedAt: now,
+    startedAt: now,
+    policyHashes: {
+      organization: "a".repeat(64),
+      repository: "b".repeat(64),
+      grant: "c".repeat(64),
+    },
+    budgetLimits: { ...DEFAULT_BUDGET_LIMITS },
+    budgetUsage: zeroBudgetUsage(),
+    turnSequence: 0,
+    mutationSequence: 0,
+    pendingOperations: [],
+    completedOperationIds: [],
+    mutations: [],
+    validations: [],
+    protocolRepairStreak: 0,
+  };
+  const store = new SessionStore(stateHome);
+  await store.create(state);
+  await writeRuntimeManifest(store.sessionDirectory(state.sessionId), {
+    schema_version: SESSION_RUNTIME_MANIFEST_VERSION,
+    transport: "edge",
+    browser_config_sha256: sha256(stableJson(browser)),
+    created_at: now,
+  });
+
+  await assert.rejects(configureMachine({
+    paths,
+    force: false,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+  }, {
+    verifyManualBrowser: async () => ({
+      ...edge,
+      executableSha256: "b".repeat(64),
+      source: "manual",
+    }),
+  }), (error: unknown) =>
+    error instanceof AgentError &&
+    error.details.diagnosticCode === "BROWSER_CONFIG_RECOVERY_BLOCKED" &&
+    (error.details.sessions as Array<{ reason?: string; next?: string }>)[0]?.reason ===
+      "BROWSER_IDENTITY_CHANGED" &&
+    /cope abort session_browser_identity_drift/u.test(
+      String((error.details.sessions as Array<{ next?: string }>)[0]?.next),
+    ) &&
+    !/cope resume/u.test(JSON.stringify(error.details)));
 });

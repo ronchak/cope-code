@@ -259,6 +259,13 @@ export function parseCliArguments(argv: readonly string[]): CliCommand {
       return { command, sessionId, ...common, ...(reason === undefined ? {} : { reason }) };
     }
     case "abort": {
+      if (args.includes("--all")) {
+        throw new AgentError(
+          "CONFIG_INVALID",
+          "Bulk abort is not supported because saved sessions may contain unrelated or unreconciled work",
+          { next: "Run cope sessions --all, then abort each intended session by its full session_... identifier." },
+        );
+      }
       const sessionId = requirePositional(args, "abort requires a session identifier");
       const reason = takeOption(args, "--reason");
       assertNoUnknown(args);
