@@ -33,6 +33,7 @@ const MODEL_MESSAGE_TYPES = new Set<ProtocolMessage["message_type"]>([
   "user_input_request",
   "capability_request",
   "progress_update",
+  "plan_submission",
   "completion",
   "blocked",
 ]);
@@ -136,7 +137,7 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
       createToolResultMessage(correlationFor(input.taskId, input.priorTurnId, "decision"), [
         {
           operation_id: input.requestId,
-          tool: input.kind === "user_input" ? "request_user_input" : "request_capability",
+          tool: input.kind === "capability" ? "request_capability" : "request_user_input",
           status: "success",
           output: input.decision,
         },
@@ -201,6 +202,15 @@ function normalizeMessage(message: ProtocolMessage): NormalizedModelMessage {
       return normalizeCapability(message.operation_id, message.request);
     case "progress_update":
       return { type: "progress", summary: message.summary };
+    case "plan_submission":
+      return {
+        type: "plan",
+        planId: message.operation_id,
+        summary: message.plan.summary,
+        steps: message.plan.steps,
+        anticipatedMutations: message.plan.anticipated_mutations,
+        validation: message.plan.validation,
+      };
     case "completion":
       return normalizeCompletion(message.operation_id, message.report);
     case "blocked":

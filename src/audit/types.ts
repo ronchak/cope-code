@@ -21,6 +21,8 @@ export const AUDIT_EVENT_TYPES = [
   "user.requested",
   "user.decided",
   "user.decision_replayed",
+  "plan.required",
+  "plan.decided",
   "completion.claimed",
   "completion.verified",
   "session.recovered",

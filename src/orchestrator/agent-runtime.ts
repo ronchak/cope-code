@@ -626,6 +626,54 @@ export class AgentRuntime {
         await this.move("awaiting_model");
         return { terminal: false, outbound };
       }
+      case "plan": {
+        await this.move("awaiting_user");
+        const submittedAt = this.now();
+        const planContent = {
+          summary: action.summary,
+          steps: action.steps,
+          anticipatedMutations: action.anticipatedMutations,
+          validation: action.validation,
+        };
+        const planHash = sha256(stableJson(planContent));
+        const decision = await this.executeUserDecision(
+          action.planId,
+          "request_user_input",
+          { type: "plan", planHash },
+          turnId,
+          async () => ({ approved: await this.dependencies.user.requestPlanApproval(planContent) }),
+        );
+        const approved = decision.approved === true;
+        this.state.plan = {
+          planId: action.planId,
+          ...planContent,
+          planHash,
+          status: approved ? "approved" : "rejected",
+          submittedAt,
+          decidedAt: this.now(),
+        };
+        await this.persist();
+        await this.dependencies.audit.append({
+          type: "plan.decided",
+          taskId: this.state.taskId,
+          turnId,
+          operationId: action.planId,
+          data: { planHash, approved, stepCount: action.steps.length },
+        });
+        const outbound = await this.serializeForDisclosure(
+          this.dependencies.protocol.renderUserDecision({
+            taskId: this.state.taskId,
+            priorTurnId: turnId,
+            requestId: action.planId,
+            kind: "plan",
+            decision: { approved, plan_hash: planHash },
+          }),
+          "decision",
+        );
+        await this.move("returning_results");
+        await this.move("awaiting_model");
+        return { terminal: false, outbound };
+      }
       case "complete_task": {
         await this.move("validating_completion");
         await this.dependencies.audit.append({
@@ -843,6 +891,26 @@ export class AgentRuntime {
 
   private async executeCall(call: NormalizedToolCall, turnId: string): Promise<ToolOutcome> {
     const mutating = !READ_ONLY_TOOLS.has(call.name);
+    if (mutating && this.state.mode !== "inspect" && this.state.plan?.status !== "approved") {
+      await this.dependencies.audit.append({
+        type: "plan.required",
+        taskId: this.state.taskId,
+        turnId,
+        operationId: call.operationId,
+        data: { tool: call.name, planStatus: this.state.plan?.status ?? "missing" },
+      });
+      return {
+        operationId: call.operationId,
+        tool: call.name,
+        status: "denied",
+        data: {
+          code: "PLAN_APPROVAL_REQUIRED",
+          decision: "deny",
+          message: "Submit a plan_submission and obtain user approval before requesting a mutation or command.",
+        },
+        safeMetadata: { reasonCode: "PLAN_APPROVAL_REQUIRED" },
+      };
+    }
     const operationAlreadyAccounted =
       this.state.completedOperationIds.includes(call.operationId) ||
       this.state.pendingOperations.some((operation) => operation.operationId === call.operationId);

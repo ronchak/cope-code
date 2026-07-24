@@ -28,7 +28,7 @@ Operation-bearing messages also carry globally unique `operation_id` values. An 
 
 ## Direction and message classes
 
-Copilot may send `tool_request`, `user_input_request`, `capability_request`, `progress_update`, `completion`, and `blocked`. The harness may send `tool_result`, `tool_denial`, and `protocol_error`. Receiving a harness-direction message from Copilot is invalid.
+Copilot may send `tool_request`, `user_input_request`, `capability_request`, `progress_update`, `plan_submission`, `completion`, and `blocked`. The harness may send `tool_result`, `tool_denial`, and `protocol_error`. Receiving a harness-direction message from Copilot is invalid.
 
 The normal model request is:
 
@@ -37,6 +37,12 @@ The normal model request is:
 ```
 
 Only independent read-only operations may be batched: `list_files`, `search_text`, `read_file`, `git_status`, and `git_diff`. `apply_patch`, `run_command`, `request_user_input`, `request_capability`, and `complete_task` must be alone so Copilot observes each material outcome before planning a dependent action.
+
+Before `apply_patch` or `run_command` in `edit`/`auto`, Copilot submits a standalone `plan_submission` containing a unique `operation_id`, a summary, one or more ordered steps, anticipated mutations, and validation steps. The harness hashes and persists the exact plan with the user's explicit approve/reject decision. An approved plan unlocks only the mutation sequencing gate; policy, grant, budget, checkpoint, and tool checks still apply independently. A rejected plan unlocks nothing, and revision requires a new operation ID.
+
+```cba/1
+{"protocol":"cba/1","message_type":"plan_submission","message_id":"m_20","task_id":"task_example","turn_id":3,"operation_id":"op_plan_20","plan":{"summary":"Update parser behavior and verify it","steps":["Apply a hash-guarded parser edit","Run the approved unit-test command"],"anticipated_mutations":["src/parser.ts"],"validation":["npm.test"]}}
+```
 
 ## V1 tools
 

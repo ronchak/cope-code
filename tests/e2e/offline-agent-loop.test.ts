@@ -189,6 +189,7 @@ test("offline fixture completes discovery, edit, failed validation, correction, 
     transport,
     disclosure: contentSecurity,
     user: {
+      requestPlanApproval: async () => true,
       requestInput: async () => { throw new Error("fixture did not authorize user input"); },
       requestCapability: async () => { throw new Error("fixture exceeded its grant"); },
     },
@@ -229,15 +230,29 @@ function scriptedTurns(
   const messages: ProtocolMessage[] = [
     request(taskId, 1, "op_list", "list_files", { path: "src", max_depth: 2, max_results: 20 }),
     request(taskId, 2, "op_read", "read_file", { path: "src/answer.js", max_bytes: 4_096 }),
-    request(taskId, 3, "op_patch_first", "apply_patch", {
+    {
+      protocol: "cba/1",
+      message_type: "plan_submission",
+      message_id: "model_message_3",
+      task_id: taskId,
+      turn_id: 3,
+      operation_id: "op_plan_answer",
+      plan: {
+        summary: "Correct the answer and verify the final repository state",
+        steps: ["Update src/answer.js", "Run validation", "Correct any failure and validate again"],
+        anticipated_mutations: ["src/answer.js"],
+        validation: ["validate-answer"],
+      },
+    },
+    request(taskId, 4, "op_patch_first", "apply_patch", {
       changes: [{ kind: "update", path: "src/answer.js", base_sha256: initialHash, content: firstAttempt }],
     }),
-    request(taskId, 4, "op_validate_fail", "run_command", { command_id: "validate-answer" }),
-    request(taskId, 5, "op_patch_correct", "apply_patch", {
+    request(taskId, 5, "op_validate_fail", "run_command", { command_id: "validate-answer" }),
+    request(taskId, 6, "op_patch_correct", "apply_patch", {
       changes: [{ kind: "update", path: "src/answer.js", base_sha256: firstAttemptHash, content: corrected }],
     }),
-    request(taskId, 6, "op_validate_pass", "run_command", { command_id: "validate-answer" }),
-    request(taskId, 7, "op_diff", "git_diff", {
+    request(taskId, 7, "op_validate_pass", "run_command", { command_id: "validate-answer" }),
+    request(taskId, 8, "op_diff", "git_diff", {
       scope: "working_tree",
       paths: ["src/answer.js"],
       max_bytes: 8_192,
@@ -245,9 +260,9 @@ function scriptedTurns(
     {
       protocol: "cba/1",
       message_type: "completion",
-      message_id: "model_message_8",
+      message_id: "model_message_9",
       task_id: taskId,
-      turn_id: 8,
+      turn_id: 9,
       operation_id: "op_complete",
       report: {
         summary: "Updated the answer to 42 after correcting the failed first validation, then validated the final repository state.",

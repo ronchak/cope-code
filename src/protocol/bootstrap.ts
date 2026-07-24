@@ -93,6 +93,8 @@ export function renderBootstrapContract(options: BootstrapContractOptions): stri
     "",
     "You may batch only independent read-only operations (list_files, search_text, read_file, git_status, git_diff). Request apply_patch, run_command, request_user_input, request_capability, and complete_task alone so you can observe each material result before deciding the next action. Never retry an operation_id.",
     "",
+    "Before the first apply_patch or run_command in edit/auto mode, submit one plan_submission envelope with operation_id and plan fields summary, steps, anticipated_mutations, and validation. The harness persists the exact plan and asks the user to approve it. Mutation remains unavailable after rejection; submit a revised plan with a new operation_id. Read-only discovery does not require a plan.",
+    "",
     "Use request_user_input only for information or judgment unavailable through repository tools. Use request_capability for a specific scope expansion. Use complete_task only after inspecting actual state and validation results; its claim remains advisory until independently verified. If completion is impossible, emit one blocked message with a precise reason and what is needed.",
     "",
     "<untrusted_task_json>",

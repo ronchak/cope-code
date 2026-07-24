@@ -48,6 +48,7 @@ const SESSION_KEYS = [
   "validations",
   "lastCheckpointId",
   "lastModelSummaryHash",
+  "plan",
   "completionHandoff",
   "protocolRepairStreak",
 ] as const;
@@ -413,6 +414,9 @@ function assertValidSessionState(value: Partial<SessionState>): asserts value is
   if (value.lastModelSummaryHash !== undefined && !HASH_PATTERN.test(value.lastModelSummaryHash)) {
     throw new AgentError("RECOVERY_REQUIRED", "Session model-summary fingerprint is malformed");
   }
+  if (value.plan !== undefined && !isSessionPlan(value.plan)) {
+    throw new AgentError("RECOVERY_REQUIRED", "Session plan record is malformed");
+  }
   if (value.lastCheckpointId !== undefined && (typeof value.lastCheckpointId !== "string" || value.lastCheckpointId.length > 128)) {
     throw new AgentError("RECOVERY_REQUIRED", "Session checkpoint reference is malformed");
   }
@@ -425,6 +429,22 @@ function assertValidSessionState(value: Partial<SessionState>): asserts value is
       typeof value.failure.message !== "string" || value.failure.message.length > 64 * 1024)) {
     throw new AgentError("RECOVERY_REQUIRED", "Session failure record is malformed");
   }
+}
+
+function isSessionPlan(value: unknown): value is NonNullable<SessionState["plan"]> {
+  if (typeof value !== "object" || value === null) return false;
+  const plan = value as Partial<NonNullable<SessionState["plan"]>>;
+  return hasExactKeys(plan, [
+    "planId", "summary", "steps", "anticipatedMutations", "validation", "planHash", "status", "submittedAt", "decidedAt",
+  ]) &&
+    typeof plan.planId === "string" && isOperationId(plan.planId) &&
+    typeof plan.summary === "string" && plan.summary.length > 0 && plan.summary.length <= 64 * 1024 &&
+    boundedStringArray(plan.steps, 256, 16 * 1024) && plan.steps.length > 0 &&
+    boundedStringArray(plan.anticipatedMutations, 1_024, 32_768) &&
+    boundedStringArray(plan.validation, 256, 16 * 1024) &&
+    typeof plan.planHash === "string" && HASH_PATTERN.test(plan.planHash) &&
+    (plan.status === "approved" || plan.status === "rejected") &&
+    isIsoTimestamp(plan.submittedAt) && isIsoTimestamp(plan.decidedAt);
 }
 
 function isSessionStatus(value: unknown): value is SessionState["status"] {

@@ -119,6 +119,17 @@ function state(repositoryRoot: string): SessionState {
     completedOperationIds: [],
     mutations: [],
     validations: [],
+    plan: {
+      planId: "op_plan_default",
+      summary: "Existing approved test plan",
+      steps: ["Execute the test scenario"],
+      anticipatedMutations: [],
+      validation: [],
+      planHash: "e".repeat(64),
+      status: "approved",
+      submittedAt: "2026-01-01T00:00:00.000Z",
+      decidedAt: "2026-01-01T00:00:00.000Z",
+    },
     protocolRepairStreak: 0,
   };
 }
@@ -191,6 +202,7 @@ test("runtime completes a multi-turn autonomous tool loop", async () => {
     transport,
     disclosure: { inspectAndSerialize: async (message) => message },
     user: {
+      requestPlanApproval: async () => true,
       requestInput: async () => ({ answer: "unused" }),
       requestCapability: async () => ({ decision: "deny" }),
     },
@@ -215,6 +227,89 @@ test("runtime completes a multi-turn autonomous tool loop", async () => {
   const durableHandoff = await completionHandoffs.read(localState.completionHandoff);
   assert.equal(durableHandoff.claim.summary, "Repository inspected.");
   assert.equal(durableHandoff.verification.accepted, true);
+});
+
+test("runtime persists approved plan before allowing mutation", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-plan-"));
+  const localState = state(root);
+  delete localState.plan;
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const clock = { now: () => new Date("2026-01-01T00:01:00.000Z") };
+  let executions = 0;
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{ operationId: "op_patch_before_plan", name: "apply_patch", arguments: { changes: [] } }],
+    }]),
+    JSON.stringify([{
+      type: "plan",
+      planId: "op_plan_review",
+      summary: "Make one bounded update",
+      steps: ["Apply the approved patch"],
+      anticipatedMutations: ["src/a.ts"],
+      validation: ["Run tests"],
+    }]),
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{ operationId: "op_patch_after_plan", name: "apply_patch", arguments: { changes: [] } }],
+    }]),
+    JSON.stringify([{ type: "blocked", reason: "test finished", recoverable: false }]),
+  ]);
+  const artifacts = new SessionArtifactStore(path.join(root, "artifacts"));
+  const runtime = new AgentRuntime({
+    state: localState,
+    store,
+    journal: new OperationJournal(path.join(root, "operations"), localState.sessionId),
+    audit: new AuditLog(path.join(root, "audit.jsonl"), localState.sessionId, clock),
+    protocol,
+    policy: {
+      summarize: () => ({ mode: "auto" }),
+      authorize: () => ({ outcome: "allow", reasonCode: "OK", explanation: "ok" }),
+      expandSessionGrant: async () => false,
+    },
+    tools: {
+      execute: async (call) => {
+        executions += 1;
+        return {
+          operationId: call.operationId,
+          tool: call.name,
+          status: "success",
+          data: {},
+          safeMetadata: {
+            changedFileCount: 0,
+            changedLines: 0,
+            checkpointId: "checkpoint_plan_test",
+            changedPaths: [],
+            repositoryFingerprint: "d".repeat(64),
+          },
+        };
+      },
+      inspectCompletionState: async () => ({
+        pathKey: completionPathKey, known: true, fingerprint: "d".repeat(64),
+        excludedStateFingerprint: "0".repeat(64), hasConflicts: false, changedPaths: [], outOfScopePaths: [], gitStatusSummary: "clean",
+      }),
+    },
+    transport,
+    disclosure: { inspectAndSerialize: async (message) => message },
+    user: {
+      requestPlanApproval: async () => true,
+      requestInput: async () => ({}),
+      requestCapability: async () => ({ decision: "deny" }),
+    },
+    completionRequirements: { requiredCommandIds: [], requireValidationAfterLastMutation: false, requireCleanPendingOperations: true },
+    clock,
+    artifacts,
+  });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "blocked");
+  assert.equal(executions, 1);
+  assert.equal(localState.completedOperationIds.includes("op_patch_before_plan"), false);
+  const durable = await store.read(localState.sessionId);
+  assert.equal(durable.plan?.status, "approved");
+  assert.equal(durable.plan?.summary, "Make one bounded update");
+  assert.match(durable.plan?.planHash ?? "", /^[a-f0-9]{64}$/u);
 });
 
 test("runtime sends protocol repair feedback and continues", async () => {
@@ -254,6 +349,7 @@ test("runtime sends protocol repair feedback and continues", async () => {
     transport: new QueueTransport(["not-json", validCompletion]),
     disclosure: { inspectAndSerialize: async (message) => message },
     user: {
+      requestPlanApproval: async () => true,
       requestInput: async () => ({}),
       requestCapability: async () => ({ decision: "deny" }),
     },
@@ -319,6 +415,7 @@ test("runtime resumes from an integrity-checked cached model response without re
     transport: new QueueTransport([]),
     disclosure: { inspectAndSerialize: async (message) => message },
     user: {
+      requestPlanApproval: async () => true,
       requestInput: async () => ({}),
       requestCapability: async () => ({ decision: "deny" }),
     },
@@ -367,6 +464,7 @@ test("runtime pauses instead of replaying an indeterminate mutation", async () =
     }])]),
     disclosure: { inspectAndSerialize: async (message) => message },
     user: {
+      requestPlanApproval: async () => true,
       requestInput: async () => ({}),
       requestCapability: async () => ({ decision: "deny" }),
     },
@@ -437,6 +535,7 @@ test("runtime replays a completed journal record while recovering an interrupted
     }])]),
     disclosure: { inspectAndSerialize: async (message) => message },
     user: {
+      requestPlanApproval: async () => true,
       requestInput: async () => ({}),
       requestCapability: async () => ({ decision: "deny" }),
     },
@@ -524,6 +623,7 @@ test("completed mutation replay idempotently restores durable session effects wi
     }])]),
     disclosure: { inspectAndSerialize: async (message) => message },
     user: {
+      requestPlanApproval: async () => true,
       requestInput: async () => ({}),
       requestCapability: async () => ({ decision: "deny" }),
     },
@@ -618,6 +718,7 @@ test("completed command replay restores validation evidence used by completion",
     }])]),
     disclosure: { inspectAndSerialize: async (message) => message },
     user: {
+      requestPlanApproval: async () => true,
       requestInput: async () => ({}),
       requestCapability: async () => ({ decision: "deny" }),
     },
@@ -720,6 +821,7 @@ test("completed user decision is replayed from an integrity-checked artifact wit
     }])]),
     disclosure: { inspectAndSerialize: async (message) => message },
     user: {
+      requestPlanApproval: async () => true,
       requestInput: async () => { prompts += 1; return { answer: "unexpected" }; },
       requestCapability: async () => ({ decision: "deny" }),
     },
@@ -795,6 +897,7 @@ test("standalone allow_once capability decision is durable but not treated as un
     transport,
     disclosure: { inspectAndSerialize: async (message) => message },
     user: {
+      requestPlanApproval: async () => true,
       requestInput: async () => ({}),
       requestCapability: async () => { prompts += 1; return { decision: "allow_once" }; },
     },
@@ -845,6 +948,7 @@ test("caller stop signal leaves a resumable paused session", async () => {
     transport: new QueueTransport([]),
     disclosure: { inspectAndSerialize: async (message) => message },
     user: {
+      requestPlanApproval: async () => true,
       requestInput: async () => ({}),
       requestCapability: async () => ({ decision: "deny" }),
     },

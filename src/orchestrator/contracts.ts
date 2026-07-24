@@ -26,6 +26,14 @@ export type NormalizedModelMessage =
       readonly risk?: string;
     }
   | { readonly type: "progress"; readonly summary: string }
+  | {
+      readonly type: "plan";
+      readonly planId: string;
+      readonly summary: string;
+      readonly steps: readonly string[];
+      readonly anticipatedMutations: readonly string[];
+      readonly validation: readonly string[];
+    }
   | { readonly type: "complete_task"; readonly operationId: string; readonly claim: CompletionClaim }
   | { readonly type: "blocked"; readonly reason: string; readonly recoverable: boolean };
 
@@ -84,7 +92,7 @@ export interface ProtocolAdapter {
     readonly taskId: string;
     readonly priorTurnId: string;
     readonly requestId: string;
-    readonly kind: "user_input" | "capability";
+    readonly kind: "user_input" | "capability" | "plan";
     readonly decision: Readonly<Record<string, unknown>>;
   }): string;
   renderCompletionRejected(input: {
@@ -116,6 +124,12 @@ export interface DisclosureGuard {
 }
 
 export interface UserInteraction {
+  requestPlanApproval(request: {
+    readonly summary: string;
+    readonly steps: readonly string[];
+    readonly anticipatedMutations: readonly string[];
+    readonly validation: readonly string[];
+  }): Promise<boolean>;
   requestInput(request: {
     readonly question: string;
     readonly choices?: readonly string[];
