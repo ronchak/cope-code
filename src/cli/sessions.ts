@@ -48,7 +48,8 @@ export async function listSessions(options: {
     : await realpath(requestedRepository).catch(() => path.resolve(requestedRepository));
   const summaries: SessionSummary[] = [];
   const recoveryBySession = new Map(
-    (await scanSessionRecovery(stateHome)).map((assessment) => [assessment.sessionId, assessment] as const),
+    (await scanSessionRecovery(stateHome, host))
+      .map((assessment) => [assessment.sessionId, assessment] as const),
   );
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;

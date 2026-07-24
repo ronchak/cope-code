@@ -6,7 +6,7 @@ import { BrowserConfigTransactionLock } from "../config/browser-config-lock.js";
 import type { BrowserFileConfig } from "../config/types.js";
 import type { PolicyDocument } from "../policy/index.js";
 import { AgentError } from "../shared/errors.js";
-import type { HostPlatform } from "../platform/index.js";
+import { CURRENT_HOST_PLATFORM, type HostPlatform } from "../platform/index.js";
 import {
   browserSetupBlockedErrorDetails,
   liveBrowserSetupBlockers,
@@ -40,7 +40,7 @@ export async function commitBrowserSetup(options: {
   const lock = await BrowserConfigTransactionLock.acquire(options.stateHome);
   try {
     await assertBaselineUnchanged(options.browserFile, options.browserBaseline);
-    await assertBrowserSetupRecoveryReady(options.stateHome);
+    await assertBrowserSetupRecoveryReady(options.stateHome, options.host);
     await options.revalidate();
     await assertBaselineUnchanged(options.browserFile, options.browserBaseline);
     if (options.organizationPolicyToCreate !== undefined) {
@@ -92,8 +92,11 @@ async function assertBaselineUnchanged(filename: string, baseline: BrowserConfig
   }
 }
 
-export async function assertBrowserSetupRecoveryReady(stateHome: string): Promise<void> {
-  const blockers = liveBrowserSetupBlockers(await scanSessionRecovery(stateHome));
+export async function assertBrowserSetupRecoveryReady(
+  stateHome: string,
+  host: HostPlatform = CURRENT_HOST_PLATFORM,
+): Promise<void> {
+  const blockers = liveBrowserSetupBlockers(await scanSessionRecovery(stateHome, host));
   if (blockers.length === 0) return;
   throw new AgentError(
     "RECOVERY_REQUIRED",

@@ -2,6 +2,7 @@ import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 
 import { parseBrowserConfig } from "../config/loader.js";
+import { CURRENT_HOST_PLATFORM, type HostPlatform } from "../platform/index.js";
 import { SessionStore } from "../session/store.js";
 import { isTerminal } from "../session/state-machine.js";
 import type { SessionState, SessionStatus } from "../session/types.js";
@@ -46,6 +47,7 @@ export async function assessSessionRecovery(
   stateHome: string,
   state: SessionState,
   browserEvidence?: BrowserConfigurationEvidence,
+  host: HostPlatform = CURRENT_HOST_PLATFORM,
 ): Promise<SessionRecoveryAssessment> {
   const base = {
     sessionId: state.sessionId,
@@ -65,7 +67,7 @@ export async function assessSessionRecovery(
       ...base,
       disposition: "reconcile_required",
       reason: "RUNTIME_MANIFEST_UNREADABLE",
-      next: `Run ${recoveryCommand(stateHome, "status", state.sessionId)} and verify its audit before changing browser setup.`,
+      next: `Run ${recoveryCommand(stateHome, host, "status", state.sessionId)} and verify its audit before changing browser setup.`,
     };
   }
   if (manifest.transport !== "edge") {
@@ -73,7 +75,7 @@ export async function assessSessionRecovery(
       ...base,
       transport: manifest.transport,
       disposition: "resume_candidate",
-      next: recoveryCommand(stateHome, "resume", state.sessionId),
+      next: recoveryCommand(stateHome, host, "resume", state.sessionId),
     };
   }
 
@@ -83,6 +85,7 @@ export async function assessSessionRecovery(
       { ...base, transport: manifest.transport },
       state,
       stateHome,
+      host,
       "BROWSER_CONFIG_MISSING",
     );
   }
@@ -91,6 +94,7 @@ export async function assessSessionRecovery(
       { ...base, transport: manifest.transport },
       state,
       stateHome,
+      host,
       "BROWSER_CONFIG_INVALID",
     );
   }
@@ -102,6 +106,7 @@ export async function assessSessionRecovery(
       { ...base, transport: manifest.transport },
       state,
       stateHome,
+      host,
       "BROWSER_CONFIG_CHANGED",
     );
   }
@@ -109,12 +114,13 @@ export async function assessSessionRecovery(
     ...base,
     transport: manifest.transport,
     disposition: "resume_candidate",
-    next: recoveryCommand(stateHome, "resume", state.sessionId),
+    next: recoveryCommand(stateHome, host, "resume", state.sessionId),
   };
 }
 
 export async function scanSessionRecovery(
   stateHome: string,
+  host: HostPlatform = CURRENT_HOST_PLATFORM,
 ): Promise<readonly SessionRecoveryAssessment[]> {
   const sessionsDirectory = path.join(stateHome, "sessions");
   let entries;
@@ -131,7 +137,7 @@ export async function scanSessionRecovery(
     if (!entry.isDirectory()) continue;
     try {
       const state = await store.read(entry.name);
-      assessments.push(await assessSessionRecovery(stateHome, state, browserEvidence));
+      assessments.push(await assessSessionRecovery(stateHome, state, browserEvidence, host));
     } catch {
       assessments.push({
         sessionId: entry.name,
@@ -220,6 +226,7 @@ function recoveryBlocked(
   },
   state: SessionState,
   stateHome: string,
+  host: HostPlatform,
   reason: Exclude<SessionRecoveryReason, "MUTATION_EVIDENCE_PRESENT">,
 ): SessionRecoveryAssessment {
   const mutationEvidence =
@@ -231,7 +238,7 @@ function recoveryBlocked(
       ...base,
       disposition: "reconcile_required",
       reason: "MUTATION_EVIDENCE_PRESENT",
-      next: `Run ${recoveryCommand(stateHome, "status", state.sessionId)} and reconcile or roll back the recorded mutation before setup.`,
+      next: `Run ${recoveryCommand(stateHome, host, "status", state.sessionId)} and reconcile or roll back the recorded mutation before setup.`,
     };
   }
   return {
@@ -240,6 +247,7 @@ function recoveryBlocked(
     reason,
     next: recoveryCommand(
       stateHome,
+      host,
       "abort",
       state.sessionId,
       "--reason",
@@ -248,15 +256,19 @@ function recoveryBlocked(
   };
 }
 
-function recoveryCommand(stateHome: string, ...arguments_: readonly string[]): string {
+function recoveryCommand(
+  stateHome: string,
+  host: HostPlatform,
+  ...arguments_: readonly string[]
+): string {
   return ["cope", ...arguments_, "--state-home", stateHome]
-    .map(quoteCommandArgument)
+    .map((argument) => quoteCommandArgument(argument, host))
     .join(" ");
 }
 
-function quoteCommandArgument(value: string): string {
+function quoteCommandArgument(value: string, host: HostPlatform): string {
   if (/^[A-Za-z0-9_./:@=-]+$/u.test(value)) return value;
-  if (process.platform === "win32") {
+  if (host.platform === "win32") {
     return `'${value.replaceAll("'", "''")}'`;
   }
   return `'${value.replaceAll("'", "'\"'\"'")}'`;

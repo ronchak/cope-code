@@ -118,7 +118,7 @@ export async function executeDoctorCommand(
   let recoveryBlocksSetup = false;
   try {
     const recoveryBlockers = liveBrowserSetupBlockers(
-      await scanSessionRecovery(paths.stateHome),
+      await scanSessionRecovery(paths.stateHome, host),
     );
     recoveryBlocksSetup = recoveryBlockers.length > 0;
     for (const recovery of recoveryBlockers) {

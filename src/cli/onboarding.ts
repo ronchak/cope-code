@@ -310,7 +310,7 @@ export async function configureMachine(options: {
 
   // Fail before browser selection, prompts, or sign-in. The final transaction
   // repeats this check under the configuration lock to catch later races.
-  await assertBrowserSetupRecoveryReady(options.paths.stateHome);
+  await assertBrowserSetupRecoveryReady(options.paths.stateHome, options.host);
 
   // Eligibility includes the live GUI session, so defer it until after the
   // read-only idempotent path has decided no browser needs to open.

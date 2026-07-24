@@ -450,7 +450,7 @@ async function resumeSession(
   if (isTerminal(state.status)) {
     throw new AgentError("RECOVERY_REQUIRED", `Session is terminal (${state.status}) and cannot be resumed`);
   }
-  const recovery = await assessSessionRecovery(stateHome, state);
+  const recovery = await assessSessionRecovery(stateHome, state, undefined, host);
   if (recovery.disposition !== "resume_candidate") {
     throw new AgentError(
       "RECOVERY_REQUIRED",
