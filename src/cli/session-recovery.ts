@@ -65,7 +65,7 @@ export async function assessSessionRecovery(
       ...base,
       disposition: "reconcile_required",
       reason: "RUNTIME_MANIFEST_UNREADABLE",
-      next: `Run cope status ${state.sessionId} and verify its audit before changing browser setup.`,
+      next: `Run ${recoveryCommand(stateHome, "status", state.sessionId)} and verify its audit before changing browser setup.`,
     };
   }
   if (manifest.transport !== "edge") {
@@ -73,28 +73,43 @@ export async function assessSessionRecovery(
       ...base,
       transport: manifest.transport,
       disposition: "resume_candidate",
-      next: `cope resume ${state.sessionId}`,
+      next: recoveryCommand(stateHome, "resume", state.sessionId),
     };
   }
 
   const browser = browserEvidence ?? await readBrowserConfigurationEvidence(stateHome);
   if (browser.status === "missing") {
-    return recoveryBlocked({ ...base, transport: manifest.transport }, state, "BROWSER_CONFIG_MISSING");
+    return recoveryBlocked(
+      { ...base, transport: manifest.transport },
+      state,
+      stateHome,
+      "BROWSER_CONFIG_MISSING",
+    );
   }
   if (browser.status === "invalid") {
-    return recoveryBlocked({ ...base, transport: manifest.transport }, state, "BROWSER_CONFIG_INVALID");
+    return recoveryBlocked(
+      { ...base, transport: manifest.transport },
+      state,
+      stateHome,
+      "BROWSER_CONFIG_INVALID",
+    );
   }
   if (
     manifest.browser_config_sha256 === undefined ||
     manifest.browser_config_sha256 !== browser.hash
   ) {
-    return recoveryBlocked({ ...base, transport: manifest.transport }, state, "BROWSER_CONFIG_CHANGED");
+    return recoveryBlocked(
+      { ...base, transport: manifest.transport },
+      state,
+      stateHome,
+      "BROWSER_CONFIG_CHANGED",
+    );
   }
   return {
     ...base,
     transport: manifest.transport,
     disposition: "resume_candidate",
-    next: `cope resume ${state.sessionId}`,
+    next: recoveryCommand(stateHome, "resume", state.sessionId),
   };
 }
 
@@ -204,24 +219,43 @@ function recoveryBlocked(
     readonly transport?: SessionRuntimeManifest["transport"];
   },
   state: SessionState,
+  stateHome: string,
   reason: Exclude<SessionRecoveryReason, "MUTATION_EVIDENCE_PRESENT">,
 ): SessionRecoveryAssessment {
   const mutationEvidence =
     state.mutationSequence > 0 ||
     state.mutations.length > 0 ||
-    state.pendingOperations.length > 0;
+    state.pendingOperations.some((operation) => operation.mutating);
   if (mutationEvidence) {
     return {
       ...base,
       disposition: "reconcile_required",
       reason: "MUTATION_EVIDENCE_PRESENT",
-      next: `Run cope status ${state.sessionId} and reconcile or roll back the recorded mutation before setup.`,
+      next: `Run ${recoveryCommand(stateHome, "status", state.sessionId)} and reconcile or roll back the recorded mutation before setup.`,
     };
   }
   return {
     ...base,
     disposition: "abort_required",
     reason,
-    next: `cope abort ${state.sessionId} --reason "Discard interrupted session that cannot resume"`,
+    next: recoveryCommand(
+      stateHome,
+      "abort",
+      state.sessionId,
+      "--reason",
+      "Discard interrupted session that cannot resume",
+    ),
   };
+}
+
+function recoveryCommand(stateHome: string, ...arguments_: readonly string[]): string {
+  return ["cope", ...arguments_, "--state-home", stateHome]
+    .map(quoteCommandArgument)
+    .join(" ");
+}
+
+function quoteCommandArgument(value: string): string {
+  return /^[A-Za-z0-9_./:@=-]+$/u.test(value)
+    ? value
+    : `"${value.replaceAll("\"", "\\\"")}"`;
 }

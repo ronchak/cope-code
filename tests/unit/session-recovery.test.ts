@@ -56,7 +56,7 @@ test("live recovery distinguishes matching, missing, invalid, and changed browse
   const matching = await assessSessionRecovery(root, state);
   assert.equal(matching.disposition, "resume_candidate");
   assert.equal(matching.reason, undefined);
-  assert.equal(matching.next, "cope resume session_recovery_static");
+  assert.equal(matching.next, `cope resume session_recovery_static --state-home ${root}`);
 });
 
 test("missing browser configuration requires reconciliation when mutation evidence exists", async (context) => {
@@ -85,6 +85,37 @@ test("missing browser configuration requires reconciliation when mutation eviden
   assert.equal(assessment.disposition, "reconcile_required");
   assert.equal(assessment.reason, "MUTATION_EVIDENCE_PRESENT");
   assert.match(assessment.next ?? "", /cope status session_recovery_mutation/u);
+});
+
+test("a pending read-only operation still permits abort when browser configuration is missing", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-session-recovery-read-only-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const state = sessionState("session_recovery_read_only");
+  state.pendingOperations.push({
+    operationId: "op-read-only",
+    tool: "read_file",
+    mutating: false,
+    requestHash: "d".repeat(64),
+    status: "indeterminate",
+    acceptedAt: now,
+  });
+  const store = new SessionStore(root);
+  await store.create(state);
+  await writeRuntimeManifest(store.sessionDirectory(state.sessionId), {
+    schema_version: SESSION_RUNTIME_MANIFEST_VERSION,
+    transport: "edge",
+    browser_config_sha256: "a".repeat(64),
+    created_at: now,
+  });
+
+  const assessment = await assessSessionRecovery(root, state);
+  assert.equal(assessment.disposition, "abort_required");
+  assert.equal(assessment.reason, "BROWSER_CONFIG_MISSING");
+
+  state.pendingOperations[0] = { ...state.pendingOperations[0]!, mutating: true };
+  const mutatingAssessment = await assessSessionRecovery(root, state);
+  assert.equal(mutatingAssessment.disposition, "reconcile_required");
+  assert.equal(mutatingAssessment.reason, "MUTATION_EVIDENCE_PRESENT");
 });
 
 test("terminal sessions never require runtime or browser recovery inputs", async (context) => {
