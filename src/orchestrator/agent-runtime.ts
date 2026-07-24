@@ -34,6 +34,7 @@ import type {
 } from "./contracts.js";
 
 const READ_ONLY_TOOLS = new Set(["list_files", "search_text", "read_file", "git_status", "git_diff"]);
+const MAX_PARALLEL_READS = 4;
 
 export interface AgentRuntimeDependencies {
   readonly state: SessionState;
@@ -85,6 +86,7 @@ export class AgentRuntime {
   private finalModelSummary?: string;
   private finalModelReport?: CompletionClaim;
   private interruption?: { readonly status: "paused" | "aborted"; readonly reason: string };
+  private persistTail: Promise<void> = Promise.resolve();
 
   public constructor(private readonly dependencies: AgentRuntimeDependencies) {
     this.state = dependencies.state;
@@ -814,11 +816,31 @@ export class AgentRuntime {
         safeMetadata: { reasonCode: "SEQUENCING_REQUIRED" },
       }));
     }
-    const outcomes: ToolOutcome[] = [];
-    for (const call of calls) {
-      outcomes.push(await this.executeCall(call, turnId));
+    if (calls.length <= 1) {
+      const call = calls[0];
+      return call === undefined ? [] : [await this.executeCall(call, turnId)];
     }
-    return outcomes;
+
+    const settled: PromiseSettledResult<ToolOutcome>[] = new Array(calls.length);
+    let nextIndex = 0;
+    const workers = Array.from(
+      { length: Math.min(MAX_PARALLEL_READS, calls.length) },
+      async () => {
+        while (nextIndex < calls.length) {
+          const index = nextIndex++;
+          const call = calls[index];
+          if (call === undefined) continue;
+          const [result] = await Promise.allSettled([this.executeCall(call, turnId)]);
+          if (result !== undefined) settled[index] = result;
+        }
+      },
+    );
+    await Promise.all(workers);
+
+    return settled.map((result) => {
+      if (result?.status === "fulfilled") return result.value;
+      throw result?.reason ?? new AgentError("INTERNAL_ERROR", "Read-only batch did not produce an outcome");
+    });
   }
 
   private async serializeForDisclosure(
@@ -1213,7 +1235,10 @@ export class AgentRuntime {
 
   private async persist(): Promise<void> {
     this.state.updatedAt = this.now();
-    await this.dependencies.store.write(this.state);
+    const snapshot = structuredClone(this.state);
+    const write = this.persistTail.then(() => this.dependencies.store.write(snapshot));
+    this.persistTail = write.catch(() => undefined);
+    await write;
   }
 
   private now(): string {

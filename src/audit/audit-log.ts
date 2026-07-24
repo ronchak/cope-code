@@ -13,6 +13,7 @@ export class AuditLog {
   private sequence = 0;
   private previousHash = GENESIS_HASH;
   private initialized = false;
+  private appendTail: Promise<void> = Promise.resolve();
 
   public constructor(
     private readonly filename: string,
@@ -38,6 +39,18 @@ export class AuditLog {
   }
 
   public async append(input: AuditEventInput): Promise<AuditEvent> {
+    let release!: () => void;
+    const predecessor = this.appendTail;
+    this.appendTail = new Promise<void>((resolve) => { release = resolve; });
+    await predecessor;
+    try {
+      return await this.appendSerial(input);
+    } finally {
+      release();
+    }
+  }
+
+  private async appendSerial(input: AuditEventInput): Promise<AuditEvent> {
     await this.initialize();
     if (input.operationId !== undefined && !isOperationId(input.operationId)) {
       throw new AgentError("PROTOCOL_INVALID", "Audit operation identifier does not satisfy the cba/1 contract");
