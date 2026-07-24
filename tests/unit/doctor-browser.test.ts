@@ -86,4 +86,30 @@ test("doctor reports Chrome preview identity and privacy concisely while JSON in
   assert.equal(browser?.evidence?.executable_path, executablePath);
   assert.equal(browser?.evidence?.support_track, "preview-candidate");
   assert.equal(browser?.evidence?.certification_status, "offline-evidence-only");
+
+  let upgradedJson = "";
+  await executeDoctorCommand({
+    command: "doctor",
+    repository: process.cwd(),
+    stateHome,
+    json: true,
+  }, {
+    stdout: { write: (value) => { upgradedJson += value; } },
+    stderr: { write: () => undefined },
+  }, host, {
+    browserIdentityVerifier: async (product, selectedPath) => ({
+      ...await identityVerifier(product, selectedPath),
+      version: "150.0.1.3",
+      executableSha256: "b".repeat(64),
+    }),
+  });
+  const upgradedReport = JSON.parse(upgradedJson) as {
+    ok: boolean;
+    checks: Array<{ name: string; ok: boolean; evidence?: Record<string, unknown> }>;
+  };
+  assert.equal(upgradedReport.ok, true);
+  assert.equal(
+    upgradedReport.checks.find((check) => check.name === "Selected browser")?.evidence?.version,
+    "150.0.1.3",
+  );
 });
