@@ -56,7 +56,13 @@ test("live recovery distinguishes matching, missing, invalid, and changed browse
   const matching = await assessSessionRecovery(root, state);
   assert.equal(matching.disposition, "resume_candidate");
   assert.equal(matching.reason, undefined);
-  assert.equal(matching.next, `cope resume session_recovery_static --state-home ${root}`);
+  const stateHomeArgument = /^[A-Za-z0-9_./:@=-]+$/u.test(root)
+    ? root
+    : `"${root.replaceAll("\"", "\\\"")}"`;
+  assert.equal(
+    matching.next,
+    `cope resume session_recovery_static --state-home ${stateHomeArgument}`,
+  );
 });
 
 test("missing browser configuration requires reconciliation when mutation evidence exists", async (context) => {
