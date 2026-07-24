@@ -468,6 +468,12 @@ export class ToolHost {
             truncated: result.truncated,
             redactionCount: result.redactionCount,
             sideEffects: command.sideEffects,
+            ...(result.containment === undefined
+              ? {}
+              : {
+                  containmentBackend: result.containment.backend,
+                  containmentProfileVersion: result.containment.profileVersion,
+                }),
             repositoryFingerprint: repositoryAfter.status.snapshotSha256,
             repositoryStateKnown: true,
             repositoryHasConflicts: repositoryAfter.status.hasConflicts,

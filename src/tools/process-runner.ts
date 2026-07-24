@@ -8,6 +8,12 @@ import type { RepositoryBoundary } from "../repository/boundary.js";
 import type { CommandCatalog, ResolvedCommand, RunCommandRequest } from "./command-catalog.js";
 import { CURRENT_HOST_PLATFORM, type HostPlatform } from "../platform/index.js";
 import { spawnSupervisedProcess } from "./process-supervisor.js";
+import {
+  assertValidContainmentProfile,
+  platformContainmentBackend,
+  type CommandContainmentBackend,
+  type CommandContainmentProfile,
+} from "./command-containment.js";
 
 export type CommandOutcomeKind =
   | "success"
@@ -27,6 +33,10 @@ export interface CommandOutcome {
   readonly truncated: boolean;
   readonly durationMs: number;
   readonly redactionCount: number;
+  readonly containment?: {
+    readonly profileVersion: CommandContainmentProfile["version"];
+    readonly backend: string;
+  };
   readonly error?: string;
 }
 
@@ -35,6 +45,11 @@ export interface ProcessRunnerOptions {
   readonly inheritedEnvironmentKeys?: readonly string[];
   readonly terminationGraceMs?: number;
   readonly host?: HostPlatform;
+  /** When set, every catalog command must launch through this profile or fail closed. */
+  readonly containment?: {
+    readonly profile: CommandContainmentProfile;
+    readonly backend?: CommandContainmentBackend;
+  };
 }
 
 export class ProcessRunner {
@@ -44,6 +59,7 @@ export class ProcessRunner {
   private readonly active = new Map<ChildProcess, () => void>();
   private readonly pendingLaunches = new Set<AbortController>();
   private readonly host: HostPlatform;
+  private readonly containment: ProcessRunnerOptions["containment"];
 
   public constructor(
     private readonly boundary: RepositoryBoundary,
@@ -66,6 +82,7 @@ export class ProcessRunner {
       ];
     this.terminationGraceMs = options.terminationGraceMs ?? 1_000;
     this.host = options.host ?? CURRENT_HOST_PLATFORM;
+    this.containment = options.containment;
   }
 
   /**
@@ -94,6 +111,30 @@ export class ProcessRunner {
       command.workingDirectory === "" ? "." : command.workingDirectory,
     );
 
+    let launchExecutable = command.executable;
+    let launchArguments = command.arguments;
+    let containmentEvidence: CommandOutcome["containment"];
+    if (this.containment !== undefined) {
+      try {
+        assertValidContainmentProfile(this.containment.profile);
+        const contained = await (this.containment.backend ?? platformContainmentBackend(this.host)).prepare({
+          profile: this.containment.profile,
+          executable: command.executable,
+          arguments: command.arguments,
+          repositoryRoot: this.boundary.root,
+          workingDirectory: cwd.absolutePath,
+        });
+        launchExecutable = await this.validateExecutable(contained.executable);
+        launchArguments = contained.arguments;
+        containmentEvidence = {
+          profileVersion: this.containment.profile.version,
+          backend: contained.backend,
+        };
+      } catch (error) {
+        return outcomeForError(command.id, "policy-denied", error, Date.now() - startedAt);
+      }
+    }
+
     let child: ChildProcess;
     const launchController = new AbortController();
     const abortLaunch = (): void => launchController.abort();
@@ -101,7 +142,7 @@ export class ProcessRunner {
     this.pendingLaunches.add(launchController);
     try {
       child = this.host.platform === "win32"
-        ? spawn(command.executable, command.arguments, {
+        ? spawn(launchExecutable, launchArguments, {
             cwd: cwd.absolutePath,
             env: this.environmentFor(command),
             shell: false,
@@ -110,8 +151,8 @@ export class ProcessRunner {
             stdio: ["ignore", "pipe", "pipe"],
           })
         : await spawnSupervisedProcess({
-            executable: command.executable,
-            arguments: command.arguments,
+            executable: launchExecutable,
+            arguments: launchArguments,
             cwd: cwd.absolutePath,
             environment: this.environmentFor(command),
             signal: launchController.signal,
@@ -220,6 +261,7 @@ export class ProcessRunner {
           truncated,
           durationMs: Date.now() - startedAt,
           redactionCount: stdout.redactionCount + stderr.redactionCount,
+          ...(containmentEvidence === undefined ? {} : { containment: containmentEvidence }),
         });
       });
     });

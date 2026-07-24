@@ -39,6 +39,18 @@ AgentRuntime --> ProtocolAdapter
 
 The tool layer cannot import Copilot DOM assumptions. The browser adapter cannot read or modify a repository. Selecting Edge or Chrome changes local launch/configuration state only; it does not change the model-transport contract, policy, tools, correlation, classifier, or agent loop.
 
+Command execution also has an additive containment boundary. A caller may mark
+containment required with a versioned filesystem, network, and resource profile.
+The process runner then prepares and verifies the containment launcher before
+starting the catalog command; missing or unsupported containment is a policy
+denial. The current backends are Linux bubblewrap and macOS `sandbox-exec`
+(Seatbelt). Windows deliberately has no backend until a native restricted-token,
+Job Object, filesystem, and network design is implemented. Host allow-lists and
+resource limits are represented but rejected by current backends rather than
+silently weakened. Existing runtime composition does not yet require this
+additive profile, so this foundation does not claim that all commands are
+currently OS-contained.
+
 ## Authoritative control flow
 
 1. The CLI resolves the canonical Git repository, rejects index gitlinks and descendant Git boundaries, loads versioned configuration, records policy-visible pre-existing changes plus a keyed aggregate of hidden state, performs host preflight, and acquires the per-workspace lock.
