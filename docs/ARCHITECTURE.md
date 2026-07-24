@@ -161,6 +161,10 @@ The final report distinguishes all working-tree changes, agent-recorded changed 
 - Configuration must fail closed on unknown schema versions and fields at every validated nesting level, including command, browser-host, UI-contract, signal-group, locator, and text-pattern objects.
 - Keep tests capable of executing the complete loop without network, an installed browser, or Copilot.
 
+### Background command foundation
+
+`BackgroundTaskRegistry` is a local runtime primitive, not a `cba/1` model tool. It can launch only a `RunCommandRequest` that the configured `CommandCatalog` resolves; it accepts no executable path, argument vector, command string, or shell. The registry durably hash-chains queued, running, and terminal status transitions, bounds retained tasks and concurrent processes, exposes opaque task handles, and supports explicit status and cancellation. On restart, a queued or running record becomes `interrupted` and is never replayed automatically. Command output remains bounded and content-processed by `ProcessRunner`. Any future protocol surface must add separate policy, budget, audit, disclosure, and completion semantics before exposing this primitive to a model.
+
 ## Browser product boundary
 
 `BrowserProduct` is exactly `edge | chrome`. A browser launch configuration records the product, canonical verified executable, version/hash identity evidence, product-specific profile directory, independent browser/UI contract version, approved entry point, and host/UI checks. Existing strict `cba-browser-config/1` Edge documents are interpreted as Edge in memory; they are not silently rewritten, switched to Chrome, or detached from their authenticated Edge profile. New browser-aware documents use `cba-browser-config/2`.
