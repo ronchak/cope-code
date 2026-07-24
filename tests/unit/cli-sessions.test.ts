@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -58,6 +58,27 @@ test("sessions marks a statically blocked live session with its exact recovery c
     reason: "BROWSER_CONFIG_MISSING",
     next: 'cope abort session_cli_recovery --reason "Discard interrupted session that cannot resume"',
   });
+});
+
+test("sessions --all surfaces an unreadable session that blocks setup", async (context) => {
+  const stateHome = await mkdtemp(path.join(tmpdir(), "cope-cli-sessions-unreadable-"));
+  context.after(async () => rm(stateHome, { recursive: true, force: true }));
+  const sessionDirectory = path.join(stateHome, "sessions", "session_unreadable");
+  await mkdir(sessionDirectory, { recursive: true, mode: 0o700 });
+  await writeFile(path.join(sessionDirectory, "session.json"), "{broken", { encoding: "utf8", mode: 0o600 });
+
+  let human = "";
+  await executeSessionsCommand(
+    { command: "sessions", all: true, stateHome, json: false },
+    { stdout: { write: (value) => { human += value; } }, stderr: { write: () => undefined } },
+    createStandardUserHost(),
+  );
+
+  assert.match(human, /! Unreadable session/u);
+  assert.match(human, /Recovery: reconcile required/u);
+  assert.match(human, /session_unreadable/u);
+  assert.match(human, /trusted recovery tooling/u);
+  assert.match(human, /Updated: unknown/u);
 });
 
 function sessionState(): SessionState {

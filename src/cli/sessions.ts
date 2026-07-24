@@ -19,7 +19,7 @@ export interface SessionSummary {
   readonly objective: string;
   readonly repositoryRoot: string;
   readonly status: SessionStatus;
-  readonly mode: SessionState["mode"];
+  readonly mode: SessionState["mode"] | "unknown";
   readonly updatedAt: string;
   readonly resumable: boolean;
   readonly recovery: {
@@ -52,13 +52,17 @@ export async function listSessions(options: {
   );
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
+    const directoryRecovery = recoveryBySession.get(entry.name);
     try {
       const raw = JSON.parse(await readFile(path.join(directory, entry.name, "session.json"), "utf8")) as Partial<SessionState>;
       if (
         typeof raw.sessionId !== "string" || typeof raw.objective !== "string" ||
         typeof raw.repositoryRoot !== "string" || typeof raw.updatedAt !== "string" ||
         !isStatus(raw.status) || (raw.mode !== "inspect" && raw.mode !== "edit" && raw.mode !== "auto")
-      ) continue;
+      ) {
+        appendUnreadableSession(summaries, directoryRecovery, canonicalRepository);
+        continue;
+      }
       if (canonicalRepository !== undefined) {
         const canonical = await realpath(raw.repositoryRoot).catch(() => path.resolve(raw.repositoryRoot!));
         if (canonical !== canonicalRepository) continue;
@@ -83,7 +87,7 @@ export async function listSessions(options: {
         },
       });
     } catch {
-      // Ignore corrupt entries here; status/verify-audit remain the recovery tools.
+      appendUnreadableSession(summaries, directoryRecovery, canonicalRepository);
     }
   }
   return summaries.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, options.limit ?? 20);
@@ -129,7 +133,13 @@ export async function executeSessionsCommand(
       keyValue("Why", recoveryReasonSummary(session.recovery.reason), io.stdout);
       if (session.recovery.next !== undefined) keyValue("Next", session.recovery.next, io.stdout);
     }
-    keyValue("Updated", session.updatedAt.replace("T", " ").slice(0, 19), io.stdout);
+    keyValue(
+      "Updated",
+      session.updatedAt === "unknown"
+        ? session.updatedAt
+        : session.updatedAt.replace("T", " ").slice(0, 19),
+      io.stdout,
+    );
     keyValue("ID", session.sessionId, io.stdout);
   }
   hint("* can resume. ! needs the recovery action shown before setup can change.", io.stdout);
@@ -142,4 +152,29 @@ function isStatus(value: unknown): value is SessionStatus {
     "awaiting_model", "executing_tools", "returning_results", "awaiting_user", "paused",
     "validating_completion", "recovering", "completed", "rolled_back", "blocked", "aborted", "failed",
   ].includes(value);
+}
+
+function appendUnreadableSession(
+  summaries: SessionSummary[],
+  recovery: Awaited<ReturnType<typeof scanSessionRecovery>>[number] | undefined,
+  canonicalRepository: string | undefined,
+): void {
+  // An unreadable session cannot be attributed to a requested repository
+  // safely, but it must remain visible in the unfiltered recovery listing
+  // because the same directory blocks browser setup.
+  if (canonicalRepository !== undefined || recovery === undefined) return;
+  summaries.push({
+    sessionId: recovery.sessionId,
+    objective: recovery.objective,
+    repositoryRoot: recovery.repositoryRoot,
+    status: recovery.status,
+    mode: "unknown",
+    updatedAt: "unknown",
+    resumable: false,
+    recovery: {
+      disposition: recovery.disposition,
+      ...(recovery.reason === undefined ? {} : { reason: recovery.reason }),
+      ...(recovery.next === undefined ? {} : { next: recovery.next }),
+    },
+  });
 }
