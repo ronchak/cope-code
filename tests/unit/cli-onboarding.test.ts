@@ -1226,6 +1226,8 @@ test("setup reports stale recovery before browser discovery, prompts, or launch"
   await mkdir(stateHome, { mode: 0o700 });
   const host = createStandardUserHost();
   const paths = configurationPaths(stateHome, host);
+  await mkdir(path.dirname(paths.browser), { recursive: true, mode: 0o700 });
+  await writeFile(paths.browser, "{broken", { encoding: "utf8", mode: 0o600 });
   const now = "2026-07-24T12:00:00.000Z";
   const state: SessionState = {
     schemaVersion: 1,
@@ -1294,5 +1296,5 @@ test("setup reports stale recovery before browser discovery, prompts, or launch"
     error.details.diagnosticCode === "BROWSER_CONFIG_RECOVERY_BLOCKED" &&
     error.details.sessionId === state.sessionId);
   assert.equal(browserWorkStarted, false);
-  await assert.rejects(readFile(paths.browser), { code: "ENOENT" });
+  assert.equal(await readFile(paths.browser, "utf8"), "{broken");
 });

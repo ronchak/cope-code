@@ -290,9 +290,24 @@ export async function configureMachine(options: {
   const promptConfirm = dependencies.promptConfirm ?? confirmPrompt;
   const discover = dependencies.discoverBrowsers ?? discoverInstalledBrowsers;
   const verifyManual = dependencies.verifyManualBrowser ?? verifyManualBrowserExecutable;
-  const browserBaseline = await readBrowserConfigBaseline(options.paths.browser);
-  const organizationPolicyToCreate = await policyForSetup(options.paths.organizationPolicy);
-  const current = await readExistingBrowserSetup(options, browserBaseline, verifyManual, dependencies.identityVerifier);
+  let browserBaseline: Awaited<ReturnType<typeof readBrowserConfigBaseline>>;
+  let organizationPolicyToCreate: PolicyDocument | undefined;
+  let current: ExistingBrowserSetup | undefined;
+  try {
+    browserBaseline = await readBrowserConfigBaseline(options.paths.browser);
+    organizationPolicyToCreate = await policyForSetup(options.paths.organizationPolicy);
+    current = await readExistingBrowserSetup(
+      options,
+      browserBaseline,
+      verifyManual,
+      dependencies.identityVerifier,
+    );
+  } catch (error) {
+    // Invalid setup inputs cannot take the idempotent path. Prefer the shared
+    // session recovery action when that invalid input also strands live work.
+    await assertBrowserSetupRecoveryReady(options.paths.stateHome, options.host);
+    throw error;
+  }
 
   // Managed and automation callers can treat an already-valid setup as an
   // idempotent check. Interactive setup always shows the current selection.
