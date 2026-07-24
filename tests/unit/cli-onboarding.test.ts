@@ -1380,7 +1380,7 @@ test("setup does not advertise resume after incompatible browser identity drift"
     error instanceof AgentError &&
     error.details.diagnosticCode === "BROWSER_CONFIG_RECOVERY_BLOCKED" &&
     (error.details.sessions as Array<{ reason?: string; next?: string }>)[0]?.reason ===
-      "BROWSER_CONFIG_INVALID" &&
+      "BROWSER_IDENTITY_CHANGED" &&
     /cope abort session_browser_identity_drift/u.test(
       String((error.details.sessions as Array<{ next?: string }>)[0]?.next),
     ) &&

@@ -27,18 +27,21 @@ a browser.
   `cope abort --all` is rejected because sessions with mutation evidence need
   individual reconciliation rather than bulk disposal.
 - Incompatible browser executable identity drift can no longer produce a
-  misleading resume action during setup. It is classified through the same
-  abort-or-reconcile safety path as invalid browser configuration.
+  misleading resume action in setup, sessions, doctor, or resume preflight.
+  The shared assessment verifies the current local executable and its runtime
+  identity pin, then uses the same abort-or-reconcile safety path as invalid
+  browser configuration. Compatible signed upgrades remain resumable.
 - A session file whose embedded ID disagrees with its directory is surfaced as
   unreadable under the directory ID, preserving the exact recovery target.
 
 ## Recovery model
 
 The shared assessment derives one of four dispositions from persisted session
-state, runtime pins, browser-configuration integrity, and mutation evidence:
-`terminal`, `resume_candidate`, `abort_required`, or `reconcile_required`.
-Passing the static assessment does not bypass the existing audit, repository,
-ownership, runtime, or live-page checks.
+state, runtime pins, browser-configuration integrity, current locally verified
+browser-executable identity, and mutation evidence: `terminal`,
+`resume_candidate`, `abort_required`, or `reconcile_required`. Passing the
+assessment does not bypass the existing audit, repository, ownership, runtime,
+or live-page checks.
 
 Sessions interrupted in `created` or `preflight` are never advertised as
 resumable, even if a legacy startup already wrote a runtime pin. New sessions

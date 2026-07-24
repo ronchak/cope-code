@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -167,6 +167,8 @@ test("doctor reports a resume candidate before an otherwise-required setup retry
   context.after(async () => rm(root, { recursive: true, force: true }));
   const stateHome = path.join(root, "state");
   await mkdir(path.join(stateHome, "config"), { recursive: true, mode: 0o700 });
+  const executablePath = path.join(root, "edge");
+  await writeFile(executablePath, "edge", "utf8");
   const now = "2026-07-24T12:00:00.000Z";
   const browser: BrowserFileConfig = {
     schema_version: "cba-browser-config/2",
@@ -177,7 +179,7 @@ test("doctor reports a resume candidate before an otherwise-required setup retry
     expected_identity: "person@example.com",
     require_protection_indicator: false,
     profile_directory: "/private/cope/edge",
-    browser_executable: "/verified/edge",
+    browser_executable: executablePath,
     browser_version: "149.0.1.2",
     browser_executable_sha256: digest,
   };
@@ -205,7 +207,23 @@ test("doctor reports a resume candidate before an otherwise-required setup retry
   }, {
     stdout: { write: (value) => { human += value; } },
     stderr: { write: () => undefined },
-  }, createStandardUserHost());
+  }, createStandardUserHost(), {
+    browserIdentityVerifier: async (product, selectedPath) => ({
+      product,
+      executablePath: await realpath(selectedPath),
+      version: browser.browser_version,
+      executableSha256: browser.browser_executable_sha256,
+      size: 4,
+      modifiedMs: 1,
+      evidence: {
+        platform: "darwin",
+        productName: "Microsoft Edge Stable",
+        publisher: "UBF8T346G9",
+        identifier: "com.microsoft.edgemac",
+        signatureStatus: "valid",
+      },
+    }),
+  });
 
   const recoveryIndex = human.indexOf("Session recovery:");
   const setupIndex = human.indexOf("Browser setup:");

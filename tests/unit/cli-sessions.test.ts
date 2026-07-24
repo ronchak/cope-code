@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import type { BrowserIdentityVerifier } from "../../src/browser/index.js";
 import { executeSessionsCommand } from "../../src/cli/sessions.js";
 import {
   SESSION_RUNTIME_MANIFEST_VERSION,
@@ -15,6 +16,8 @@ import {
   zeroBudgetUsage,
   type SessionState,
 } from "../../src/session/types.js";
+import type { BrowserFileConfig } from "../../src/config/types.js";
+import { sha256, stableJson } from "../../src/shared/crypto.js";
 import { createStandardUserHost } from "../helpers/standard-user-host.js";
 
 test("sessions marks a statically blocked live session with its exact recovery command", async (context) => {
@@ -111,6 +114,71 @@ test("sessions --all treats an embedded session id mismatch as unreadable", asyn
   assert.match(human, new RegExp(directoryId, "u"));
   assert.doesNotMatch(human, /session_embedded_identity/u);
   assert.match(human, /trusted recovery tooling/u);
+});
+
+test("sessions --all does not advertise resume after browser identity drift", async (context) => {
+  const stateHome = await mkdtemp(path.join(tmpdir(), "cope-cli-sessions-identity-"));
+  context.after(async () => rm(stateHome, { recursive: true, force: true }));
+  const executablePath = path.join(stateHome, "edge");
+  await writeFile(executablePath, "edge", { encoding: "utf8", mode: 0o600 });
+  const browser: BrowserFileConfig = {
+    schema_version: "cba-browser-config/2",
+    product: "edge",
+    browser_contract_version: "cope-visible-browser/v1",
+    entry_url: "https://m365.cloud.microsoft/chat",
+    approved_hosts: [{ hostname: "m365.cloud.microsoft", allow_subdomains: false }],
+    expected_identity: "person@example.com",
+    require_protection_indicator: false,
+    profile_directory: path.join(stateHome, "profiles", "edge"),
+    browser_executable: executablePath,
+    browser_version: "149.0.1.2",
+    browser_executable_sha256: "a".repeat(64),
+  };
+  await mkdir(path.join(stateHome, "config"), { recursive: true, mode: 0o700 });
+  await writeFile(
+    path.join(stateHome, "config", "browser.json"),
+    `${JSON.stringify(browser)}\n`,
+    { encoding: "utf8", mode: 0o600 },
+  );
+  const state = sessionState();
+  const store = new SessionStore(stateHome);
+  await store.create(state);
+  await writeRuntimeManifest(store.sessionDirectory(state.sessionId), {
+    schema_version: SESSION_RUNTIME_MANIFEST_VERSION,
+    transport: "edge",
+    browser_config_sha256: sha256(stableJson(browser)),
+    browser_identity_sha256: "e".repeat(64),
+    created_at: state.createdAt,
+  });
+  const identityVerifier: BrowserIdentityVerifier = async (product, selectedPath) => ({
+    product,
+    executablePath: await realpath(selectedPath),
+    version: browser.browser_version,
+    executableSha256: "b".repeat(64),
+    size: 4,
+    modifiedMs: 1,
+    evidence: {
+      platform: "darwin",
+      productName: "Microsoft Edge Stable",
+      publisher: "UBF8T346G9",
+      identifier: "com.microsoft.edgemac",
+      signatureStatus: "valid",
+    },
+  });
+
+  let human = "";
+  await executeSessionsCommand(
+    { command: "sessions", all: true, stateHome, json: false },
+    { stdout: { write: (value) => { human += value; } }, stderr: { write: () => undefined } },
+    createStandardUserHost(),
+    identityVerifier,
+  );
+
+  assert.match(human, /! Verify browser uptime/u);
+  assert.match(human, /verified browser executable no longer matches/u);
+  assert.match(human, /cope abort session_cli_recovery/u);
+  assert.doesNotMatch(human, /\* Verify browser uptime/u);
+  assert.doesNotMatch(human, /cope resume/u);
 });
 
 function sessionState(): SessionState {

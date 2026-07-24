@@ -1,7 +1,15 @@
-import { readFile, readdir } from "node:fs/promises";
+import { readFile, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 
-import { parseBrowserConfig } from "../config/loader.js";
+import {
+  isCompatibleBrowserExecutableUpgrade,
+  verifyBrowserExecutable,
+  type BrowserIdentityVerifier,
+} from "../browser/index.js";
+import {
+  parseBrowserConfig,
+  verifiedBrowserIdentityHashes,
+} from "../config/loader.js";
 import { CURRENT_HOST_PLATFORM, type HostPlatform } from "../platform/index.js";
 import { SessionStore } from "../session/store.js";
 import { isTerminal } from "../session/state-machine.js";
@@ -20,6 +28,7 @@ export type SessionRecoveryReason =
   | "BROWSER_CONFIG_MISSING"
   | "BROWSER_CONFIG_INVALID"
   | "BROWSER_CONFIG_CHANGED"
+  | "BROWSER_IDENTITY_CHANGED"
   | "RUNTIME_MANIFEST_UNREADABLE"
   | "MUTATION_EVIDENCE_PRESENT";
 
@@ -35,9 +44,15 @@ export interface SessionRecoveryAssessment {
 }
 
 export interface BrowserConfigurationEvidence {
-  readonly status: "missing" | "invalid" | "valid";
+  readonly status: "missing" | "invalid" | "identity_invalid" | "valid";
   readonly hash?: string;
+  readonly identityHash?: string;
+  readonly identityAliases?: readonly string[];
 }
+
+type BrowserConfigurationEvidenceSource =
+  | BrowserConfigurationEvidence
+  | (() => Promise<BrowserConfigurationEvidence>);
 
 /**
  * A static, source-free preflight. A resume candidate still goes through the
@@ -47,8 +62,9 @@ export interface BrowserConfigurationEvidence {
 export async function assessSessionRecovery(
   stateHome: string,
   state: SessionState,
-  browserEvidence?: BrowserConfigurationEvidence,
+  browserEvidence?: BrowserConfigurationEvidenceSource,
   host: HostPlatform = CURRENT_HOST_PLATFORM,
+  browserIdentityVerifier?: BrowserIdentityVerifier,
 ): Promise<SessionRecoveryAssessment> {
   const base = {
     sessionId: state.sessionId,
@@ -89,7 +105,11 @@ export async function assessSessionRecovery(
     };
   }
 
-  const browser = browserEvidence ?? await readBrowserConfigurationEvidence(stateHome);
+  const browser = browserEvidence === undefined
+    ? await readBrowserConfigurationEvidence(stateHome, host, browserIdentityVerifier)
+    : typeof browserEvidence === "function"
+      ? await browserEvidence()
+      : browserEvidence;
   if (browser.status === "missing") {
     return recoveryBlocked(
       { ...base, transport: manifest.transport },
@@ -108,6 +128,15 @@ export async function assessSessionRecovery(
       "BROWSER_CONFIG_INVALID",
     );
   }
+  if (browser.status === "identity_invalid") {
+    return recoveryBlocked(
+      { ...base, transport: manifest.transport },
+      state,
+      stateHome,
+      host,
+      "BROWSER_IDENTITY_CHANGED",
+    );
+  }
   if (
     manifest.browser_config_sha256 === undefined ||
     manifest.browser_config_sha256 !== browser.hash
@@ -118,6 +147,19 @@ export async function assessSessionRecovery(
       stateHome,
       host,
       "BROWSER_CONFIG_CHANGED",
+    );
+  }
+  if (
+    manifest.browser_identity_sha256 !== undefined &&
+    manifest.browser_identity_sha256 !== browser.identityHash &&
+    !(browser.identityAliases ?? []).includes(manifest.browser_identity_sha256)
+  ) {
+    return recoveryBlocked(
+      { ...base, transport: manifest.transport },
+      state,
+      stateHome,
+      host,
+      "BROWSER_IDENTITY_CHANGED",
     );
   }
   return {
@@ -132,6 +174,7 @@ export async function scanSessionRecovery(
   stateHome: string,
   host: HostPlatform = CURRENT_HOST_PLATFORM,
   browserEvidenceOverride?: BrowserConfigurationEvidence,
+  browserIdentityVerifier?: BrowserIdentityVerifier,
 ): Promise<readonly SessionRecoveryAssessment[]> {
   const sessionsDirectory = path.join(stateHome, "sessions");
   let entries;
@@ -141,8 +184,16 @@ export async function scanSessionRecovery(
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
     throw error;
   }
-  const browserEvidence = browserEvidenceOverride ??
-    await readBrowserConfigurationEvidence(stateHome);
+  let browserEvidencePromise: Promise<BrowserConfigurationEvidence> | undefined;
+  const browserEvidence: BrowserConfigurationEvidenceSource =
+    browserEvidenceOverride ?? (() => {
+      browserEvidencePromise ??= readBrowserConfigurationEvidence(
+        stateHome,
+        host,
+        browserIdentityVerifier,
+      );
+      return browserEvidencePromise;
+    });
   const store = new SessionStore(stateHome);
   const assessments: SessionRecoveryAssessment[] = [];
   for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
@@ -183,6 +234,8 @@ export function recoveryReasonSummary(reason: SessionRecoveryReason | undefined)
       return "the browser configuration required by this session is invalid";
     case "BROWSER_CONFIG_CHANGED":
       return "the browser configuration no longer matches the session";
+    case "BROWSER_IDENTITY_CHANGED":
+      return "the verified browser executable no longer matches the session";
     case "RUNTIME_MANIFEST_UNREADABLE":
       return "the session recovery manifest is unreadable";
     case "MUTATION_EVIDENCE_PRESENT":
@@ -217,16 +270,55 @@ export function browserSetupBlockedErrorDetails(
 
 async function readBrowserConfigurationEvidence(
   stateHome: string,
+  host: HostPlatform,
+  browserIdentityVerifier?: BrowserIdentityVerifier,
 ): Promise<BrowserConfigurationEvidence> {
+  let raw: unknown;
+  let parsed: ReturnType<typeof parseBrowserConfig>;
   try {
-    const raw = JSON.parse(
+    raw = JSON.parse(
       await readFile(path.join(stateHome, "config", "browser.json"), "utf8"),
     ) as unknown;
-    parseBrowserConfig(raw);
-    return { status: "valid", hash: sha256(stableJson(raw)) };
+    parsed = parseBrowserConfig(raw);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return { status: "missing" };
     return { status: "invalid" };
+  }
+  const hash = sha256(stableJson(raw));
+  try {
+    const verified = await (browserIdentityVerifier ?? ((product, executablePath) =>
+      verifyBrowserExecutable(product, executablePath, { host })))(
+      parsed.config.product,
+      parsed.config.browserExecutable,
+    );
+    const configuredCanonicalExecutable =
+      await realpath(parsed.config.browserExecutable).catch(() => undefined);
+    if (
+      verified.product !== parsed.config.product ||
+      configuredCanonicalExecutable === undefined ||
+      verified.executablePath !== configuredCanonicalExecutable ||
+      !isCompatibleBrowserExecutableUpgrade(
+        parsed.config.browserVersion,
+        parsed.config.browserExecutableSha256,
+        verified.version,
+        verified.executableSha256,
+      )
+    ) {
+      return { status: "identity_invalid", hash };
+    }
+    const identities = verifiedBrowserIdentityHashes(
+      parsed.file,
+      parsed.config,
+      verified,
+    );
+    return {
+      status: "valid",
+      hash,
+      identityHash: identities.primary,
+      ...(identities.aliases === undefined ? {} : { identityAliases: identities.aliases }),
+    };
+  } catch {
+    return { status: "identity_invalid", hash };
   }
 }
 

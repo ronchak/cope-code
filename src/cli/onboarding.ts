@@ -2,7 +2,11 @@ import { constants } from "node:fs";
 import { access, lstat, mkdir, open, readFile, rename } from "node:fs/promises";
 import path from "node:path";
 
-import { parseBrowserConfig, parseRepositoryConfig } from "../config/loader.js";
+import {
+  parseBrowserConfig,
+  parseRepositoryConfig,
+  verifiedBrowserIdentityHashes,
+} from "../config/loader.js";
 import {
   BROWSER_CONFIG_VERSION,
   REPOSITORY_CONFIG_VERSION,
@@ -33,6 +37,7 @@ import {
 } from "../policy/index.js";
 import { resolveStateHome } from "../session/paths.js";
 import { AgentError, errorMessage } from "../shared/errors.js";
+import { sha256, stableJson } from "../shared/crypto.js";
 import { CURRENT_HOST_PLATFORM, type HostPlatform } from "../platform/index.js";
 import { preparePrivateStateHome, verifyPrivateStateHome } from "../platform/private-storage.js";
 import type { CommandDefinition } from "../tools/index.js";
@@ -51,6 +56,7 @@ import {
   commitBrowserSetup,
   readBrowserConfigBaseline,
 } from "./setup-transaction.js";
+import type { BrowserConfigurationEvidence } from "./session-recovery.js";
 
 const DEFAULT_COPILOT_ENTRY_URL = "https://m365.cloud.microsoft/chat";
 const CONFIG_DIRECTORY_NAME = "config";
@@ -82,7 +88,7 @@ interface ExistingBrowserSetup {
   readonly config: BrowserLaunchConfig;
   readonly browser?: DiscoveredBrowser;
   readonly evidenceChanged: boolean;
-  readonly browserIdentityInvalid: boolean;
+  readonly recoveryBrowserEvidence: BrowserConfigurationEvidence;
 }
 
 interface MachineSetupSummary {
@@ -310,7 +316,7 @@ export async function configureMachine(options: {
     await assertBrowserSetupRecoveryReadyBeforeSetup(
       options.paths.stateHome,
       options.host,
-      browserIdentityValidationFailed(error) ? { status: "invalid" } : undefined,
+      browserIdentityValidationFailed(error) ? { status: "identity_invalid" } : undefined,
     );
     throw error;
   }
@@ -334,7 +340,7 @@ export async function configureMachine(options: {
   await assertBrowserSetupRecoveryReadyBeforeSetup(
     options.paths.stateHome,
     options.host,
-    current?.browserIdentityInvalid === true ? { status: "invalid" } : undefined,
+    current?.recoveryBrowserEvidence,
   );
 
   // Eligibility includes the live GUI session, so defer it until after the
@@ -612,7 +618,10 @@ async function readExistingBrowserSetup(
         file: parsed.file,
         config: { ...parsed.config, profileDirectory },
         evidenceChanged: false,
-        browserIdentityInvalid: browserIdentityValidationFailed(error),
+        recoveryBrowserEvidence: {
+          status: browserIdentityValidationFailed(error) ? "identity_invalid" : "invalid",
+          hash: sha256(stableJson(raw)),
+        },
       };
     }
     const evidenceChanged =
@@ -625,6 +634,11 @@ async function readExistingBrowserSetup(
       browser.version,
       browser.executableSha256,
     );
+    const browserIdentityHashes = verifiedBrowserIdentityHashes(
+      parsed.file,
+      parsed.config,
+      browser,
+    );
     return {
       file: parsed.file,
       config: {
@@ -636,7 +650,19 @@ async function readExistingBrowserSetup(
       },
       browser,
       evidenceChanged,
-      browserIdentityInvalid,
+      recoveryBrowserEvidence: browserIdentityInvalid
+        ? {
+            status: "identity_invalid",
+            hash: sha256(stableJson(raw)),
+          }
+        : {
+            status: "valid",
+            hash: sha256(stableJson(raw)),
+            identityHash: browserIdentityHashes.primary,
+            ...(browserIdentityHashes.aliases === undefined
+              ? {}
+              : { identityAliases: browserIdentityHashes.aliases }),
+          },
     };
   } catch (error) {
     if (

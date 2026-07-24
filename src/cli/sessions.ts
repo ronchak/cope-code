@@ -1,6 +1,7 @@
 import { readdir, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 
+import type { BrowserIdentityVerifier } from "../browser/index.js";
 import { resolveStateHome } from "../session/paths.js";
 import type { SessionState, SessionStatus } from "../session/types.js";
 import type { CliCommand } from "./arguments.js";
@@ -34,6 +35,7 @@ export async function listSessions(options: {
   readonly stateHome?: string;
   readonly limit?: number;
   readonly host?: HostPlatform;
+  readonly browserIdentityVerifier?: BrowserIdentityVerifier;
 }): Promise<readonly SessionSummary[]> {
   const host = options.host ?? CURRENT_HOST_PLATFORM;
   const stateHome = path.resolve(options.stateHome ?? resolveStateHome(process.env, host));
@@ -48,7 +50,12 @@ export async function listSessions(options: {
     : await realpath(requestedRepository).catch(() => path.resolve(requestedRepository));
   const summaries: SessionSummary[] = [];
   const recoveryBySession = new Map(
-    (await scanSessionRecovery(stateHome, host))
+    (await scanSessionRecovery(
+      stateHome,
+      host,
+      undefined,
+      options.browserIdentityVerifier,
+    ))
       .map((assessment) => [assessment.sessionId, assessment] as const),
   );
   for (const entry of entries) {
@@ -110,12 +117,14 @@ export async function executeSessionsCommand(
   command: Extract<CliCommand, { readonly command: "sessions" }>,
   io: { readonly stdout: Writable; readonly stderr: Writable },
   host: HostPlatform = CURRENT_HOST_PLATFORM,
+  browserIdentityVerifier?: BrowserIdentityVerifier,
 ): Promise<number> {
   const sessions = await listSessions({
     ...(command.repository === undefined || command.all ? {} : { repositoryRoot: command.repository }),
     ...(command.stateHome === undefined ? {} : { stateHome: command.stateHome }),
     limit: command.all ? 100 : 20,
     host,
+    ...(browserIdentityVerifier === undefined ? {} : { browserIdentityVerifier }),
   });
   if (command.json) {
     io.stdout.write(`${JSON.stringify({ ok: true, sessions })}\n`);

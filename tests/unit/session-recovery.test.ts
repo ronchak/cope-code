@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import type { BrowserIdentityVerifier } from "../../src/browser/index.js";
 import {
   assessSessionRecovery,
   scanSessionRecovery,
@@ -28,6 +29,7 @@ test("live recovery distinguishes matching, missing, invalid, and changed browse
   const root = await mkdtemp(path.join(tmpdir(), "cope-session-recovery-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
   const browser = browserConfig();
+  const browserIdentityHash = "e".repeat(64);
   const state = sessionState("session_recovery_static");
   const store = new SessionStore(root);
   await store.create(state);
@@ -35,6 +37,7 @@ test("live recovery distinguishes matching, missing, invalid, and changed browse
     schema_version: SESSION_RUNTIME_MANIFEST_VERSION,
     transport: "edge",
     browser_config_sha256: sha256(stableJson(browser)),
+    browser_identity_sha256: browserIdentityHash,
     created_at: now,
   });
 
@@ -45,17 +48,33 @@ test("live recovery distinguishes matching, missing, invalid, and changed browse
   await writeFile(path.join(root, "config", "browser.json"), "{broken", "utf8");
   assert.equal((await assessSessionRecovery(root, state)).reason, "BROWSER_CONFIG_INVALID");
 
+  const changedBrowser = { ...browser, expected_identity: "other@example.com" };
   await writeFile(
     path.join(root, "config", "browser.json"),
-    `${JSON.stringify({ ...browser, expected_identity: "other@example.com" })}\n`,
+    `${JSON.stringify(changedBrowser)}\n`,
     "utf8",
   );
-  assert.equal((await assessSessionRecovery(root, state)).reason, "BROWSER_CONFIG_CHANGED");
+  assert.equal((await assessSessionRecovery(root, state, {
+    status: "valid",
+    hash: sha256(stableJson(changedBrowser)),
+    identityHash: browserIdentityHash,
+  })).reason, "BROWSER_CONFIG_CHANGED");
 
   await writeFile(path.join(root, "config", "browser.json"), `${JSON.stringify(browser)}\n`, "utf8");
-  const matching = await assessSessionRecovery(root, state);
+  const matchingEvidence = {
+    status: "valid",
+    hash: sha256(stableJson(browser)),
+    identityHash: browserIdentityHash,
+  } as const;
+  const matching = await assessSessionRecovery(root, state, matchingEvidence);
   assert.equal(matching.disposition, "resume_candidate");
   assert.equal(matching.reason, undefined);
+  const identityChanged = await assessSessionRecovery(root, state, {
+    ...matchingEvidence,
+    identityHash: "d".repeat(64),
+  });
+  assert.equal(identityChanged.disposition, "abort_required");
+  assert.equal(identityChanged.reason, "BROWSER_IDENTITY_CHANGED");
   const stateHomeArgument = /^[A-Za-z0-9_./:@=-]+$/u.test(root)
     ? root
     : process.platform === "win32"
@@ -65,6 +84,84 @@ test("live recovery distinguishes matching, missing, invalid, and changed browse
     matching.next,
     `cope resume session_recovery_static --state-home ${stateHomeArgument}`,
   );
+});
+
+test("shared recovery scan validates current browser executable identity", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-session-recovery-identity-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const executablePath = path.join(root, "edge");
+  await writeFile(executablePath, "edge", "utf8");
+  const browser = {
+    ...browserConfig(),
+    browser_executable: executablePath,
+  };
+  await mkdir(path.join(root, "config"), { recursive: true });
+  await writeFile(
+    path.join(root, "config", "browser.json"),
+    `${JSON.stringify(browser)}\n`,
+    "utf8",
+  );
+  const state = sessionState("session_recovery_identity");
+  const store = new SessionStore(root);
+  await store.create(state);
+  await writeRuntimeManifest(store.sessionDirectory(state.sessionId), {
+    schema_version: SESSION_RUNTIME_MANIFEST_VERSION,
+    transport: "edge",
+    browser_config_sha256: sha256(stableJson(browser)),
+    browser_identity_sha256: "e".repeat(64),
+    created_at: now,
+  });
+  const identityVerifier: BrowserIdentityVerifier = async (product, selectedPath) => ({
+    product,
+    executablePath: await realpath(selectedPath),
+    version: browser.browser_version,
+    executableSha256: "b".repeat(64),
+    size: 4,
+    modifiedMs: 1,
+    evidence: {
+      platform: "darwin",
+      productName: "Microsoft Edge Stable",
+      publisher: "UBF8T346G9",
+      identifier: "com.microsoft.edgemac",
+      signatureStatus: "valid",
+    },
+  });
+
+  const [assessment] = await scanSessionRecovery(
+    root,
+    undefined,
+    undefined,
+    identityVerifier,
+  );
+  assert.equal(assessment?.disposition, "abort_required");
+  assert.equal(assessment?.reason, "BROWSER_IDENTITY_CHANGED");
+  assert.match(assessment?.next ?? "", /cope abort session_recovery_identity/u);
+
+  const compatibleVerifier: BrowserIdentityVerifier = async (product, selectedPath) => ({
+    ...(await identityVerifier(product, selectedPath)),
+    version: "150.0.0.0",
+  });
+  const verifiedUpgrade = await compatibleVerifier(browser.product, executablePath);
+  const compatibleLegacyPin = sha256(stableJson({
+    product: browser.product,
+    executable_path: verifiedUpgrade.executablePath,
+    version: browser.browser_version,
+    executable_sha256: browser.browser_executable_sha256,
+  }));
+  await writeRuntimeManifest(store.sessionDirectory(state.sessionId), {
+    schema_version: SESSION_RUNTIME_MANIFEST_VERSION,
+    transport: "edge",
+    browser_config_sha256: sha256(stableJson(browser)),
+    browser_identity_sha256: compatibleLegacyPin,
+    created_at: now,
+  });
+  const [compatibleAssessment] = await scanSessionRecovery(
+    root,
+    undefined,
+    undefined,
+    compatibleVerifier,
+  );
+  assert.equal(compatibleAssessment?.disposition, "resume_candidate");
 });
 
 test("missing browser configuration requires reconciliation when mutation evidence exists", async (context) => {
