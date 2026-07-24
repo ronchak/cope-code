@@ -8,8 +8,8 @@ a browser.
 ## Session recovery
 
 - Setup scans unfinished live-browser sessions before discovery, prompts, or
-  launch, and repeats the scan under the browser-configuration lock before
-  commit.
+  launch. That early scan is ordered through the browser-configuration lock,
+  and setup repeats the scan while holding the commit lock.
 - New live sessions use that same lock to publish session state and its pinned
   runtime manifest as one configuration transaction. Concurrent setup either
   commits first, leaving no partial session, or waits behind a fully

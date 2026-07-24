@@ -12,6 +12,7 @@ import {
 } from "../../src/cli/session-files.js";
 import {
   commitBrowserSetup,
+  assertBrowserSetupRecoveryReadyBeforeSetup,
   pinBrowserConfigurationForSession,
   readBrowserConfigBaseline,
 } from "../../src/cli/setup-transaction.js";
@@ -473,4 +474,38 @@ test("live session publication holds the setup lock until its runtime evidence i
     finishPublication();
     await publishing;
   }
+});
+
+test("early setup recovery deflects while live session publication owns the lock", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-early-recovery-publication-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  let publicationStarted!: () => void;
+  let finishPublication!: () => void;
+  let sessionPublished = false;
+  const started = new Promise<void>((resolve) => { publicationStarted = resolve; });
+  const finish = new Promise<void>((resolve) => { finishPublication = resolve; });
+  const publishing = pinBrowserConfigurationForSession({
+    stateHome: root,
+    expectedBrowserHash: "a".repeat(64),
+    loadCurrent: async () => ({ hashes: { browser: "a".repeat(64) } }),
+    publishSession: async () => {
+      publicationStarted();
+      await finish;
+      sessionPublished = true;
+    },
+  });
+  await started;
+
+  try {
+    await assert.rejects(
+      assertBrowserSetupRecoveryReadyBeforeSetup(root, host),
+      (error: unknown) => error instanceof AgentError &&
+        error.details.diagnosticCode === "BROWSER_CONFIG_LOCKED",
+    );
+    assert.equal(sessionPublished, false);
+  } finally {
+    finishPublication();
+    await publishing;
+  }
+  assert.equal(sessionPublished, true);
 });

@@ -46,7 +46,7 @@ import {
   type BrowserSetupScreen,
 } from "./browser-setup-ui.js";
 import {
-  assertBrowserSetupRecoveryReady,
+  assertBrowserSetupRecoveryReadyBeforeSetup,
   commitBrowserSetup,
   readBrowserConfigBaseline,
 } from "./setup-transaction.js";
@@ -305,7 +305,7 @@ export async function configureMachine(options: {
   } catch (error) {
     // Invalid setup inputs cannot take the idempotent path. Prefer the shared
     // session recovery action when that invalid input also strands live work.
-    await assertBrowserSetupRecoveryReady(options.paths.stateHome, options.host);
+    await assertBrowserSetupRecoveryReadyBeforeSetup(options.paths.stateHome, options.host);
     throw error;
   }
 
@@ -325,7 +325,7 @@ export async function configureMachine(options: {
 
   // Fail before browser selection, prompts, or sign-in. The final transaction
   // repeats this check under the configuration lock to catch later races.
-  await assertBrowserSetupRecoveryReady(options.paths.stateHome, options.host);
+  await assertBrowserSetupRecoveryReadyBeforeSetup(options.paths.stateHome, options.host);
 
   // Eligibility includes the live GUI session, so defer it until after the
   // read-only idempotent path has decided no browser needs to open.

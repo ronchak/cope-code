@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { mkdir, open, readFile, rename } from "node:fs/promises";
+import { access, mkdir, open, readFile, rename } from "node:fs/promises";
 import path from "node:path";
 
 import { BrowserConfigTransactionLock } from "../config/browser-config-lock.js";
@@ -110,6 +110,24 @@ export async function assertBrowserSetupRecoveryReady(
       : `Browser setup is blocked by ${String(blockers.length)} unfinished live-browser sessions`,
     browserSetupBlockedErrorDetails(blockers),
   );
+}
+
+export async function assertBrowserSetupRecoveryReadyBeforeSetup(
+  stateHome: string,
+  host: HostPlatform = CURRENT_HOST_PLATFORM,
+): Promise<void> {
+  try {
+    await access(stateHome);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  const lock = await BrowserConfigTransactionLock.acquire(stateHome);
+  try {
+    await assertBrowserSetupRecoveryReady(stateHome, host);
+  } finally {
+    await lock.release();
+  }
 }
 
 async function atomicWriteJson(filename: string, value: unknown, host: HostPlatform): Promise<void> {
