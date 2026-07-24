@@ -8,6 +8,7 @@ export const TOOL_NAMES = [
   "read_file",
   "git_status",
   "git_diff",
+  "edit_text",
   "apply_patch",
   "run_command",
   "request_user_input",
@@ -86,6 +87,17 @@ export type AtomicFileChange = CreateFileChange | UpdateFileChange | DeleteFileC
 export interface ApplyPatchArguments {
   /** Every change succeeds, or the tool restores the complete prior state. */
   readonly changes: readonly AtomicFileChange[];
+}
+
+export interface EditTextArguments {
+  readonly path: string;
+  /** SHA-256 of the exact current file bytes the model observed. */
+  readonly base_sha256: string;
+  /** Exact text to replace; regular expressions are never interpreted. */
+  readonly old_text: string;
+  readonly new_text: string;
+  /** The edit proceeds only when old_text occurs exactly this many times. */
+  readonly expected_occurrences: number;
 }
 
 export type CommandParameterValue = string | number | boolean | readonly string[];
@@ -206,6 +218,7 @@ export interface ToolArgumentsByName {
   readonly read_file: ReadFileArguments;
   readonly git_status: GitStatusArguments;
   readonly git_diff: GitDiffArguments;
+  readonly edit_text: EditTextArguments;
   readonly apply_patch: ApplyPatchArguments;
   readonly run_command: RunCommandArguments;
   readonly request_user_input: RequestUserInputArguments;

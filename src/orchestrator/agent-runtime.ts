@@ -1068,7 +1068,7 @@ export class AgentRuntime {
   ): Promise<void> {
     const metadata = outcome.safeMetadata;
     if (
-      call.name === "apply_patch" &&
+      (call.name === "apply_patch" || call.name === "edit_text") &&
       outcome.status === "success" &&
       !this.state.mutations.some((record) => record.operationId === call.operationId)
     ) {

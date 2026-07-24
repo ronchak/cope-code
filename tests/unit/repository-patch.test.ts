@@ -14,6 +14,37 @@ import {
 import { PatchEngine } from "../../src/repository/patch-engine.js";
 import { ProtectedPathPolicy } from "../../src/security/protected-paths.js";
 
+test("targeted edit is hash- and occurrence-guarded and uses atomic checkpoints", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-edit-text-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  const before = "alpha beta alpha\n";
+  await writeFile(path.join(root, "file.txt"), before);
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(boundary, path.join(temporary, "checkpoints"));
+  const engine = new PatchEngine(boundary, checkpoints, new ProtectedPathPolicy());
+
+  await assert.rejects(
+    engine.editText({
+      path: "file.txt", base_sha256: sha256(before), old_text: "alpha", new_text: "gamma",
+      expected_occurrences: 1,
+    }),
+    (error: unknown) => error instanceof AgentError && error.code === "STALE_STATE",
+  );
+  assert.equal(await readFile(path.join(root, "file.txt"), "utf8"), before);
+
+  const result = await engine.editText({
+    path: "file.txt", base_sha256: sha256(before), old_text: "alpha", new_text: "gamma",
+    expected_occurrences: 2, operationId: "op_edit",
+  });
+  assert.equal(await readFile(path.join(root, "file.txt"), "utf8"), "gamma beta gamma\n");
+  assert.equal((await checkpoints.verify(result.checkpointId)).operationId, "op_edit");
+  assert.equal((await checkpoints.verify(result.checkpointId)).sealed, true);
+  await checkpoints.rollback(result.checkpointId);
+  assert.equal(await readFile(path.join(root, "file.txt"), "utf8"), before);
+});
+
 test("full-text patch transaction updates, creates, deletes, verifies, and rolls back", async (context) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-patch-"));
   context.after(async () => rm(temporary, { recursive: true, force: true }));

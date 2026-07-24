@@ -6,6 +6,7 @@ export type ToolName =
   | "read_file"
   | "git_status"
   | "git_diff"
+  | "edit_text"
   | "apply_patch"
   | "run_command";
 
