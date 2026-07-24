@@ -318,6 +318,14 @@ test("live configuration canonicalizes the profile and exposes a separate verifi
     loaded.browser?.profileDirectory,
     join(await realpath(safeTarget), "future-profile"),
   );
+  assert.deepEqual(loaded.hashes.browserIdentityAliases, [
+    sha256(stableJson({
+      product: "edge",
+      executable_path: process.execPath,
+      version: "149.0.1.2",
+      executable_sha256: "a".repeat(64),
+    })),
+  ]);
   const afterUpdate = await loadRuntimeConfiguration({
     repositoryRoot,
     stateHome,
