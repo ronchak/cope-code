@@ -122,14 +122,12 @@ export async function loadRuntimeConfiguration(
       identifier: verified.evidence.identifier,
       signature_status: verified.evidence.signatureStatus,
     }));
-    if (configuredVersion !== undefined && configuredExecutableSha256 !== undefined) {
-      browserIdentityAliases = [sha256(stableJson({
-        product: verified.product,
-        executable_path: verified.executablePath,
-        version: configuredVersion,
-        executable_sha256: configuredExecutableSha256,
-      }))];
-    }
+    browserIdentityAliases = [sha256(stableJson({
+      product: verified.product,
+      executable_path: verified.executablePath,
+      version: configuredVersion ?? verified.version,
+      executable_sha256: configuredExecutableSha256 ?? verified.executableSha256,
+    }))];
   }
 
   return {
