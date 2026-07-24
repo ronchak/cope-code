@@ -19,7 +19,7 @@ import { createStandardUserHost } from "../helpers/standard-user-host.js";
 
 test("sessions marks a statically blocked live session with its exact recovery command", async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), "cope-cli-sessions-recovery-"));
-  const stateHome = path.join(root, "custom state");
+  const stateHome = path.join(root, "custom $USER `state`'s");
   await mkdir(stateHome, { mode: 0o700 });
   context.after(async () => rm(root, { recursive: true, force: true }));
   const state = sessionState();
@@ -55,11 +55,14 @@ test("sessions marks a statically blocked live session with its exact recovery c
     }>;
   };
   assert.equal(result.sessions[0]?.resumable, false);
+  const quotedStateHome = process.platform === "win32"
+    ? `'${stateHome.replaceAll("'", "''")}'`
+    : `'${stateHome.replaceAll("'", "'\"'\"'")}'`;
   assert.deepEqual(result.sessions[0]?.recovery, {
     disposition: "abort_required",
     reason: "BROWSER_CONFIG_MISSING",
-    next: `cope abort session_cli_recovery --reason "Discard interrupted session that cannot resume" ` +
-      `--state-home "${stateHome}"`,
+    next: `cope abort session_cli_recovery --reason 'Discard interrupted session that cannot resume' ` +
+      `--state-home ${quotedStateHome}`,
   });
 });
 

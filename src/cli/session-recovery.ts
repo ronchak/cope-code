@@ -255,7 +255,9 @@ function recoveryCommand(stateHome: string, ...arguments_: readonly string[]): s
 }
 
 function quoteCommandArgument(value: string): string {
-  return /^[A-Za-z0-9_./:@=-]+$/u.test(value)
-    ? value
-    : `"${value.replaceAll("\"", "\\\"")}"`;
+  if (/^[A-Za-z0-9_./:@=-]+$/u.test(value)) return value;
+  if (process.platform === "win32") {
+    return `'${value.replaceAll("'", "''")}'`;
+  }
+  return `'${value.replaceAll("'", "'\"'\"'")}'`;
 }

@@ -58,7 +58,9 @@ test("live recovery distinguishes matching, missing, invalid, and changed browse
   assert.equal(matching.reason, undefined);
   const stateHomeArgument = /^[A-Za-z0-9_./:@=-]+$/u.test(root)
     ? root
-    : `"${root.replaceAll("\"", "\\\"")}"`;
+    : process.platform === "win32"
+      ? `'${root.replaceAll("'", "''")}'`
+      : `'${root.replaceAll("'", "'\"'\"'")}'`;
   assert.equal(
     matching.next,
     `cope resume session_recovery_static --state-home ${stateHomeArgument}`,
