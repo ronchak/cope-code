@@ -17,13 +17,14 @@ import {
 } from "../../src/cli/setup-transaction.js";
 import type { BrowserFileConfig } from "../../src/config/types.js";
 import { BrowserConfigTransactionLock } from "../../src/config/browser-config-lock.js";
-import { UnsupportedHostPlatform } from "../../src/platform/index.js";
+import { UnsupportedHostPlatform, WindowsHostPlatform } from "../../src/platform/index.js";
 import { DEFAULT_ORGANIZATION_POLICY } from "../../src/policy/index.js";
 import { SessionStore } from "../../src/session/store.js";
 import { DEFAULT_BUDGET_LIMITS, zeroBudgetUsage, type SessionState } from "../../src/session/types.js";
 import { AgentError } from "../../src/shared/errors.js";
 
 const host = new UnsupportedHostPlatform("linux", "x64");
+const windowsHost = new WindowsHostPlatform("x64");
 
 function browserConfig(product: "edge" | "chrome" = "edge"): BrowserFileConfig {
   return {
@@ -410,7 +411,7 @@ test("browser setup lock prevents live session publication during its critical s
     browserBaseline: baseline,
     organizationPolicyFile: policyFile,
     browserConfig: browserConfig("chrome"),
-    host,
+    host: windowsHost,
     revalidate: async () => {
       await assert.rejects(
         pinBrowserConfigurationForSession({
