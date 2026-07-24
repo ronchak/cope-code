@@ -179,18 +179,18 @@ test("browser configuration lock still rejects persistently unreadable owner met
   );
 });
 
-test("session pinning rejects a browser hash race before writing its runtime manifest", async (context) => {
+test("session pinning rejects a browser hash race before publishing session state", async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), "cope-session-pin-race-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
-  let manifestWritten = false;
+  let sessionPublished = false;
   await assert.rejects(pinBrowserConfigurationForSession({
     stateHome: root,
     expectedBrowserHash: "a".repeat(64),
     loadCurrent: async () => ({ hashes: { browser: "b".repeat(64) } }),
-    writeManifest: async () => { manifestWritten = true; },
+    publishSession: async () => { sessionPublished = true; },
   }), (error: unknown) => error instanceof AgentError &&
     error.details.diagnosticCode === "BROWSER_CONFIG_START_RACE");
-  assert.equal(manifestWritten, false);
+  assert.equal(sessionPublished, false);
 });
 
 test("legacy runtime manifests remain compatible while new manifests pin verified browser identity", () => {
@@ -391,4 +391,85 @@ test("browser setup rechecks recovery after final revalidation", async (context)
   );
   assert.equal(await readFile(browserFile, "utf8"), "original\n");
   await assert.rejects(readFile(policyFile), { code: "ENOENT" });
+});
+
+test("browser setup lock prevents live session publication during its critical section", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-setup-session-publication-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const configDirectory = path.join(root, "config");
+  const browserFile = path.join(configDirectory, "browser.json");
+  const policyFile = path.join(configDirectory, "organization-policy.json");
+  await mkdir(configDirectory, { recursive: true });
+  await writeFile(browserFile, "original\n", "utf8");
+  const baseline = await readBrowserConfigBaseline(browserFile);
+  let sessionPublished = false;
+
+  await commitBrowserSetup({
+    stateHome: root,
+    browserFile,
+    browserBaseline: baseline,
+    organizationPolicyFile: policyFile,
+    browserConfig: browserConfig("chrome"),
+    host,
+    revalidate: async () => {
+      await assert.rejects(
+        pinBrowserConfigurationForSession({
+          stateHome: root,
+          expectedBrowserHash: "a".repeat(64),
+          loadCurrent: async () => ({ hashes: { browser: "a".repeat(64) } }),
+          publishSession: async () => { sessionPublished = true; },
+        }),
+        (error: unknown) => error instanceof AgentError &&
+          error.details.diagnosticCode === "BROWSER_CONFIG_LOCKED",
+      );
+    },
+  });
+
+  assert.equal(sessionPublished, false);
+  assert.deepEqual(JSON.parse(await readFile(browserFile, "utf8")), browserConfig("chrome"));
+});
+
+test("live session publication holds the setup lock until its runtime evidence is durable", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-session-publication-setup-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const configDirectory = path.join(root, "config");
+  const browserFile = path.join(configDirectory, "browser.json");
+  const policyFile = path.join(configDirectory, "organization-policy.json");
+  await mkdir(configDirectory, { recursive: true });
+  await writeFile(browserFile, "original\n", "utf8");
+  const baseline = await readBrowserConfigBaseline(browserFile);
+  let publicationStarted!: () => void;
+  let finishPublication!: () => void;
+  const started = new Promise<void>((resolve) => { publicationStarted = resolve; });
+  const finish = new Promise<void>((resolve) => { finishPublication = resolve; });
+  const publishing = pinBrowserConfigurationForSession({
+    stateHome: root,
+    expectedBrowserHash: "a".repeat(64),
+    loadCurrent: async () => ({ hashes: { browser: "a".repeat(64) } }),
+    publishSession: async () => {
+      publicationStarted();
+      await finish;
+    },
+  });
+  await started;
+
+  try {
+    await assert.rejects(
+      commitBrowserSetup({
+        stateHome: root,
+        browserFile,
+        browserBaseline: baseline,
+        organizationPolicyFile: policyFile,
+        browserConfig: browserConfig("chrome"),
+        host,
+        revalidate: async () => undefined,
+      }),
+      (error: unknown) => error instanceof AgentError &&
+        error.details.diagnosticCode === "BROWSER_CONFIG_LOCKED",
+    );
+    assert.equal(await readFile(browserFile, "utf8"), "original\n");
+  } finally {
+    finishPublication();
+    await publishing;
+  }
 });

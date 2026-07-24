@@ -285,7 +285,7 @@ async function runNewSession(
       isPathAllowed: (candidate, operation) => initialPolicy.isReadPathAllowed(operation, candidate),
     }).status();
     const grantHash = sha256(stableJson(grant));
-    state = {
+    const newState: SessionState = {
       schemaVersion: SESSION_SCHEMA_VERSION,
       protocolVersion: "cba/1",
       sessionId,
@@ -318,20 +318,29 @@ async function runNewSession(
       validations: [],
       protocolRepairStreak: 0,
     };
-    await store.create(state);
+    state = newState;
     const sessionDirectory = store.sessionDirectory(sessionId);
-    audit = new AuditLog(path.join(sessionDirectory, "audit.jsonl"), sessionId);
-    await audit.append({
-      type: "session.created",
-      taskId,
-      data: {
-        mode: command.mode,
-        repositoryFingerprint: initialStatus.snapshotSha256,
-        preExistingChangeCount: state.preExistingChanges.length,
-      },
-    });
-    await moveState(state, "preflight", store, audit);
-    await writeSessionGrant(sessionDirectory, grant);
+    const sessionAudit = new AuditLog(path.join(sessionDirectory, "audit.jsonl"), sessionId);
+    const publishSession = async (pinnedConfiguration: LoadedRuntimeConfiguration): Promise<void> => {
+      await store.create(newState);
+      audit = sessionAudit;
+      await sessionAudit.append({
+        type: "session.created",
+        taskId,
+        data: {
+          mode: command.mode,
+          repositoryFingerprint: initialStatus.snapshotSha256,
+          preExistingChangeCount: newState.preExistingChanges.length,
+        },
+      });
+      await moveState(newState, "preflight", store, sessionAudit);
+      await writeSessionGrant(sessionDirectory, grant);
+      await writeRuntimeManifest(
+        sessionDirectory,
+        createRuntimeManifest(command.transport, source, pinnedConfiguration, now),
+      );
+      await moveState(newState, "grant_pending", store, sessionAudit);
+    };
     if (command.transport === "edge") {
       const expectedBrowserHash = configuration.hashes.browser;
       if (expectedBrowserHash === undefined) {
@@ -346,18 +355,11 @@ async function runNewSession(
           requireBrowser: true,
           host,
         }),
-        writeManifest: async (pinnedConfiguration) => {
-          await writeRuntimeManifest(
-            sessionDirectory,
-            createRuntimeManifest(command.transport, source, pinnedConfiguration, now),
-          );
-        },
+        publishSession,
       });
     } else {
-      const runtimeManifest = createRuntimeManifest(command.transport, source, configuration, now);
-      await writeRuntimeManifest(sessionDirectory, runtimeManifest);
+      await publishSession(configuration);
     }
-    await moveState(state, "grant_pending", store, audit);
 
     const user = terminalUser(command.json, io);
     const approved = await user.approveInitialGrant(
@@ -365,16 +367,16 @@ async function runNewSession(
       command.approveGrant,
     );
     if (!approved) {
-      await moveState(state, "aborted", store, audit, "Initial session grant was declined");
-      output(command.json, io, sessionResult(state, "Initial session grant was declined"));
+      await moveState(newState, "aborted", store, sessionAudit, "Initial session grant was declined");
+      output(command.json, io, sessionResult(newState, "Initial session grant was declined"));
       return 2;
     }
-    await audit.append({
+    await sessionAudit.append({
       type: "grant.established",
       taskId,
       data: { grantHash, approvedCapabilityCount: grant.approved_capabilities.length },
     });
-    await moveState(state, "transport_starting", store, audit);
+    await moveState(newState, "transport_starting", store, sessionAudit);
     monitor = new SessionControlMonitor(sessionDirectory, sessionId, setupControl);
     monitor.start();
     const prepared = await prepareTransport(command.transport, source?.canonicalPath, state, configuration, io, setupControl, host);

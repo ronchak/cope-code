@@ -65,7 +65,7 @@ export async function pinBrowserConfigurationForSession<T>(options: {
   readonly stateHome: string;
   readonly expectedBrowserHash: string;
   readonly loadCurrent: () => Promise<T & { readonly hashes: { readonly browser?: string } }>;
-  readonly writeManifest: (configuration: T) => Promise<void>;
+  readonly publishSession: (configuration: T) => Promise<void>;
 }): Promise<void> {
   const lock = await BrowserConfigTransactionLock.acquire(options.stateHome);
   try {
@@ -75,7 +75,11 @@ export async function pinBrowserConfigurationForSession<T>(options: {
         diagnosticCode: "BROWSER_CONFIG_START_RACE",
       });
     }
-    await options.writeManifest(current);
+    // Session state and its pinned runtime manifest must become durable while
+    // holding the same lock used by setup. Setup can therefore commit first,
+    // or session publication can commit first, but they cannot strand an
+    // in-between live-browser session.
+    await options.publishSession(current);
   } finally {
     await lock.release();
   }
