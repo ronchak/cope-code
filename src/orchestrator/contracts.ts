@@ -1,13 +1,7 @@
 import type { CompletionClaim, CompletionVerification, RepositoryCompletionState } from "./completion.js";
+import type { LocalToolName } from "../protocol/types.js";
 
-export type ToolName =
-  | "list_files"
-  | "search_text"
-  | "read_file"
-  | "git_status"
-  | "git_diff"
-  | "apply_patch"
-  | "run_command";
+export type ToolName = LocalToolName;
 
 export interface NormalizedToolCall {
   readonly operationId: string;

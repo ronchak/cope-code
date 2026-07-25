@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { CbaProtocolAdapter } from "../../src/orchestrator/cba-protocol-adapter.js";
 import {
+  ORCHESTRATOR_TOOL_NAMES,
   ProtocolParseError,
+  TOOL_REGISTRY,
   parseProtocolEnvelope,
   serializeProtocolEnvelope,
 } from "../../src/protocol/index.js";
@@ -43,6 +45,56 @@ test("CBA adapter renders bootstrap and normalizes a typed tool request", () => 
       calls: [{ operationId: "op_1", name: "list_files", arguments: { path: "." } }],
     },
   ]);
+});
+
+test("CBA adapter ignores unknown policy-summary tools and scopes bootstrap guidance to active tools", () => {
+  const bootstrap = new CbaProtocolAdapter().renderBootstrap({
+    sessionId: "session_12345678",
+    taskId: "task_12345678",
+    objective: "Inspect the repository",
+    acceptanceCriteria: [],
+    policySummary: {
+      mode: "inspect",
+      tools: ["git_status", "forged_tool", 42],
+      readable_paths: ["**"],
+      writable_paths: [],
+      command_ids: [],
+      disclosure_classifications: ["internal"],
+      network: "deny",
+    },
+    budgetSummary: {},
+  });
+  assert.match(bootstrap, /active tool catalog \(git_status\)/u);
+  assert.match(bootstrap, /"tool":"git_status"/u);
+  assert.doesNotMatch(bootstrap, /forged_tool/u);
+  assert.doesNotMatch(bootstrap, /active tool catalog \([^)]*list_files/u);
+});
+
+test("CBA adapter routes every registry orchestrator tool outside ToolHost calls", () => {
+  const expectedTypes = {
+    request_user_input: "request_user_input",
+    request_capability: "request_capability",
+    complete_task: "complete_task",
+  } as const;
+  for (const tool of ORCHESTRATOR_TOOL_NAMES) {
+    const response = serializeProtocolEnvelope({
+      protocol: "cba/1",
+      message_type: "tool_request",
+      message_id: `message_${tool}`,
+      task_id: "task_12345678",
+      turn_id: 1,
+      operations: [{
+        operation_id: `operation_${tool}`,
+        tool,
+        arguments: TOOL_REGISTRY[tool].bootstrap_example,
+      }] as never,
+    });
+    const parsed = new CbaProtocolAdapter().parseModelTurn(response, {
+      taskId: "task_12345678",
+      turnId: "turn_0001",
+    });
+    assert.equal(parsed.messages[0]?.type, expectedTypes[tool], `${tool} must route as an orchestrator action`);
+  }
 });
 
 test("CBA adapter maps completion claims and emits structured rejection results", () => {
