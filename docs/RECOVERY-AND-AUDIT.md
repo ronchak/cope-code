@@ -20,7 +20,7 @@ The Windows default state root is `%LOCALAPPDATA%\CopilotBrowserAgent`. The expe
 | `artifacts/response` | exact received model response needed for parse recovery | source/model/task-bearing |
 | `artifacts/decision` | exact user input or capability decision needed for replay | may contain free-form source/task-sensitive text |
 | `fingerprint.key` | per-session 256-bit HMAC key for stable secret fingerprints | secret local key; never prompt/export content |
-| completion handoff | bounded redacted model claim plus verifier facts | durable task prose and repository paths; not source-free |
+| completion handoff | bounded redacted model claim plus verifier facts; separately flushed where supported and otherwise inline with session state | durable task prose and repository paths; not source-free |
 | checkpoints | prior bytes/modes for paths in a mutation | source-bearing |
 | `review-package.json` | optional source-free derived counts/hashes/budgets/findings | sensitive metadata; digest is not a signature |
 | `control/request.json` | one versioned local pause or abort request for an active owner | operational metadata |

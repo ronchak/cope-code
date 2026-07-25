@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { SecretScanner } from "../../src/security/secrets.js";
 import { BudgetMeter } from "../../src/session/budgets.js";
 import { CompletionHandoffStore } from "../../src/session/completion-handoff-store.js";
 import { SessionStore } from "../../src/session/store.js";
@@ -111,7 +112,7 @@ test("session store migrates legacy non-completed terminal handoffs on load", as
   assert.equal(migrated.completionHandoff, undefined);
   await assert.rejects(() => readFile(handoffFilename, "utf8"), { code: "ENOENT" });
   const durable = JSON.parse(await readFile(path.join(sessionDirectory, "session.json"), "utf8")) as SessionState;
-  assert.equal(durable.completionHandoff, undefined);
+  assert.deepEqual(durable.completionHandoff, state.completionHandoff);
 });
 
 test("session store removes an orphaned legacy terminal handoff without a state reference", async () => {
@@ -131,6 +132,78 @@ test("session store removes an orphaned legacy terminal handoff without a state 
   assert.equal(migrated.status, "failed");
   assert.equal(migrated.completionHandoff, undefined);
   await assert.rejects(() => readFile(handoffFilename, "utf8"), { code: "ENOENT" });
+});
+
+test("hosts without directory fsync commit completion handoffs inline with session state", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-session-inline-handoff-"));
+  const sessionStore = new SessionStore(root);
+  const state = makeState({
+    status: "completed",
+    completedAt: "2026-01-01T00:00:03.000Z",
+  });
+  const handoffDirectory = path.join(sessionStore.sessionDirectory(state.sessionId), "handoff");
+  const handoffs = new CompletionHandoffStore(
+    handoffDirectory,
+    state.sessionId,
+    new SecretScanner(Buffer.alloc(32, 17)),
+    false,
+  );
+  const reference = await handoffs.save({
+    summary: "Inline Windows completion",
+    acceptanceCriteria: [],
+    validation: [],
+    skippedValidation: [],
+    remainingRisks: [],
+    recommendedFollowUp: [],
+  }, {
+    accepted: true,
+    reasons: [],
+    actual: {
+      changedPaths: [],
+      agentChangedPaths: [],
+      preExistingPaths: [],
+      successfulCommands: [],
+      failedCommands: [],
+      gitStatusSummary: "clean",
+      repositoryFingerprint: "f".repeat(64),
+    },
+  }, "2026-01-01T00:00:02.000Z");
+  assert.ok(reference.inlineRecord);
+  await assert.rejects(
+    () => readFile(path.join(handoffDirectory, "completion.json"), "utf8"),
+    { code: "ENOENT" },
+  );
+
+  state.completionHandoff = reference;
+  await sessionStore.create(state);
+  const durable = await sessionStore.read(state.sessionId);
+  assert.deepEqual(durable.completionHandoff, reference);
+  assert.equal((await handoffs.read(durable.completionHandoff)).claim.summary, "Inline Windows completion");
+
+  const inlineRecord = reference.inlineRecord;
+  assert.ok(inlineRecord);
+  const tampered: SessionState = {
+    ...state,
+    completionHandoff: {
+      ...reference,
+      inlineRecord: {
+        ...inlineRecord,
+        claim: { ...inlineRecord.claim, summary: "tampered after hashing" },
+      },
+    },
+  };
+  await assert.rejects(() => sessionStore.write(tampered), /reference is malformed/u);
+});
+
+test("hosts without directory fsync still unlink legacy handoff files", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-session-inline-legacy-cleanup-"));
+  const handoffDirectory = path.join(root, "handoff");
+  const filename = path.join(handoffDirectory, "completion.json");
+  await mkdir(handoffDirectory, { recursive: true, mode: 0o700 });
+  await writeFile(filename, "legacy report\n", "utf8");
+
+  await CompletionHandoffStore.removeAt(handoffDirectory, false);
+  await assert.rejects(() => readFile(filename, "utf8"), { code: "ENOENT" });
 });
 
 test("legacy handoff migration cannot overwrite a concurrent terminal state write", async () => {
@@ -167,7 +240,6 @@ test("legacy handoff migration cannot overwrite a concurrent terminal state writ
     await originalRemoveAt(directory);
   };
 
-  let writerSettled = false;
   try {
     const migration = store.read(state.sessionId);
     await removalEntered;
@@ -179,13 +251,11 @@ test("legacy handoff migration cannot overwrite a concurrent terminal state writ
     };
     delete rolledBack.pauseReason;
     delete rolledBack.completionHandoff;
-    const concurrentWrite = store.write(rolledBack).finally(() => {
-      writerSettled = true;
-    });
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    assert.equal(writerSettled, false, "the concurrent writer must wait for migration serialization");
+    const concurrentWrite = store.write(rolledBack);
+    await concurrentWrite;
     releaseRemoval();
-    await Promise.all([migration, concurrentWrite]);
+    const migrated = await migration;
+    assert.equal(migrated.status, "rolled_back");
   } finally {
     releaseRemoval();
     CompletionHandoffStore.removeAt = originalRemoveAt;

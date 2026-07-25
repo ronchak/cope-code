@@ -154,7 +154,7 @@ test("status migrates a legacy handoff from a non-completed terminal session", a
   const durable = JSON.parse(
     await readFile(path.join(sessionDirectory, "session.json"), "utf8"),
   ) as SessionState;
-  assert.equal(durable.completionHandoff, undefined);
+  assert.deepEqual(durable.completionHandoff, state.completionHandoff);
 });
 
 test("resume reports missing pinned browser configuration without exposing raw ENOENT", async (context) => {

@@ -26,6 +26,11 @@ export interface CompletionHandoffReference {
   readonly integrity: string;
   readonly createdAt: string;
   readonly redactionCount: number;
+  /**
+   * Hosts that cannot durably flush a directory entry keep the handoff in the
+   * same atomic session-state commit as this reference.
+   */
+  readonly inlineRecord?: CompletionHandoffRecord;
 }
 
 /**
@@ -37,6 +42,7 @@ export class CompletionHandoffStore {
     private readonly directory: string,
     private readonly sessionId: string,
     private readonly scanner: SecretScanner,
+    private readonly supportsDirectoryFsync = CURRENT_HOST_PLATFORM.supportsDirectoryFsync,
   ) {}
 
   public async save(
@@ -61,31 +67,40 @@ export class CompletionHandoffStore {
     if (Buffer.byteLength(serialized) > MAX_HANDOFF_BYTES) {
       throw new AgentError("BUDGET_EXCEEDED", "Completion handoff exceeds its durable storage bound");
     }
-    await mkdir(this.directory, { recursive: true, mode: 0o700 });
-    await atomicWrite(this.filename(), serialized);
-    return {
+    const reference: CompletionHandoffReference = {
       version: record.version,
       integrity: record.integrity,
       createdAt: record.createdAt,
       redactionCount: record.redactionCount,
     };
+    if (!this.supportsDirectoryFsync) {
+      // Windows cannot flush directory handles through Node. Keeping the
+      // bounded record inline avoids a cross-file commit whose ordering could
+      // otherwise expose a reference before its rename is durable.
+      return { ...reference, inlineRecord: record };
+    }
+    await mkdir(this.directory, { recursive: true, mode: 0o700 });
+    await atomicWrite(this.filename(), serialized);
+    return reference;
   }
 
   public async read(expected?: CompletionHandoffReference): Promise<CompletionHandoffRecord> {
-    let raw: string;
-    try {
-      raw = await readFile(this.filename(), "utf8");
-    } catch (error) {
-      throw new AgentError("RECOVERY_REQUIRED", "Completion handoff is unavailable", {}, { cause: error });
-    }
-    if (Buffer.byteLength(raw) > MAX_HANDOFF_BYTES || !raw.endsWith("\n")) {
-      throw new AgentError("RECOVERY_REQUIRED", "Completion handoff is oversized or partial");
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw) as unknown;
-    } catch (error) {
-      throw new AgentError("RECOVERY_REQUIRED", "Completion handoff is not valid JSON", {}, { cause: error });
+    let parsed: unknown = expected?.inlineRecord;
+    if (parsed === undefined) {
+      let raw: string;
+      try {
+        raw = await readFile(this.filename(), "utf8");
+      } catch (error) {
+        throw new AgentError("RECOVERY_REQUIRED", "Completion handoff is unavailable", {}, { cause: error });
+      }
+      if (Buffer.byteLength(raw) > MAX_HANDOFF_BYTES || !raw.endsWith("\n")) {
+        throw new AgentError("RECOVERY_REQUIRED", "Completion handoff is oversized or partial");
+      }
+      try {
+        parsed = JSON.parse(raw) as unknown;
+      } catch (error) {
+        throw new AgentError("RECOVERY_REQUIRED", "Completion handoff is not valid JSON", {}, { cause: error });
+      }
     }
     if (!isCompletionHandoffRecord(parsed) || parsed.sessionId !== this.sessionId) {
       throw new AgentError("RECOVERY_REQUIRED", "Completion handoff identity or schema is invalid");
@@ -126,17 +141,35 @@ export class CompletionHandoffStore {
   }
 
   public async remove(): Promise<void> {
-    await CompletionHandoffStore.removeAt(this.directory);
+    await CompletionHandoffStore.removeAt(this.directory, this.supportsDirectoryFsync);
   }
 
-  public static async removeAt(directory: string): Promise<void> {
+  public static async removeAt(
+    directory: string,
+    supportsDirectoryFsync = CURRENT_HOST_PLATFORM.supportsDirectoryFsync,
+  ): Promise<void> {
+    let handoffWasMissing = false;
     try {
       await unlink(path.join(directory, "completion.json"));
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      handoffWasMissing = true;
+    }
+    if (!supportsDirectoryFsync) {
+      // New records are inline on this host, so this can only be legacy file
+      // cleanup. Non-completed terminal state is a durable tombstone and every
+      // later load retries the unlink if a power loss restores the entry.
+      return;
+    }
+    try {
+      // Sync even when the file is already absent. A previous unlink may have
+      // succeeded while its directory fsync failed, so the retry must finish
+      // making that deletion durable before session cleanup may proceed.
+      await syncDirectory(directory);
+    } catch (error) {
+      if (handoffWasMissing && (error as NodeJS.ErrnoException).code === "ENOENT") return;
       throw error;
     }
-    await syncDirectory(directory);
   }
 
   private filename(): string {
@@ -205,7 +238,7 @@ function redactVerification(
   };
 }
 
-function isCompletionHandoffRecord(value: unknown): value is CompletionHandoffRecord {
+export function isCompletionHandoffRecord(value: unknown): value is CompletionHandoffRecord {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const candidate = value as Partial<CompletionHandoffRecord>;
   return candidate.version === COMPLETION_HANDOFF_VERSION &&
@@ -220,6 +253,45 @@ function isCompletionHandoffRecord(value: unknown): value is CompletionHandoffRe
     hasExactKeys(candidate as unknown as Record<string, unknown>, [
       "version", "sessionId", "createdAt", "claim", "verification", "redactionCount", "integrity",
     ]);
+}
+
+export function isCompletionHandoffReference(
+  value: unknown,
+  expectedSessionId: string,
+): value is CompletionHandoffReference {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as Partial<CompletionHandoffReference>;
+  if (
+    !hasExactKeys(
+      candidate as unknown as Record<string, unknown>,
+      ["version", "integrity", "createdAt", "redactionCount", "inlineRecord"],
+      true,
+    ) ||
+    candidate.version !== COMPLETION_HANDOFF_VERSION ||
+    typeof candidate.integrity !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(candidate.integrity) ||
+    !isIsoTimestamp(candidate.createdAt) ||
+    !Number.isSafeInteger(candidate.redactionCount) ||
+    (candidate.redactionCount ?? -1) < 0
+  ) {
+    return false;
+  }
+  if (candidate.inlineRecord === undefined) return true;
+  if (!isCompletionHandoffRecord(candidate.inlineRecord)) return false;
+  if (Buffer.byteLength(`${stableJson(candidate.inlineRecord)}\n`) > MAX_HANDOFF_BYTES) return false;
+  const { integrity, ...body } = candidate.inlineRecord;
+  return candidate.inlineRecord.sessionId === expectedSessionId &&
+    sha256(stableJson(body)) === integrity &&
+    candidate.version === candidate.inlineRecord.version &&
+    candidate.integrity === candidate.inlineRecord.integrity &&
+    candidate.createdAt === candidate.inlineRecord.createdAt &&
+    candidate.redactionCount === candidate.inlineRecord.redactionCount;
+}
+
+function isIsoTimestamp(value: unknown): value is string {
+  if (typeof value !== "string" || value.length < 20 || value.length > 64) return false;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value;
 }
 
 function isCompletionClaim(value: unknown): value is CompletionClaim {
@@ -298,7 +370,6 @@ async function atomicWrite(filename: string, content: string): Promise<void> {
 }
 
 async function syncDirectory(directory: string): Promise<void> {
-  if (!CURRENT_HOST_PLATFORM.supportsDirectoryFsync) return;
   const handle = await open(directory, constants.O_RDONLY);
   try {
     await handle.sync();

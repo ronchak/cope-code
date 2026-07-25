@@ -8,14 +8,12 @@ import { currentHost, workspaceKey } from "./paths.js";
 import { SESSION_SCHEMA_VERSION, type SessionState } from "./types.js";
 import { allowedTransitions, isTerminal } from "./state-machine.js";
 import {
-  COMPLETION_HANDOFF_VERSION,
   CompletionHandoffStore,
+  isCompletionHandoffReference,
 } from "./completion-handoff-store.js";
 import { CURRENT_HOST_PLATFORM } from "../platform/index.js";
 
 const MAX_SESSION_BYTES = 4 * 1024 * 1024;
-const SESSION_WRITE_LOCK_TIMEOUT_MS = 15_000;
-const SESSION_WRITE_LOCK_POLL_MS = 25;
 const HASH_PATTERN = /^[a-f0-9]{64}$/u;
 const SESSION_KEYS = [
   "schemaVersion",
@@ -66,14 +64,6 @@ interface LockRecord {
   readonly createdAt: string;
 }
 
-interface SessionWriteLockRecord {
-  readonly schemaVersion: 1;
-  readonly pid: number;
-  readonly host: string;
-  readonly sessionId: string;
-  readonly createdAt: string;
-}
-
 export class SessionStore {
   public constructor(private readonly stateHome: string) {}
 
@@ -96,49 +86,35 @@ export class SessionStore {
     assertValidSessionState(state);
     const directory = this.sessionDirectory(state.sessionId);
     await mkdir(directory, { recursive: true, mode: 0o700 });
-    const lock = await this.acquireSessionWriteLock(state.sessionId);
-    try {
-      await this.writeUnlocked(state);
-    } finally {
-      await lock.release();
-    }
+    await this.writeValidated(state);
   }
 
   public async read(sessionId: string): Promise<SessionState> {
     const parsed = await this.readValidated(sessionId);
     if (!isTerminal(parsed.status) || parsed.status === "completed") return parsed;
 
-    const lock = await this.acquireSessionWriteLock(sessionId);
     try {
-      // Re-read under the same serialization used by every state write. A
-      // concurrent terminal transition therefore cannot be overwritten by the
-      // legacy migration's earlier snapshot.
+      // Legacy rollback paths could leave a completion report attached to a
+      // later non-completed terminal state. Removing the report is sufficient
+      // to retire the sensitive artifact and deliberately avoids rewriting a
+      // possibly newer state snapshot.
+      await CompletionHandoffStore.removeAt(path.join(this.sessionDirectory(sessionId), "handoff"));
       const current = await this.readValidated(sessionId);
-      if (!isTerminal(current.status) || current.status === "completed") return current;
-      try {
-        // Legacy rollback paths could leave a completion report attached to a
-        // later non-completed terminal state. Durably remove the report before
-        // clearing its reference so an interrupted migration is retried.
-        await CompletionHandoffStore.removeAt(path.join(this.sessionDirectory(sessionId), "handoff"));
-        if (current.completionHandoff !== undefined) {
-          delete current.completionHandoff;
-          await this.writeUnlocked(current);
-        }
-      } catch (error) {
-        throw new AgentError(
-          "RECOVERY_REQUIRED",
-          "Cannot remove a legacy completion handoff from a non-completed terminal session",
-          { sessionId, status: current.status },
-          { cause: error },
-        );
-      }
+      // Suppress the obsolete reference in memory. A later legitimate state
+      // transition persists the already-established terminal invariant.
+      if (isTerminal(current.status) && current.status !== "completed") delete current.completionHandoff;
       return current;
-    } finally {
-      await lock.release();
+    } catch (error) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Cannot remove a legacy completion handoff from a non-completed terminal session",
+        { sessionId, status: parsed.status },
+        { cause: error },
+      );
     }
   }
 
-  private async writeUnlocked(state: SessionState): Promise<void> {
+  private async writeValidated(state: SessionState): Promise<void> {
     const directory = this.sessionDirectory(state.sessionId);
     const destination = path.join(directory, "session.json");
     const temporary = path.join(directory, `session.${newId("write")}.tmp`);
@@ -189,66 +165,6 @@ export class SessionStore {
     }
     assertValidSessionState(parsed);
     return parsed;
-  }
-
-  private async acquireSessionWriteLock(sessionId: string): Promise<SessionWriteLock> {
-    const directory = this.sessionDirectory(sessionId);
-    await mkdir(directory, { recursive: true, mode: 0o700 });
-    const filename = path.join(directory, ".session-state.lock");
-    const deadline = Date.now() + SESSION_WRITE_LOCK_TIMEOUT_MS;
-    const record: SessionWriteLockRecord = {
-      schemaVersion: 1,
-      pid: process.pid,
-      host: currentHost(),
-      sessionId,
-      createdAt: new Date().toISOString(),
-    };
-
-    while (true) {
-      try {
-        const handle = await open(filename, "wx", 0o600);
-        try {
-          await handle.writeFile(`${stableJson(record)}\n`, "utf8");
-          await handle.sync();
-          return new SessionWriteLock(filename, handle);
-        } catch (error) {
-          await handle.close().catch(() => undefined);
-          await unlink(filename).catch(() => undefined);
-          throw error;
-        }
-      } catch (error) {
-        if (!isAlreadyExists(error)) throw error;
-        let existing: SessionWriteLockRecord | undefined;
-        try {
-          existing = await readSessionWriteLock(filename);
-        } catch (readError) {
-          if (Date.now() >= deadline) {
-            throw new AgentError(
-              "RECOVERY_REQUIRED",
-              "Session state lock is unreadable and requires manual inspection",
-              { sessionId, error: errorMessage(readError) },
-            );
-          }
-          await delay(SESSION_WRITE_LOCK_POLL_MS);
-          continue;
-        }
-        if (existing.host === currentHost() && !isProcessAlive(existing.pid)) {
-          await unlink(filename).catch((unlinkError: NodeJS.ErrnoException) => {
-            if (unlinkError.code !== "ENOENT") throw unlinkError;
-          });
-          continue;
-        }
-        if (Date.now() >= deadline) {
-          throw new AgentError("RECOVERY_REQUIRED", "Timed out waiting for the session state writer", {
-            sessionId,
-            pid: existing.pid,
-            host: existing.host,
-            createdAt: existing.createdAt,
-          });
-        }
-        await delay(SESSION_WRITE_LOCK_POLL_MS);
-      }
-    }
   }
 
   public async acquireWorkspaceLock(
@@ -310,23 +226,6 @@ export class WorkspaceLock {
   }
 }
 
-class SessionWriteLock {
-  private released = false;
-
-  public constructor(
-    private readonly filename: string,
-    private readonly handle: Awaited<ReturnType<typeof open>>,
-  ) {}
-
-  public async release(): Promise<void> {
-    if (this.released) return;
-    this.released = true;
-    await this.handle.close();
-    await unlink(this.filename);
-    await syncDirectory(path.dirname(this.filename));
-  }
-}
-
 async function readLock(filename: string): Promise<LockRecord> {
   try {
     const bytes = await readFile(filename);
@@ -355,26 +254,6 @@ async function readLock(filename: string): Promise<LockRecord> {
   }
 }
 
-async function readSessionWriteLock(filename: string): Promise<SessionWriteLockRecord> {
-  const bytes = await readFile(filename);
-  if (bytes.length === 0 || bytes.length > 64 * 1024) throw new Error("invalid session state lock size");
-  const raw = bytes.toString("utf8");
-  if (!raw.endsWith("\n") || raw.charCodeAt(0) === 0xfeff) throw new Error("partial session state lock");
-  const parsed = JSON.parse(raw) as Partial<SessionWriteLockRecord>;
-  if (
-    !hasExactKeys(parsed, ["schemaVersion", "pid", "host", "sessionId", "createdAt"]) ||
-    parsed.schemaVersion !== 1 ||
-    !Number.isSafeInteger(parsed.pid) ||
-    (parsed.pid ?? 0) <= 0 ||
-    typeof parsed.host !== "string" || parsed.host.length === 0 || parsed.host.length > 1_024 ||
-    typeof parsed.sessionId !== "string" ||
-    !isIsoTimestamp(parsed.createdAt)
-  ) {
-    throw new Error("invalid session state lock");
-  }
-  return parsed as SessionWriteLockRecord;
-}
-
 function isProcessAlive(pid: number): boolean {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try {
@@ -387,10 +266,6 @@ function isProcessAlive(pid: number): boolean {
 
 function isAlreadyExists(error: unknown): boolean {
   return (error as NodeJS.ErrnoException).code === "EEXIST";
-}
-
-async function delay(milliseconds: number): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function assertSafeId(value: string): void {
@@ -513,12 +388,7 @@ function assertValidSessionState(value: Partial<SessionState>): asserts value is
   }
   if (
     value.completionHandoff !== undefined &&
-    (!hasExactKeys(value.completionHandoff, ["version", "integrity", "createdAt", "redactionCount"]) ||
-      value.completionHandoff.version !== COMPLETION_HANDOFF_VERSION ||
-      !/^[a-f0-9]{64}$/u.test(value.completionHandoff.integrity) ||
-      !isIsoTimestamp(value.completionHandoff.createdAt) ||
-      !Number.isSafeInteger(value.completionHandoff.redactionCount) ||
-      value.completionHandoff.redactionCount < 0)
+    !isCompletionHandoffReference(value.completionHandoff, value.sessionId)
   ) {
     throw new AgentError("RECOVERY_REQUIRED", "Session completion-handoff reference is malformed");
   }
