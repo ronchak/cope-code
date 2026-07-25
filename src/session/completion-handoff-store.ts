@@ -77,6 +77,7 @@ export class CompletionHandoffStore {
       // Windows cannot flush directory handles through Node. Keeping the
       // bounded record inline avoids a cross-file commit whose ordering could
       // otherwise expose a reference before its rename is durable.
+      await CompletionHandoffStore.removeAt(this.directory, false);
       return { ...reference, inlineRecord: record };
     }
     await mkdir(this.directory, { recursive: true, mode: 0o700 });

@@ -137,11 +137,12 @@ test("session store removes an orphaned legacy terminal handoff without a state 
 test("hosts without directory fsync commit completion handoffs inline with session state", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-session-inline-handoff-"));
   const sessionStore = new SessionStore(root);
-  const state = makeState({
-    status: "completed",
-    completedAt: "2026-01-01T00:00:03.000Z",
-  });
+  const state = makeState();
+  await sessionStore.create(state);
   const handoffDirectory = path.join(sessionStore.sessionDirectory(state.sessionId), "handoff");
+  const legacyFilename = path.join(handoffDirectory, "completion.json");
+  await mkdir(handoffDirectory, { recursive: true, mode: 0o700 });
+  await writeFile(legacyFilename, "orphaned 0.1.6 report\n", "utf8");
   const handoffs = new CompletionHandoffStore(
     handoffDirectory,
     state.sessionId,
@@ -169,16 +170,19 @@ test("hosts without directory fsync commit completion handoffs inline with sessi
     },
   }, "2026-01-01T00:00:02.000Z");
   assert.ok(reference.inlineRecord);
-  await assert.rejects(
-    () => readFile(path.join(handoffDirectory, "completion.json"), "utf8"),
-    { code: "ENOENT" },
-  );
+  await assert.rejects(() => readFile(legacyFilename, "utf8"), { code: "ENOENT" });
 
+  state.status = "completed";
+  state.completedAt = "2026-01-01T00:00:03.000Z";
   state.completionHandoff = reference;
-  await sessionStore.create(state);
+  await sessionStore.write(state);
+  // A power loss may restore the unflushable legacy directory entry. The
+  // completed inline state is a durable cleanup tombstone on every load.
+  await writeFile(legacyFilename, "resurrected 0.1.6 report\n", "utf8");
   const durable = await sessionStore.read(state.sessionId);
   assert.deepEqual(durable.completionHandoff, reference);
   assert.equal((await handoffs.read(durable.completionHandoff)).claim.summary, "Inline Windows completion");
+  await assert.rejects(() => readFile(legacyFilename, "utf8"), { code: "ENOENT" });
 
   const inlineRecord = reference.inlineRecord;
   assert.ok(inlineRecord);

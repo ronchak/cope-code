@@ -91,13 +91,16 @@ export class SessionStore {
 
   public async read(sessionId: string): Promise<SessionState> {
     const parsed = await this.readValidated(sessionId);
-    if (!isTerminal(parsed.status) || parsed.status === "completed") return parsed;
+    if (!isTerminal(parsed.status)) return parsed;
+    if (parsed.status === "completed" && parsed.completionHandoff?.inlineRecord === undefined) return parsed;
 
     try {
       // Legacy rollback paths could leave a completion report attached to a
-      // later non-completed terminal state. Removing the report is sufficient
-      // to retire the sensitive artifact and deliberately avoids rewriting a
-      // possibly newer state snapshot.
+      // later non-completed terminal state. A completed inline handoff can
+      // likewise coexist with an orphaned file from an interrupted 0.1.6
+      // completion. Removing the separate report is sufficient to retire the
+      // sensitive artifact and deliberately avoids rewriting a possibly newer
+      // state snapshot.
       await CompletionHandoffStore.removeAt(path.join(this.sessionDirectory(sessionId), "handoff"));
       const current = await this.readValidated(sessionId);
       // Suppress the obsolete reference in memory. A later legitimate state
@@ -107,7 +110,7 @@ export class SessionStore {
     } catch (error) {
       throw new AgentError(
         "RECOVERY_REQUIRED",
-        "Cannot remove a legacy completion handoff from a non-completed terminal session",
+        "Cannot remove a legacy completion handoff from a terminal session",
         { sessionId, status: parsed.status },
         { cause: error },
       );
