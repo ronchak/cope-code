@@ -89,10 +89,14 @@ node scripts/release/activate.mjs --rollback <install-root> --trusted-public-key
 
 Activation is serialized with an exclusive `.activation.lock` directory. Stored
 bundle files are made read-only before a second verification and publication;
-this is defense against accidental mutation, not filesystem immutability. A hard
-crash can leave a stale lock, a partial `.staged-*` directory, a temporary
-`.activation-*.json`, or an unreferenced complete release, but cannot publish a
-partially written activation pointer. Operators must verify that no activation is
+this is defense against accidental mutation, not filesystem immutability. On
+POSIX hosts, file and directory synchronization durably orders release storage
+before pointer publication. Node does not expose the directory-handle flags
+needed for the equivalent Windows directory flush, so Windows power-loss
+durability is not claimed; atomic rename still prevents a partially written
+pointer from being observed during normal operation. A hard crash can leave a
+stale lock, a partial `.staged-*` directory, a temporary `.activation-*.json`, or
+an unreferenced complete release. Operators must verify that no activation is
 running before removing a stale lock. The next operation cleans recognized
 temporary residue after acquiring the lock. Consumers must resolve
 `activation.json` and reverify its selected release; the current Cope launchers do

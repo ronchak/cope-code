@@ -179,6 +179,9 @@ function tarNumericString(buffer, offset, length, label) {
     throw new Error(`Release archive contains hidden data in its numeric ${label} field`);
   }
   const bytes = terminator < 0 ? field : field.subarray(0, terminator);
+  if (bytes.some((value) => value !== 0x20 && (value < 0x30 || value > 0x37))) {
+    throw new Error(`Release archive contains an invalid octal ${label}`);
+  }
   return utf8.decode(bytes);
 }
 

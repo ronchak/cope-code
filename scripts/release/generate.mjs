@@ -74,8 +74,9 @@ export async function generateRelease(options, environment = process.env, capabi
   for (const [dependencyName, declaredSpec] of Object.entries(runtimeDeclarations)) {
     const resolved = lockDocument.packages[`node_modules/${dependencyName}`];
     if (resolved === null || typeof resolved !== "object" ||
-        typeof resolved.version !== "string" || resolved.version.length === 0) {
-      throw new Error(`package-lock.json does not resolve runtime dependency: ${dependencyName}`);
+        typeof resolved.version !== "string" || resolved.version.length === 0 ||
+        resolved.dev === true) {
+      throw new Error(`package-lock.json does not resolve a runtime package: ${dependencyName}`);
     }
     validateResolvedDependency(dependencyName, declaredSpec, resolved);
   }

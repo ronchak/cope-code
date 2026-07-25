@@ -29,6 +29,7 @@ export async function activateRelease(candidateInput, installRootInput, options)
     const releasesRoot = path.join(installRoot, "releases");
     await mkdir(releasesRoot, { recursive: true, mode: 0o700 });
     await requireRealDirectory(releasesRoot, "Release store");
+    await syncDirectory(installRoot);
 
     let staging = path.join(installRoot, `.staged-${randomUUID()}`);
     try {
@@ -45,15 +46,15 @@ export async function activateRelease(candidateInput, installRootInput, options)
       const releaseReference = { manifestSha256: releaseId, version: verification.version };
       const prior = await readActivationState(installRoot);
       if (prior !== undefined) {
-        for (const remembered of [prior.current, prior.previous].filter((value) => value !== null)) {
+        const rememberedReleases = [prior.current, prior.previous].filter((value) => value !== null);
+        for (const remembered of rememberedReleases) {
           if (compareReleaseVersions(releaseReference.version, remembered.version) === 0 &&
               releaseReference.manifestSha256 !== remembered.manifestSha256) {
             throw new Error("Ordinary activation refuses same-version release equivocation");
           }
-        }
-        const precedence = compareReleaseVersions(releaseReference.version, prior.current.version);
-        if (precedence < 0) {
-          throw new Error("Ordinary activation refuses a signed downgrade; use the explicit authenticated rollback path");
+          if (compareReleaseVersions(releaseReference.version, remembered.version) < 0) {
+            throw new Error("Ordinary activation refuses a signed downgrade; use the explicit authenticated rollback path");
+          }
         }
       }
 
@@ -81,7 +82,10 @@ export async function activateRelease(candidateInput, installRootInput, options)
             finalVerification.version !== releaseReference.version) {
           throw new Error("Read-only activation snapshot changed before release-store publication");
         }
+        await syncDirectory(staging);
         await rename(staging, releasePath);
+        await syncDirectory(releasesRoot);
+        await syncDirectory(installRoot);
       }
       staging = undefined;
 
@@ -424,9 +428,28 @@ async function commitActivationState(installRoot, state) {
     await handle.close();
     handle = undefined;
     await rename(temporary, path.join(installRoot, "activation.json"));
+    await syncDirectory(installRoot);
   } finally {
     if (handle !== undefined) await handle.close();
     await rm(temporary, { force: true });
+  }
+}
+
+async function syncDirectory(directory) {
+  let handle;
+  try {
+    handle = await open(directory, fsConstants.O_RDONLY);
+    await handle.sync();
+  } catch (error) {
+    if (process.platform !== "win32" ||
+        !["EACCES", "EINVAL", "EISDIR", "EPERM"].includes(error?.code)) {
+      throw error;
+    }
+    // Node does not expose FILE_FLAG_BACKUP_SEMANTICS for opening directory
+    // handles on Windows. Atomic rename still prevents partial pointer bytes,
+    // but Windows power-loss durability is deliberately not claimed.
+  } finally {
+    if (handle !== undefined) await handle.close();
   }
 }
 

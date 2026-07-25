@@ -147,7 +147,25 @@ test("release evidence is canonical, reproducible, SPDX-correct, and explicit ab
   unresolvedArguments[unresolvedArguments.indexOf("--lock") + 1] = unresolvedLockFile;
   expectFailure(
     invoke(generateScript, unresolvedArguments, { COPE_RELEASE_SIGNING_KEY_FILE: undefined }),
-    /does not resolve runtime dependency: not-resolved/iu,
+    /does not resolve a runtime package: not-resolved/iu,
+  );
+
+  const devOnlyCandidate = await fixture.emptyCandidate("dev-only-runtime-dependency", "dependency-drift");
+  const devOnlyPackageJson = npmPackageJson("1.2.3", { dependencies: { example: "2.0.0" } });
+  await writeFile(path.join(devOnlyCandidate, "cope.tgz"), npmArchive([
+    { archivePath: "package/package.json", content: devOnlyPackageJson },
+  ]));
+  const devOnlyLockFile = path.join(fixture.root, "dev-only-runtime.package-lock.json");
+  const devOnlyLock = JSON.parse(await readFile(fixture.lockFile, "utf8")) as {
+    packages: Record<string, { dev?: boolean }>;
+  };
+  devOnlyLock.packages["node_modules/example"]!.dev = true;
+  await writeFile(devOnlyLockFile, JSON.stringify(devOnlyLock));
+  const devOnlyArguments = generationArguments(fixture, devOnlyCandidate, "preview");
+  devOnlyArguments[devOnlyArguments.indexOf("--lock") + 1] = devOnlyLockFile;
+  expectFailure(
+    invoke(generateScript, devOnlyArguments, { COPE_RELEASE_SIGNING_KEY_FILE: undefined }),
+    /does not resolve a runtime package: example/iu,
   );
 
   for (const [name, declaredSpec, resolvedVersion, resolvedName] of [
@@ -283,6 +301,16 @@ test("release generation rejects traversal, links, and non-regular payload bound
     /hidden data in its numeric uid field/iu,
   );
 
+  const nonTarWhitespace = await fixture.emptyCandidate("non-tar-numeric-whitespace", "bad");
+  const nonTarWhitespaceBytes = gunzipSync(await readFile(path.join(nonTarWhitespace, "cope.tgz")));
+  nonTarWhitespaceBytes[108] = 0x09;
+  rewriteTarChecksum(nonTarWhitespaceBytes.subarray(0, 512));
+  await writeFile(path.join(nonTarWhitespace, "cope.tgz"), deterministicGzip(nonTarWhitespaceBytes));
+  expectFailure(
+    invoke(generateScript, generationArguments(fixture, nonTarWhitespace, "preview")),
+    /invalid octal uid/iu,
+  );
+
   const collidingPaths = await fixture.emptyCandidate("colliding-paths", "bad");
   await writeFile(path.join(collidingPaths, "cope.tgz"), npmArchive([
     { archivePath: "package/package.json", content: npmPackageJson("1.2.3") },
@@ -382,7 +410,7 @@ test("release generation rejects traversal, links, and non-regular payload bound
 test("activation is publisher-authenticated, locked, pointer-atomic, and explicitly reversible", async (context) => {
   const fixture = await releaseFixture(context);
   const first = await fixture.candidate("candidate-one", "stable", "one");
-  const second = await fixture.candidate("candidate-two", "stable", "two", true, "1.2.4");
+  const second = await fixture.candidate("candidate-two", "stable", "two", true, "1.2.5");
   const firstId = await manifestDigest(first);
   const secondId = await manifestDigest(second);
   const installRoot = path.join(fixture.root, "install-root");
@@ -412,7 +440,7 @@ test("activation is publisher-authenticated, locked, pointer-atomic, and explici
     fixture.publicKeyFile,
   ]));
   assert.deepEqual(await activationState(installRoot), {
-    current: { manifestSha256: secondId, version: "1.2.4" },
+    current: { manifestSha256: secondId, version: "1.2.5" },
     previous: { manifestSha256: firstId, version: "1.2.3" },
     schemaVersion: "cope-release-activation/2",
   });
@@ -445,9 +473,23 @@ test("activation is publisher-authenticated, locked, pointer-atomic, and explici
   ]));
   assert.deepEqual(await activationState(installRoot), {
     current: { manifestSha256: firstId, version: "1.2.3" },
-    previous: { manifestSha256: secondId, version: "1.2.4" },
+    previous: { manifestSha256: secondId, version: "1.2.5" },
     schemaVersion: "cope-release-activation/2",
   });
+
+  const intermediateAfterRollback = await fixture.candidate(
+    "intermediate-after-rollback",
+    "stable",
+    "intermediate",
+    true,
+    "1.2.4",
+  );
+  expectFailure(invoke(activateScript, [
+    intermediateAfterRollback,
+    installRoot,
+    "--trusted-public-key",
+    fixture.publicKeyFile,
+  ]), /refuses a signed downgrade/iu);
 
   const equivocation = await fixture.candidate("same-version-different-release", "stable", "different");
   expectFailure(invoke(activateScript, [
@@ -462,7 +504,7 @@ test("activation is publisher-authenticated, locked, pointer-atomic, and explici
     "stable",
     "different-remembered",
     true,
-    "1.2.4",
+    "1.2.5",
   );
   expectFailure(invoke(activateScript, [
     rememberedEquivocation,
@@ -513,6 +555,10 @@ test("release evidence remains deliberately separate from current local installe
   }
   assert.match(documentation, /not wired into the current installers or `cope update`/u);
   assert.match(documentation, /Neither path downloads or activates this release evidence/u);
+  assert.match(documentation, /Windows power-loss\s+durability is not claimed/u);
+  const activationSource = await readFile(activateScript, "utf8");
+  assert.match(activationSource, /await syncDirectory\(releasesRoot\);\s+await syncDirectory\(installRoot\);/u);
+  assert.match(activationSource, /rename\(temporary, path\.join\(installRoot, "activation\.json"\)\);\s+await syncDirectory\(installRoot\);/u);
 });
 
 interface ReleaseFixture {
