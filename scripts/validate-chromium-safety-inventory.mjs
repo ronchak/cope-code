@@ -16,64 +16,96 @@ function importsRuntimeChromium(source) {
     LanguageVariant.Standard,
     source,
   );
-  let kind = scanner.scan();
-  while (kind === SyntaxKind.ImportKeyword) {
-    const tokens = [];
-    let moduleSeen = false;
-    for (;;) {
-      kind = scanner.scan();
-      const precededByLineBreak = scanner.hasPrecedingLineBreak();
-      if (
-        moduleSeen &&
-        precededByLineBreak &&
-        kind !== SyntaxKind.SemicolonToken &&
-        kind !== SyntaxKind.WithKeyword &&
-        kind !== SyntaxKind.AssertKeyword
-      ) {
-        break;
-      }
-      if (kind === SyntaxKind.EndOfFile) break;
-      const previousKind = tokens.at(-1)?.kind;
+  const tokens = [];
+  const templateContexts = [];
+  for (let kind = scanner.scan(); kind !== SyntaxKind.EndOfFile;) {
+    if (
+      kind === SyntaxKind.CloseBraceToken &&
+      templateContexts.at(-1)?.braceDepth === 0
+    ) {
+      kind = scanner.reScanTemplateToken(false);
       tokens.push({
         kind,
         text: scanner.getTokenText(),
         value: scanner.getTokenValue(),
       });
-      if (
-        kind === SyntaxKind.StringLiteral &&
-        (tokens.length === 1 || previousKind === SyntaxKind.FromKeyword)
-      ) {
-        moduleSeen = true;
+      if (kind === SyntaxKind.TemplateTail) {
+        templateContexts.pop();
       }
-      if (kind === SyntaxKind.SemicolonToken) {
-        kind = scanner.scan();
-        break;
-      }
+      kind = scanner.scan();
+      continue;
     }
-    const first = tokens[0];
+    tokens.push({
+      kind,
+      text: scanner.getTokenText(),
+      value: scanner.getTokenValue(),
+    });
+    if (kind === SyntaxKind.TemplateHead) {
+      templateContexts.push({ braceDepth: 0 });
+    } else if (kind === SyntaxKind.OpenBraceToken && templateContexts.length > 0) {
+      templateContexts[templateContexts.length - 1].braceDepth += 1;
+    } else if (kind === SyntaxKind.CloseBraceToken && templateContexts.length > 0) {
+      templateContexts[templateContexts.length - 1].braceDepth -= 1;
+    }
+    kind = scanner.scan();
+  }
+
+  for (let importIndex = 0; importIndex < tokens.length; importIndex += 1) {
+    if (tokens[importIndex]?.kind !== SyntaxKind.ImportKeyword) continue;
+    if (
+      tokens[importIndex - 1]?.kind === SyntaxKind.DotToken ||
+      tokens[importIndex - 1]?.kind === SyntaxKind.QuestionDotToken
+    ) {
+      continue;
+    }
+
+    const first = tokens[importIndex + 1];
     if (first?.kind === SyntaxKind.OpenParenToken) {
       if (
-        tokens[1]?.kind === SyntaxKind.StringLiteral &&
-        tokens[1]?.value === "playwright-core"
+        tokens[importIndex + 2]?.kind === SyntaxKind.StringLiteral &&
+        tokens[importIndex + 2]?.value === "playwright-core"
       ) {
         return true;
       }
       continue;
     }
-
-    let moduleIndex = 0;
-    while (
-      moduleIndex < tokens.length &&
-      tokens[moduleIndex]?.kind !== SyntaxKind.StringLiteral &&
-      tokens[moduleIndex]?.kind !== SyntaxKind.SemicolonToken
-    ) {
-      moduleIndex += 1;
+    if (first?.kind === SyntaxKind.StringLiteral) {
+      if (first.value === "playwright-core") return true;
+      continue;
     }
-    if (tokens[moduleIndex]?.value !== "playwright-core") continue;
-    if (moduleIndex === 0) return true;
-    const clause = tokens.slice(0, moduleIndex);
+
+    const clause = [];
+    let moduleSpecifier;
+    for (let tokenIndex = importIndex + 1; tokenIndex < tokens.length; tokenIndex += 1) {
+      const token = tokens[tokenIndex];
+      if (
+        token?.kind === SyntaxKind.SemicolonToken ||
+        token?.kind === SyntaxKind.ImportKeyword
+      ) {
+        break;
+      }
+      if (token?.kind === SyntaxKind.FromKeyword) {
+        moduleSpecifier = tokens[tokenIndex + 1];
+        break;
+      }
+      if (
+        token?.kind === SyntaxKind.EqualsToken &&
+        tokens[tokenIndex + 1]?.kind === SyntaxKind.Identifier &&
+        tokens[tokenIndex + 1]?.text === "require" &&
+        tokens[tokenIndex + 2]?.kind === SyntaxKind.OpenParenToken
+      ) {
+        moduleSpecifier = tokens[tokenIndex + 3];
+        break;
+      }
+      clause.push(token);
+    }
+    if (
+      moduleSpecifier?.kind !== SyntaxKind.StringLiteral ||
+      moduleSpecifier.value !== "playwright-core"
+    ) {
+      continue;
+    }
     if (clause[0]?.kind === SyntaxKind.TypeKeyword) continue;
-    if (clause[0]?.kind === SyntaxKind.StringLiteral) return true;
     if (clause.some((token) => token.kind === SyntaxKind.AsteriskToken)) return true;
     if (clause.some((token) =>
       token.kind === SyntaxKind.Identifier && token.text === "chromium")) {

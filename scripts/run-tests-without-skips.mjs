@@ -6,6 +6,7 @@ import path from "node:path";
 import { validateChromiumSafetyManifest } from "./validate-chromium-safety-inventory.mjs";
 
 const tapSkipDirective = /^\s*(?:not )?ok \d+(?:\s+-\s+.*?)?\s+# SKIP(?:\s|$)/imu;
+const tapTodoDirective = /^\s*(?:not )?ok \d+(?:\s+-\s+.*?)?\s+# TODO(?:\s|$)/imu;
 const args = process.argv.slice(2);
 let testFiles = args;
 let expectedTestCount;
@@ -38,6 +39,9 @@ if (testFiles.length === 0) {
     process.exitCode = result.status ?? 1;
   } else if (tapSkipDirective.test(result.stdout ?? "")) {
     process.stderr.write("Safety test contract violated: one or more tests were skipped.\n");
+    process.exitCode = 1;
+  } else if (tapTodoDirective.test(result.stdout ?? "")) {
+    process.stderr.write("Safety test contract violated: one or more tests were marked TODO.\n");
     process.exitCode = 1;
   } else if (expectedTestCount !== undefined) {
     const reportedTestCount = /^# tests (\d+)$/mu.exec(result.stdout ?? "")?.[1];

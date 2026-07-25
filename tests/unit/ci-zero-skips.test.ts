@@ -5,18 +5,23 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-test("zero-skip runner accepts passing tests and rejects a skipped safety test", async (context) => {
+test("zero-skip runner accepts passing tests and rejects skipped or TODO safety tests", async (context) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "cope-zero-skips-"));
   context.after(async () => rm(temporary, { recursive: true, force: true }));
   const passing = path.join(temporary, "passing.test.mjs");
   const noisy = path.join(temporary, "noisy.test.mjs");
   const skipped = path.join(temporary, "skipped.test.mjs");
+  const todo = path.join(temporary, "todo.test.mjs");
   await writeFile(passing, "import test from 'node:test'; test('runs', () => {});\n");
   await writeFile(
     noisy,
-    "import test from 'node:test'; test('diagnostic output is not a skip', () => console.log('# SKIP in output'));\n",
+    "import test from 'node:test'; test('diagnostic output is inert', () => console.log('# SKIP and # TODO in output'));\n",
   );
   await writeFile(skipped, "import test from 'node:test'; test('must run', { skip: true }, () => {});\n");
+  await writeFile(
+    todo,
+    "import test from 'node:test'; test('must pass', { todo: true }, () => { throw new Error('broken'); });\n",
+  );
   const runner = path.resolve("scripts/run-tests-without-skips.mjs");
   const environment = { ...process.env };
   delete environment.NODE_TEST_CONTEXT;
@@ -31,6 +36,9 @@ test("zero-skip runner accepts passing tests and rejects a skipped safety test",
   const skipResult = spawnSync(process.execPath, [runner, skipped], { encoding: "utf8", env: environment });
   assert.equal(skipResult.status, 1, skipResult.stderr);
   assert.match(skipResult.stderr, /Safety test contract violated/u);
+  const todoResult = spawnSync(process.execPath, [runner, todo], { encoding: "utf8", env: environment });
+  assert.equal(todoResult.status, 1, todoResult.stderr);
+  assert.match(todoResult.stderr, /marked TODO/u);
 });
 
 test("Chromium safety command covers the current 15-test inventory", async () => {
@@ -89,7 +97,7 @@ test("Chromium inventory validation rejects an omitted runtime test file", async
   context.after(async () => rm(temporary, { recursive: true, force: true }));
   const unitDirectory = path.join(temporary, "tests", "unit");
   await mkdir(unitDirectory, { recursive: true });
-  const runtimeImport = [
+  const listedRuntimeImport = [
     'import test from "node:test"',
     "import {",
     "  chromium as testChromium,",
@@ -99,8 +107,27 @@ test("Chromium inventory validation rejects an omitted runtime test file", async
     'test("must run with Chromium", { skip: browserUnavailable }, () => {})',
     "",
   ].join("\n");
-  await writeFile(path.join(unitDirectory, "listed.test.ts"), runtimeImport);
-  await writeFile(path.join(unitDirectory, "omitted.test.ts"), runtimeImport);
+  const lateRuntimeImport = [
+    'import test from "node:test"',
+    "const browserUnavailable = true",
+    'import type { Browser } from "playwright-core"',
+    'import { chromium as testChromium } from "playwright-core"',
+    "void testChromium",
+    'test("must run with Chromium", { skip: browserUnavailable }, () => {})',
+    "",
+  ].join("\n");
+  const dynamicRuntimeImport = [
+    'import test from "node:test"',
+    "const browserUnavailable = true",
+    'test("must run with Chromium", { skip: browserUnavailable }, async () => {',
+    '  const { chromium } = await import("playwright-core")',
+    "  void chromium",
+    "})",
+    "",
+  ].join("\n");
+  await writeFile(path.join(unitDirectory, "listed.test.ts"), listedRuntimeImport);
+  await writeFile(path.join(unitDirectory, "omitted-late.test.ts"), lateRuntimeImport);
+  await writeFile(path.join(unitDirectory, "omitted-dynamic.test.ts"), dynamicRuntimeImport);
   await writeFile(
     path.join(temporary, "manifest.json"),
     `${JSON.stringify({
@@ -116,7 +143,10 @@ test("Chromium inventory validation rejects an omitted runtime test file", async
     { encoding: "utf8" },
   );
   assert.equal(validation.status, 1);
-  assert.match(validation.stderr, /manifest omits runtime Chromium test files: tests\/unit\/omitted\.test\.ts/u);
+  assert.match(
+    validation.stderr,
+    /manifest omits runtime Chromium test files: tests\/unit\/omitted-dynamic\.test\.ts, tests\/unit\/omitted-late\.test\.ts/u,
+  );
 });
 
 test("manifested zero-skip runner rejects fewer tests than declared", async (context) => {
