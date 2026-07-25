@@ -366,6 +366,53 @@ test("ancestor-directory replacement is detected before mutation syscalls reach 
   assert.equal(await readFile(path.join(sourceDirectory, "file.txt"), "utf8"), before);
 });
 
+test("transaction-directory replacement is detected before staging can follow it", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-patch-transaction-race-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  const outside = path.join(temporary, "outside");
+  await mkdir(root);
+  await mkdir(outside);
+  const target = path.join(root, "file.txt");
+  const before = "before\n";
+  await writeFile(target, before);
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(boundary, path.join(temporary, "checkpoints"));
+  let transactionDirectory: string | undefined;
+  let parkedDirectory: string | undefined;
+  const engine = new PatchEngine(
+    boundary,
+    checkpoints,
+    new ProtectedPathPolicy(),
+    {},
+    {
+      afterTransactionDirectory: async (_path, directory) => {
+        transactionDirectory = directory;
+        parkedDirectory = `${directory}.parked`;
+        await rename(directory, parkedDirectory);
+        await symlink(outside, directory, "dir");
+      },
+    },
+  );
+
+  await assert.rejects(
+    engine.editText({
+      path: "file.txt",
+      base_sha256: sha256(before),
+      old_text: "before",
+      new_text: "after",
+      expected_occurrences: 1,
+    }),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  assert.deepEqual(await readdir(outside), []);
+  assert.equal(await readFile(target, "utf8"), before);
+  assert.ok(transactionDirectory);
+  assert.ok(parkedDirectory);
+  await unlink(transactionDirectory);
+  await rename(parkedDirectory, transactionDirectory);
+});
+
 test("recovery preserves a concurrent deletion of an installed result", async (context) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-patch-delete-race-"));
   context.after(async () => rm(temporary, { recursive: true, force: true }));
@@ -610,6 +657,34 @@ test("checkpoint rollback removes deterministic transaction artifacts left by an
   await assert.rejects(readFile(artifacts.backupPath));
   await assert.rejects(readFile(legacyTemporary));
   await assert.rejects(readFile(legacyBackup));
+});
+
+test("checkpoint cleanup refuses a replaced transaction directory before touching its children", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-checkpoint-artifact-race-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  const outside = path.join(temporary, "outside");
+  await mkdir(root);
+  await mkdir(outside);
+  const target = path.join(root, "file.txt");
+  await writeFile(target, "original\n");
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(boundary, path.join(temporary, "checkpoints"));
+  const checkpoint = await checkpoints.createCheckpoint(["file.txt"]);
+  const artifacts = checkpointMutationArtifactPaths(target, "file.txt", checkpoint.id);
+  await writeFile(target, "partial\n");
+  await writeFile(path.join(outside, "new"), "outside new\n");
+  await writeFile(path.join(outside, "old"), "outside old\n");
+  await symlink(outside, artifacts.transactionDirectory, "dir");
+
+  await assert.rejects(
+    checkpoints.rollback(checkpoint.id, { force: true }),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  assert.equal(await readFile(target, "utf8"), "partial\n");
+  assert.equal(await readFile(path.join(outside, "new"), "utf8"), "outside new\n");
+  assert.equal(await readFile(path.join(outside, "old"), "utf8"), "outside old\n");
+  await unlink(artifacts.transactionDirectory);
 });
 
 test("sealed checkpoint rollback refuses to overwrite later user edits", async (context) => {

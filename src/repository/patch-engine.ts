@@ -64,6 +64,11 @@ export interface PatchEngineHooks {
   readonly beforeCheckpoint?: () => Promise<void>;
   /** @internal Deterministic checkpoint race injection point. */
   readonly afterCheckpoint?: () => Promise<void>;
+  /** @internal Deterministic transaction-directory race injection point. */
+  readonly afterTransactionDirectory?: (
+    path: string,
+    transactionDirectory: string,
+  ) => Promise<void>;
   /** @internal Deterministic fault/race injection point used by repository tests. */
   readonly beforeCapture?: (path: string) => Promise<void>;
   /** @internal Deterministic fault/race injection point used by repository tests. */
@@ -96,6 +101,7 @@ interface MutationPlan {
   readonly expectedSha256: string | null;
   readonly directoryIdentities: readonly MutationDirectoryIdentity[];
   transactionDirectory: string | null;
+  transactionDirectoryIdentity: MutationDirectoryIdentity | null;
   temporaryPath: string | null;
   backupPath: string | null;
   temporaryCreated: boolean;
@@ -291,6 +297,7 @@ export class PatchEngine {
         expectedSha256: oldBytes === null ? null : sha256(oldBytes),
         directoryIdentities,
         transactionDirectory: null,
+        transactionDirectoryIdentity: null,
         temporaryPath: null,
         backupPath: null,
         temporaryCreated: false,
@@ -409,6 +416,13 @@ export class PatchEngine {
           path: plan.path,
         });
       }
+      plan.transactionDirectoryIdentity = {
+        absolutePath: plan.transactionDirectory,
+        device: transactionStat.dev,
+        inode: transactionStat.ino,
+      };
+      await this.hooks.afterTransactionDirectory?.(plan.path, plan.transactionDirectory);
+      await assertMutationDirectoriesStable(plan);
     }
 
     for (const plan of plans) {
@@ -574,6 +588,7 @@ export class PatchEngine {
     await assertMutationDirectoriesStable(plan);
     await rmdir(plan.transactionDirectory);
     plan.transactionDirectory = null;
+    plan.transactionDirectoryIdentity = null;
   }
 }
 
@@ -654,7 +669,11 @@ async function captureMutationDirectoryIdentities(
 }
 
 async function assertMutationDirectoriesStable(plan: MutationPlan): Promise<void> {
-  for (const expected of plan.directoryIdentities) {
+  const identities = [
+    ...plan.directoryIdentities,
+    ...(plan.transactionDirectoryIdentity === null ? [] : [plan.transactionDirectoryIdentity]),
+  ];
+  for (const expected of identities) {
     try {
       const linkState = await lstat(expected.absolutePath);
       const current = await stat(expected.absolutePath);

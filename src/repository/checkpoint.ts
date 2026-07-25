@@ -2,6 +2,7 @@ import { constants } from "node:fs";
 import {
   access,
   chmod,
+  lstat,
   mkdir,
   readFile,
   readdir,
@@ -699,13 +700,47 @@ async function cleanupMutationArtifacts(
   checkpointId: string,
 ): Promise<void> {
   const artifacts = checkpointMutationArtifactPaths(absoluteTarget, relativePath, checkpointId);
-  for (const artifact of [artifacts.temporaryPath, artifacts.backupPath]) {
-    await rm(artifact, { force: true });
-  }
+  let transactionIdentity: { readonly device: number; readonly inode: number } | undefined;
   try {
-    await rmdir(artifacts.transactionDirectory);
+    const linkState = await lstat(artifacts.transactionDirectory);
+    const directoryState = await stat(artifacts.transactionDirectory);
+    if (
+      linkState.isSymbolicLink() ||
+      !directoryState.isDirectory() ||
+      (await realpath(artifacts.transactionDirectory)) !== artifacts.transactionDirectory
+    ) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Checkpoint transaction artifact directory is not a stable directory",
+        { checkpointId, path: relativePath },
+      );
+    }
+    transactionIdentity = {
+      device: directoryState.dev,
+      inode: directoryState.ino,
+    };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  for (const artifact of [artifacts.temporaryPath, artifacts.backupPath]) {
+    if (transactionIdentity !== undefined) {
+      await assertCheckpointTransactionDirectory(
+        artifacts.transactionDirectory,
+        transactionIdentity,
+        checkpointId,
+        relativePath,
+      );
+    }
+    await rm(artifact, { force: true });
+  }
+  if (transactionIdentity !== undefined) {
+    await assertCheckpointTransactionDirectory(
+      artifacts.transactionDirectory,
+      transactionIdentity,
+      checkpointId,
+      relativePath,
+    );
+    await rmdir(artifacts.transactionDirectory);
   }
 
   const legacyKey = sha256(relativePath).slice(0, 20);
@@ -715,6 +750,34 @@ async function cleanupMutationArtifacts(
     path.join(path.dirname(absoluteTarget), `${legacyPrefix}.old`),
   ]) {
     await rm(legacyArtifact, { force: true });
+  }
+}
+
+async function assertCheckpointTransactionDirectory(
+  transactionDirectory: string,
+  expected: { readonly device: number; readonly inode: number },
+  checkpointId: string,
+  relativePath: string,
+): Promise<void> {
+  try {
+    const linkState = await lstat(transactionDirectory);
+    const current = await stat(transactionDirectory);
+    if (
+      linkState.isSymbolicLink() ||
+      !current.isDirectory() ||
+      current.dev !== expected.device ||
+      current.ino !== expected.inode ||
+      (await realpath(transactionDirectory)) !== transactionDirectory
+    ) {
+      throw new Error("transaction directory identity mismatch");
+    }
+  } catch (error) {
+    throw new AgentError(
+      "RECOVERY_REQUIRED",
+      "Checkpoint transaction artifact directory changed during cleanup",
+      { checkpointId, path: relativePath },
+      { cause: error },
+    );
   }
 }
 
