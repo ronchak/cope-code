@@ -48,7 +48,9 @@ export function inspectNpmArchive(archiveBytes) {
 
   const entries = [];
   const paths = new Set();
+  const pathParents = new Set();
   const portablePaths = new Set();
+  const portablePathParents = new Set();
   let packageJsonBytes;
   let offset = 0;
   let terminated = false;
@@ -89,8 +91,16 @@ export function inspectNpmArchive(archiveBytes) {
     if (portablePaths.has(portablePath)) {
       throw new Error(`Release archive contains paths that collide on a portable filesystem: ${archivePath}`);
     }
+    if (pathParents.has(archivePath) ||
+        properPathParents(archivePath).some((parent) => paths.has(parent)) ||
+        portablePathParents.has(portablePath) ||
+        properPathParents(portablePath).some((parent) => portablePaths.has(parent))) {
+      throw new Error(`Release archive contains a file path nested beneath another file: ${archivePath}`);
+    }
     paths.add(archivePath);
+    for (const parent of properPathParents(archivePath)) pathParents.add(parent);
     portablePaths.add(portablePath);
+    for (const parent of properPathParents(portablePath)) portablePathParents.add(parent);
     if (paths.size > MAX_ARCHIVE_ENTRIES) throw new Error("Release archive contains too many entries");
 
     const mode = octalNumber(header, 100, 8, "mode");
@@ -129,6 +139,14 @@ export function inspectNpmArchive(archiveBytes) {
     entries,
     package: packageIdentity(packageJsonBytes),
   };
+}
+
+function properPathParents(value) {
+  const parents = [];
+  for (let index = value.indexOf("/"); index >= 0; index = value.indexOf("/", index + 1)) {
+    parents.push(value.slice(0, index));
+  }
+  return parents;
 }
 
 function validateArchivePath(value) {

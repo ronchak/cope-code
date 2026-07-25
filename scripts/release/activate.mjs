@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, rm } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -45,6 +45,11 @@ export async function activateRelease(candidateInput, installRootInput, options)
       const releaseId = verification.manifestSha256;
       const releaseReference = { manifestSha256: releaseId, version: verification.version };
       const prior = await readActivationState(installRoot);
+      const sameCurrentManifest = prior?.current.manifestSha256 === releaseId;
+      if (sameCurrentManifest && prior.current.version !== releaseReference.version) {
+        throw new Error("Activation state version does not match its manifest digest");
+      }
+      const unchangedCurrent = sameCurrentManifest === true;
       if (prior !== undefined) {
         const rememberedReleases = [prior.current, prior.previous].filter((value) => value !== null);
         for (const remembered of rememberedReleases) {
@@ -52,7 +57,7 @@ export async function activateRelease(candidateInput, installRootInput, options)
               releaseReference.manifestSha256 !== remembered.manifestSha256) {
             throw new Error("Ordinary activation refuses same-version release equivocation");
           }
-          if (compareReleaseVersions(releaseReference.version, remembered.version) < 0) {
+          if (!unchangedCurrent && compareReleaseVersions(releaseReference.version, remembered.version) < 0) {
             throw new Error("Ordinary activation refuses a signed downgrade; use the explicit authenticated rollback path");
           }
         }
@@ -89,7 +94,7 @@ export async function activateRelease(candidateInput, installRootInput, options)
       }
       staging = undefined;
 
-      if (prior?.current.manifestSha256 === releaseId) {
+      if (unchangedCurrent) {
         return {
           activated: false,
           unchanged: true,
@@ -314,7 +319,19 @@ async function makeBundleReadOnly(directory) {
   if (entries.some((entry) => !entry.isFile() || entry.isSymbolicLink())) {
     throw new Error("Verified activation snapshot contains a non-regular entry");
   }
-  for (const entry of entries) await chmod(path.join(directory, entry.name), 0o444);
+  for (const entry of entries) {
+    const filename = path.join(directory, entry.name);
+    const noFollow = fsConstants.O_NOFOLLOW ?? 0;
+    const handle = await open(filename, fsConstants.O_RDWR | noFollow);
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile()) throw new Error("Verified activation snapshot contains a non-regular entry");
+      await handle.chmod(0o444);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  }
 }
 
 async function removeStaging(directory) {

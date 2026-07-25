@@ -249,7 +249,7 @@ function buildSpdxDocument({
       }
       const dependency = {
         SPDXID: `SPDXRef-Dependency-${sha256Bytes(packagePath).slice(0, 24)}`,
-        name: packageNameFromLockPath(packagePath),
+        name: packageNameFromLockEntry(packagePath, entry),
         versionInfo: entry.version,
         downloadLocation: "NOASSERTION",
         filesAnalyzed: false,
@@ -305,6 +305,18 @@ function integrityChecksum(value, packagePath) {
     throw new Error(`Non-canonical SHA-512 integrity for ${packagePath}`);
   }
   return { algorithm: "SHA512", checksumValue: digest.toString("hex") };
+}
+
+function packageNameFromLockEntry(packagePath, entry) {
+  const installedName = packageNameFromLockPath(packagePath);
+  if (entry.name === undefined) return installedName;
+  if (typeof entry.name !== "string") throw new Error(`Invalid dependency package name for ${packagePath}`);
+  try {
+    if (npa.resolve(entry.name, "*").name !== entry.name) throw new Error("Package name changed during parsing");
+  } catch {
+    throw new Error(`Invalid dependency package name for ${packagePath}`);
+  }
+  return entry.name;
 }
 
 function packageNameFromLockPath(packagePath) {

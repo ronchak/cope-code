@@ -3,6 +3,7 @@ import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
 import {
   copyFile,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
@@ -197,6 +198,13 @@ test("release evidence is canonical, reproducible, SPDX-correct, and explicit ab
     arguments_[arguments_.indexOf("--package") + 1] = packageFile;
     arguments_[arguments_.indexOf("--lock") + 1] = lockFile;
     expectSuccess(invoke(generateScript, arguments_, { COPE_RELEASE_SIGNING_KEY_FILE: undefined }));
+    if (name === "alias") {
+      const sbom = JSON.parse(await readFile(path.join(candidate, "sbom.spdx.json"), "utf8")) as {
+        packages: Array<{ name: string }>;
+      };
+      assert.ok(sbom.packages.some((entry) => entry.name === "real-example"));
+      assert.equal(sbom.packages.some((entry) => entry.name === "example"), false);
+    }
   }
 
   const mismatchedResolution = await fixture.emptyCandidate("mismatched-resolution", "dependency-drift");
@@ -321,6 +329,31 @@ test("release generation rejects traversal, links, and non-regular payload bound
     invoke(generateScript, generationArguments(fixture, collidingPaths, "preview")),
     /collide on a portable filesystem/iu,
   );
+
+  for (const [name, entries] of [
+    ["parent-before-child", [
+      { archivePath: "package/a", content: "parent" },
+      { archivePath: "package/a/b", content: "child" },
+    ]],
+    ["child-before-parent", [
+      { archivePath: "package/a/b", content: "child" },
+      { archivePath: "package/a", content: "parent" },
+    ]],
+    ["portable-parent-collision", [
+      { archivePath: "package/A", content: "parent" },
+      { archivePath: "package/a/b", content: "child" },
+    ]],
+  ] as const) {
+    const candidate = await fixture.emptyCandidate(name, "bad");
+    await writeFile(path.join(candidate, "cope.tgz"), npmArchive([
+      { archivePath: "package/package.json", content: npmPackageJson("1.2.3") },
+      ...entries,
+    ]));
+    expectFailure(
+      invoke(generateScript, generationArguments(fixture, candidate, "preview")),
+      /file path nested beneath another file/iu,
+    );
+  }
 
   for (const [name, archivePath] of [
     ["drive-path", "package/C:/escape.js"],
@@ -477,6 +510,27 @@ test("activation is publisher-authenticated, locked, pointer-atomic, and explici
     schemaVersion: "cope-release-activation/2",
   });
 
+  const unchangedAfterRollback = expectSuccess(invoke(activateScript, [
+    first,
+    installRoot,
+    "--trusted-public-key",
+    fixture.publicKeyFile,
+  ]));
+  assert.equal(JSON.parse(unchangedAfterRollback.stdout).unchanged, true);
+  await rm(path.join(installRoot, "releases", firstId), { recursive: true });
+  const repairedAfterRollback = expectSuccess(invoke(activateScript, [
+    first,
+    installRoot,
+    "--trusted-public-key",
+    fixture.publicKeyFile,
+  ]));
+  assert.equal(JSON.parse(repairedAfterRollback.stdout).unchanged, true);
+  assert.equal((await lstat(path.join(installRoot, "releases", firstId))).isDirectory(), true);
+  assert.equal(
+    (await lstat(path.join(installRoot, "releases", firstId, "manifest.json"))).mode & 0o777,
+    0o444,
+  );
+
   const intermediateAfterRollback = await fixture.candidate(
     "intermediate-after-rollback",
     "stable",
@@ -559,6 +613,7 @@ test("release evidence remains deliberately separate from current local installe
   const activationSource = await readFile(activateScript, "utf8");
   assert.match(activationSource, /await syncDirectory\(releasesRoot\);\s+await syncDirectory\(installRoot\);/u);
   assert.match(activationSource, /rename\(temporary, path\.join\(installRoot, "activation\.json"\)\);\s+await syncDirectory\(installRoot\);/u);
+  assert.match(activationSource, /await handle\.chmod\(0o444\);\s+await handle\.sync\(\);/u);
 });
 
 interface ReleaseFixture {
