@@ -21,6 +21,7 @@ import {
 } from "./lib.mjs";
 
 const SEMVER = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u;
+const NPM_PACKAGE_NAME = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/u;
 const utf8 = new TextDecoder("utf-8", { fatal: true });
 
 export async function verifyRelease(rootInput, options = {}) {
@@ -226,7 +227,7 @@ function validateManifest(manifest) {
       Array.isArray(artifact.archive.package.dependencies) ||
       Object.keys(artifact.archive.package.dependencies).length > 1000 ||
       Object.entries(artifact.archive.package.dependencies).some(([name, version]) =>
-        name.length === 0 || name.length > 214 ||
+        name.length > 214 || !NPM_PACKAGE_NAME.test(name) ||
         typeof version !== "string" || version.length === 0 || version.length > 256)) {
     throw new Error("Packed package identity does not match the release manifest");
   }

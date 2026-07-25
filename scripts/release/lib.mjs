@@ -200,7 +200,7 @@ function sortJson(value, seen) {
     }
     if (seen.has(value)) throw new Error("Canonical JSON cannot contain cycles");
     seen.add(value);
-    const result = {};
+    const result = Object.create(null);
     for (const key of Object.keys(value).sort(compareText)) {
       const entry = value[key];
       if (entry === undefined || typeof entry === "bigint" || typeof entry === "function" || typeof entry === "symbol") {

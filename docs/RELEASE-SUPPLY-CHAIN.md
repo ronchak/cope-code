@@ -89,8 +89,9 @@ crash can leave a stale lock, a partial `.staged-*` directory, a temporary
 `.activation-*.json`, or an unreferenced complete release, but cannot publish a
 partially written activation pointer. Operators must verify that no activation is
 running before removing a stale lock. The next operation cleans recognized
-temporary residue after acquiring the lock. Consumers must resolve and reverify
-`activation.json`; the current Cope launchers do neither yet. Strong install-root
+temporary residue after acquiring the lock. Consumers must resolve
+`activation.json` and reverify its selected release; the current Cope launchers do
+neither yet. Strong install-root
 ACLs, retention, health checks, download policy, trust-root rotation/revocation,
 and automated stale-lock recovery remain future integration work.
 

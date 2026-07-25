@@ -198,6 +198,20 @@ test("release generation rejects traversal, links, and non-regular payload bound
     /duplicate path/iu,
   );
 
+  const invalidDependencyName = await fixture.emptyCandidate("invalid-dependency-name", "bad");
+  await writeFile(path.join(invalidDependencyName, "cope.tgz"), npmArchive([
+    {
+      archivePath: "package/package.json",
+      content: npmPackageJson("1.2.3", {
+        dependencies: JSON.parse('{"__proto__":"1.0.0"}') as Record<string, string>,
+      }),
+    },
+  ]));
+  expectFailure(
+    invoke(generateScript, generationArguments(fixture, invalidDependencyName, "preview")),
+    /invalid runtime dependency metadata/iu,
+  );
+
   if (process.platform !== "win32") {
     const filesystemLink = await fixture.emptyCandidate("filesystem-link", "bad");
     const outside = path.join(fixture.root, "outside.tgz");
@@ -498,7 +512,7 @@ async function activationState(installRoot: string): Promise<{
 
 function npmPackageJson(
   version: string,
-  overrides: { name?: string; copeBin?: string } = {},
+  overrides: { name?: string; copeBin?: string; dependencies?: Record<string, string> } = {},
 ): string {
   return JSON.stringify({
     name: overrides.name ?? "@local/copilot-browser-agent",
@@ -507,7 +521,7 @@ function npmPackageJson(
       cope: overrides.copeBin ?? "dist/src/cli/main.js",
       "copilot-agent": "dist/src/cli/main.js",
     },
-    dependencies: { example: "2.0.0" },
+    dependencies: overrides.dependencies ?? { example: "2.0.0" },
   });
 }
 

@@ -9,6 +9,7 @@ const MAX_PACKAGE_JSON_BYTES = 1024 * 1024;
 const NPM_PORTABLE_MTIME = 499162500;
 const utf8 = new TextDecoder("utf-8", { fatal: true });
 const WINDOWS_RESERVED_NAME = /^(?:AUX|CON|NUL|PRN|COM[1-9]|LPT[1-9])(?:\..*)?$/iu;
+const NPM_PACKAGE_NAME = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/u;
 
 export function inspectNpmArchive(archiveBytes) {
   if (!Buffer.isBuffer(archiveBytes) || archiveBytes.length === 0 || archiveBytes.length > MAX_ARTIFACT_BYTES) {
@@ -211,7 +212,8 @@ function packageIdentity(bytes) {
   if (dependencies === null || typeof dependencies !== "object" || Array.isArray(dependencies) ||
       Object.keys(dependencies).length > 1000 ||
       Object.entries(dependencies).some(([name, version]) =>
-        name.length === 0 || name.length > 214 || typeof version !== "string" || version.length === 0 || version.length > 256)) {
+        name.length > 214 || !NPM_PACKAGE_NAME.test(name) ||
+        typeof version !== "string" || version.length === 0 || version.length > 256)) {
     throw new Error("Packed package.json has invalid runtime dependency metadata");
   }
   return {
