@@ -4,6 +4,9 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+import npa from "npm-package-arg";
+import semver from "semver";
+
 import { inspectNpmArchive } from "./archive.mjs";
 import {
   CHANNEL_VERSION,
@@ -64,16 +67,17 @@ export async function generateRelease(options, environment = process.env, capabi
     }
   }
   const runtimeDeclarations = {
+    ...(packageDocument.peerDependencies ?? {}),
     ...(packageDocument.dependencies ?? {}),
     ...(packageDocument.optionalDependencies ?? {}),
-    ...(packageDocument.peerDependencies ?? {}),
   };
-  for (const dependencyName of Object.keys(runtimeDeclarations)) {
+  for (const [dependencyName, declaredSpec] of Object.entries(runtimeDeclarations)) {
     const resolved = lockDocument.packages[`node_modules/${dependencyName}`];
     if (resolved === null || typeof resolved !== "object" ||
         typeof resolved.version !== "string" || resolved.version.length === 0) {
       throw new Error(`package-lock.json does not resolve runtime dependency: ${dependencyName}`);
     }
+    validateResolvedDependency(dependencyName, declaredSpec, resolved);
   }
 
   const artifactBytes = await readRegularFile(artifactInput, 128 * 1024 * 1024);
@@ -159,6 +163,33 @@ export async function generateRelease(options, environment = process.env, capabi
     publisherAuthenticated: false,
     manifestSha256: sha256Bytes(manifestBytes),
   };
+}
+
+function validateResolvedDependency(dependencyName, declaredSpec, resolved) {
+  let requested;
+  try {
+    requested = npa.resolve(dependencyName, declaredSpec);
+  } catch {
+    throw new Error(`Unsupported runtime dependency spec for ${dependencyName}: ${String(declaredSpec)}`);
+  }
+
+  let versionRequest = requested;
+  if (requested.type === "alias") {
+    versionRequest = requested.subSpec;
+    if (typeof resolved.name !== "string" || resolved.name !== versionRequest.name) {
+      throw new Error(`package-lock.json resolves runtime alias ${dependencyName} to the wrong package`);
+    }
+  }
+  if (versionRequest === undefined ||
+      (versionRequest.type !== "version" && versionRequest.type !== "range")) {
+    throw new Error(`Unsupported runtime dependency spec for ${dependencyName}: ${String(declaredSpec)}`);
+  }
+  if (semver.valid(resolved.version) === null ||
+      !semver.satisfies(resolved.version, versionRequest.fetchSpec)) {
+    throw new Error(
+      `package-lock.json resolved version ${resolved.version} does not satisfy ${dependencyName}@${declaredSpec}`,
+    );
+  }
 }
 
 export function expectedChannelDocument(manifest, manifestBytes, signature) {

@@ -150,6 +150,89 @@ test("release evidence is canonical, reproducible, SPDX-correct, and explicit ab
     /does not resolve runtime dependency: not-resolved/iu,
   );
 
+  for (const [name, declaredSpec, resolvedVersion, resolvedName] of [
+    ["exact", "2.0.0", "2.0.0", undefined],
+    ["range", "^2.0.0", "2.9.1", undefined],
+    ["alias", "npm:real-example@^2.0.0", "2.4.0", "real-example"],
+  ] as const) {
+    const candidate = await fixture.emptyCandidate(`satisfied-${name}`, `satisfied-${name}`);
+    const packageJson = npmPackageJson("1.2.3", { dependencies: { example: declaredSpec } });
+    await writeFile(path.join(candidate, "cope.tgz"), npmArchive([
+      { archivePath: "package/package.json", content: packageJson },
+    ]));
+    const packageFile = path.join(fixture.root, `satisfied-${name}.package.json`);
+    const lockFile = path.join(fixture.root, `satisfied-${name}.package-lock.json`);
+    const lockDocument = JSON.parse(await readFile(fixture.lockFile, "utf8")) as {
+      packages: Record<string, {
+        dependencies?: Record<string, string>;
+        integrity?: string;
+        name?: string;
+        version?: string;
+      }>;
+    };
+    lockDocument.packages[""]!.dependencies = { example: declaredSpec };
+    lockDocument.packages["node_modules/example"]!.version = resolvedVersion;
+    if (resolvedName !== undefined) lockDocument.packages["node_modules/example"]!.name = resolvedName;
+    await writeFile(packageFile, packageJson);
+    await writeFile(lockFile, JSON.stringify(lockDocument));
+    const arguments_ = generationArguments(fixture, candidate, "preview");
+    arguments_[arguments_.indexOf("--package") + 1] = packageFile;
+    arguments_[arguments_.indexOf("--lock") + 1] = lockFile;
+    expectSuccess(invoke(generateScript, arguments_, { COPE_RELEASE_SIGNING_KEY_FILE: undefined }));
+  }
+
+  const mismatchedResolution = await fixture.emptyCandidate("mismatched-resolution", "dependency-drift");
+  const mismatchedPackageJson = npmPackageJson("1.2.3", { dependencies: { example: "^2.0.0" } });
+  await writeFile(path.join(mismatchedResolution, "cope.tgz"), npmArchive([
+    { archivePath: "package/package.json", content: mismatchedPackageJson },
+  ]));
+  const mismatchedPackageFile = path.join(fixture.root, "mismatched-resolution.package.json");
+  const mismatchedLockFile = path.join(fixture.root, "mismatched-resolution.package-lock.json");
+  const mismatchedLock = JSON.parse(await readFile(fixture.lockFile, "utf8")) as {
+    packages: Record<string, {
+      dependencies?: Record<string, string>;
+      version?: string;
+    }>;
+  };
+  mismatchedLock.packages[""]!.dependencies = { example: "^2.0.0" };
+  mismatchedLock.packages["node_modules/example"]!.version = "9.0.0";
+  await writeFile(mismatchedPackageFile, mismatchedPackageJson);
+  await writeFile(mismatchedLockFile, JSON.stringify(mismatchedLock));
+  const mismatchedArguments = generationArguments(fixture, mismatchedResolution, "preview");
+  mismatchedArguments[mismatchedArguments.indexOf("--package") + 1] = mismatchedPackageFile;
+  mismatchedArguments[mismatchedArguments.indexOf("--lock") + 1] = mismatchedLockFile;
+  expectFailure(
+    invoke(generateScript, mismatchedArguments, { COPE_RELEASE_SIGNING_KEY_FILE: undefined }),
+    /resolved version 9\.0\.0 does not satisfy example@\^2\.0\.0/iu,
+  );
+
+  for (const [name, declaredSpec, resolvedName, pattern] of [
+    ["wrong-alias-target", "npm:real-example@^2.0.0", "other-example", /alias example to the wrong package/iu],
+    ["unsupported-git-spec", "git+https://example.invalid/example.git", undefined, /unsupported runtime dependency spec/iu],
+  ] as const) {
+    const candidate = await fixture.emptyCandidate(name, "dependency-drift");
+    const packageJson = npmPackageJson("1.2.3", { dependencies: { example: declaredSpec } });
+    await writeFile(path.join(candidate, "cope.tgz"), npmArchive([
+      { archivePath: "package/package.json", content: packageJson },
+    ]));
+    const packageFile = path.join(fixture.root, `${name}.package.json`);
+    const lockFile = path.join(fixture.root, `${name}.package-lock.json`);
+    const lockDocument = JSON.parse(await readFile(fixture.lockFile, "utf8")) as {
+      packages: Record<string, {
+        dependencies?: Record<string, string>;
+        name?: string;
+      }>;
+    };
+    lockDocument.packages[""]!.dependencies = { example: declaredSpec };
+    if (resolvedName !== undefined) lockDocument.packages["node_modules/example"]!.name = resolvedName;
+    await writeFile(packageFile, packageJson);
+    await writeFile(lockFile, JSON.stringify(lockDocument));
+    const arguments_ = generationArguments(fixture, candidate, "preview");
+    arguments_[arguments_.indexOf("--package") + 1] = packageFile;
+    arguments_[arguments_.indexOf("--lock") + 1] = lockFile;
+    expectFailure(invoke(generateScript, arguments_, { COPE_RELEASE_SIGNING_KEY_FILE: undefined }), pattern);
+  }
+
   const largeLeft = path.join(fixture.root, "large-compare-left");
   const largeRight = path.join(fixture.root, "large-compare-right");
   await mkdir(largeLeft);

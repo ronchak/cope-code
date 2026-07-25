@@ -30,8 +30,11 @@ mapping, and runtime dependency declarations from the packed
 The SPDX 2.3 JSON document describes the Cope artifact and the non-development
 runtime packages in `package-lock.json`. Generation requires the packed package,
 source package, lockfile root declarations, and resolved lockfile inventory to
-agree. SPDX SHA-256 and SHA-512 values are lowercase hexadecimal. The document
-and all other JSON evidence use the
+agree: each resolved runtime version must satisfy its exact or range declaration,
+and npm aliases must also resolve to the declared target package. Other npm
+dependency spec types fail closed rather than producing evidence for an
+unverifiable resolution. SPDX SHA-256 and SHA-512 values are lowercase
+hexadecimal. The document and all other JSON evidence use the
 repository's deterministic key-sorted UTF-8 encoding with one trailing newline.
 SPDX creation timestamps use whole-second UTC syntax, and each document namespace
 contains a digest of all document content plus its source/build identity.

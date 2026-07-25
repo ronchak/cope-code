@@ -48,6 +48,8 @@
   "devDependencies": {
     "@types/node": "24.13.3",
     "es-module-lexer": "2.2.0",
+    "npm-package-arg": "13.0.2",
+    "semver": "7.8.5",
     "typescript": "7.0.2"
   }
 }
