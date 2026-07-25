@@ -392,7 +392,6 @@ export class AgentRuntime {
         diagnosticCode: receipt.diagnosticCode,
       });
     }
-    this.bindConversation(receipt);
     this.state.submission = {
       ...this.state.submission,
       state: "submitted",
@@ -506,7 +505,6 @@ export class AgentRuntime {
         status: receipt.status,
       });
     }
-    this.bindConversation(receipt);
     this.state.submission = {
       ...submission,
       state: "submitted",

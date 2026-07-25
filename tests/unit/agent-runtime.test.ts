@@ -230,6 +230,27 @@ class UntrustedConversationResultTransport extends QueueTransport {
   }
 }
 
+class StaleReceiptConversationTransport extends QueueTransport {
+  public readonly receiveExpectedConversationIds: Array<string | undefined> = [];
+  public resolveCalls = 0;
+
+  public override async submit(request: SubmissionRequest) {
+    const receipt = await super.submit(request);
+    return { ...receipt, conversationId: "conversation_stale_receipt" };
+  }
+
+  public override async resolveSubmission(request: ReceiveRequest) {
+    this.resolveCalls += 1;
+    const receipt = await super.resolveSubmission(request);
+    return { ...receipt, conversationId: "conversation_stale_receipt" };
+  }
+
+  public override async receive(request: ReceiveRequest): Promise<ReceiveResult> {
+    this.receiveExpectedConversationIds.push(request.expectedConversationId);
+    return super.receive(request);
+  }
+}
+
 class CompletionWriteGateStore extends SessionStore {
   private completionWriteSeen = false;
   private markCompletionWriteStarted!: () => void;
@@ -1330,6 +1351,70 @@ test("runtime does not pin a conversation from an indeterminate receive result",
   assert.equal(result.reason, "CONVERSATION_CHANGED_DURING_RESPONSE");
   assert.equal(localState.transportConversationId, undefined);
   assert.equal(localState.submission?.state, "submitted");
+});
+
+test("runtime establishes an initial conversation only from a completed result", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-stale-receipt-conversation-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new StaleReceiptConversationTransport([JSON.stringify([{
+    type: "complete_task",
+    operationId: "op_complete",
+    claim: {
+      summary: "The completed result establishes the conversation.",
+      acceptanceCriteria: [],
+      validation: [],
+      skippedValidation: [],
+      remainingRisks: [],
+      recommendedFollowUp: [],
+    },
+  }])]);
+  const runtime = runtimeForTest({ root, state: localState, store, transport });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "completed", result.reason);
+  assert.deepEqual(transport.receiveExpectedConversationIds, [undefined]);
+  assert.equal(localState.transportConversationId, "conversation_1");
+});
+
+test("recovery does not pin an initial conversation from submission resolution", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-stale-resolution-conversation-"));
+  const localState = state(root);
+  localState.status = "paused";
+  localState.pauseReason = "process restarted";
+  localState.turnSequence = 1;
+  localState.submission = {
+    submissionId: "submission_1",
+    turnId: "turn_0001",
+    messageHash: sha256("bootstrap"),
+    marker: "marker",
+    state: "prepared",
+    preparedAt: "2026-01-01T00:00:00.000Z",
+  };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
+  await artifacts.put("outbox", "submission_1", "bootstrap");
+  const transport = new StaleReceiptConversationTransport([JSON.stringify([{
+    type: "complete_task",
+    operationId: "op_complete",
+    claim: {
+      summary: "The recovered completed result establishes the conversation.",
+      acceptanceCriteria: [],
+      validation: [],
+      skippedValidation: [],
+      remainingRisks: [],
+      recommendedFollowUp: [],
+    },
+  }])]);
+  const runtime = runtimeForTest({ root, state: localState, store, transport, artifacts });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "completed", result.reason);
+  assert.equal(transport.resolveCalls, 1);
+  assert.deepEqual(transport.receiveExpectedConversationIds, [undefined]);
+  assert.equal(localState.transportConversationId, "conversation_1");
 });
 
 test("runtime rejects a submitted receipt that omits the pinned conversation", async () => {
