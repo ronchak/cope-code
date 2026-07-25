@@ -33,6 +33,20 @@ export interface CompletionHandoffReference {
   readonly inlineRecord?: CompletionHandoffRecord;
 }
 
+export interface CompletionHandoffFileSystem {
+  readonly makeDirectory: (directory: string) => Promise<void>;
+  readonly syncDirectory: (directory: string) => Promise<void>;
+  readonly writeAtomically: (filename: string, content: string) => Promise<void>;
+}
+
+const DEFAULT_FILE_SYSTEM: CompletionHandoffFileSystem = {
+  makeDirectory: async (directory) => {
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+  },
+  syncDirectory,
+  writeAtomically: atomicWrite,
+};
+
 /**
  * Durable, integrity-protected terminal report. It is separate from audit and
  * transient browser artifacts because model prose may contain repository data.
@@ -43,6 +57,7 @@ export class CompletionHandoffStore {
     private readonly sessionId: string,
     private readonly scanner: SecretScanner,
     private readonly supportsDirectoryFsync = CURRENT_HOST_PLATFORM.supportsDirectoryFsync,
+    private readonly fileSystem = DEFAULT_FILE_SYSTEM,
   ) {}
 
   public async save(
@@ -80,8 +95,13 @@ export class CompletionHandoffStore {
       await CompletionHandoffStore.removeAt(this.directory, false);
       return { ...reference, inlineRecord: record };
     }
-    await mkdir(this.directory, { recursive: true, mode: 0o700 });
-    await atomicWrite(this.filename(), serialized);
+    await this.fileSystem.makeDirectory(this.directory);
+    // Publishing a new handoff directory is a change to the session directory,
+    // so flush that parent before a later session-state commit can reference a
+    // file inside it. The atomic writer then flushes the handoff directory
+    // after publishing completion.json.
+    await this.fileSystem.syncDirectory(path.dirname(this.directory));
+    await this.fileSystem.writeAtomically(this.filename(), serialized);
     return reference;
   }
 

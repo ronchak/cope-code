@@ -199,6 +199,55 @@ test("hosts without directory fsync commit completion handoffs inline with sessi
   await assert.rejects(() => sessionStore.write(tampered), /reference is malformed/u);
 });
 
+test("file-backed handoff creation flushes its parent before publishing the file", async () => {
+  const operations: string[] = [];
+  const directory = path.join("/state", "sessions", "session_12345678", "handoff");
+  const handoffs = new CompletionHandoffStore(
+    directory,
+    "session_12345678",
+    new SecretScanner(Buffer.alloc(32, 19)),
+    true,
+    {
+      makeDirectory: async (target) => {
+        operations.push(`mkdir:${target}`);
+      },
+      syncDirectory: async (target) => {
+        operations.push(`sync:${target}`);
+      },
+      writeAtomically: async (target) => {
+        operations.push(`write:${target}`);
+      },
+    },
+  );
+
+  await handoffs.save({
+    summary: "File-backed completion",
+    acceptanceCriteria: [],
+    validation: [],
+    skippedValidation: [],
+    remainingRisks: [],
+    recommendedFollowUp: [],
+  }, {
+    accepted: true,
+    reasons: [],
+    actual: {
+      changedPaths: [],
+      agentChangedPaths: [],
+      preExistingPaths: [],
+      successfulCommands: [],
+      failedCommands: [],
+      gitStatusSummary: "clean",
+      repositoryFingerprint: "f".repeat(64),
+    },
+  }, "2026-01-01T00:00:02.000Z");
+
+  assert.deepEqual(operations, [
+    `mkdir:${directory}`,
+    `sync:${path.dirname(directory)}`,
+    `write:${path.join(directory, "completion.json")}`,
+  ]);
+});
+
 test("hosts without directory fsync still unlink legacy handoff files", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-session-inline-legacy-cleanup-"));
   const handoffDirectory = path.join(root, "handoff");
