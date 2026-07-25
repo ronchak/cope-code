@@ -42,21 +42,14 @@ export class CompletionHandoffStore {
     verification: CompletionVerification,
     createdAt = new Date().toISOString(),
   ): Promise<CompletionHandoffReference> {
-    let redactionCount = 0;
-    const redact = (value: string): string => {
-      const result = this.scanner.redact(value);
-      redactionCount += result.redactionCount;
-      return result.content;
-    };
-    const safeClaim = redactClaim(claim, redact);
-    const safeVerification = redactVerification(verification, redact);
+    const safe = sanitizeHandoff(this.scanner, claim, verification);
     const body = {
       version: COMPLETION_HANDOFF_VERSION,
       sessionId: this.sessionId,
       createdAt,
-      claim: safeClaim,
-      verification: safeVerification,
-      redactionCount,
+      claim: safe.claim,
+      verification: safe.verification,
+      redactionCount: safe.redactionCount,
     };
     const record: CompletionHandoffRecord = {
       ...body,
@@ -111,9 +104,48 @@ export class CompletionHandoffStore {
     return parsed;
   }
 
+  public async assertReusable(
+    expected: CompletionHandoffReference,
+    claim: CompletionClaim,
+    verification: CompletionVerification,
+  ): Promise<void> {
+    const record = await this.read(expected);
+    const safe = sanitizeHandoff(this.scanner, claim, verification);
+    if (
+      record.redactionCount !== safe.redactionCount ||
+      stableJson(record.claim) !== stableJson(safe.claim) ||
+      stableJson(record.verification) !== stableJson(safe.verification)
+    ) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Completion handoff does not match the current accepted completion evidence",
+      );
+    }
+  }
+
   private filename(): string {
     return path.join(this.directory, "completion.json");
   }
+}
+
+function sanitizeHandoff(
+  scanner: SecretScanner,
+  claim: CompletionClaim,
+  verification: CompletionVerification,
+): {
+  readonly claim: CompletionClaim;
+  readonly verification: CompletionVerification;
+  readonly redactionCount: number;
+} {
+  let redactionCount = 0;
+  const redact = (value: string): string => {
+    const result = scanner.redact(value);
+    redactionCount += result.redactionCount;
+    return result.content;
+  };
+  const safeClaim = redactClaim(claim, redact);
+  const safeVerification = redactVerification(verification, redact);
+  return { claim: safeClaim, verification: safeVerification, redactionCount };
 }
 
 function redactClaim(claim: CompletionClaim, redact: (value: string) => string): CompletionClaim {

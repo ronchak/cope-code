@@ -1147,6 +1147,77 @@ test("resume reuses an accepted completion handoff saved before a pause", async 
   await completionHandoffs.read(pausedReference);
 });
 
+test("resume fails closed when accepted completion evidence changed after handoff save", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-stale-completion-handoff-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new QueueTransport([JSON.stringify([{
+    type: "complete_task",
+    operationId: "op_complete",
+    claim: {
+      summary: "Completion evidence must describe the current repository.",
+      acceptanceCriteria: [],
+      validation: [],
+      skippedValidation: [],
+      remainingRisks: [],
+      recommendedFollowUp: [],
+    },
+  }])]);
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
+  const completionHandoffs = new CompletionHandoffSaveGateStore(
+    path.join(root, "handoff"),
+    localState.sessionId,
+    new SecretScanner(Buffer.alloc(32, 10)),
+  );
+  const runtime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+    completionHandoffs,
+  });
+
+  const run = runtime.run();
+  await completionHandoffs.firstSaveCompleted;
+  await runtime.requestPause("pause after completion handoff save");
+  completionHandoffs.releaseFirstSave();
+  const paused = await run;
+  assert.equal(paused.status, "paused");
+  const pausedReference = localState.completionHandoff;
+  assert.notEqual(pausedReference, undefined);
+
+  const resumed = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+    completionHandoffs,
+    inspectCompletionState: async () => ({
+      pathKey: completionPathKey,
+      known: true,
+      fingerprint: "d".repeat(64),
+      excludedStateFingerprint: "0".repeat(64),
+      hasConflicts: false,
+      changedPaths: ["src/new-state.ts"],
+      outOfScopePaths: [],
+      gitStatusSummary: " M src/new-state.ts",
+    }),
+  }).run();
+  assert.equal(resumed.status, "paused", resumed.reason);
+  assert.match(
+    resumed.reason ?? "",
+    /Completion handoff does not match the current accepted completion evidence/u,
+  );
+  assert.equal(completionHandoffs.saveCalls, 1, "mismatched evidence must not overwrite the handoff");
+  assert.deepEqual(localState.completionHandoff, pausedReference);
+  const durable = await completionHandoffs.read(pausedReference);
+  assert.equal(durable.verification.actual.repositoryFingerprint, "d".repeat(64));
+  assert.deepEqual(durable.verification.actual.changedPaths, []);
+});
+
 test("abort cannot be downgraded by a racing pause request", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-abort-priority-"));
   const localState = state(root);

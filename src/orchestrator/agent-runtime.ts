@@ -588,7 +588,7 @@ export class AgentRuntime {
       return undefined;
     }
     if (existing !== undefined) {
-      await store.read(existing);
+      await store.assertReusable(existing, claim, verification);
       return existing;
     }
     return store.save(claim, verification, this.now());
