@@ -100,6 +100,11 @@ test("hosted offline matrix covers all three architectures without claiming cert
   assert.match(workflow, /node-version: 24/u);
   assert.match(workflow, /npm run check/u);
   assert.match(workflow, /not owner-tuple live certification/u);
+  assert.match(workflow, /Isolated install and local update smoke/u);
+  assert.match(workflow, /install-windows\.ps1 -SkipBuild -SkipSetup/u);
+  assert.match(workflow, /GetEnvironmentVariable\("COPE_SOURCE_DIR", "User"\)/u);
+  assert.match(workflow, /& \$cope update/u);
+  assert.match(workflow, /SetEnvironmentVariable\("COPE_SOURCE_DIR", \$previousSource, "User"\)/u);
   assert.match(workflow, /install-macos\.sh --skip-build --skip-setup/u);
   assert.match(workflow, /uninstall-macos\.sh/u);
   assert.match(workflow, /cope clean home/u);

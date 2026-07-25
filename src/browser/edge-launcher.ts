@@ -35,7 +35,11 @@ import {
 import { ExclusiveProfileLock, prepareDedicatedProfile } from "./profile-lock.js";
 import { CURRENT_HOST_PLATFORM, type HostPlatform } from "../platform/index.js";
 import { verifyDedicatedProfileRoot } from "../platform/private-storage.js";
-import { verifyBrowserExecutable, type BrowserIdentityVerifier } from "./discovery.js";
+import {
+  isCompatibleBrowserExecutableUpgrade,
+  verifyBrowserExecutable,
+  type BrowserIdentityVerifier,
+} from "./discovery.js";
 
 export type PersistentContextLauncher = typeof chromium.launchPersistentContext;
 
@@ -63,7 +67,7 @@ export class EdgeCopilotTransport implements ModelTransport {
   readonly #lock: ExclusiveProfileLock;
   readonly #killSwitch: BrowserKillSwitch;
   readonly #readinessWaits: BrowserWaitConfig;
-  #closed = false;
+  #closePromise: Promise<void> | undefined;
 
   private constructor(
     context: BrowserContext,
@@ -94,9 +98,12 @@ export class EdgeCopilotTransport implements ModelTransport {
     if (
       verified.product !== config.product || configuredCanonical === undefined ||
       verified.executablePath !== configuredCanonical ||
-      config.browserVersion !== undefined && verified.version !== config.browserVersion ||
-      config.browserExecutableSha256 !== undefined &&
-        verified.executableSha256 !== config.browserExecutableSha256
+      !isCompatibleBrowserExecutableUpgrade(
+        config.browserVersion,
+        config.browserExecutableSha256,
+        verified.version,
+        verified.executableSha256,
+      )
     ) {
       throw new AgentError("CONFIG_INVALID", "The selected browser identity changed before launch", {
         diagnosticCode: "BROWSER_EXECUTABLE_EVIDENCE_CHANGED",
@@ -183,8 +190,40 @@ export class EdgeCopilotTransport implements ModelTransport {
     maxWaitMs?: number,
     signal?: AbortSignal,
   ): Promise<BrowserStateInspection> {
+    return this.#waitForReadiness(maxWaitMs, signal, false);
+  }
+
+  /**
+   * Setup may prove that the configured Copilot page is ready while a
+   * provenance-bound SSO popup lingers. Runtime submission deliberately does
+   * not use this exception and remains blocked until the popup closes.
+   */
+  public async waitForSetupReadiness(
+    maxWaitMs?: number,
+    signal?: AbortSignal,
+  ): Promise<BrowserStateInspection> {
+    return this.#waitForReadiness(maxWaitMs, signal, true);
+  }
+
+  public async inspectSetupReadiness(signal?: AbortSignal): Promise<BrowserStateInspection> {
+    return this.#waitForReadiness(this.#readinessWaits.actionMs, signal, true);
+  }
+
+  async #waitForReadiness(
+    maxWaitMs: number | undefined,
+    signal: AbortSignal | undefined,
+    allowConfiguredPageProbe: boolean,
+  ): Promise<BrowserStateInspection> {
     return waitForStableManualReadiness(
-      (_sliceMs, activeSignal) => inspectEdgeReadinessOnce(this.#adapter, activeSignal),
+      (_sliceMs, activeSignal) => inspectEdgeReadinessOnce(
+        {
+          inspectState: () => this.#inspectReadinessOnce(
+            allowConfiguredPageProbe,
+            activeSignal,
+          ),
+        },
+        activeSignal,
+      ),
       this.#readinessWaits,
       maxWaitMs ?? this.#readinessWaits.manualReadinessMs,
       signal,
@@ -195,6 +234,23 @@ export class EdgeCopilotTransport implements ModelTransport {
         ),
       },
     );
+  }
+
+  async #inspectReadinessOnce(
+    allowConfiguredPageProbe: boolean,
+    signal?: AbortSignal,
+  ): Promise<BrowserStateInspection> {
+    const inspect = () => this.#adapter.inspectManualReadinessState(
+      () => this.#semanticPage.holdForManualAuthenticationHandoff(
+        false,
+        allowConfiguredPageProbe,
+      ),
+      allowConfiguredPageProbe
+        ? () => this.#semanticPage.isManualAuthenticationRedirect()
+        : undefined,
+      signal,
+    );
+    return this.#semanticPage.withManualReadinessProbe(inspect);
   }
 
   public async submit(
@@ -226,9 +282,12 @@ export class EdgeCopilotTransport implements ModelTransport {
     await this.close();
   }
 
-  public async close(): Promise<void> {
-    if (this.#closed) return;
-    this.#closed = true;
+  public close(): Promise<void> {
+    this.#closePromise ??= this.#closeOnce();
+    return this.#closePromise;
+  }
+
+  async #closeOnce(): Promise<void> {
     await this.#adapter.close();
     const existingTermination = browserContextTermination(this.#context);
     if (existingTermination !== undefined) {
@@ -241,8 +300,36 @@ export class EdgeCopilotTransport implements ModelTransport {
       ).catch(() => undefined);
       return;
     }
-    await terminateBrowserContext(this.#context);
-    await this.#lock.release();
+    const termination = terminateBrowserContext(this.#context);
+    if (await browserTerminationSettlesWithin(termination, this.#readinessWaits.actionMs)) {
+      await this.#lock.release();
+      return;
+    }
+    // Browser.close() can stall on Windows while a renderer or profile process
+    // exits. Let CLI cleanup return after the configured action bound, but keep
+    // the profile unavailable until the real process owner confirms shutdown.
+    void termination.then(
+      async () => this.#lock.release(),
+      () => undefined,
+    ).catch(() => undefined);
+  }
+}
+
+/** Exported for a no-extra-handles process-liveness regression. */
+export async function browserTerminationSettlesWithin(
+  promise: Promise<void>,
+  milliseconds: number,
+): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then(() => true),
+      new Promise<false>((resolve) => {
+        timer = setTimeout(() => resolve(false), milliseconds);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 

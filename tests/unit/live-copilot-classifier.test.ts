@@ -110,6 +110,70 @@ test("surname-first matching preserves first and middle name order", async () =>
   assert.equal(classification.state, "ready");
 });
 
+test("Microsoft account-manager wrapper verifies the configured display name", async () => {
+  const expectedIdentity = "Ronak Chakraborty";
+  const contract = createBaselineCopilotUiContract(expectedIdentity);
+  const observation = await observeCopilotPage(
+    new LiveShapePage([{
+      text: "Ronak Chakraborty",
+      accessibleLabel: "Account manager for Ronak Chakraborty",
+    }]),
+    contract,
+  );
+
+  const classification = classifyCopilotPage(
+    observation,
+    contract,
+    requirements(expectedIdentity),
+  );
+
+  assert.equal(classification.state, "ready");
+});
+
+test("a visible display name cannot be treated as proof of a configured email", async () => {
+  const expectedIdentity = "ronak@example.com";
+  const contract = createBaselineCopilotUiContract(expectedIdentity);
+  const observation = await observeCopilotPage(
+    new LiveShapePage([{
+      text: "Ronak Chakraborty",
+      accessibleLabel: "Account manager for Ronak Chakraborty",
+    }]),
+    contract,
+  );
+
+  const classification = classifyCopilotPage(
+    observation,
+    contract,
+    requirements(expectedIdentity),
+  );
+
+  assert.equal(classification.state, "identity-unverified");
+  assert.equal(classification.diagnosticCode, "IDENTITY_NOT_VERIFIED");
+});
+
+test("an alternate-profile action cannot verify the configured display name", async () => {
+  const expectedIdentity = "Ronak Chakraborty";
+  const contract = createBaselineCopilotUiContract(expectedIdentity);
+  for (const alternate of [
+    "Switch account Ronak Chakraborty",
+    "Switch to Ronak Chakraborty",
+    "Work account Ronak Chakraborty",
+  ]) {
+    const observation = await observeCopilotPage(
+      new LiveShapePage(alternate),
+      contract,
+    );
+    const classification = classifyCopilotPage(
+      observation,
+      contract,
+      requirements(expectedIdentity),
+    );
+
+    assert.equal(classification.state, "identity-unverified", alternate);
+    assert.equal(classification.diagnosticCode, "IDENTITY_NOT_VERIFIED", alternate);
+  }
+});
+
 test("an email wrapped in account-button text still verifies the exact configured address", async () => {
   const expectedIdentity = "ronak@example.com";
   const contract = createBaselineCopilotUiContract(expectedIdentity);
@@ -471,7 +535,27 @@ test("manual auth evidence still blocks a configured chat without an actionable 
 test("the baseline contract carries the current M365 locator revision and semantic fallbacks", () => {
   const contract = createBaselineCopilotUiContract("Ronak Chakraborty");
 
-  assert.equal(contract.version, "copilot-ui/v1:m365-2026-07");
+  assert.equal(contract.version, "copilot-ui/v1:m365-2026-07-r3");
+  const conversationTestId = contract.groups.conversation.candidates.find(
+    (candidate) => candidate.kind === "test-id",
+  );
+  assert.ok(conversationTestId?.kind === "test-id");
+  assert.equal(typeof conversationTestId.testId, "object");
+  if (typeof conversationTestId.testId !== "string") {
+    const conversationPattern = new RegExp(
+      conversationTestId.testId.source,
+      conversationTestId.testId.flags,
+    );
+    assert.equal(conversationPattern.test("conversation-container"), true);
+    for (const transientMessageId of ["chatQuestion", "chatOutput", "lastChatMessage"]) {
+      assert.equal(conversationPattern.test(transientMessageId), false);
+    }
+  }
+  const conversationCss = contract.groups.conversation.candidates.find(
+    (candidate) => candidate.kind === "css",
+  );
+  assert.ok(conversationCss?.kind === "css");
+  assert.equal(conversationCss.selector.includes("*="), false);
   assert.equal(contract.groups.composer.candidates.some((candidate) => candidate.kind === "label"), true);
   assert.equal(contract.groups.composer.candidates.some((candidate) => candidate.kind === "css"), true);
   assert.deepEqual(
@@ -483,7 +567,7 @@ test("the baseline contract carries the current M365 locator revision and semant
   assert.ok(identityCss?.kind === "css");
   assert.equal(
     identityCss.selector.split(",").every((selector) =>
-      /mectrl|mecontrol|me-control|account-control|account-menu|profile|persona/iu.test(selector)),
+      /user-account-avatar|mectrl|mecontrol|me-control|account-control|account-menu|profile|persona/iu.test(selector)),
     true,
   );
   assert.equal(

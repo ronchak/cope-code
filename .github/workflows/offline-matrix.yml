@@ -27,6 +27,37 @@ jobs:
           cache: npm
       - run: npm ci --no-audit --no-fund
       - run: npm run check
+      - if: runner.os == 'Windows'
+        name: Isolated install and local update smoke (not live certification)
+        shell: powershell
+        run: |
+          $prefix = Join-Path $env:RUNNER_TEMP "cope update prefix"
+          $projectRoot = (Resolve-Path .).Path
+          $previousSource = [Environment]::GetEnvironmentVariable("COPE_SOURCE_DIR", "User")
+          $previousPath = [Environment]::GetEnvironmentVariable("Path", "User")
+          $powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+          try {
+            $env:npm_config_prefix = $prefix
+            & $powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/install-windows.ps1 -SkipBuild -SkipSetup
+            if ($LASTEXITCODE -ne 0) { throw "Initial isolated Windows install failed with exit code $LASTEXITCODE" }
+
+            $persistedSource = [Environment]::GetEnvironmentVariable("COPE_SOURCE_DIR", "User")
+            if ($persistedSource -ne $projectRoot) {
+              throw "COPE_SOURCE_DIR was not persisted for the current user: $persistedSource"
+            }
+            $env:COPE_SOURCE_DIR = $persistedSource
+
+            $cope = Join-Path $prefix "cope.cmd"
+            & $cope update
+            if ($LASTEXITCODE -ne 0) { throw "Installed cope update failed with exit code $LASTEXITCODE" }
+            & $cope --version
+            if ($LASTEXITCODE -ne 0) { throw "Updated cope launch check failed with exit code $LASTEXITCODE" }
+          } finally {
+            npm.cmd uninstall --global @local/copilot-browser-agent | Out-Host
+            [Environment]::SetEnvironmentVariable("COPE_SOURCE_DIR", $previousSource, "User")
+            [Environment]::SetEnvironmentVariable("Path", $previousPath, "User")
+            Remove-Item -LiteralPath $prefix -Recurse -Force -ErrorAction SilentlyContinue
+          }
       - if: runner.os == 'macOS'
         run: sh -n scripts/install-macos.sh scripts/uninstall-macos.sh
       - if: runner.os == 'macOS'

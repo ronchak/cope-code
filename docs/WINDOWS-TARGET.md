@@ -23,7 +23,7 @@ Some inventory probes failed or were inconsistent: CPU/memory/disk collection fa
 
 ## Install as a standard user
 
-For the 0.1.2 personal-preview release, extract the zip and run `install.cmd` from a non-elevated Windows account. The installer performs `npm ci`, builds the release, packs it, installs the global `cope` command, adds the npm global command directory to the user PATH when needed, verifies `cope --version`, and offers guided setup. Reopen PowerShell after installation, then run `cope`.
+For the current personal-preview release, extract the zip and run `install.cmd` from a non-elevated Windows account. The installer reads the release version from the package manifest, performs `npm ci`, builds and packs that release, installs the global `cope` command, adds the npm global command directory to the user PATH when needed, verifies the packed and installed versions against the manifest, and offers guided setup. Reopen PowerShell after installation, then run `cope`.
 
 The packed global installation is intentional. It does not remain linked to the extracted source folder, so moving or deleting that folder later does not break `cope`. No administrator rights, Windows service, or browser extension is required.
 
@@ -58,7 +58,7 @@ The profile is credential-equivalent local state.
 - Never record passwords, MFA codes, cookies, tokens, storage state, authentication headers, or private network captures.
 - Protect the profile with Windows ACLs and include it in incident-response and decommissioning procedures.
 
-The launcher uses a persistent, headful context, disables downloads, and navigates only to the configured HTTPS entry URL. It launches the canonical executable whose requested product identity, version, and SHA-256 were verified; it does not fall back to another Playwright channel. Authentication redirect hosts are allowed only while waiting for the user; they are never valid submission hosts.
+The launcher uses a persistent, headful context, disables downloads, and navigates only to the configured HTTPS entry URL. It launches the canonical executable whose requested product identity, version, and SHA-256 were verified; it does not fall back to another Playwright channel. Setup allows up to 15 minutes for manual sign-in, MFA, consent, and tenant SSO. Known Microsoft authentication hosts and external HTTPS URLs without embedded credentials may remain visible during that wait only when their page belongs to the exact setup target/popup chain or was observed at the exact configured Copilot or strict Microsoft-auth waypoint. They are never valid submission hosts.
 
 ## Configure the target
 

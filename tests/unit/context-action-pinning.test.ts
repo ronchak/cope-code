@@ -51,7 +51,11 @@ class ActionLocator {
   public async inputValue(): Promise<string> { return this.page.composer; }
   public async getAttribute(_name: string): Promise<string | null> { return null; }
   public async elementHandle(): Promise<ElementHandle> {
-    return new BoundActionElement(this.page, this.page.documentEpoch) as unknown as ElementHandle;
+    return new BoundActionElement(
+      this.page,
+      this.page.documentEpoch,
+      this.selector,
+    ) as unknown as ElementHandle;
   }
 }
 
@@ -59,26 +63,37 @@ class BoundActionElement {
   public constructor(
     private readonly page: ActionPage,
     private readonly documentEpoch: number,
+    private readonly selector: string,
   ) {}
 
   public async isVisible(): Promise<boolean> { return true; }
   public async isEnabled(): Promise<boolean> { return true; }
   public async isEditable(): Promise<boolean> { return true; }
   public async getAttribute(_name: string): Promise<string | null> { return null; }
+  public async click(): Promise<void> {
+    this.#beforeDispatch();
+    this.page.actions.push("click");
+    this.page.trustedClickCompleted = true;
+  }
   public async evaluate(
     _callback: (...args: readonly unknown[]) => unknown,
     value?: string,
   ): Promise<unknown> {
     this.#beforeDispatch();
-    if (value === undefined) {
-      if (this.page.boundClickPreDispatchFailure) return "pre-dispatch";
-      this.page.actions.push("click");
-      return "dispatched";
-    } else {
+    if (this.selector === "#composer") {
+      if (value === undefined) throw new Error("Composer fill value is missing");
       this.page.composer = value;
       this.page.actions.push(`fill:${value}`);
       return undefined;
     }
+    if (value === undefined) {
+      return !this.page.boundClickPreDispatchFailure;
+    }
+    if (!this.page.trustedClickGuardInstalled) {
+      this.page.trustedClickGuardInstalled = true;
+      return true;
+    }
+    throw new Error("Click proof must be read through the page");
   }
 
   #beforeDispatch(): void {
@@ -95,6 +110,8 @@ class ActionPage {
   public documentEpoch = 0;
   public sendAvailable = true;
   public boundClickPreDispatchFailure = false;
+  public trustedClickGuardInstalled = false;
+  public trustedClickCompleted = false;
   public readonly actions: string[] = [];
   public locatorProbeHook: (() => void) | undefined = undefined;
   public boundActionHook: (() => void) | undefined = undefined;
@@ -108,6 +125,18 @@ class ActionPage {
   public setDefaultTimeout(_milliseconds: number): void {}
   public setDefaultNavigationTimeout(_milliseconds: number): void {}
   public async bringToFront(): Promise<void> {}
+  public async evaluate(): Promise<{
+    readonly matchedClicks: number;
+    readonly mismatchedActivation: boolean;
+  }> {
+    const proof = {
+      matchedClicks: this.trustedClickCompleted ? 1 : 0,
+      mismatchedActivation: false,
+    };
+    this.trustedClickGuardInstalled = false;
+    this.trustedClickCompleted = false;
+    return proof;
+  }
   public on(event: string, listener: (...args: readonly unknown[]) => void): this {
     if (event === "framenavigated") {
       this.#navigationListeners.push(listener as (frame: Frame) => void);
@@ -266,6 +295,20 @@ test("composer content changed after fill is rejected before send", async () => 
       error.details.diagnosticCode === "COMPOSER_CONTENT_CHANGED_BEFORE_SUBMIT",
   );
   assert.deepEqual(page.actions, ["fill:trusted prompt with marker"]);
+});
+
+test("trailing M365 Lexical sentinels preserve exact composer ownership", async () => {
+  const page = new ActionPage(`${entryUrl}/conversation/one`);
+  const context = new ActionContext([page]);
+  const tracked = createTracked(context, page);
+
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  await tracked.fill(composerGroup, "prepared draft", allowAction);
+  assert.equal(await tracked.currentUrl(), page.currentUrl);
+  page.composer += "\u200B\u200C";
+
+  await tracked.click(sendGroup, allowAction);
+  assert.deepEqual(page.actions, ["fill:prepared draft", "click"]);
 });
 
 test("a replacement Copilot tab cannot receive a fill without a new observation", async () => {

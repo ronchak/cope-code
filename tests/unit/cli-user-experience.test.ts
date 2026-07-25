@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { executeCommand } from "../../src/cli/commands.js";
+import { CLI_VERSION, executeCommand } from "../../src/cli/commands.js";
 import { configuredBrowserLabel, interactiveSetupCommand } from "../../src/cli/interactive.js";
 import { chatFooter, renderUserMessage, setupHero, startupPanel } from "../../src/cli/presentation.js";
 import { chatPromptStartRow, inputViewport } from "../../src/cli/prompts.js";
@@ -58,7 +58,7 @@ test("package and installer expose a durable global cope command", async () => {
     bin: Record<string, string>;
     scripts: Record<string, string>;
   };
-  assert.equal(packageJson.version, "0.1.2");
+  assert.equal(packageJson.version, CLI_VERSION);
   assert.equal(packageJson.bin.cope, "dist/src/cli/main.js");
   assert.equal(packageJson.bin["copilot-agent"], "dist/src/cli/main.js");
   const devScript = packageJson.scripts.dev;
@@ -71,6 +71,7 @@ test("package and installer expose a durable global cope command", async () => {
   assert.match(installer, /npm\.cmd install --global/u);
   assert.doesNotMatch(installer, /npm\.cmd link/u);
   assert.match(installer, /cope\.cmd/u);
+  assert.match(installer, /SetEnvironmentVariable\("COPE_SOURCE_DIR", \$ProjectRoot, "User"\)/u);
 });
 
 test("normal help stays compact while advanced operations remain discoverable", async () => {
@@ -145,7 +146,7 @@ test("terminal takeover leaves redirected and plain-terminal output untouched", 
 test("startup panel is responsive and preserves Cope workspace information", () => {
   const wide = new MemoryOutput();
   startupPanel({
-    version: "0.1.2",
+    version: CLI_VERSION,
     repositoryRoot: "/Users/example/projects/copilot-browser-agent",
     mode: "edit",
     transport: "demo (offline)",
@@ -159,7 +160,7 @@ test("startup panel is responsive and preserves Cope workspace information", () 
 
   const compact = new MemoryOutput();
   startupPanel({
-    version: "0.1.2",
+    version: CLI_VERSION,
     repositoryRoot: "/Users/example/projects/copilot-browser-agent",
     mode: "inspect",
     transport: "visible Edge",
@@ -175,7 +176,7 @@ test("startup panel credits Ronak Chakraborty in the responsive top bar", () => 
   for (const columns of [36, 100]) {
     const output = new MemoryOutput();
     startupPanel({
-      version: "0.1.2",
+      version: CLI_VERSION,
       repositoryRoot: "/Users/example/projects/copilot-browser-agent",
       mode: "edit",
       transport: "visible Edge",
@@ -185,10 +186,14 @@ test("startup panel credits Ronak Chakraborty in the responsive top bar", () => 
     const lines = stripAnsi(output.value).split("\n").filter((line) => line.length > 0);
     assert.match(lines[0] ?? "", /COPE.*by Ronak Chakraborty/u);
     assert.ok(lines.every((line) => displayWidth(line) === columns));
-    if (columns === 36) assert.doesNotMatch(lines[0] ?? "", /v0\.1\.2/u);
-    else assert.match(lines[0] ?? "", /v0\.1\.2/u);
+    if (columns === 36) assert.doesNotMatch(lines[0] ?? "", new RegExp(`v${escapeRegExp(CLI_VERSION)}`, "u"));
+    else assert.match(lines[0] ?? "", new RegExp(`v${escapeRegExp(CLI_VERSION)}`, "u"));
   }
 });
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
 
 test("one-time setup opens with a responsive Cope Code hero and creator credit", () => {
   for (const columns of [36, 88]) {

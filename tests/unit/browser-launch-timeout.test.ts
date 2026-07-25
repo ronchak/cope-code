@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
+import { pathToFileURL } from "node:url";
 
 import type { Browser, BrowserContext, Locator, Page } from "playwright-core";
 
@@ -16,6 +19,14 @@ interface Deferred<T> {
   readonly resolve: (value: T) => void;
   readonly reject: (reason?: unknown) => void;
 }
+
+// These are deadlock sentinels, not product timing assertions. The fixture's
+// action timeout remains 20 ms; leave enough scheduling margin for loaded and
+// emulated CI hosts to deliver that timer and the resulting promise callbacks.
+const ASYNC_DEADLOCK_WATCHDOG_MS = 2_000;
+const CLOSE_DEADLOCK_WATCHDOG_MS = 1_000;
+const CHILD_PROCESS_WATCHDOG_MS = 5_000;
+const execFileAsync = promisify(execFile);
 
 function deferred<T>(): Deferred<T> {
   let resolve!: (value: T) => void;
@@ -154,10 +165,12 @@ test("launcher returns a page timeout while held owner cleanup retains the profi
       config,
       launchDependencies(context as unknown as BrowserContext),
     ),
-    200,
+    ASYNC_DEADLOCK_WATCHDOG_MS,
   );
   assert.equal(observedError instanceof AgentError, true);
   assert.equal((observedError as AgentError).details.diagnosticCode, "BROWSER_OPERATION_TIMEOUT");
+  assert.equal((observedError as AgentError).details.semanticGroup, "context");
+  assert.equal((observedError as AgentError).details.semanticOperation, "context.newPage");
   assert.equal(browser.closeCalls, 1);
   assert.equal(context.contextCloseCalls, 0);
   await assert.rejects(ExclusiveProfileLock.acquire(profile), lockedProfileError);
@@ -182,7 +195,7 @@ test("rejected owner cleanup retains the profile lock fail-closed", async (t) =>
       config,
       launchDependencies(context as unknown as BrowserContext),
     ),
-    200,
+    ASYNC_DEADLOCK_WATCHDOG_MS,
   );
   assert.equal(observedError instanceof AgentError, true);
   assert.equal((observedError as AgentError).details.diagnosticCode, "BROWSER_OPERATION_TIMEOUT");
@@ -205,7 +218,7 @@ test("ownerless launch returns promptly while held fallback cleanup retains the 
       config,
       launchDependencies(context as unknown as BrowserContext),
     ),
-    200,
+    ASYNC_DEADLOCK_WATCHDOG_MS,
   );
   assert.equal(observedError instanceof AgentError, true);
   assert.equal(
@@ -235,7 +248,7 @@ test("ownerless launch retains the lock when fallback cleanup rejects", async (t
       config,
       launchDependencies(context as unknown as BrowserContext),
     ),
-    200,
+    ASYNC_DEADLOCK_WATCHDOG_MS,
   );
   assert.equal(observedError instanceof AgentError, true);
   assert.equal(
@@ -248,7 +261,7 @@ test("ownerless launch retains the lock when fallback cleanup rejects", async (t
   await assert.rejects(ExclusiveProfileLock.acquire(profile), lockedProfileError);
 });
 
-test("context-owned persistent launch remains usable and releases its lock on close", async (t) => {
+test("normal transport close is bounded while a stalled owner retains the profile lock", async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), "cope-ownerless-success-"));
   t.after(async () => rm(root, { recursive: true, force: true }));
   const closeRelease = deferred<void>();
@@ -260,15 +273,67 @@ test("context-owned persistent launch remains usable and releases its lock on cl
     launchDependencies(context as unknown as BrowserContext),
   );
   await assert.rejects(ExclusiveProfileLock.acquire(profile), lockedProfileError);
-  const closePromise = transport.close();
+  const firstClose = transport.close();
+  const secondClose = transport.close();
+  assert.equal(firstClose, secondClose, "concurrent close callers must join one cleanup");
+  let secondSettled = false;
+  void secondClose.then(() => { secondSettled = true; });
   await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(secondSettled, false);
+  await Promise.race([
+    Promise.all([firstClose, secondClose]),
+    new Promise<never>((_resolve, reject) => {
+      setTimeout(() => reject(new Error("normal transport close remained unbounded")), CLOSE_DEADLOCK_WATCHDOG_MS);
+    }),
+  ]);
   assert.equal(context.closeCalls, 1);
   await assert.rejects(ExclusiveProfileLock.acquire(profile), lockedProfileError);
   closeRelease.resolve();
-  await closePromise;
+  await new Promise((resolve) => setTimeout(resolve, 20));
 
   const reacquired = await ExclusiveProfileLock.acquire(profile);
   await reacquired.release();
+});
+
+test("normal transport close surfaces rejection and retains the profile lock", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-ownerless-close-rejected-normal-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const closeResult = deferred<void>();
+  const context = new OwnerlessOperationContext(closeResult.promise);
+  const { config, profile } = await launchFixture(root);
+  const transport = await EdgeCopilotTransport.launch(
+    config,
+    launchDependencies(context as unknown as BrowserContext),
+  );
+
+  const closePromise = transport.close();
+  const concurrentClose = transport.close();
+  assert.equal(closePromise, concurrentClose);
+  closeResult.reject(new Error("synthetic normal close failure"));
+  await assert.rejects(closePromise, /synthetic normal close failure/u);
+  await assert.rejects(concurrentClose, /synthetic normal close failure/u);
+  assert.equal(context.closeCalls, 1);
+  await assert.rejects(ExclusiveProfileLock.acquire(profile), lockedProfileError);
+});
+
+test("the normal-close deadline keeps a handle alive without an external watchdog", async () => {
+  const launcherUrl = pathToFileURL(
+    path.resolve("dist/src/browser/edge-launcher.js"),
+  ).href;
+  const source = [
+    `import { browserTerminationSettlesWithin } from ${JSON.stringify(launcherUrl)};`,
+    "const settled = await browserTerminationSettlesWithin(new Promise(() => {}), 20);",
+    "process.stdout.write(String(settled));",
+  ].join("\n");
+
+  const { stdout } = await execFileAsync(
+    process.execPath,
+    ["--input-type=module", "--eval", source],
+    // Cold Windows runners may spend materially longer loading Playwright than
+    // the 20 ms deadline behavior this child verifies.
+    { timeout: CHILD_PROCESS_WATCHDOG_MS },
+  );
+  assert.equal(stdout, "false");
 });
 
 test("ownerless operation timeout shares context teardown and retains the lock until success", async (t) => {
@@ -283,13 +348,17 @@ test("ownerless operation timeout shares context teardown and retains the lock u
   );
 
   const [firstError, secondError] = await Promise.all([
-    rejectionWithin(transport.inspectState(), 200),
-    rejectionWithin(transport.inspectState(), 200),
+    rejectionWithin(transport.inspectState(), ASYNC_DEADLOCK_WATCHDOG_MS),
+    rejectionWithin(transport.inspectState(), ASYNC_DEADLOCK_WATCHDOG_MS),
   ]);
-  for (const error of [firstError, secondError]) {
+  const diagnosticCodes = [firstError, secondError].map((error) => {
     assert.equal(error instanceof AgentError, true);
-    assert.equal((error as AgentError).details.diagnosticCode, "BROWSER_OPERATION_TIMEOUT");
-  }
+    return (error as AgentError).details.diagnosticCode;
+  }).sort();
+  assert.deepEqual(diagnosticCodes, [
+    "BROWSER_OPERATION_TIMEOUT",
+    "CONCURRENT_BROWSER_OPERATION",
+  ]);
   await transport.close();
   assert.equal(context.closeCalls, 1);
   await assert.rejects(ExclusiveProfileLock.acquire(profile), lockedProfileError);
@@ -311,7 +380,7 @@ test("rejected ownerless operation teardown retains the profile lock fail-closed
     launchDependencies(context as unknown as BrowserContext),
   );
 
-  const operationError = await rejectionWithin(transport.inspectState(), 200);
+  const operationError = await rejectionWithin(transport.inspectState(), ASYNC_DEADLOCK_WATCHDOG_MS);
   assert.equal(operationError instanceof AgentError, true);
   assert.equal((operationError as AgentError).details.diagnosticCode, "BROWSER_OPERATION_TIMEOUT");
   await transport.close();
@@ -333,13 +402,13 @@ test("public transport close stays bounded after a held operation teardown", asy
     launchDependencies(context as unknown as BrowserContext),
   );
 
-  const operationError = await rejectionWithin(transport.inspectState(), 200);
+  const operationError = await rejectionWithin(transport.inspectState(), ASYNC_DEADLOCK_WATCHDOG_MS);
   assert.equal(operationError instanceof AgentError, true);
   assert.equal((operationError as AgentError).details.diagnosticCode, "BROWSER_OPERATION_TIMEOUT");
   await Promise.race([
     transport.close(),
     new Promise<never>((_resolve, reject) => {
-      setTimeout(() => reject(new Error("transport close inherited stalled teardown")), 100);
+      setTimeout(() => reject(new Error("transport close inherited stalled teardown")), CLOSE_DEADLOCK_WATCHDOG_MS);
     }),
   ]);
   assert.equal(browser.closeCalls, 1);
@@ -363,7 +432,7 @@ test("public transport close retains the lock when operation teardown rejects", 
     launchDependencies(context as unknown as BrowserContext),
   );
 
-  const operationError = await rejectionWithin(transport.inspectState(), 200);
+  const operationError = await rejectionWithin(transport.inspectState(), ASYNC_DEADLOCK_WATCHDOG_MS);
   assert.equal(operationError instanceof AgentError, true);
   assert.equal((operationError as AgentError).details.diagnosticCode, "BROWSER_OPERATION_TIMEOUT");
   await transport.close();

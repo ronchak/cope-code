@@ -6,7 +6,9 @@ import test from "node:test";
 import { AuditLog } from "../../src/audit/audit-log.js";
 import { sha256, stableJson } from "../../src/shared/crypto.js";
 import { AgentRuntime } from "../../src/orchestrator/agent-runtime.js";
+import { CbaProtocolAdapter } from "../../src/orchestrator/cba-protocol-adapter.js";
 import { ProtocolParseError } from "../../src/protocol/parser.js";
+import { serializeProtocolEnvelope } from "../../src/protocol/index.js";
 import type {
   NormalizedModelMessage,
   ParsedModelTurn,
@@ -112,6 +114,76 @@ class CancelledOnStopTransport extends QueueTransport {
   }
 }
 
+class CompletedOnStopTransport extends QueueTransport {
+  private markReceiveStarted!: () => void;
+  private finishReceive!: () => void;
+  public readonly receiveStarted = new Promise<void>((resolve) => { this.markReceiveStarted = resolve; });
+  private readonly stopped = new Promise<void>((resolve) => { this.finishReceive = resolve; });
+
+  public constructor(private readonly content: string) {
+    super([]);
+  }
+
+  public override async receive(request: ReceiveRequest): Promise<ReceiveResult> {
+    this.markReceiveStarted();
+    await this.stopped;
+    return {
+      contractVersion: MODEL_TRANSPORT_CONTRACT_VERSION,
+      taskId: request.taskId,
+      turnId: request.turnId,
+      submissionId: request.submissionId,
+      observedAt: "2026-01-01T00:00:00.000Z",
+      conversationId: "conversation_1",
+      status: "completed",
+      responseId: "response_completed_during_pause",
+      content: this.content,
+    };
+  }
+
+  public override async emergencyStop() {
+    this.finishReceive();
+  }
+}
+
+class RecoveredPrefixTransport extends QueueTransport {
+  public override async receive(request: ReceiveRequest): Promise<ReceiveResult> {
+    const result = await super.receive(request);
+    return result.status === "completed"
+      ? { ...result, responseId: "recovered_untrusted_transport_value" }
+      : result;
+  }
+}
+
+class MismatchedReceiptTransport extends QueueTransport {
+  public receiveCalls = 0;
+
+  public override async submit(request: SubmissionRequest) {
+    const receipt = await super.submit(request);
+    return { ...receipt, turnId: "turn_wrong" };
+  }
+
+  public override async receive(request: ReceiveRequest): Promise<ReceiveResult> {
+    this.receiveCalls += 1;
+    return super.receive(request);
+  }
+}
+
+class MismatchedResultTransport extends QueueTransport {
+  public override async receive(request: ReceiveRequest): Promise<ReceiveResult> {
+    const result = await super.receive(request);
+    return { ...result, submissionId: "submission_wrong" };
+  }
+}
+
+class RecoveryProbeTransport extends QueueTransport {
+  public resolveCalls = 0;
+
+  public override async resolveSubmission(request: ReceiveRequest) {
+    this.resolveCalls += 1;
+    return super.resolveSubmission(request);
+  }
+}
+
 const protocol: ProtocolAdapter = {
   renderBootstrap: () => "bootstrap",
   parseModelTurn: (raw, expected): ParsedModelTurn => ({
@@ -154,6 +226,57 @@ function state(repositoryRoot: string): SessionState {
     validations: [],
     protocolRepairStreak: 0,
   };
+}
+
+function runtimeForTest(input: {
+  readonly root: string;
+  readonly state: SessionState;
+  readonly store: SessionStore;
+  readonly transport: ModelTransport;
+  readonly protocol?: ProtocolAdapter;
+  readonly artifacts?: SessionArtifactStore;
+  readonly execute?: ToolExecutor["execute"];
+  readonly idFactory?: (prefix: string) => string;
+}): AgentRuntime {
+  return new AgentRuntime({
+    state: input.state,
+    store: input.store,
+    journal: new OperationJournal(path.join(input.root, "operations"), input.state.sessionId),
+    audit: new AuditLog(path.join(input.root, "audit.jsonl"), input.state.sessionId),
+    protocol: input.protocol ?? protocol,
+    policy: {
+      summarize: () => ({}),
+      authorize: () => ({ outcome: "allow", reasonCode: "OK", explanation: "ok" }),
+      expandSessionGrant: async () => false,
+    },
+    tools: {
+      execute: input.execute ?? (async () => { throw new Error("unused"); }),
+      inspectCompletionState: async () => ({
+        pathKey: completionPathKey,
+        known: true,
+        fingerprint: "d".repeat(64),
+        excludedStateFingerprint: "0".repeat(64),
+        hasConflicts: false,
+        changedPaths: [],
+        outOfScopePaths: [],
+        gitStatusSummary: "clean",
+      }),
+    },
+    transport: input.transport,
+    disclosure: { inspectAndSerialize: async (message) => message },
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => ({ decision: "deny" }),
+    },
+    completionRequirements: {
+      requiredCommandIds: [],
+      requireValidationAfterLastMutation: true,
+      requireCleanPendingOperations: true,
+    },
+    clock: { now: () => new Date("2026-01-01T00:01:00.000Z") },
+    idFactory: input.idFactory ?? (() => "submission_1"),
+    ...(input.artifacts === undefined ? {} : { artifacts: input.artifacts }),
+  });
 }
 
 test("runtime completes a multi-turn autonomous tool loop", async () => {
@@ -300,6 +423,23 @@ test("runtime sends protocol repair feedback and continues", async () => {
   assert.equal(localState.budgetUsage.protocolRepairs, 1);
 });
 
+test("runtime does not send or charge a repair after the protocol-repair budget is exhausted", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-repair-budget-"));
+  const localState = state(root);
+  localState.budgetLimits = { ...localState.budgetLimits, maxProtocolRepairs: 1 };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new QueueTransport(["first-invalid-response", "second-invalid-response"]);
+  const runtime = runtimeForTest({ root, state: localState, store, transport });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "failed");
+  assert.match(result.reason ?? "", /exhausted the protocol-repair budget/u);
+  assert.equal(transport.submittedContents.length, 2, "only bootstrap and one repair may be submitted");
+  assert.equal(localState.budgetUsage.protocolRepairs, 1);
+  assert.equal(localState.protocolRepairStreak, 1);
+});
+
 test("runtime fails closed without retrying a non-repairable protocol violation", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-non-repairable-"));
   const localState = state(root);
@@ -342,6 +482,50 @@ test("runtime fails closed without retrying a non-repairable protocol violation"
   assert.equal(localState.budgetUsage.protocolRepairs, 0);
 });
 
+test("a live transport cannot opt into recovery replay through its response id", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-untrusted-recovery-id-"));
+  const localState = state(root);
+  localState.completedOperationIds = ["op_used"];
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const response = serializeProtocolEnvelope({
+    protocol: "cba/1",
+    message_type: "tool_request",
+    message_id: "msg_replayed",
+    task_id: localState.taskId,
+    turn_id: 1,
+    operations: [{ operation_id: "op_used", tool: "git_status", arguments: {} }],
+  });
+  const transport = new RecoveredPrefixTransport([response]);
+  let executions = 0;
+  const runtime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    protocol: new CbaProtocolAdapter({
+      seenOperationIds: () => new Set(localState.completedOperationIds),
+    }),
+    execute: async (call) => {
+      executions += 1;
+      return {
+        operationId: call.operationId,
+        tool: call.name,
+        status: "success",
+        data: {},
+        safeMetadata: {},
+      };
+    },
+  });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "failed");
+  assert.match(result.reason ?? "", /already been used/u);
+  assert.equal(executions, 0);
+  assert.equal(transport.submittedContents.length, 1, "must not submit duplicate-operation repair feedback");
+  assert.equal(localState.budgetUsage.protocolRepairs, 0);
+});
+
 test("user-requested pause wins when transport reports cancellation", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-pause-race-"));
   const localState = state(root);
@@ -377,6 +561,125 @@ test("user-requested pause wins when transport reports cancellation", async () =
   const result = await run;
   assert.equal(result.status, "paused");
   assert.equal(result.reason, "operator pause");
+});
+
+test("user-requested pause wins when a completed response arrives during transport shutdown", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-pause-completed-race-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new CompletedOnStopTransport(JSON.stringify([{
+    type: "complete_task",
+    operationId: "op_complete",
+    claim: {
+      summary: "Must remain cached until resume.",
+      acceptanceCriteria: [],
+      validation: [],
+      skippedValidation: [],
+      remainingRisks: [],
+      recommendedFollowUp: [],
+    },
+  }]));
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
+  const runtime = runtimeForTest({ root, state: localState, store, transport, artifacts });
+
+  const run = runtime.run();
+  await transport.receiveStarted;
+  await runtime.requestPause("operator pause");
+  const result = await run;
+  assert.equal(result.status, "paused");
+  assert.equal(result.reason, "operator pause");
+  assert.equal(localState.submission?.state, "answered", "the completed response remains recoverable");
+  assert.equal(localState.lastModelSummaryHash, undefined, "the response must not be processed after pause");
+  assert.match(await artifacts.get("response", "turn_0001"), /Must remain cached until resume/u);
+});
+
+test("abort cannot be downgraded by a racing pause request", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-abort-priority-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new CancelledOnStopTransport();
+  const runtime = runtimeForTest({ root, state: localState, store, transport });
+
+  const run = runtime.run();
+  await transport.receiveStarted;
+  await Promise.all([
+    runtime.emergencyStop("operator kill switch"),
+    runtime.requestPause("late pause"),
+  ]);
+  const result = await run;
+  assert.equal(result.status, "aborted");
+  assert.equal(result.reason, "operator kill switch");
+});
+
+test("runtime pauses on a mismatched submission receipt without attempting receive", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-receipt-correlation-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new MismatchedReceiptTransport(["unused"]);
+  const runtime = runtimeForTest({ root, state: localState, store, transport });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "paused");
+  assert.match(result.reason ?? "", /submission receipt correlation mismatch/u);
+  assert.equal(transport.receiveCalls, 0);
+  assert.equal(localState.submission?.state, "prepared");
+});
+
+test("runtime pauses on a mismatched receive result without parsing or marking it answered", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-result-correlation-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new MismatchedResultTransport([JSON.stringify([{
+    type: "complete_task",
+    operationId: "op_complete",
+    claim: {
+      summary: "Mismatched result must not be processed.",
+      acceptanceCriteria: [],
+      validation: [],
+      skippedValidation: [],
+      remainingRisks: [],
+      recommendedFollowUp: [],
+    },
+  }])]);
+  const runtime = runtimeForTest({ root, state: localState, store, transport });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "paused");
+  assert.match(result.reason ?? "", /receive result correlation mismatch/u);
+  assert.equal(localState.submission?.state, "submitted");
+  assert.equal(localState.lastModelSummaryHash, undefined);
+});
+
+test("recovery refuses an integrity-valid outbox that does not match the durable submission hash", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-recovery-message-hash-"));
+  const localState = state(root);
+  localState.status = "paused";
+  localState.pauseReason = "process restarted";
+  localState.turnSequence = 1;
+  localState.submission = {
+    submissionId: "submission_1",
+    turnId: "turn_0001",
+    messageHash: sha256("expected exact outbound"),
+    marker: "marker",
+    state: "prepared",
+    preparedAt: "2026-01-01T00:00:00.000Z",
+  };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
+  await artifacts.put("outbox", "submission_1", "different integrity-valid outbound");
+  const transport = new RecoveryProbeTransport([]);
+  const runtime = runtimeForTest({ root, state: localState, store, transport, artifacts });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "paused");
+  assert.match(result.reason ?? "", /does not match the durable submission intent/u);
+  assert.equal(transport.resolveCalls, 0, "transport must not observe mismatched recovery bytes");
+  assert.equal(localState.submission.state, "prepared");
 });
 
 test("runtime resumes from an integrity-checked cached model response without resubmitting", async () => {

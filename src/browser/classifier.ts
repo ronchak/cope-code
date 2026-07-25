@@ -5,6 +5,7 @@ import {
   type CopilotUiContract,
   type ElementSnapshot,
   type GroupSnapshot,
+  type SemanticObservationCompletion,
   type SemanticPage,
   type TextPattern,
 } from "./contracts.js";
@@ -56,15 +57,108 @@ const SIGNALS: readonly CopilotSignal[] = [
   "modal",
 ];
 
+// Setup/manual readiness proves whether the current page is safe and actionable;
+// it never consumes historical prompt or response text. Keep transcript capture
+// out of this path so a large authenticated conversation cannot turn an
+// otherwise ready page into a session-revoking observation timeout. Submission
+// and response correlation continue to use the full SIGNALS observation below.
+const READINESS_SIGNALS: readonly CopilotSignal[] = SIGNALS.filter(
+  (signal) => signal !== "responses" && signal !== "user-messages",
+);
+
 export async function observeCopilotPage(
   page: SemanticPage,
   contract: CopilotUiContract,
 ): Promise<CopilotPageObservation> {
+  return observeSignals(page, contract, SIGNALS);
+}
+
+export async function observeCopilotReadinessPage(
+  page: SemanticPage,
+  contract: CopilotUiContract,
+): Promise<CopilotPageObservation> {
+  return observeSignals(page, contract, READINESS_SIGNALS);
+}
+
+async function observeSignals(
+  page: SemanticPage,
+  contract: CopilotUiContract,
+  signals: readonly CopilotSignal[],
+): Promise<CopilotPageObservation> {
   const url = await page.currentUrl();
-  const entries = await Promise.all(
-    SIGNALS.map(async (signal) => [signal, await page.snapshot(contract.groups[signal])] as const),
-  );
-  return { url, ...Object.fromEntries(entries) } as CopilotPageObservation;
+  // Native/DOM modal evidence is the final semantic snapshot. A modal that
+  // appears while another group is being read must not be hidden by an earlier
+  // empty modal result from the concurrent batch.
+  const concurrentSignals = signals.filter((signal) => signal !== "modal");
+  let entries: readonly (readonly [CopilotSignal, GroupSnapshot])[] = [];
+  let modal = emptySnapshot("modal");
+  let completion: SemanticObservationCompletion | undefined;
+  let observationFailure: { readonly error: unknown } | undefined;
+  try {
+    // Promise.all would release the adapter's exclusive-operation lock on the
+    // first rejection while sibling Playwright probes were still running.
+    // Drain every bounded probe, retain the first failure, and only then close
+    // the observation so stale work cannot overlap a later inspect or submit.
+    let firstSnapshotFailure: { readonly error: unknown } | undefined;
+    const collected = await Promise.all(
+      concurrentSignals.map(async (signal) => {
+        try {
+          return [signal, await page.snapshot(contract.groups[signal])] as const;
+        } catch (error) {
+          firstSnapshotFailure ??= { error };
+          return undefined;
+        }
+      }),
+    );
+    if (firstSnapshotFailure !== undefined) throw firstSnapshotFailure.error;
+    const drainedEntries: Array<readonly [CopilotSignal, GroupSnapshot]> = [];
+    for (const entry of collected) {
+      if (entry !== undefined) drainedEntries.push(entry);
+    }
+    entries = drainedEntries;
+    modal = signals.includes("modal")
+      ? await page.snapshot(contract.groups.modal)
+      : emptySnapshot("modal");
+  } catch (error) {
+    observationFailure = { error };
+  } finally {
+    try {
+      completion = await page.completeObservation?.();
+    } catch (error) {
+      observationFailure ??= { error };
+    }
+  }
+  if (observationFailure !== undefined) throw observationFailure.error;
+  if (completion?.nativeDialogDetected === true) {
+    modal = nativeDialogSnapshot(contract.groups.modal);
+  }
+  const emptyEntries = SIGNALS.map((signal) => [signal, emptySnapshot(signal)] as const);
+  return {
+    url,
+    ...Object.fromEntries(emptyEntries),
+    ...Object.fromEntries(entries),
+    modal,
+  } as CopilotPageObservation;
+}
+
+function emptySnapshot(signal: CopilotSignal): GroupSnapshot {
+  return {
+    signal,
+    matchedCandidates: 0,
+    visibleElements: 0,
+    enabledElements: 0,
+    elements: [],
+  };
+}
+
+function nativeDialogSnapshot(group: CopilotUiContract["groups"]["modal"]): GroupSnapshot {
+  return {
+    signal: "modal",
+    matchedCandidates: group.minimumCandidateMatches,
+    visibleElements: 1,
+    enabledElements: 0,
+    elements: [{ visible: true, enabled: false, text: "", value: "", accessibleLabel: "" }],
+  };
 }
 
 export function classifyCopilotPage(
@@ -93,7 +187,7 @@ export function classifyCopilotPage(
     isSameOriginAuthenticationUrl(observation.url, requirements.entryUrl);
 
   // Generic sign-in, MFA, and consent text on an unrelated approved-host page
-  // must not buy the ten-minute manual window. Outside the configured chat path,
+  // must not buy the full manual window. Outside the configured chat path,
   // the URL itself must also have a genuine authentication shape.
   if (!withinConfiguredSurface && !sameOriginAuthentication) {
     return result("unapproved-host", false, "COPILOT_SURFACE_NOT_APPROVED");
@@ -246,8 +340,14 @@ function identityElementIdentity(
 
   if (typeof expected === "string") {
     // Every explicit text/ARIA channel must independently verify the literal
-    // identity. One matching channel can never override another person's name.
-    if (!explicit.every((entry) => identityStringMatches(entry.channel, expected))) {
+    // identity. Microsoft 365's current-owner control may wrap the subject as
+    // "Account manager for Jane Doe"; unwrap only that owned-control phrase.
+    // Broad profile actions such as "Switch account Jane Doe" must not become
+    // current-account proof. One matching channel can never override another
+    // person's name.
+    if (!explicit.every((entry) =>
+      identityStringMatches(entry.channel, expected) ||
+      identityStringMatches(accountManagerSubject(entry.channel), expected))) {
       return undefined;
     }
     const expectedComparable = expected.normalize("NFKC").trim().toLowerCase();
@@ -289,6 +389,7 @@ const GENERIC_IDENTITY_LABELS = new Set([
 
 const IDENTITY_PREFIX_PHRASES: readonly (readonly string[])[] = [
   ["current", "account"],
+  ["account", "manager", "for"],
   ["account", "manager"],
   ["manage", "account"],
   ["microsoft", "account"],
@@ -366,6 +467,10 @@ function stripBoundaryWrapperPhrases(tokens: readonly string[]): readonly string
     equalTokenSequence(lower.slice(end - phrase.length, end), phrase));
   if (suffix !== undefined) end -= suffix.length;
   return tokens.slice(start, end);
+}
+
+function accountManagerSubject(value: string): string {
+  return value.replace(/^\s*account\s+manager\s+for\s+/iu, "");
 }
 
 /**

@@ -73,7 +73,7 @@ function inspection(state: CopilotPageState, diagnosticCode: string): BrowserSta
   return {
     classification: { state, retryable: state === "ready", diagnosticCode },
     diagnostic: {
-      uiContractVersion: "copilot-ui/v1:m365-2026-07",
+      uiContractVersion: "copilot-ui/v1:m365-2026-07-r3",
       state,
       diagnosticCode,
       locatorQuorum,

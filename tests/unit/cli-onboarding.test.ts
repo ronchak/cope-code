@@ -19,8 +19,19 @@ import type {
 import { createBaselineCopilotUiContract } from "../../src/browser/index.js";
 import { parseBrowserConfig } from "../../src/config/loader.js";
 import { AgentError } from "../../src/shared/errors.js";
+import { sha256, stableJson } from "../../src/shared/crypto.js";
 import { PromptCancelledError } from "../../src/cli/prompts.js";
 import { createStandardUserHost } from "../helpers/standard-user-host.js";
+import {
+  SESSION_RUNTIME_MANIFEST_VERSION,
+  writeRuntimeManifest,
+} from "../../src/cli/session-files.js";
+import { SessionStore } from "../../src/session/store.js";
+import {
+  DEFAULT_BUDGET_LIMITS,
+  zeroBudgetUsage,
+  type SessionState,
+} from "../../src/session/types.js";
 
 test("guided project setup detects useful package scripts and chooses one completion check", async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), "cope-onboarding-"));
@@ -107,10 +118,14 @@ function discoveredBrowser(product: BrowserProduct, executablePath = `/verified/
   };
 }
 
-function readyTransport(observed: BrowserLaunchConfig[]): EdgeCopilotTransport {
+function readyTransport(_observed: BrowserLaunchConfig[]): EdgeCopilotTransport {
   return {
+    waitForSetupReadiness: async () => ({ classification: { state: "ready" } }),
+    inspectSetupReadiness: async () => ({ classification: { state: "ready" } }),
     waitForManualReadiness: async () => ({ classification: { state: "ready" } }),
-    inspectState: async () => ({ classification: { state: "ready" } }),
+    inspectState: async () => {
+      throw new Error("machine setup must use its setup-only final readiness path");
+    },
     close: async () => undefined,
   } as unknown as EdgeCopilotTransport;
 }
@@ -161,6 +176,67 @@ test("guided machine setup preselects the only detected browser and commits only
   assert.equal(persisted.browser_executable, chrome.executablePath);
   assert.equal(path.basename(String(persisted.profile_directory)), "CopilotBrowserAgentChromeProfile");
   assert.ok(await readFile(paths.organizationPolicy, "utf8"));
+});
+
+test("final setup readiness preserves identity diagnostics and commits nothing", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-machine-final-readiness-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const stateHome = path.join(root, "state");
+  await mkdir(stateHome, { mode: 0o700 });
+  const host = createStandardUserHost();
+  const paths = configurationPaths(stateHome, host);
+  const chrome = discoveredBrowser("chrome");
+  let closed = false;
+  const identityFailure = {
+    classification: {
+      state: "identity-unverified" as const,
+      retryable: false,
+      diagnosticCode: "IDENTITY_NOT_VERIFIED",
+    },
+    diagnostic: {
+      uiContractVersion: "copilot-ui/v1:m365-2026-07-r3",
+      state: "identity-unverified" as const,
+      diagnosticCode: "IDENTITY_NOT_VERIFIED",
+      locatorQuorum: {},
+      summary: "Copilot loaded, but Cope could not verify the configured work account.",
+      next: "Run cope setup --force and enter the exact visible account.",
+      missingSignals: ["identity"] as const,
+    },
+  };
+
+  await assert.rejects(configureMachine({
+    paths,
+    force: false,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+    browser: "chrome",
+    identity: "Ronak Chakraborty",
+    entryUrl: "https://m365.cloud.microsoft/chat",
+    requireProtectionIndicator: false,
+  }, {
+    discoverBrowsers: async () => [chrome],
+    verifyManualBrowser: async (product, executablePath) => ({
+      ...discoveredBrowser(product, executablePath),
+      source: "manual",
+    }),
+    launchBrowser: async () => ({
+      waitForSetupReadiness: async () => ({ classification: { state: "ready" } }),
+      inspectSetupReadiness: async () => identityFailure,
+      close: async () => { closed = true; },
+    } as unknown as EdgeCopilotTransport),
+  }), (error: unknown) => {
+    assert.ok(error instanceof AgentError);
+    assert.match(error.message, /stopped being ready/iu);
+    assert.equal(error.details.diagnosticCode, "IDENTITY_NOT_VERIFIED");
+    assert.equal(error.details.state, "identity-unverified");
+    assert.deepEqual(error.details.missingSignals, ["identity"]);
+    return true;
+  });
+
+  assert.equal(closed, true);
+  await assert.rejects(readFile(paths.browser), { code: "ENOENT" });
+  await assert.rejects(readFile(paths.organizationPolicy), { code: "ENOENT" });
 });
 
 test("two-browser setup defaults to Edge and explicit automation can choose Chrome without UI", async (context) => {
@@ -508,7 +584,7 @@ test("forced setup replaces only a stale pinned UI contract", async (context) =>
       launchBrowser: async (config) => {
         assert.notEqual(config.uiContract.version, validButStaleContract.version);
         return {
-          waitForManualReadiness: async () => ({
+          waitForSetupReadiness: async () => ({
             classification: {
               state: "changed-selector" as const,
               diagnosticCode: "UI_CONTRACT_QUORUM_FAILED",
@@ -964,10 +1040,33 @@ test("no-browser setup offers manual installation selection and never saves befo
       source: "manual",
     }),
     launchBrowser: async () => ({
-      waitForManualReadiness: async () => ({ classification: { state: "signed-out" } }),
+      waitForSetupReadiness: async () => ({
+        classification: {
+          state: "identity-unverified",
+          retryable: false,
+          diagnosticCode: "IDENTITY_NOT_VERIFIED",
+        },
+        diagnostic: {
+          uiContractVersion: "copilot-ui/v1:m365-2026-07-r3",
+          state: "identity-unverified",
+          diagnosticCode: "IDENTITY_NOT_VERIFIED",
+          locatorQuorum: {},
+          summary: "Copilot loaded, but Cope could not verify the configured work account.",
+          next: "Run cope setup --force and enter the exact visible account.",
+          missingSignals: ["identity"],
+        },
+      }),
       close: async () => { closed = true; },
     } as unknown as EdgeCopilotTransport),
-  }), (error: unknown) => error instanceof Error && /did not reach/iu.test(error.message));
+  }), (error: unknown) => {
+    assert.ok(error instanceof AgentError);
+    assert.match(error.message, /did not reach/iu);
+    assert.equal(error.details.diagnosticCode, "IDENTITY_NOT_VERIFIED");
+    assert.equal(error.details.state, "identity-unverified");
+    assert.deepEqual(error.details.missingSignals, ["identity"]);
+    assert.match(String(error.details.next), /exact visible account/u);
+    return true;
+  });
   assert.deepEqual(screens, ["none", "manual-product"]);
   assert.equal(closed, true);
   await assert.rejects(readFile(paths.browser), { code: "ENOENT" });
@@ -1107,7 +1206,7 @@ test("Ctrl+C during manual browser readiness cancels cleanly before persistence"
     discoverBrowsers: async () => [chrome],
     verifyManualBrowser: async (product, executablePath) => ({ ...discoveredBrowser(product, executablePath), source: "manual" }),
     launchBrowser: async () => ({
-      waitForManualReadiness: async (_maxWaitMs?: number, signal?: AbortSignal) => {
+      waitForSetupReadiness: async (_maxWaitMs?: number, signal?: AbortSignal) => {
         process.emit("SIGINT", "SIGINT");
         assert.equal(signal?.aborted, true);
         return { classification: { state: "signed-out" } };
@@ -1119,4 +1218,171 @@ test("Ctrl+C during manual browser readiness cancels cleanly before persistence"
   assert.equal(process.listenerCount("SIGINT"), priorSigintListeners);
   await assert.rejects(readFile(paths.browser), { code: "ENOENT" });
   await assert.rejects(readFile(paths.organizationPolicy), { code: "ENOENT" });
+});
+
+test("setup reports stale recovery before browser discovery, prompts, or launch", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-machine-recovery-preflight-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const stateHome = path.join(root, "state");
+  await mkdir(stateHome, { mode: 0o700 });
+  const host = createStandardUserHost();
+  const paths = configurationPaths(stateHome, host);
+  await mkdir(path.dirname(paths.browser), { recursive: true, mode: 0o700 });
+  await writeFile(paths.browser, "{broken", { encoding: "utf8", mode: 0o600 });
+  const now = "2026-07-24T12:00:00.000Z";
+  const state: SessionState = {
+    schemaVersion: 1,
+    protocolVersion: "cba/1",
+    sessionId: "session_setup_preflight",
+    taskId: "task_setup_preflight",
+    repositoryRoot: path.join(root, "repository"),
+    repositoryFingerprintAtStart: "f".repeat(64),
+    repositoryExcludedStateAtStart: "0".repeat(64),
+    preExistingChanges: [],
+    objective: "Verify browser uptime",
+    acceptanceCriteria: [],
+    mode: "inspect",
+    status: "transport_starting",
+    createdAt: now,
+    updatedAt: now,
+    startedAt: now,
+    policyHashes: {
+      organization: "a".repeat(64),
+      repository: "b".repeat(64),
+      grant: "c".repeat(64),
+    },
+    budgetLimits: { ...DEFAULT_BUDGET_LIMITS },
+    budgetUsage: zeroBudgetUsage(),
+    turnSequence: 0,
+    mutationSequence: 0,
+    pendingOperations: [],
+    completedOperationIds: [],
+    mutations: [],
+    validations: [],
+    protocolRepairStreak: 0,
+  };
+  const store = new SessionStore(stateHome);
+  await store.create(state);
+  await writeRuntimeManifest(store.sessionDirectory(state.sessionId), {
+    schema_version: SESSION_RUNTIME_MANIFEST_VERSION,
+    transport: "edge",
+    browser_config_sha256: "a".repeat(64),
+    created_at: now,
+  });
+
+  let browserWorkStarted = false;
+  await assert.rejects(configureMachine({
+    paths,
+    force: false,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+    browser: "edge",
+    identity: "person@example.com",
+  }, {
+    discoverBrowsers: async () => {
+      browserWorkStarted = true;
+      return [discoveredBrowser("edge")];
+    },
+    promptText: async () => {
+      browserWorkStarted = true;
+      return "person@example.com";
+    },
+    launchBrowser: async () => {
+      browserWorkStarted = true;
+      throw new Error("browser must not launch");
+    },
+  }), (error: unknown) =>
+    error instanceof AgentError &&
+    error.details.diagnosticCode === "BROWSER_CONFIG_RECOVERY_BLOCKED" &&
+    error.details.sessionId === state.sessionId);
+  assert.equal(browserWorkStarted, false);
+  assert.equal(await readFile(paths.browser, "utf8"), "{broken");
+});
+
+test("setup does not advertise resume after incompatible browser identity drift", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "cope-machine-identity-recovery-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const stateHome = path.join(root, "state");
+  await mkdir(stateHome, { mode: 0o700 });
+  const host = createStandardUserHost();
+  const paths = configurationPaths(stateHome, host);
+  const edge = discoveredBrowser("edge");
+  await configureMachine({
+    paths,
+    force: false,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+    browser: "edge",
+    identity: "person@example.com",
+  }, {
+    discoverBrowsers: async () => [edge],
+    verifyManualBrowser: async () => ({ ...edge, source: "manual" }),
+    launchBrowser: async () => readyTransport([]),
+  });
+
+  const browser = JSON.parse(await readFile(paths.browser, "utf8")) as unknown;
+  const now = "2026-07-24T12:00:00.000Z";
+  const state: SessionState = {
+    schemaVersion: 1,
+    protocolVersion: "cba/1",
+    sessionId: "session_browser_identity_drift",
+    taskId: "task_browser_identity_drift",
+    repositoryRoot: path.join(root, "repository"),
+    repositoryFingerprintAtStart: "f".repeat(64),
+    repositoryExcludedStateAtStart: "0".repeat(64),
+    preExistingChanges: [],
+    objective: "Recover after browser replacement",
+    acceptanceCriteria: [],
+    mode: "inspect",
+    status: "transport_starting",
+    createdAt: now,
+    updatedAt: now,
+    startedAt: now,
+    policyHashes: {
+      organization: "a".repeat(64),
+      repository: "b".repeat(64),
+      grant: "c".repeat(64),
+    },
+    budgetLimits: { ...DEFAULT_BUDGET_LIMITS },
+    budgetUsage: zeroBudgetUsage(),
+    turnSequence: 0,
+    mutationSequence: 0,
+    pendingOperations: [],
+    completedOperationIds: [],
+    mutations: [],
+    validations: [],
+    protocolRepairStreak: 0,
+  };
+  const store = new SessionStore(stateHome);
+  await store.create(state);
+  await writeRuntimeManifest(store.sessionDirectory(state.sessionId), {
+    schema_version: SESSION_RUNTIME_MANIFEST_VERSION,
+    transport: "edge",
+    browser_config_sha256: sha256(stableJson(browser)),
+    created_at: now,
+  });
+
+  await assert.rejects(configureMachine({
+    paths,
+    force: false,
+    interactive: false,
+    output: { write: () => undefined },
+    host,
+  }, {
+    verifyManualBrowser: async () => ({
+      ...edge,
+      executableSha256: "b".repeat(64),
+      source: "manual",
+    }),
+  }), (error: unknown) =>
+    error instanceof AgentError &&
+    error.details.diagnosticCode === "BROWSER_CONFIG_RECOVERY_BLOCKED" &&
+    (error.details.sessions as Array<{ reason?: string; next?: string }>)[0]?.reason ===
+      "BROWSER_IDENTITY_CHANGED" &&
+    /cope abort session_browser_identity_drift/u.test(
+      String((error.details.sessions as Array<{ next?: string }>)[0]?.next),
+    ) &&
+    !/cope resume/u.test(JSON.stringify(error.details)));
 });

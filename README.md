@@ -4,6 +4,12 @@ Cope turns Microsoft 365 Copilot Chat into a local coding agent through a visibl
 
 The deterministic harness remains responsible for repository boundaries, permissions, local tools, checkpoints, validation, recovery, and audit records. Copilot supplies the coding judgment through its normal browser UI. Cope does not use private Copilot endpoints, token extraction, network interception, or automated sign-in.
 
+## Current release
+
+The current package version is **0.1.6**. See the
+[Cope 0.1.6 release notes](docs/RELEASE-NOTES-0.1.6.md) for the complete
+interrupted-session recovery and setup/startup concurrency fixes.
+
 ## Install on Windows
 
 Extract the release zip, then double-click:
@@ -13,6 +19,8 @@ install.cmd
 ```
 
 The installer performs a locked dependency install, builds the TypeScript release, creates a packed npm artifact, installs the global `cope` command, and offers to run guided browser setup. It is browser-neutral: it neither chooses nor downloads a browser. The packed install is deliberate. Moving or deleting the extracted release folder later will not break the global command.
+
+The installer also remembers the extracted source folder for local updates. From that checkout, pull or apply the changes you want, then run `cope update` to rebuild and reinstall Cope. Moving or deleting the source folder does not break the installed command, but you must rerun `install.cmd` from the folder's new location before using `cope update` again.
 
 Open a new PowerShell window after installation and run:
 
@@ -131,6 +139,8 @@ cope help advanced
 
 Setup creates local machine policy, browser configuration, and a product-specific dedicated profile, then visibly launches the selected browser for manual sign-in readiness. It asks for the account name or email visibly shown in Microsoft 365 Copilot and uses `https://m365.cloud.microsoft/chat` by default. Credentials, MFA, CAPTCHA, consent, and ordinary-profile import are never automated. For managed automation only, `cope setup --browser edge|chrome` and `--browser-executable <path>` are available; normal users do not need them.
 
+Before setup discovers or launches a browser, Cope checks unfinished live-browser sessions against their pinned runtime and browser configuration. Live session state and its runtime pin are published under the same configuration lock used by setup, so concurrent startup cannot leave setup observing a half-created session. `cope sessions --all` marks a session with `*` when it can be resumed and `!` when recovery is blocked, then prints the exact `resume`, `abort`, or reconciliation action. Setup never silently discards a session or repeats the browser flow while unresolved recovery evidence exists.
+
 Per-project setup is guided automatically. Cope detects useful package scripts such as `test`, `check`, `build`, `typecheck`, and `lint`, then creates `.cba\repository.json`. Inspect mode starts read-only. Edit mode allows project changes subject to the layered policy and task grant.
 
 Run the environment checker at any time:
@@ -178,6 +188,7 @@ Architecture and controls remain documented under `docs`:
 - `docs/WINDOWS-TARGET.md`
 - `docs/MACOS-TARGET.md`
 - `docs/LIVE-PILOT-ACCEPTANCE.md`
+- `docs/RELEASE-NOTES-0.1.6.md`
 
 ## Uninstall
 

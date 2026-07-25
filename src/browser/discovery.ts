@@ -42,6 +42,22 @@ export type BrowserIdentityVerifier = (
   executablePath: string,
 ) => Promise<VerifiedBrowserExecutable>;
 
+/**
+ * A verified, vendor-signed browser may replace itself with a newer release.
+ * Same-version byte changes and version downgrades remain fail-closed.
+ */
+export function isCompatibleBrowserExecutableUpgrade(
+  configuredVersion: string | undefined,
+  configuredExecutableSha256: string | undefined,
+  verifiedVersion: string,
+  verifiedExecutableSha256: string,
+): boolean {
+  if (configuredVersion === undefined || configuredExecutableSha256 === undefined) return true;
+  const comparison = compareBrowserVersions(verifiedVersion, configuredVersion);
+  return comparison > 0 || comparison === 0 &&
+    verifiedExecutableSha256 === configuredExecutableSha256;
+}
+
 export interface BrowserDiscoveryOptions {
   readonly host?: HostPlatform;
   readonly environment?: NodeJS.ProcessEnv;
@@ -380,6 +396,17 @@ export function parseWindowsBrowserIdentityEvidence(
 
 function validVersion(value: string): boolean {
   return /^\d+(?:\.\d+){1,3}$/u.test(value);
+}
+
+function compareBrowserVersions(left: string, right: string): number {
+  const leftParts = left.split(".").map((part) => Number.parseInt(part, 10));
+  const rightParts = right.split(".").map((part) => Number.parseInt(part, 10));
+  const length = Math.max(leftParts.length, rightParts.length);
+  for (let index = 0; index < length; index += 1) {
+    const difference = (leftParts[index] ?? 0) - (rightParts[index] ?? 0);
+    if (difference !== 0) return Math.sign(difference);
+  }
+  return 0;
 }
 
 async function sha256File(filename: string): Promise<string> {

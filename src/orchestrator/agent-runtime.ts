@@ -1,9 +1,12 @@
 import type { AuditLog } from "../audit/audit-log.js";
-import type {
-  CompletedReceiveResult,
-  ModelTransport,
-  ReceiveResult,
-  SubmissionReceipt,
+import {
+  MODEL_TRANSPORT_CONTRACT_VERSION,
+  type CompletedReceiveResult,
+  type ModelTransport,
+  type ReceiveRequest,
+  type ReceiveResult,
+  type SubmissionReceipt,
+  type SubmissionRequest,
 } from "../transport/model-transport.js";
 import { newId, sha256, stableJson } from "../shared/crypto.js";
 import { AgentError, errorMessage } from "../shared/errors.js";
@@ -92,8 +95,7 @@ export class AgentRuntime {
     this.clock = dependencies.clock ?? systemClock;
     const handleCallerAbort = (): void => {
       const reason = interruptionReason(dependencies.signal?.reason, "Caller requested a resumable stop");
-      this.interruption = { status: "paused", reason };
-      this.controller.abort(dependencies.signal?.reason);
+      this.recordInterruption("paused", reason, dependencies.signal?.reason);
       void dependencies.transport.emergencyStop(reason).catch(() => undefined);
     };
     if (dependencies.signal?.aborted === true) handleCallerAbort();
@@ -105,17 +107,28 @@ export class AgentRuntime {
       const startupResult = await this.advanceStartup();
       if (startupResult !== undefined) return startupResult;
       let outbound: string | undefined;
-      let recovered: { readonly turnId: string; readonly response: CompletedReceiveResult } | undefined;
+      let recovered:
+        | {
+            readonly turnId: string;
+            readonly response: CompletedReceiveResult;
+            readonly recoveryReplay: boolean;
+          }
+        | undefined;
       if (this.state.queuedOutbound !== undefined) {
         outbound = await this.readQueuedOutbound();
       } else if (this.state.submission !== undefined && this.state.turnSequence > 0) {
-        const response = await this.recoverExchange();
+        const exchange = await this.recoverExchange();
+        const response = exchange.result;
         if (response.status !== "completed") {
           const terminal = await this.handleTransportResult(response);
           if (terminal) return terminal;
           throw new AgentError("TRANSPORT_INDETERMINATE", `Unhandled recovered transport state ${response.status}`);
         }
-        recovered = { turnId: this.state.submission.turnId, response };
+        recovered = {
+          turnId: this.state.submission.turnId,
+          response,
+          recoveryReplay: exchange.recoveryReplay,
+        };
       } else if (this.state.turnSequence === 0) {
         const bootstrap = this.dependencies.protocol.renderBootstrap({
           sessionId: this.state.sessionId,
@@ -134,9 +147,11 @@ export class AgentRuntime {
       while (!this.controller.signal.aborted) {
         let turnId: string;
         let response: ReceiveResult;
+        let recoveryReplay = false;
         if (recovered !== undefined) {
           turnId = recovered.turnId;
           response = recovered.response;
+          recoveryReplay = recovered.recoveryReplay;
           recovered = undefined;
         } else {
           if (outbound === undefined) {
@@ -155,6 +170,7 @@ export class AgentRuntime {
           response = await this.exchange(turnId, outbound);
           outbound = undefined;
         }
+        if (this.interruption !== undefined) return await this.finishInterruption();
         if (response.status !== "completed") {
           const terminal = await this.handleTransportResult(response);
           if (terminal) return terminal;
@@ -176,15 +192,16 @@ export class AgentRuntime {
           messages = this.dependencies.protocol.parseModelTurn(response.content, {
             taskId: this.state.taskId,
             turnId,
-            ...(response.responseId.startsWith("recovered_") ? { recoveryReplay: true } : {}),
+            ...(recoveryReplay ? { recoveryReplay: true } : {}),
           }).messages;
           this.state.protocolRepairStreak = 0;
         } catch (error) {
           const repairable = this.dependencies.protocol.isRepairableParseError(error);
-          if (repairable) {
-            this.meter.consume("protocolRepairs");
-            this.state.protocolRepairStreak += 1;
-          }
+          const repairAttempt = repairable ? this.state.protocolRepairStreak + 1 : undefined;
+          const repairBudgetAvailable =
+            repairAttempt !== undefined &&
+            repairAttempt <= this.state.budgetLimits.maxProtocolRepairs &&
+            this.meter.remaining("protocolRepairs") > 0;
           await this.dependencies.audit.append({
             type: "protocol.error",
             taskId: this.state.taskId,
@@ -192,7 +209,14 @@ export class AgentRuntime {
             data: {
               error: errorMessage(error),
               repairable,
-              ...(repairable ? { repairAttempt: this.state.protocolRepairStreak } : {}),
+              ...(repairAttempt === undefined
+                ? {}
+                : {
+                    repairAttempt,
+                    repairBudgetAvailable,
+                    repairBudgetUsed: this.state.budgetUsage.protocolRepairs,
+                    repairBudgetLimit: this.state.budgetLimits.maxProtocolRepairs,
+                  }),
             },
           });
           if (!repairable) {
@@ -203,9 +227,15 @@ export class AgentRuntime {
               { cause: error },
             );
           }
-          if (this.state.protocolRepairStreak > this.state.budgetLimits.maxProtocolRepairs) {
-            throw new AgentError("PROTOCOL_INVALID", "Copilot exceeded the consecutive protocol-repair limit");
+          if (!repairBudgetAvailable || repairAttempt === undefined) {
+            throw new AgentError("PROTOCOL_INVALID", "Copilot exhausted the protocol-repair budget", {
+              repairAttempt,
+              used: this.state.budgetUsage.protocolRepairs,
+              limit: this.state.budgetLimits.maxProtocolRepairs,
+            });
           }
+          this.meter.consume("protocolRepairs");
+          this.state.protocolRepairStreak = repairAttempt;
           outbound = await this.serializeForDisclosure(
             this.dependencies.protocol.renderProtocolError({
               taskId: this.state.taskId,
@@ -251,14 +281,12 @@ export class AgentRuntime {
   }
 
   public async emergencyStop(reason: string): Promise<void> {
-    this.interruption = { status: "aborted", reason };
-    this.controller.abort(reason);
+    this.recordInterruption("aborted", reason);
     await this.dependencies.transport.emergencyStop(reason);
   }
 
   public async requestPause(reason: string): Promise<void> {
-    this.interruption = { status: "paused", reason };
-    this.controller.abort(reason);
+    this.recordInterruption("paused", reason);
     await this.dependencies.transport.emergencyStop(reason);
   }
 
@@ -338,19 +366,21 @@ export class AgentRuntime {
       data: { submissionId, phase: "prepared", bytes: Buffer.byteLength(content), messageHash: sha256(content) },
     });
 
+    const request: SubmissionRequest = {
+      taskId: this.state.taskId,
+      turnId,
+      submissionId,
+      content,
+      ...(this.state.transportConversationId === undefined
+        ? {}
+        : { expectedConversationId: this.state.transportConversationId }),
+    };
     let receipt = await this.dependencies.transport.submit(
-      {
-        taskId: this.state.taskId,
-        turnId,
-        submissionId,
-        content,
-        ...(this.state.transportConversationId === undefined
-          ? {}
-          : { expectedConversationId: this.state.transportConversationId }),
-      },
+      request,
       { signal: this.controller.signal },
     );
-    receipt = await this.resolveReceipt(receipt, content);
+    this.assertTransportCorrelation(receipt, request, "submission receipt");
+    receipt = await this.resolveReceipt(receipt, request);
     if (receipt.status !== "submitted") {
       throw new AgentError("TRANSPORT_INDETERMINATE", "Submission could not be proven delivered", {
         submissionId,
@@ -365,29 +395,27 @@ export class AgentRuntime {
       submittedAt: receipt.observedAt,
     };
     await this.persist();
-    return this.receiveAndRecord(
-      receipt,
-      turnId,
-      submissionId,
-    );
+    return this.receiveAndRecord(turnId, submissionId);
   }
 
   private async receiveAndRecord(
-    receipt: SubmissionReceipt,
     turnId: string,
     submissionId: string,
   ): Promise<ReceiveResult> {
+    const request: ReceiveRequest = {
+      taskId: this.state.taskId,
+      turnId,
+      submissionId,
+      ...(this.state.transportConversationId === undefined
+        ? {}
+        : { expectedConversationId: this.state.transportConversationId }),
+    };
     const result = await this.dependencies.transport.receive(
-      {
-        taskId: this.state.taskId,
-        turnId,
-        submissionId,
-        ...(this.state.transportConversationId === undefined
-          ? {}
-          : { expectedConversationId: this.state.transportConversationId }),
-      },
+      request,
       { signal: this.controller.signal },
     );
+    this.assertTransportCorrelation(result, request, "receive result");
+    this.bindConversation(result);
     if (result.status === "completed") {
       await this.dependencies.artifacts?.put("response", turnId, result.content);
       if (this.state.submission?.submissionId === submissionId) {
@@ -403,7 +431,10 @@ export class AgentRuntime {
     return result;
   }
 
-  private async recoverExchange(): Promise<ReceiveResult> {
+  private async recoverExchange(): Promise<{
+    readonly result: ReceiveResult;
+    readonly recoveryReplay: boolean;
+  }> {
     const submission = this.state.submission;
     if (submission === undefined) {
       throw new AgentError("RECOVERY_REQUIRED", "No submission is available for recovery");
@@ -411,47 +442,61 @@ export class AgentRuntime {
     if (submission.state === "answered") {
       const content = await this.requireArtifacts().get("response", submission.turnId);
       return {
-        contractVersion: "model-transport/v1",
-        taskId: this.state.taskId,
-        turnId: submission.turnId,
-        submissionId: submission.submissionId,
-        ...(this.state.transportConversationId === undefined
-          ? {}
-          : { expectedConversationId: this.state.transportConversationId }),
-        observedAt: submission.answeredAt ?? this.now(),
-        status: "completed",
-        responseId: `recovered_${submission.turnId}`,
-        content,
+        recoveryReplay: true,
+        result: {
+          contractVersion: MODEL_TRANSPORT_CONTRACT_VERSION,
+          taskId: this.state.taskId,
+          turnId: submission.turnId,
+          submissionId: submission.submissionId,
+          ...(this.state.transportConversationId === undefined
+            ? {}
+            : { conversationId: this.state.transportConversationId }),
+          observedAt: submission.answeredAt ?? this.now(),
+          status: "completed",
+          responseId: `recovered_${submission.turnId}`,
+          content,
+        },
       };
     }
 
     const content = await this.requireArtifacts().get("outbox", submission.submissionId);
+    const contentHash = sha256(content);
+    if (contentHash !== submission.messageHash) {
+      throw new AgentError("RECOVERY_REQUIRED", "Recovered outbound message does not match the durable submission intent", {
+        submissionId: submission.submissionId,
+        expectedMessageHash: submission.messageHash,
+        actualMessageHash: contentHash,
+      });
+    }
+    const request: SubmissionRequest = {
+      taskId: this.state.taskId,
+      turnId: submission.turnId,
+      submissionId: submission.submissionId,
+      content,
+      ...(this.state.transportConversationId === undefined
+        ? {}
+        : { expectedConversationId: this.state.transportConversationId }),
+    };
     let receipt = await this.dependencies.transport.resolveSubmission(
       {
-        taskId: this.state.taskId,
-        turnId: submission.turnId,
-        submissionId: submission.submissionId,
-        ...(this.state.transportConversationId === undefined
+        taskId: request.taskId,
+        turnId: request.turnId,
+        submissionId: request.submissionId,
+        ...(request.expectedConversationId === undefined
           ? {}
-          : { expectedConversationId: this.state.transportConversationId }),
+          : { expectedConversationId: request.expectedConversationId }),
       },
       { signal: this.controller.signal },
     );
+    this.assertTransportCorrelation(receipt, request, "submission resolution");
     if (receipt.status === "not-submitted") {
       receipt = await this.dependencies.transport.submit(
-        {
-          taskId: this.state.taskId,
-          turnId: submission.turnId,
-          submissionId: submission.submissionId,
-          content,
-          ...(this.state.transportConversationId === undefined
-            ? {}
-            : { expectedConversationId: this.state.transportConversationId }),
-        },
+        request,
         { signal: this.controller.signal },
       );
+      this.assertTransportCorrelation(receipt, request, "recovery submission receipt");
     }
-    receipt = await this.resolveReceipt(receipt, content);
+    receipt = await this.resolveReceipt(receipt, request);
     if (receipt.status !== "submitted") {
       throw new AgentError("TRANSPORT_INDETERMINATE", "Recovery could not prove submission delivery", {
         status: receipt.status,
@@ -464,7 +509,10 @@ export class AgentRuntime {
       submittedAt: receipt.observedAt,
     };
     await this.persist();
-    return this.receiveAndRecord(receipt, submission.turnId, submission.submissionId);
+    return {
+      result: await this.receiveAndRecord(submission.turnId, submission.submissionId),
+      recoveryReplay: false,
+    };
   }
 
   private async queueOutbound(content: string, turnId: string): Promise<void> {
@@ -479,18 +527,18 @@ export class AgentRuntime {
     await this.persist();
   }
 
-  private bindConversation(receipt: SubmissionReceipt): void {
-    if (receipt.conversationId === undefined) return;
+  private bindConversation(value: { readonly conversationId?: string }): void {
+    if (value.conversationId === undefined) return;
     if (
       this.state.transportConversationId !== undefined &&
-      this.state.transportConversationId !== receipt.conversationId
+      this.state.transportConversationId !== value.conversationId
     ) {
       throw new AgentError("TRANSPORT_INDETERMINATE", "Transport conversation changed during the active task", {
         expectedConversationId: this.state.transportConversationId,
-        actualConversationId: receipt.conversationId,
+        actualConversationId: value.conversationId,
       });
     }
-    this.state.transportConversationId = receipt.conversationId;
+    this.state.transportConversationId = value.conversationId;
   }
 
   private async readQueuedOutbound(): Promise<string> {
@@ -516,7 +564,11 @@ export class AgentRuntime {
     }
   }
 
-  private async resolveReceipt(receipt: SubmissionReceipt, content: string): Promise<SubmissionReceipt> {
+  private async resolveReceipt(
+    receipt: SubmissionReceipt,
+    request: SubmissionRequest,
+  ): Promise<SubmissionReceipt> {
+    this.assertTransportCorrelation(receipt, request, "submission receipt");
     if (receipt.status !== "indeterminate") return receipt;
     if (this.state.submission) {
       this.state.submission = { ...this.state.submission, state: "indeterminate" };
@@ -524,30 +576,68 @@ export class AgentRuntime {
     }
     const resolved = await this.dependencies.transport.resolveSubmission(
       {
-        taskId: receipt.taskId,
-        turnId: receipt.turnId,
-        submissionId: receipt.submissionId,
-        ...(this.state.transportConversationId === undefined
+        taskId: request.taskId,
+        turnId: request.turnId,
+        submissionId: request.submissionId,
+        ...(request.expectedConversationId === undefined
           ? {}
-          : { expectedConversationId: this.state.transportConversationId }),
+          : { expectedConversationId: request.expectedConversationId }),
       },
       { signal: this.controller.signal },
     );
+    this.assertTransportCorrelation(resolved, request, "submission resolution");
     if (resolved.status === "not-submitted") {
-      return this.dependencies.transport.submit(
-        {
-          taskId: receipt.taskId,
-          turnId: receipt.turnId,
-          submissionId: receipt.submissionId,
-          content,
-          ...(this.state.transportConversationId === undefined
-            ? {}
-            : { expectedConversationId: this.state.transportConversationId }),
-        },
+      const retried = await this.dependencies.transport.submit(
+        request,
         { signal: this.controller.signal },
       );
+      this.assertTransportCorrelation(retried, request, "retried submission receipt");
+      return retried;
     }
     return resolved;
+  }
+
+  private assertTransportCorrelation(
+    actual: {
+      readonly contractVersion: string;
+      readonly taskId: string;
+      readonly turnId: string;
+      readonly submissionId: string;
+      readonly conversationId?: string;
+    },
+    expected: {
+      readonly taskId: string;
+      readonly turnId: string;
+      readonly submissionId: string;
+      readonly expectedConversationId?: string;
+    },
+    kind: string,
+  ): void {
+    const expectedConversationId =
+      expected.expectedConversationId ?? this.state.transportConversationId;
+    if (
+      actual.contractVersion !== MODEL_TRANSPORT_CONTRACT_VERSION ||
+      actual.taskId !== expected.taskId ||
+      actual.turnId !== expected.turnId ||
+      actual.submissionId !== expected.submissionId ||
+      (expectedConversationId !== undefined &&
+        actual.conversationId !== undefined &&
+        actual.conversationId !== expectedConversationId)
+    ) {
+      throw new AgentError("TRANSPORT_INDETERMINATE", `${kind} correlation mismatch`, {
+        expectedContractVersion: MODEL_TRANSPORT_CONTRACT_VERSION,
+        actualContractVersion: actual.contractVersion,
+        expectedTaskId: expected.taskId,
+        actualTaskId: actual.taskId,
+        expectedTurnId: expected.turnId,
+        actualTurnId: actual.turnId,
+        expectedSubmissionId: expected.submissionId,
+        actualSubmissionId: actual.submissionId,
+        ...(expectedConversationId === undefined
+          ? {}
+          : { expectedConversationId, actualConversationId: actual.conversationId }),
+      });
+    }
   }
 
   private async handleAction(
@@ -1190,6 +1280,19 @@ export class AgentRuntime {
     }
     if (this.state.status !== "paused") await this.move("paused", interruption.reason);
     return this.result(interruption.reason);
+  }
+
+  private recordInterruption(
+    status: "paused" | "aborted",
+    reason: string,
+    signalReason: unknown = reason,
+  ): void {
+    if (this.interruption?.status !== "aborted") {
+      if (this.interruption === undefined || status === "aborted") {
+        this.interruption = { status, reason };
+      }
+    }
+    if (!this.controller.signal.aborted) this.controller.abort(signalReason);
   }
 
   private async fail(error: unknown): Promise<AgentRunResult> {

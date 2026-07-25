@@ -19,15 +19,21 @@ import {
   classifyCopilotPage,
   groupMatches,
   observeCopilotPage,
+  observeCopilotReadinessPage,
   type PageClassification,
 } from "./classifier.js";
 import {
   conversationIdFromUrl,
   isApprovedUrl,
+  isConfiguredCopilotEntryRoute,
   validateBrowserConfig,
   type CopilotBrowserAdapterConfig,
 } from "./config.js";
-import type { CopilotPageObservation, SemanticPage } from "./contracts.js";
+import type {
+  CopilotPageObservation,
+  CopilotSignal,
+  SemanticPage,
+} from "./contracts.js";
 import { minimalBrowserDiagnostic, type MinimalBrowserDiagnostic } from "./diagnostics.js";
 import {
   assertKillSwitchEnabled,
@@ -47,9 +53,11 @@ interface SubmissionRecord {
   readonly submissionId: string;
   readonly contentSha256: string;
   readonly marker: string;
-  readonly conversationId: string;
+  conversationId: string;
+  conversationMayMaterialize: boolean;
   readonly baselineResponseCount: number;
   readonly baselineResponseSequenceSha256: string;
+  readonly baselineResponseSha256s?: readonly string[];
   readonly baselineKnown: boolean;
   activationAttempted: boolean;
   receipt: SubmissionReceipt;
@@ -111,6 +119,7 @@ export class CopilotBrowserAdapter implements ModelTransport {
   readonly #taskConversations = new Map<string, string>();
   #stopped = false;
   #closed = false;
+  #operationActive = false;
 
   public constructor(
     page: SemanticPage,
@@ -127,8 +136,40 @@ export class CopilotBrowserAdapter implements ModelTransport {
   }
 
   public async inspectState(): Promise<BrowserStateInspection> {
+    return this.#runExclusiveBrowserOperation(() => this.#inspectState());
+  }
+
+  /**
+   * Manual setup can follow a provenance-validated external identity-provider
+   * page without reading its DOM. Once the handoff ends, the normal complete
+   * Copilot readiness observation runs again before setup can be persisted.
+   */
+  public async inspectManualReadinessState(
+    holdForManualHandoff: () => Promise<boolean>,
+    manualHandoffStillActive?: () => boolean,
+    signal?: AbortSignal,
+  ): Promise<BrowserStateInspection> {
+    return this.#runExclusiveBrowserOperation(async () => {
+      this.#assertUsable(signal);
+      if (await holdForManualHandoff()) {
+        this.#assertUsable(signal);
+        return this.#manualHandoffInspection();
+      }
+      this.#assertUsable(signal);
+      const inspection = await this.#inspectState();
+      if (
+        inspection.classification.state !== "ready" &&
+        manualHandoffStillActive?.() === true
+      ) {
+        return this.#manualHandoffInspection();
+      }
+      return inspection;
+    });
+  }
+
+  async #inspectState(): Promise<BrowserStateInspection> {
     this.#assertUsable();
-    const { observation, classification } = await this.#observe();
+    const { observation, classification } = await this.#observeReadiness();
     return this.#inspection(observation, classification);
   }
 
@@ -137,12 +178,21 @@ export class CopilotBrowserAdapter implements ModelTransport {
     maxWaitMs = this.#config.waits.manualReadinessMs,
     signal?: AbortSignal,
   ): Promise<BrowserStateInspection> {
+    return this.#runExclusiveBrowserOperation(
+      () => this.#waitForManualReadiness(maxWaitMs, signal),
+    );
+  }
+
+  async #waitForManualReadiness(
+    maxWaitMs: number,
+    signal?: AbortSignal,
+  ): Promise<BrowserStateInspection> {
     const boundedWait = Math.min(maxWaitMs, this.#config.waits.manualReadinessMs);
     if (!Number.isFinite(boundedWait) || boundedWait <= 0) {
       throw new TypeError("Manual readiness wait must be positive and bounded");
     }
     const deadline = this.#monotonicNow() + boundedWait;
-    let observed = await this.#observe();
+    let observed = await this.#observeReadiness();
     let inspection = this.#inspection(observed.observation, observed.classification);
     while (inspection.classification.state !== "ready" && this.#monotonicNow() < deadline) {
       const approvedManualAuthenticationRedirect =
@@ -162,7 +212,7 @@ export class CopilotBrowserAdapter implements ModelTransport {
         return inspection;
       }
       await this.#boundedSleep(deadline, signal);
-      observed = await this.#observe();
+      observed = await this.#observeReadiness();
       inspection = this.#inspection(observed.observation, observed.classification);
     }
     return inspection;
@@ -171,6 +221,13 @@ export class CopilotBrowserAdapter implements ModelTransport {
   public async submit(
     request: SubmissionRequest,
     options: TransportCallOptions = {},
+  ): Promise<SubmissionReceipt> {
+    return this.#runExclusiveBrowserOperation(() => this.#submit(request, options));
+  }
+
+  async #submit(
+    request: SubmissionRequest,
+    options: TransportCallOptions,
   ): Promise<SubmissionReceipt> {
     this.#assertUsable(options.signal);
     assertValidCorrelation(request);
@@ -182,7 +239,7 @@ export class CopilotBrowserAdapter implements ModelTransport {
       this.#assertRecordMatches(existing, request, true);
       if (existing.receipt.status === "submitted") return existing.receipt;
       if (existing.receipt.status === "indeterminate") {
-        const resolved = await this.resolveSubmission(request, options);
+        const resolved = await this.#resolveSubmission(request, options);
         if (resolved.status !== "not-submitted") return resolved;
       }
       // A repeated call is an explicit retry and is only allowed after the
@@ -364,6 +421,15 @@ export class CopilotBrowserAdapter implements ModelTransport {
     request: SubmissionResolutionRequest,
     options: TransportCallOptions = {},
   ): Promise<SubmissionReceipt> {
+    return this.#runExclusiveBrowserOperation(
+      () => this.#resolveSubmission(request, options),
+    );
+  }
+
+  async #resolveSubmission(
+    request: SubmissionResolutionRequest,
+    options: TransportCallOptions,
+  ): Promise<SubmissionReceipt> {
     this.#assertUsable(options.signal);
     assertValidCorrelation(request);
     this.#assertKnownCorrelation(request);
@@ -389,25 +455,34 @@ export class CopilotBrowserAdapter implements ModelTransport {
     }
     const conversationId = conversationIdFromUrl(state.observation.url);
     if (
-      request.expectedConversationId !== undefined &&
-      request.expectedConversationId !== conversationId
+      record !== undefined &&
+      record.conversationId !== conversationId &&
+      this.#adoptMaterializedConversation(record, conversationId, recoveredMarker)
     ) {
-      return this.#receipt(
-        request,
-        "indeterminate",
-        conversationId,
-        marker,
-        "CONVERSATION_MISMATCH",
-      );
-    }
-    if (record !== undefined && record.conversationId !== conversationId) {
-      return this.#receipt(
-        request,
-        "indeterminate",
-        conversationId,
-        marker,
-        "CONVERSATION_CHANGED_AFTER_ATTEMPT",
-      );
+      // The first send from M365's entry route materialized a conversation URL
+      // and the exact task marker proves that this is the same submission.
+    } else {
+      if (
+        request.expectedConversationId !== undefined &&
+        request.expectedConversationId !== conversationId
+      ) {
+        return this.#receipt(
+          request,
+          "indeterminate",
+          conversationId,
+          marker,
+          "CONVERSATION_MISMATCH",
+        );
+      }
+      if (record !== undefined && record.conversationId !== conversationId) {
+        return this.#receipt(
+          request,
+          "indeterminate",
+          conversationId,
+          marker,
+          "CONVERSATION_CHANGED_AFTER_ATTEMPT",
+        );
+      }
     }
     if (recoveredMarker.status === "unique" && recoveredMarker.marker === marker) {
       const receipt = this.#receipt(request, "submitted", conversationId, marker, "MARKER_CONFIRMED");
@@ -460,6 +535,13 @@ export class CopilotBrowserAdapter implements ModelTransport {
     request: ReceiveRequest,
     options: TransportCallOptions = {},
   ): Promise<ReceiveResult> {
+    return this.#runExclusiveBrowserOperation(() => this.#receive(request, options));
+  }
+
+  async #receive(
+    request: ReceiveRequest,
+    options: TransportCallOptions,
+  ): Promise<ReceiveResult> {
     if (isAborted(options.signal)) return this.#cancelled(request, "ABORTED");
     try {
       this.#assertUsable(options.signal);
@@ -474,7 +556,7 @@ export class CopilotBrowserAdapter implements ModelTransport {
 
     const record = this.#records.get(request.submissionId);
     if (record !== undefined) this.#assertRecordMatches(record, request, false);
-    const resolution = await this.resolveSubmission(request, options);
+    const resolution = await this.#resolveSubmission(request, options);
     if (resolution.status !== "submitted") {
       return this.#receiveBase(request, {
         status: "blocked",
@@ -503,6 +585,7 @@ export class CopilotBrowserAdapter implements ModelTransport {
     let stableSamples = 0;
     let stableSince = this.#monotonicNow();
     let sawCandidate = false;
+    let markerCurrentlyProven = true;
 
     while (this.#monotonicNow() < deadline) {
       if (isAborted(options.signal)) return this.#cancelled(request, "ABORTED");
@@ -535,17 +618,35 @@ export class CopilotBrowserAdapter implements ModelTransport {
         return this.#blockedForClassification(request, state.classification, conversationId);
       }
       const markerEvidence = taskMarkerEvidence(state.observation, request);
-      if (
-        markerEvidence.status !== "unique" ||
-        markerEvidence.marker !== activeRecord.marker
-      ) {
+      if (markerEvidence.status === "ambiguous") {
         return this.#receiveBase(request, {
           status: "indeterminate",
-          diagnosticCode: markerEvidence.status === "ambiguous"
-            ? "TASK_MARKER_AMBIGUOUS"
-            : "TASK_MARKER_NOT_OBSERVED",
+          diagnosticCode: "TASK_MARKER_AMBIGUOUS",
         }, conversationId);
       }
+      if (markerEvidence.status === "absent") {
+        // The current M365 client briefly unmounts chatQuestion envelopes while
+        // reconciling a newly appended answer. Do not correlate any response
+        // across that evidence gap, but allow the same pinned conversation to
+        // restore the exact immutable marker before the bounded deadline.
+        markerCurrentlyProven = false;
+        lastCandidateSha = undefined;
+        stableSamples = 0;
+        stableSince = this.#monotonicNow();
+        try {
+          await this.#boundedSleep(deadline, options.signal);
+        } catch {
+          return this.#cancelled(request, "ABORTED");
+        }
+        continue;
+      }
+      if (markerEvidence.marker !== activeRecord.marker) {
+        return this.#receiveBase(request, {
+          status: "indeterminate",
+          diagnosticCode: "TASK_MARKER_NOT_OBSERVED",
+        }, conversationId);
+      }
+      markerCurrentlyProven = true;
 
       const correlation = associatedResponse(state.observation, activeRecord);
       if (correlation.status === "indeterminate") {
@@ -592,6 +693,12 @@ export class CopilotBrowserAdapter implements ModelTransport {
         return this.#cancelled(request, "ABORTED");
       }
     }
+    if (!markerCurrentlyProven) {
+      return this.#receiveBase(request, {
+        status: "indeterminate",
+        diagnosticCode: "TASK_MARKER_NOT_OBSERVED",
+      }, activeRecord.conversationId);
+    }
     return this.#receiveBase(request, {
       status: "timed-out",
       diagnosticCode: sawCandidate ? "RESPONSE_INCOMPLETE" : "NO_RESPONSE",
@@ -609,8 +716,28 @@ export class CopilotBrowserAdapter implements ModelTransport {
     this.#closed = true;
   }
 
+  async #runExclusiveBrowserOperation<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.#operationActive) {
+      throw new AgentError(
+        "TRANSPORT_INDETERMINATE",
+        "Another semantic browser operation is already in progress",
+        {
+          diagnosticCode: "CONCURRENT_BROWSER_OPERATION",
+          dispatchAttempted: false,
+        },
+      );
+    }
+    this.#operationActive = true;
+    try {
+      return await operation();
+    } finally {
+      this.#operationActive = false;
+    }
+  }
+
   async #confirmSubmission(record: SubmissionRecord, signal?: AbortSignal): Promise<SubmissionReceipt> {
     const deadline = this.#monotonicNow() + this.#config.waits.submissionConfirmationMs;
+    let markerConfirmedOnEntry = false;
     while (this.#monotonicNow() < deadline) {
       if (signal?.aborted === true || this.#stopped || !this.#killSwitch.status().enabled) {
         return this.#receipt(
@@ -625,6 +752,14 @@ export class CopilotBrowserAdapter implements ModelTransport {
       try {
         state = await this.#observe();
       } catch {
+        if (record.conversationMayMaterialize && this.#monotonicNow() < deadline) {
+          // The entry route can change documents while the first post-click
+          // observation is in flight. No response is trusted from that mixed
+          // snapshot; retry only within the bounded first-send materialization
+          // window and still require the exact marker on the final URL.
+          await this.#boundedSleep(deadline, signal).catch(() => undefined);
+          continue;
+        }
         return this.#receipt(
           record,
           "indeterminate",
@@ -633,15 +768,7 @@ export class CopilotBrowserAdapter implements ModelTransport {
           "SUBMISSION_CONFIRMATION_INTERRUPTED",
         );
       }
-      if (conversationIdFromUrl(state.observation.url) !== record.conversationId) {
-        return this.#receipt(
-          record,
-          "indeterminate",
-          record.conversationId,
-          record.marker,
-          "CONVERSATION_CHANGED_AFTER_ACTIVATION",
-        );
-      }
+      const conversationId = conversationIdFromUrl(state.observation.url);
       const markerEvidence = taskMarkerEvidence(state.observation, record);
       if (markerEvidence.status === "ambiguous") {
         return this.#receipt(
@@ -652,7 +779,34 @@ export class CopilotBrowserAdapter implements ModelTransport {
           "TASK_MARKER_AMBIGUOUS",
         );
       }
+      if (conversationId !== record.conversationId) {
+        if (this.#adoptMaterializedConversation(record, conversationId, markerEvidence)) {
+          return this.#receipt(
+            record,
+            "submitted",
+            record.conversationId,
+            record.marker,
+            "MARKER_CONFIRMED",
+          );
+        }
+        if (record.conversationMayMaterialize && markerEvidence.status === "absent") {
+          await this.#boundedSleep(deadline, signal).catch(() => undefined);
+          continue;
+        }
+        return this.#receipt(
+          record,
+          "indeterminate",
+          record.conversationId,
+          record.marker,
+          "CONVERSATION_CHANGED_AFTER_ACTIVATION",
+        );
+      }
       if (markerEvidence.status === "unique" && markerEvidence.marker === record.marker) {
+        if (record.conversationMayMaterialize) {
+          markerConfirmedOnEntry = true;
+          await this.#boundedSleep(deadline, signal).catch(() => undefined);
+          continue;
+        }
         return this.#receipt(
           record,
           "submitted",
@@ -671,6 +825,67 @@ export class CopilotBrowserAdapter implements ModelTransport {
         );
       }
       await this.#boundedSleep(deadline, signal).catch(() => undefined);
+    }
+    if (markerConfirmedOnEntry) {
+      let finalState: ObservedPageState;
+      try {
+        finalState = await this.#observe();
+      } catch {
+        return this.#receipt(
+          record,
+          "indeterminate",
+          record.conversationId,
+          record.marker,
+          "SUBMISSION_CONFIRMATION_INTERRUPTED",
+        );
+      }
+      const finalConversationId = conversationIdFromUrl(finalState.observation.url);
+      const finalMarkerEvidence = taskMarkerEvidence(finalState.observation, record);
+      if (finalMarkerEvidence.status === "ambiguous") {
+        return this.#receipt(
+          record,
+          "indeterminate",
+          record.conversationId,
+          record.marker,
+          "TASK_MARKER_AMBIGUOUS",
+        );
+      }
+      if (finalConversationId !== record.conversationId) {
+        if (this.#adoptMaterializedConversation(
+          record,
+          finalConversationId,
+          finalMarkerEvidence,
+        )) {
+          return this.#receipt(
+            record,
+            "submitted",
+            record.conversationId,
+            record.marker,
+            "MARKER_CONFIRMED",
+          );
+        }
+        return this.#receipt(
+          record,
+          "indeterminate",
+          record.conversationId,
+          record.marker,
+          "CONVERSATION_CHANGED_AFTER_ACTIVATION",
+        );
+      }
+      if (
+        finalMarkerEvidence.status === "unique" &&
+        finalMarkerEvidence.marker === record.marker
+      ) {
+        record.conversationMayMaterialize = false;
+        this.#taskConversations.set(record.taskId, record.conversationId);
+        return this.#receipt(
+          record,
+          "submitted",
+          record.conversationId,
+          record.marker,
+          "MARKER_CONFIRMED",
+        );
+      }
     }
     return this.#receipt(
       record,
@@ -693,6 +908,18 @@ export class CopilotBrowserAdapter implements ModelTransport {
     return { observation, classification };
   }
 
+  async #observeReadiness(): Promise<ObservedPageState> {
+    this.#assertUsable();
+    const observation = await observeCopilotReadinessPage(this.#page, this.#config.uiContract);
+    this.#assertUsable();
+    const classification = classifyCopilotPage(
+      observation,
+      this.#config.uiContract,
+      this.#config,
+    );
+    return { observation, classification };
+  }
+
   #inspection(
     observation: CopilotPageObservation,
     classification: PageClassification,
@@ -700,6 +927,28 @@ export class CopilotBrowserAdapter implements ModelTransport {
     return {
       classification,
       diagnostic: minimalBrowserDiagnostic(observation, this.#config.uiContract, classification),
+    };
+  }
+
+  #manualHandoffInspection(): BrowserStateInspection {
+    const classification: PageClassification = {
+      state: "sign-in-required",
+      retryable: true,
+      diagnosticCode: "MANUAL_SSO_HANDOFF",
+    };
+    const signals = Object.keys(this.#config.uiContract.groups) as CopilotSignal[];
+    return {
+      classification,
+      diagnostic: {
+        uiContractVersion: this.#config.uiContract.version,
+        state: classification.state,
+        diagnosticCode: classification.diagnosticCode,
+        locatorQuorum: Object.fromEntries(
+          signals.map((signal) => [signal, false] as const),
+        ) as Readonly<Record<CopilotSignal, boolean>>,
+        summary: "The dedicated browser is waiting for manual tenant sign-in.",
+        next: "Complete the visible tenant sign-in and wait for Copilot Chat to return.",
+      },
     };
   }
 
@@ -719,9 +968,16 @@ export class CopilotBrowserAdapter implements ModelTransport {
       contentSha256: sha256(request.content),
       marker,
       conversationId,
+      conversationMayMaterialize:
+        request.expectedConversationId === undefined &&
+        this.#taskConversations.get(request.taskId) === undefined &&
+        isConfiguredCopilotEntryRoute(observation.url, this.#config.entryUrl),
       baselineResponseCount: recoveredBaseline?.responseCount ?? responses.length,
       baselineResponseSequenceSha256: recoveredBaseline?.responseSequenceSha256 ??
         responseSequenceSha256(responses),
+      ...(recoveredBaseline === undefined
+        ? { baselineResponseSha256s: responses.map((response) => sha256(response)) }
+        : {}),
       baselineKnown,
       activationAttempted: false,
       receipt: this.#receipt(request, "not-submitted", conversationId, marker, "NOT_ACTIVATED"),
@@ -749,14 +1005,34 @@ export class CopilotBrowserAdapter implements ModelTransport {
         contentSha256: sha256(request.content),
         marker,
         conversationId,
+        conversationMayMaterialize: false,
         baselineResponseCount: 0,
         baselineResponseSequenceSha256: responseSequenceSha256([]),
+        baselineResponseSha256s: [],
         baselineKnown: false,
         activationAttempted: false,
         receipt,
       });
     }
     return receipt;
+  }
+
+  #adoptMaterializedConversation(
+    record: SubmissionRecord,
+    conversationId: string,
+    markerEvidence: TaskMarkerEvidence,
+  ): boolean {
+    if (
+      !record.conversationMayMaterialize ||
+      markerEvidence.status !== "unique" ||
+      markerEvidence.marker !== record.marker
+    ) {
+      return false;
+    }
+    record.conversationId = conversationId;
+    record.conversationMayMaterialize = false;
+    this.#taskConversations.set(record.taskId, conversationId);
+    return true;
   }
 
   #receipt(
@@ -986,25 +1262,63 @@ function associatedResponse(
   | { readonly status: "candidate"; readonly content: string }
   | { readonly status: "indeterminate"; readonly diagnosticCode: string } {
   const responses = responseEnvelopeTexts(observation);
-  if (responses.length < record.baselineResponseCount) {
-    return { status: "indeterminate", diagnosticCode: "RESPONSE_BASELINE_TRUNCATED" };
+  const baselinePrefixMatches =
+    responses.length >= record.baselineResponseCount &&
+    responseSequenceSha256(responses.slice(0, record.baselineResponseCount)) ===
+      record.baselineResponseSequenceSha256;
+  if (baselinePrefixMatches) {
+    if (responses.length === record.baselineResponseCount) {
+      return { status: "pending" };
+    }
+    if (responses.length !== record.baselineResponseCount + 1) {
+      return { status: "indeterminate", diagnosticCode: "RESPONSE_SEQUENCE_AMBIGUOUS" };
+    }
+    const content = responses[record.baselineResponseCount]!;
+    return content.length === 0
+      ? { status: "pending" }
+      : { status: "candidate", content };
   }
+
+  // M365 virtualizes the oldest assistant envelope once its bounded transcript
+  // window is full. Locally retained per-envelope digests can prove the exact
+  // one-position suffix shift without weakening restart recovery, whose marker
+  // intentionally carries only the aggregate baseline and still fails closed.
+  const baselineDigests = record.baselineResponseSha256s;
   if (
-    responseSequenceSha256(responses.slice(0, record.baselineResponseCount)) !==
-    record.baselineResponseSequenceSha256
+    baselineDigests !== undefined &&
+    baselineDigests.length === record.baselineResponseCount &&
+    baselineDigests.length >= 2
   ) {
-    return { status: "indeterminate", diagnosticCode: "RESPONSE_BASELINE_CHANGED" };
+    const currentDigests = responses.map((response) => sha256(response));
+    const retainedBaseline = baselineDigests.slice(1);
+    if (
+      currentDigests.length === retainedBaseline.length &&
+      digestSequencesEqual(currentDigests, retainedBaseline)
+    ) {
+      return { status: "pending" };
+    }
+    if (
+      currentDigests.length === baselineDigests.length &&
+      digestSequencesEqual(currentDigests.slice(0, -1), retainedBaseline)
+    ) {
+      const content = responses.at(-1)!;
+      return content.length === 0
+        ? { status: "pending" }
+        : { status: "candidate", content };
+    }
   }
-  if (responses.length === record.baselineResponseCount) {
-    return { status: "pending" };
-  }
-  if (responses.length !== record.baselineResponseCount + 1) {
-    return { status: "indeterminate", diagnosticCode: "RESPONSE_SEQUENCE_AMBIGUOUS" };
-  }
-  const content = responses[record.baselineResponseCount]!;
-  return content.length === 0
-    ? { status: "pending" }
-    : { status: "candidate", content };
+
+  return {
+    status: "indeterminate",
+    diagnosticCode: responses.length < record.baselineResponseCount
+      ? "RESPONSE_BASELINE_TRUNCATED"
+      : "RESPONSE_BASELINE_CHANGED",
+  };
+}
+
+function digestSequencesEqual(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length &&
+    left.every((digest, index) => digest === right[index]);
 }
 
 function taskMarkerEvidence(

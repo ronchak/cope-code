@@ -30,7 +30,7 @@ const blockedInspection: BrowserStateInspection = {
     diagnosticCode: "HOST_NOT_APPROVED",
   },
   diagnostic: {
-    uiContractVersion: "copilot-ui/v1:m365-2026-07",
+    uiContractVersion: "copilot-ui/v1:m365-2026-07-r3",
     state: "unapproved-host",
     diagnosticCode: "HOST_NOT_APPROVED",
     locatorQuorum,

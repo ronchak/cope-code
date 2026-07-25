@@ -353,10 +353,22 @@ test("launch reuses a pre-existing external Microsoft authentication page", asyn
   const tracked = await openTrackedCopilotPage(context.asContext(), config);
 
   assert.equal(context.newPageCalls, 0);
-  assert.equal(await tracked.currentUrl(), authUrl);
+  assert.equal(tracked.isManualAuthenticationRedirect(), true);
   assert.ok(authentication.frontCount >= 1);
   assert.equal(authentication.defaultTimeout, config.waits.actionMs);
   assert.equal(authentication.defaultNavigationTimeout, config.waits.actionMs);
+});
+
+test("launch reuses a query-distinguished conversation on the configured path", async () => {
+  const conversation = new FakePage(`${entryUrl}?conversation=existing`);
+  const context = new FakeContext([conversation]);
+  const config = browserConfig();
+
+  const tracked = await openTrackedCopilotPage(context.asContext(), config);
+
+  assert.equal(context.newPageCalls, 0);
+  assert.equal(await tracked.currentUrl(), conversation.currentUrl);
+  assert.ok(conversation.frontCount >= 1);
 });
 
 test("launch gives external authentication ownership over ambiguous chats", async () => {
@@ -375,11 +387,16 @@ test("launch gives external authentication ownership over ambiguous chats", asyn
   const tracked = await openTrackedCopilotPage(context.asContext(), config);
 
   assert.equal(context.newPageCalls, 0);
-  assert.equal(await tracked.currentUrl(), authentication.currentUrl);
+  assert.equal(tracked.isManualAuthenticationRedirect(), true);
   assert.ok(authentication.frontCount >= 1);
 
   authentication.closed = true;
-  assert.equal(await tracked.currentUrl(), olderAuthentication.currentUrl);
+  assert.equal(
+    await tracked.withManualReadinessProbe(() =>
+      tracked.holdForManualAuthenticationHandoff(true)),
+    true,
+  );
+  assert.ok(olderAuthentication.frontCount >= 1);
 
   olderAuthentication.closed = true;
   await assert.rejects(
@@ -425,13 +442,21 @@ test("tracked semantic page moves to the returned Copilot tab after auth closes"
     config.waits.actionMs,
   );
 
-  assert.equal(await tracked.currentUrl(), authUrl);
+  assert.equal(
+    await tracked.withManualReadinessProbe(() =>
+      tracked.holdForManualAuthenticationHandoff(true)),
+    true,
+  );
   assert.equal(tracked.isManualAuthenticationRedirect(), true);
 
   const approved = new FakePage(`${entryUrl}/conversation/returned`);
   context.pageList.push(approved);
 
-  assert.equal(await tracked.currentUrl(), authUrl);
+  assert.equal(
+    await tracked.withManualReadinessProbe(() =>
+      tracked.holdForManualAuthenticationHandoff(true)),
+    true,
+  );
   authentication.closed = true;
   assert.equal(await tracked.currentUrl(), approved.currentUrl);
   assert.equal(tracked.isManualAuthenticationRedirect(), false);

@@ -8,7 +8,10 @@ import {
   isTerminalManualReadinessState,
   waitForStableManualReadiness,
 } from "../../src/browser/manual-readiness.js";
-import type { BrowserWaitConfig } from "../../src/browser/config.js";
+import {
+  DEFAULT_BROWSER_WAITS,
+  type BrowserWaitConfig,
+} from "../../src/browser/config.js";
 import type { CopilotPageState, PageClassification } from "../../src/browser/classifier.js";
 import type { CopilotSignal } from "../../src/browser/contracts.js";
 import { renderHumanError } from "../../src/cli/friendly-output.js";
@@ -41,6 +44,10 @@ const locatorQuorum: Readonly<Record<CopilotSignal, boolean>> = {
   "service-error": false,
   modal: false,
 };
+
+test("default manual setup allows fifteen minutes for SSO and MFA", () => {
+  assert.equal(DEFAULT_BROWSER_WAITS.manualReadinessMs, 15 * 60 * 1_000);
+});
 
 test("a transient identity miss does not abort visible Edge readiness", async () => {
   let now = 0;
@@ -189,7 +196,7 @@ test("a transient unknown page can hydrate into the certified Copilot surface", 
   assert.equal(now, waits.pollMs);
 });
 
-test("a persistent unknown page returns a bounded diagnostic instead of waiting ten minutes", async () => {
+test("a persistent unknown page returns a bounded diagnostic instead of waiting for the full manual window", async () => {
   let now = 0;
   let calls = 0;
   const unknown = inspection("unknown", "UNKNOWN_PAGE_STATE");
@@ -294,6 +301,20 @@ test("human errors surface the safe browser diagnostic and remediation", () => {
   assert.match(output, /IDENTITY_NOT_VERIFIED/u);
   assert.match(output, /Missing browser signals: identity/u);
   assert.match(output, /cope setup --force/u);
+});
+
+test("human errors expose only the controlled page-change reason", () => {
+  const output = renderHumanError(new AgentError(
+    "TRANSPORT_INDETERMINATE",
+    "The Copilot page changed during semantic readiness inspection",
+    {
+      diagnosticCode: "ACTIVE_PAGE_CHANGED_DURING_OBSERVATION",
+      dispatchAttempted: false,
+      observationChangeReason: "navigation-epoch",
+    },
+  ));
+
+  assert.match(output, /Page-change reason: navigation-epoch/u);
 });
 
 function inspection(state: CopilotPageState, diagnosticCode: string): BrowserStateInspection {

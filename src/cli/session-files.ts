@@ -92,14 +92,19 @@ export async function sourceFileIdentity(filename: string): Promise<{
 
 export function assertBrowserRuntimeManifestMatches(
   manifest: SessionRuntimeManifest,
-  hashes: { readonly browser?: string; readonly browserIdentity?: string },
+  hashes: {
+    readonly browser?: string;
+    readonly browserIdentity?: string;
+    readonly browserIdentityAliases?: readonly string[];
+  },
 ): void {
   if (manifest.browser_config_sha256 !== hashes.browser) {
     throw new AgentError("RECOVERY_REQUIRED", "Browser configuration changed during the session");
   }
   if (
     manifest.browser_identity_sha256 !== undefined &&
-    manifest.browser_identity_sha256 !== hashes.browserIdentity
+    manifest.browser_identity_sha256 !== hashes.browserIdentity &&
+    !(hashes.browserIdentityAliases ?? []).includes(manifest.browser_identity_sha256)
   ) {
     throw new AgentError("RECOVERY_REQUIRED", "Verified browser identity changed during the session");
   }

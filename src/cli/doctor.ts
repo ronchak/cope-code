@@ -20,12 +20,18 @@ import {
 import { verifyDedicatedProfileRoot, verifyPrivateStateHome } from "../platform/private-storage.js";
 import {
   browserProductPresentation,
+  isCompatibleBrowserExecutableUpgrade,
   otherDedicatedBrowserProfileRoots,
   resolveSafeBrowserProfileDirectory,
   verifyDedicatedProfileMarker,
   verifyManualBrowserExecutable,
   type BrowserIdentityVerifier,
 } from "../browser/index.js";
+import {
+  liveBrowserSetupBlockers,
+  recoveryReasonSummary,
+  scanSessionRecovery,
+} from "./session-recovery.js";
 
 interface Check {
   readonly name: string;
@@ -109,14 +115,50 @@ export async function executeDoctorCommand(
   } catch (error) {
     checks.push({ name: "State privacy", ok: false, detail: errorMessage(error), required: true });
   }
+  let recoveryBlocksSetup = false;
+  try {
+    const recoveryBlockers = liveBrowserSetupBlockers(
+      await scanSessionRecovery(
+        paths.stateHome,
+        host,
+        undefined,
+        dependencies.browserIdentityVerifier,
+      ),
+    );
+    recoveryBlocksSetup = recoveryBlockers.length > 0;
+    for (const recovery of recoveryBlockers) {
+      checks.push({
+        name: "Session recovery",
+        ok: false,
+        detail: `${recovery.objective} (${recovery.sessionId}, ${recovery.status}): ` +
+          `${recoveryReasonSummary(recovery.reason)}. Next: ${recovery.next ?? "inspect and reconcile the session"}`,
+        required: true,
+        evidence: recovery,
+      });
+    }
+  } catch (error) {
+    recoveryBlocksSetup = true;
+    checks.push({
+      name: "Session recovery",
+      ok: false,
+      detail: `Unable to assess saved sessions safely: ${errorMessage(error)}`,
+      required: true,
+    });
+  }
   const machine = await inspectMachineConfiguration(paths);
   checks.push({
     name: "Browser setup",
     ok: machine.valid,
     detail: machine.valid
       ? paths.browser
-      : `${machine.problems.join(" ")} Install Microsoft Edge Stable or Google Chrome Stable, then run cope setup.`,
-    summary: machine.valid ? "configured" : "missing or invalid; run cope setup",
+      : recoveryBlocksSetup
+        ? `${machine.problems.join(" ")} Resolve Session recovery above, then run cope setup.`
+        : `${machine.problems.join(" ")} Install Microsoft Edge Stable or Google Chrome Stable, then run cope setup.`,
+    summary: machine.valid
+      ? "configured"
+      : recoveryBlocksSetup
+        ? "missing or invalid; resolve session recovery before setup"
+        : "missing or invalid; run cope setup",
     required: true,
   });
 
@@ -133,12 +175,13 @@ export async function executeDoctorCommand(
             : { identityVerifier: dependencies.browserIdentityVerifier }),
         },
       );
-      if (
-        parsed.config.browserVersion !== undefined && parsed.config.browserVersion !== verified.version ||
-        parsed.config.browserExecutableSha256 !== undefined &&
-          parsed.config.browserExecutableSha256 !== verified.executableSha256
-      ) {
-        throw new Error("Configured browser version or executable digest changed after setup; run cope setup to verify the update");
+      if (!isCompatibleBrowserExecutableUpgrade(
+        parsed.config.browserVersion,
+        parsed.config.browserExecutableSha256,
+        verified.version,
+        verified.executableSha256,
+      )) {
+        throw new Error("Configured browser version or executable digest changed incompatibly after setup; run cope setup to verify the browser");
       }
       const presentation = browserProductPresentation(parsed.config.product);
       const support = parsed.config.product === "chrome"

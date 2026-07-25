@@ -5,12 +5,14 @@ import {
   DEFAULT_BROWSER_WAITS,
   createBaselineCopilotUiContract,
   isBrowserProduct,
+  isCompatibleBrowserExecutableUpgrade,
   otherDedicatedBrowserProfileRoots,
   resolveSafeBrowserProfileDirectory,
   validateBrowserLaunchConfig,
   verifyBrowserExecutable,
   type BrowserIdentityVerifier,
   type BrowserLaunchConfig,
+  type VerifiedBrowserExecutable,
 } from "../browser/index.js";
 import { assertValidPolicyDocument, type PolicyDocument } from "../policy/index.js";
 import { sha256, stableJson } from "../shared/crypto.js";
@@ -59,6 +61,7 @@ export async function loadRuntimeConfiguration(
   let browser: (BrowserLaunchConfig & { readonly browserExecutable: string }) | undefined;
   let browserHash: string | undefined;
   let browserIdentityHash: string | undefined;
+  let browserIdentityAliases: readonly string[] | undefined;
   if (options.requireBrowser) {
     const browserRaw = await readJson(browserFile, "browser configuration");
     const parsed = parseBrowserConfig(browserRaw);
@@ -78,11 +81,14 @@ export async function loadRuntimeConfiguration(
         product: parsed.config.product,
       });
     }
-    if (
-      parsed.config.browserVersion !== undefined && parsed.config.browserVersion !== verified.version ||
-      parsed.config.browserExecutableSha256 !== undefined &&
-        parsed.config.browserExecutableSha256 !== verified.executableSha256
-    ) {
+    const configuredVersion = parsed.config.browserVersion;
+    const configuredExecutableSha256 = parsed.config.browserExecutableSha256;
+    if (!isCompatibleBrowserExecutableUpgrade(
+      configuredVersion,
+      configuredExecutableSha256,
+      verified.version,
+      verified.executableSha256,
+    )) {
       throw new AgentError("CONFIG_INVALID", "The configured browser identity changed after setup", {
         diagnosticCode: "BROWSER_EXECUTABLE_EVIDENCE_CHANGED",
         product: parsed.config.product,
@@ -108,12 +114,13 @@ export async function loadRuntimeConfiguration(
       }),
     };
     browserHash = sha256(stableJson(browserRaw));
-    browserIdentityHash = sha256(stableJson({
-      product: verified.product,
-      executable_path: verified.executablePath,
-      version: verified.version,
-      executable_sha256: verified.executableSha256,
-    }));
+    const identityHashes = verifiedBrowserIdentityHashes(
+      parsed.file,
+      parsed.config,
+      verified,
+    );
+    browserIdentityHash = identityHashes.primary;
+    browserIdentityAliases = identityHashes.aliases;
   }
 
   return {
@@ -125,12 +132,49 @@ export async function loadRuntimeConfiguration(
       repository: sha256(stableJson(repositoryRaw)),
       ...(browserHash === undefined ? {} : { browser: browserHash }),
       ...(browserIdentityHash === undefined ? {} : { browserIdentity: browserIdentityHash }),
+      ...(browserIdentityAliases === undefined ? {} : { browserIdentityAliases }),
     },
     files: {
       organization: await canonicalOrResolved(organizationFile),
       repository: await canonicalOrResolved(repositoryFile),
       ...(options.requireBrowser ? { browser: await canonicalOrResolved(browserFile) } : {}),
     },
+  };
+}
+
+export function verifiedBrowserIdentityHashes(
+  file: AnyBrowserFileConfig,
+  config: BrowserLaunchConfig & { readonly browserExecutable: string },
+  verified: VerifiedBrowserExecutable,
+): {
+  readonly primary: string;
+  readonly aliases?: readonly string[];
+} {
+  const releaseIdentityHash = sha256(stableJson({
+    product: verified.product,
+    executable_path: verified.executablePath,
+    version: config.browserVersion ?? verified.version,
+    executable_sha256: config.browserExecutableSha256 ?? verified.executableSha256,
+  }));
+  if (file.schema_version === LEGACY_BROWSER_CONFIG_VERSION) {
+    // Legacy configuration has no durable setup-time version/digest pin.
+    // Keep its session identity release-bound so a running session cannot
+    // silently cross any executable replacement.
+    return { primary: releaseIdentityHash };
+  }
+  return {
+    primary: sha256(stableJson({
+      product: verified.product,
+      executable_path: verified.executablePath,
+      platform: verified.evidence.platform,
+      product_name: verified.evidence.productName,
+      publisher: verified.evidence.publisher,
+      identifier: verified.evidence.identifier,
+      signature_status: verified.evidence.signatureStatus,
+    })),
+    // Sessions created before stable signed-identity hashing used the
+    // setup-pinned release tuple. Accept that exact legacy identity once.
+    aliases: [releaseIdentityHash],
   };
 }
 

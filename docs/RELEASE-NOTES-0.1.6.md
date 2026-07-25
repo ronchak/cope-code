@@ -1,0 +1,65 @@
+# Cope 0.1.6
+
+Cope 0.1.6 hardens recovery across rapid upgrades and interrupted
+live-browser starts. It replaces status-only guesses with one shared static
+assessment and gives operators an exact recovery action before setup launches
+a browser.
+
+## Session recovery
+
+- Setup scans unfinished live-browser sessions before discovery, prompts, or
+  launch. That early scan is ordered through the browser-configuration lock,
+  and setup repeats the scan while holding the commit lock.
+- New live sessions use that same lock to publish session state and its pinned
+  runtime manifest as one configuration transaction. Concurrent setup either
+  commits first, leaving no partial session, observes a fully recoverable
+  session, or deflects with `BROWSER_CONFIG_LOCKED` while publication owns the
+  lock; it cannot strand the state between those outcomes.
+- `cope sessions --all` distinguishes resume candidates (`*`) from blocked
+  recovery (`!`) and explains the reason and exact next command.
+- `cope resume <session-id>` checks recovery inputs before loading browser
+  configuration, replacing raw missing-file errors with a stable Cope
+  diagnostic.
+- `cope doctor` reports session recovery before browser setup, avoiding the
+  previous loop in which setup asked for a session action that other commands
+  could not clearly perform.
+- Explicit `cope abort <session-id>` remains configuration-independent.
+  `cope abort --all` is rejected because sessions with mutation evidence need
+  individual reconciliation rather than bulk disposal.
+- Incompatible browser executable identity drift can no longer produce a
+  misleading resume action in setup, sessions, doctor, or resume preflight.
+  The shared assessment verifies the current local executable and its runtime
+  identity pin, then uses the same abort-or-reconcile safety path as invalid
+  browser configuration. Compatible signed upgrades remain resumable.
+- A session file whose embedded ID disagrees with its directory is surfaced as
+  unreadable under the directory ID, preserving the exact recovery target.
+
+## Recovery model
+
+The shared assessment derives one of four dispositions from persisted session
+state, runtime pins, browser-configuration integrity, current locally verified
+browser-executable identity, and mutation evidence: `terminal`,
+`resume_candidate`, `abort_required`, or `reconcile_required`. Passing the
+assessment does not bypass the existing audit, repository, ownership, runtime,
+or live-page checks.
+
+Sessions interrupted in `created` or `preflight` are never advertised as
+resumable, even if a legacy startup already wrote a runtime pin. New sessions
+persist `grant_pending` before making that pin readable, eliminating the
+pre-grant resume gap.
+
+This release does not add new Microsoft 365 identity heuristics or automate
+credentials, MFA, consent, or profile import. The product-specific dedicated
+browser profile remains the durable authentication boundary. Cope continues to
+verify live page readiness when work begins without making setup depend on
+every transient page presentation.
+
+## Verification
+
+- Recovery classification covers matching, missing, invalid, changed, and
+  unreadable inputs, with and without mutation evidence.
+- CLI regressions cover early setup blocking, session markers and JSON,
+  configuration-independent abort, resume diagnostics, doctor ordering,
+  executable identity drift, mismatched session IDs, and unsafe bulk-abort
+  rejection.
+- The build, complete deterministic unit suite, and end-to-end CLI suite pass.
