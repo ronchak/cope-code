@@ -93,10 +93,13 @@ test("manual browser selection verifies identity and missing executables fail cl
   );
   assert.equal(selected.source, "manual");
   assert.equal(selected.product, "chrome");
+  const expectedDiagnostic = process.platform === "darwin" || process.platform === "win32"
+    ? "BROWSER_EXECUTABLE_UNAVAILABLE"
+    : "BROWSER_IDENTITY_HOST_UNSUPPORTED";
   await assert.rejects(
     verifyManualBrowserExecutable("chrome", "/definitely/missing/Google Chrome"),
     (error: unknown) =>
-      error instanceof AgentError && error.details.diagnosticCode === "BROWSER_EXECUTABLE_UNAVAILABLE",
+      error instanceof AgentError && error.details.diagnosticCode === expectedDiagnostic,
   );
 });
 

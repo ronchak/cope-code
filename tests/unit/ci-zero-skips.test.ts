@@ -155,7 +155,8 @@ test("manifested zero-skip runner rejects fewer tests than declared", async (con
 });
 
 test("offline matrix provisions the pinned browser once on every hosted tuple", async () => {
-  const workflow = await readFile(path.resolve(".github/workflows/offline-matrix.yml"), "utf8");
+  const workflow = (await readFile(path.resolve(".github/workflows/offline-matrix.yml"), "utf8"))
+    .replaceAll("\r\n", "\n");
   const tuples = [...workflow.matchAll(/^\s+- tuple: (.+)$/gmu)].map((match) => match[1]);
   assert.deepEqual(tuples, ["linux-x64", "windows-x64", "macos-arm64", "macos-x64"]);
   assert.equal(
