@@ -21,3 +21,24 @@ test("terminal cleanup attempts handoff removal when artifact clearing fails", a
   }), /artifact cleanup failed/u);
   assert.equal(handoffRemovalCalls, 1);
 });
+
+test("terminal cleanup retains approved source artifacts but removes a non-completed handoff", async () => {
+  let artifactClearCalls = 0;
+  let handoffRemovalCalls = 0;
+  await cleanupTerminalRecoveryArtifacts({
+    status: "aborted",
+    retainSourceArtifacts: true,
+    artifacts: {
+      clear: async () => {
+        artifactClearCalls += 1;
+      },
+    },
+    completionHandoffs: {
+      remove: async () => {
+        handoffRemovalCalls += 1;
+      },
+    },
+  });
+  assert.equal(artifactClearCalls, 0);
+  assert.equal(handoffRemovalCalls, 1);
+});

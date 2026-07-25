@@ -15,9 +15,11 @@ export interface TerminalCleanupDependencies {
 export async function cleanupTerminalRecoveryArtifacts(
   dependencies: TerminalCleanupDependencies,
 ): Promise<void> {
-  if (!isTerminal(dependencies.status) || dependencies.retainSourceArtifacts) return;
+  if (!isTerminal(dependencies.status)) return;
   const cleanup: Promise<void>[] = [];
-  if (dependencies.artifacts !== undefined) cleanup.push(dependencies.artifacts.clear());
+  if (!dependencies.retainSourceArtifacts && dependencies.artifacts !== undefined) {
+    cleanup.push(dependencies.artifacts.clear());
+  }
   if (dependencies.status !== "completed" && dependencies.completionHandoffs !== undefined) {
     cleanup.push(dependencies.completionHandoffs.remove());
   }
