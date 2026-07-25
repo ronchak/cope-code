@@ -7,6 +7,9 @@ import {
   renderBootstrapContract,
   renderProtocolReminder,
   serializeProtocolEnvelope,
+  isLocalToolName,
+  isOrchestratorToolName,
+  isToolName,
   type CapabilityRequestMessage,
   type CompleteTaskArguments,
   type CompletionMessage,
@@ -14,6 +17,7 @@ import {
   type ProtocolErrorCode,
   type ProtocolMessage,
   type RequestCapabilityArguments,
+  type OrchestratorToolName,
   type ToolName as WireToolName,
   type ToolOperation,
   type ToolOutcomeStatus,
@@ -169,15 +173,17 @@ function normalizeMessage(message: ProtocolMessage): NormalizedModelMessage {
   switch (message.message_type) {
     case "tool_request": {
       const operation = message.operations[0];
-      if (message.operations.length === 1 && operation !== undefined) {
-        if (operation.tool === "request_user_input") return normalizeUserInput(operation);
-        if (operation.tool === "request_capability") return normalizeCapability(operation.operation_id, operation.arguments);
-        if (operation.tool === "complete_task") return normalizeCompletion(operation.operation_id, operation.arguments);
+      if (
+        message.operations.length === 1 &&
+        operation !== undefined &&
+        isOrchestratorOperation(operation)
+      ) {
+        return normalizeOrchestratorTool(operation);
       }
       return {
         type: "tool_request",
         calls: message.operations.map((entry) => {
-          if (entry.tool === "request_user_input" || entry.tool === "request_capability" || entry.tool === "complete_task") {
+          if (!isLocalToolName(entry.tool)) {
             throw new AgentError("PROTOCOL_INVALID", `${entry.tool} must be requested alone`);
           }
           return {
@@ -213,6 +219,25 @@ function normalizeMessage(message: ProtocolMessage): NormalizedModelMessage {
     case "tool_denial":
     case "protocol_error":
       throw new AgentError("PROTOCOL_INVALID", `Model cannot send harness message type ${message.message_type}`);
+  }
+}
+
+function isOrchestratorOperation(
+  operation: ToolOperation,
+): operation is ToolOperation<OrchestratorToolName> {
+  return isOrchestratorToolName(operation.tool);
+}
+
+function normalizeOrchestratorTool(
+  operation: ToolOperation<OrchestratorToolName>,
+): NormalizedModelMessage {
+  switch (operation.tool) {
+    case "request_user_input":
+      return normalizeUserInput(operation);
+    case "request_capability":
+      return normalizeCapability(operation.operation_id, operation.arguments);
+    case "complete_task":
+      return normalizeCompletion(operation.operation_id, operation.arguments);
   }
 }
 
@@ -305,7 +330,7 @@ function strings(value: unknown): readonly string[] {
 
 function wireTools(value: unknown): readonly WireToolName[] | undefined {
   if (!Array.isArray(value)) return undefined;
-  return value.filter((entry): entry is WireToolName => typeof entry === "string") as readonly WireToolName[];
+  return value.filter(isToolName);
 }
 
 function mode(value: unknown): "inspect" | "edit" | "auto" {

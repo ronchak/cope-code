@@ -16,6 +16,7 @@ import type { OperationJournal, OperationRecord } from "../session/operation-jou
 import type { SessionStore } from "../session/store.js";
 import { transitionSession } from "../session/state-machine.js";
 import type { SessionState } from "../session/types.js";
+import { isBatchableToolName, isReadOnlyToolName } from "../protocol/types.js";
 import {
   verifyCompletion,
   type CompletionClaim,
@@ -32,8 +33,6 @@ import type {
   ToolOutcome,
   UserInteraction,
 } from "./contracts.js";
-
-const READ_ONLY_TOOLS = new Set(["list_files", "search_text", "read_file", "git_status", "git_diff"]);
 
 export interface AgentRuntimeDependencies {
   readonly state: SessionState;
@@ -805,7 +804,7 @@ export class AgentRuntime {
   }
 
   private async executeCalls(calls: readonly NormalizedToolCall[], turnId: string): Promise<readonly ToolOutcome[]> {
-    if (calls.length > 1 && calls.some((call) => !READ_ONLY_TOOLS.has(call.name))) {
+    if (calls.length > 1 && calls.some((call) => !isBatchableToolName(call.name))) {
       return calls.map((call) => ({
         operationId: call.operationId,
         tool: call.name,
@@ -842,7 +841,7 @@ export class AgentRuntime {
   }
 
   private async executeCall(call: NormalizedToolCall, turnId: string): Promise<ToolOutcome> {
-    const mutating = !READ_ONLY_TOOLS.has(call.name);
+    const mutating = !isReadOnlyToolName(call.name);
     const operationAlreadyAccounted =
       this.state.completedOperationIds.includes(call.operationId) ||
       this.state.pendingOperations.some((operation) => operation.operationId === call.operationId);

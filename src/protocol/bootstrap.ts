@@ -1,19 +1,14 @@
 import { stableJson } from "../shared/crypto.js";
 import { TOOL_ARGUMENT_SCHEMAS } from "./schemas.js";
-import { PROTOCOL_VERSION, TOOL_NAMES, type BudgetMetric, type ToolName } from "./types.js";
-
-const TOOL_DESCRIPTIONS: Readonly<Record<ToolName, string>> = {
-  list_files: "List a bounded repository-relative directory view.",
-  search_text: "Search approved text and return bounded, located excerpts.",
-  read_file: "Read an approved text file or bounded line range with file-state metadata.",
-  git_status: "Inspect branch, revision, working-tree, conflict, and pre-existing-change state.",
-  git_diff: "Inspect a bounded diff against an approved local baseline.",
-  apply_patch: "Atomically create, hash-guardedly update, or hash-guardedly delete approved text files.",
-  run_command: "Run one policy-catalog command with only its approved typed parameters.",
-  request_user_input: "Pause for genuinely missing information or a necessary development decision.",
-  request_capability: "Request one specific, bounded expansion of the active session grant.",
-  complete_task: "Submit an advisory completion report for independent harness verification.",
-};
+import {
+  PROTOCOL_VERSION,
+  TOOL_NAMES,
+  TOOL_REGISTRY,
+  isBatchableToolName,
+  isToolName,
+  type BudgetMetric,
+  type ToolName,
+} from "./types.js";
 
 export interface BootstrapPolicySummary {
   readonly mode: "inspect" | "edit" | "auto";
@@ -51,9 +46,10 @@ export function getBootstrapToolDefinitions(
 ): readonly BootstrapToolDefinition[] {
   const unique = new Set<ToolName>();
   return tools.map((tool) => {
+    if (!isToolName(tool)) throw new TypeError(`Unknown bootstrap tool '${String(tool)}'`);
     if (unique.has(tool)) throw new TypeError(`Duplicate bootstrap tool '${tool}'`);
     unique.add(tool);
-    const base = { name: tool, purpose: TOOL_DESCRIPTIONS[tool] } as const;
+    const base = { name: tool, purpose: TOOL_REGISTRY[tool].purpose } as const;
     return includeArgumentSchemas ? { ...base, arguments_schema: TOOL_ARGUMENT_SCHEMAS[tool] } : base;
   });
 }
@@ -61,6 +57,31 @@ export function getBootstrapToolDefinitions(
 export function renderBootstrapContract(options: BootstrapContractOptions): string {
   const tools = options.tools ?? TOOL_NAMES;
   const definitions = getBootstrapToolDefinitions(tools, options.include_argument_schemas ?? true);
+  const exampleTool = tools[0];
+  const requestExample = exampleTool === undefined
+    ? []
+    : [
+        "Tool request shape:",
+        "```json",
+        stableJson({
+          protocol: PROTOCOL_VERSION,
+          message_type: "tool_request",
+          message_id: "msg_unique",
+          task_id: options.task_id,
+          turn_id: options.first_turn_id,
+          operations: [{
+            operation_id: "op_unique",
+            tool: exampleTool,
+            arguments: TOOL_REGISTRY[exampleTool].bootstrap_example,
+          }],
+        }),
+        "```",
+        "",
+      ];
+  const batchableTools = tools.filter(isBatchableToolName);
+  const batchGuidance = batchableTools.length === 0
+    ? "No currently granted tool is batchable. Request every operation alone so you can observe each material result before deciding the next action. Never retry an operation_id."
+    : `You may batch only independent operations marked batchable in the active tool catalog (${batchableTools.join(", ")}). Request all other tools alone so you can observe each material result before deciding the next action. Never retry an operation_id.`;
   const taskData = {
     session_id: options.session_id,
     task_id: options.task_id,
@@ -79,19 +100,8 @@ export function renderBootstrapContract(options: BootstrapContractOptions): stri
     "",
     "For every machine action, emit exactly one complete fenced JSON envelope. The opening line must be exactly ```cba/1 and the closing line exactly ```. Prose may appear outside, but never emit a second cba envelope. JSON must use protocol='cba/1', the active task_id, the expected numeric turn_id, a unique message_id, and globally unique operation_id values.",
     "",
-    "Tool request shape:",
-    "```json",
-    stableJson({
-      protocol: PROTOCOL_VERSION,
-      message_type: "tool_request",
-      message_id: "msg_unique",
-      task_id: options.task_id,
-      turn_id: options.first_turn_id,
-      operations: [{ operation_id: "op_unique", tool: "list_files", arguments: { path: "." } }],
-    }),
-    "```",
-    "",
-    "You may batch only independent read-only operations (list_files, search_text, read_file, git_status, git_diff). Request apply_patch, run_command, request_user_input, request_capability, and complete_task alone so you can observe each material result before deciding the next action. Never retry an operation_id.",
+    ...requestExample,
+    batchGuidance,
     "",
     "Use request_user_input only for information or judgment unavailable through repository tools. Use request_capability for a specific scope expansion. Use complete_task only after inspecting actual state and validation results; its claim remains advisory until independently verified. If completion is impossible, emit one blocked message with a precise reason and what is needed.",
     "",

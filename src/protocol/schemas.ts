@@ -242,7 +242,13 @@ const completeTaskSchema = strictObject(
   ["summary", "acceptance_criteria", "validation", "skipped_validation", "remaining_risks", "follow_up"],
 );
 
-export const TOOL_ARGUMENT_SCHEMAS: Readonly<Record<ToolName, JsonSchema>> = {
+function deepFreeze<T>(value: T): T {
+  if (value === null || typeof value !== "object" || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value as Readonly<Record<string, unknown>>)) deepFreeze(child);
+  return Object.freeze(value);
+}
+
+export const TOOL_ARGUMENT_SCHEMAS = deepFreeze({
   list_files: listFilesSchema,
   search_text: searchTextSchema,
   read_file: readFileSchema,
@@ -253,7 +259,7 @@ export const TOOL_ARGUMENT_SCHEMAS: Readonly<Record<ToolName, JsonSchema>> = {
   request_user_input: requestUserInputSchema,
   request_capability: requestCapabilitySchema,
   complete_task: completeTaskSchema,
-};
+} as const satisfies Readonly<Record<ToolName, JsonSchema>>);
 
 const baseProperties = {
   protocol: { const: PROTOCOL_VERSION },
