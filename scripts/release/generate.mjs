@@ -60,26 +60,26 @@ export async function generateRelease(options, environment = process.env, capabi
       lockDocument?.packages?.[""]?.version !== packageDocument.version) {
     throw new Error("package-lock.json release identity does not match package.json");
   }
-  for (const field of ["dependencies", "optionalDependencies", "peerDependencies"]) {
+  for (const field of ["dependencies", "optionalDependencies", "peerDependencies", "peerDependenciesMeta"]) {
     if (canonicalJson(packageDocument[field] ?? {}) !==
         canonicalJson(lockDocument.packages[""][field] ?? {})) {
       throw new Error(`package-lock.json root ${field} do not match package.json`);
     }
   }
+  validatePeerDependenciesMeta(
+    packageDocument.peerDependenciesMeta ?? {},
+    packageDocument.peerDependencies ?? {},
+    "package.json",
+  );
   const runtimeDeclarations = {
-    ...(packageDocument.peerDependencies ?? {}),
+    ...Object.fromEntries(
+      Object.entries(packageDocument.peerDependencies ?? {})
+        .filter(([name]) => packageDocument.peerDependenciesMeta?.[name]?.optional !== true),
+    ),
     ...(packageDocument.dependencies ?? {}),
     ...(packageDocument.optionalDependencies ?? {}),
   };
-  for (const [dependencyName, declaredSpec] of Object.entries(runtimeDeclarations)) {
-    const resolved = lockDocument.packages[`node_modules/${dependencyName}`];
-    if (resolved === null || typeof resolved !== "object" ||
-        typeof resolved.version !== "string" || resolved.version.length === 0 ||
-        resolved.dev === true) {
-      throw new Error(`package-lock.json does not resolve a runtime package: ${dependencyName}`);
-    }
-    validateResolvedDependency(dependencyName, declaredSpec, resolved);
-  }
+  const runtimePackagePaths = collectRuntimePackagePaths(lockDocument.packages, runtimeDeclarations);
 
   const artifactBytes = await readRegularFile(artifactInput, 128 * 1024 * 1024);
   const archiveInspection = inspectNpmArchive(artifactBytes);
@@ -90,9 +90,17 @@ export async function generateRelease(options, environment = process.env, capabi
     dependencies: packageDocument.dependencies ?? {},
     optionalDependencies: packageDocument.optionalDependencies ?? {},
     peerDependencies: packageDocument.peerDependencies ?? {},
+    peerDependenciesMeta: packageDocument.peerDependenciesMeta ?? {},
   };
   if (canonicalJson(archiveInspection.package) !== canonicalJson(expectedPackageIdentity)) {
     throw new Error("Packed package.json identity does not match the source package metadata");
+  }
+  const archiveEntries = new Map(archiveInspection.entries.map((entry) => [entry.path, entry]));
+  for (const target of new Set(Object.values(archiveInspection.package.bin))) {
+    const entry = archiveEntries.get(`package/${target}`);
+    if (entry === undefined || entry.mode !== 0o755) {
+      throw new Error(`Packed package is missing its executable CLI target: ${target}`);
+    }
   }
   const artifact = {
     path: artifactName,
@@ -123,6 +131,7 @@ export async function generateRelease(options, environment = process.env, capabi
     createdAt,
     lockDocument,
     packageDocument,
+    runtimePackagePaths,
     sourceCommit,
   });
   const sbomBytes = Buffer.from(canonicalJsonLine(sbom));
@@ -164,6 +173,88 @@ export async function generateRelease(options, environment = process.env, capabi
     publisherAuthenticated: false,
     manifestSha256: sha256Bytes(manifestBytes),
   };
+}
+
+function collectRuntimePackagePaths(packages, rootDeclarations) {
+  if (packages === null || typeof packages !== "object" || Array.isArray(packages)) {
+    throw new Error("package-lock.json packages inventory is invalid");
+  }
+  const runtimePaths = new Set();
+  const pending = [];
+  for (const [name, spec] of Object.entries(rootDeclarations)) {
+    pending.push(resolveLockDependency(packages, "", name, spec));
+  }
+  while (pending.length > 0) {
+    const packagePath = pending.pop();
+    if (runtimePaths.has(packagePath)) continue;
+    runtimePaths.add(packagePath);
+    const entry = packages[packagePath];
+    for (const field of ["dependencies", "optionalDependencies"]) {
+      const declarations = entry[field] ?? {};
+      validateLockDependencyMap(declarations, packagePath, field);
+      for (const [name, spec] of Object.entries(declarations)) {
+        pending.push(resolveLockDependency(packages, packagePath, name, spec));
+      }
+    }
+  }
+  return runtimePaths;
+}
+
+function resolveLockDependency(packages, fromPackagePath, dependencyName, declaredSpec) {
+  const candidates = lockResolutionCandidates(fromPackagePath, dependencyName);
+  for (const candidate of candidates) {
+    if (!Object.hasOwn(packages, candidate)) continue;
+    const resolved = packages[candidate];
+    if (resolved === null || typeof resolved !== "object" || Array.isArray(resolved) ||
+        typeof resolved.version !== "string" || resolved.version.length === 0 ||
+        resolved.dev === true) {
+      break;
+    }
+    validateResolvedDependency(dependencyName, declaredSpec, resolved);
+    return candidate;
+  }
+  const context = fromPackagePath === "" ? dependencyName : `${dependencyName} from ${fromPackagePath}`;
+  throw new Error(`package-lock.json does not resolve a runtime package: ${context}`);
+}
+
+function lockResolutionCandidates(fromPackagePath, dependencyName) {
+  if (fromPackagePath === "") return [`node_modules/${dependencyName}`];
+  const candidates = [`${fromPackagePath}/node_modules/${dependencyName}`];
+  let ancestor = fromPackagePath;
+  while (true) {
+    const marker = ancestor.lastIndexOf("/node_modules/");
+    if (marker < 0) {
+      candidates.push(`node_modules/${dependencyName}`);
+      break;
+    }
+    ancestor = ancestor.slice(0, marker);
+    candidates.push(`${ancestor}/node_modules/${dependencyName}`);
+  }
+  return [...new Set(candidates)];
+}
+
+function validateLockDependencyMap(declarations, packagePath, field) {
+  if (declarations === null || typeof declarations !== "object" || Array.isArray(declarations) ||
+      Object.keys(declarations).length > 1000 ||
+      Object.entries(declarations).some(([name, spec]) =>
+        typeof name !== "string" || name.length === 0 || name.length > 214 ||
+        typeof spec !== "string" || spec.length === 0 || spec.length > 256)) {
+    throw new Error(`package-lock.json has invalid ${field} for ${packagePath}`);
+  }
+}
+
+function validatePeerDependenciesMeta(metadata, peerDependencies, label) {
+  if (metadata === null || typeof metadata !== "object" || Array.isArray(metadata) ||
+      Object.keys(metadata).length > 1000) {
+    throw new Error(`${label} has invalid peer dependency metadata`);
+  }
+  for (const [name, value] of Object.entries(metadata)) {
+    if (!Object.hasOwn(peerDependencies, name) ||
+        value === null || typeof value !== "object" || Array.isArray(value) ||
+        Object.keys(value).length !== 1 || typeof value.optional !== "boolean") {
+      throw new Error(`${label} has invalid peer dependency metadata`);
+    }
+  }
 }
 
 function validateResolvedDependency(dependencyName, declaredSpec, resolved) {
@@ -224,6 +315,7 @@ function buildSpdxDocument({
   createdAt,
   lockDocument,
   packageDocument,
+  runtimePackagePaths,
   sourceCommit,
 }) {
   const rootId = "SPDXRef-Package-Cope";
@@ -241,7 +333,7 @@ function buildSpdxDocument({
   };
 
   const dependencyPackages = Object.entries(lockDocument.packages ?? {})
-    .filter(([packagePath, entry]) => packagePath !== "" && entry?.dev !== true)
+    .filter(([packagePath]) => runtimePackagePaths.has(packagePath))
     .sort(([left], [right]) => compareText(left, right))
     .map(([packagePath, entry]) => {
       if (typeof entry.version !== "string" || entry.version.length === 0) {

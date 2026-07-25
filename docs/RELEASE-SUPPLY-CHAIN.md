@@ -25,7 +25,8 @@ or otherwise non-portable names, concatenated gzip members, unexpected top-level
 files, non-portable archive owners/modes/timestamps, non-canonical metadata, and
 digest or inventory drift. The manifest also binds the name, version, executable
 mapping, and runtime dependency declarations from the packed
-`package/package.json`; those claims cannot diverge from what npm installs.
+`package/package.json`, and requires the mapped CLI target to be present with an
+executable archive mode; those claims cannot diverge from what npm installs.
 
 The SPDX 2.3 JSON document describes the Cope artifact and the non-development
 runtime packages in `package-lock.json`. Generation requires the packed package,
@@ -33,8 +34,11 @@ source package, lockfile root declarations, and resolved lockfile inventory to
 agree: each resolved runtime version must satisfy its exact or range declaration,
 and npm aliases must also resolve to the declared target package. Other npm
 dependency spec types fail closed rather than producing evidence for an
-unverifiable resolution. SPDX SHA-256 and SHA-512 values are lowercase
-hexadecimal. The document and all other JSON evidence use the
+unverifiable resolution. Generation follows and validates every reachable
+non-development dependency and optional-dependency edge; optional peers may be
+absent only when matching bound `peerDependenciesMeta` marks them optional.
+SPDX SHA-256 and SHA-512 values are lowercase hexadecimal. The document and all
+other JSON evidence use the
 repository's deterministic key-sorted UTF-8 encoding with one trailing newline.
 SPDX creation timestamps use whole-second UTC syntax, and each document namespace
 contains a digest of all document content plus its source/build identity.

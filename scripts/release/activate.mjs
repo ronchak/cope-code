@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -78,6 +78,9 @@ export async function activateRelease(candidateInput, installRootInput, options)
             !stored.publisherAuthenticated) {
           throw new Error("Existing release-store entry failed publisher-authenticated verification");
         }
+        await syncStoredBundle(releasePath);
+        await syncDirectory(releasesRoot);
+        await syncDirectory(installRoot);
         await removeStaging(staging);
       } else {
         await makeBundleReadOnly(staging);
@@ -468,6 +471,26 @@ async function syncDirectory(directory) {
   } finally {
     if (handle !== undefined) await handle.close();
   }
+}
+
+async function syncStoredBundle(directory) {
+  if (process.platform === "win32") return;
+  const entries = await readdir(directory, { withFileTypes: true });
+  if (entries.some((entry) => !entry.isFile() || entry.isSymbolicLink())) {
+    throw new Error("Stored release contains a non-regular entry");
+  }
+  for (const entry of entries) {
+    const noFollow = fsConstants.O_NOFOLLOW ?? 0;
+    const handle = await open(path.join(directory, entry.name), fsConstants.O_RDONLY | noFollow);
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile()) throw new Error("Stored release contains a non-regular entry");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  }
+  await syncDirectory(directory);
 }
 
 async function writeExclusive(filename, value) {

@@ -222,6 +222,7 @@ function validateManifest(manifest) {
     "name",
     "optionalDependencies",
     "peerDependencies",
+    "peerDependenciesMeta",
     "version",
   ], "Packed package identity");
   exactObjectKeys(artifact.archive.package.bin, ["cope", "copilot-agent"], "Packed package executable mapping");
@@ -234,6 +235,18 @@ function validateManifest(manifest) {
   for (const field of ["dependencies", "optionalDependencies", "peerDependencies"]) {
     if (!validDependencyMap(artifact.archive.package[field])) {
       throw new Error("Packed package identity does not match the release manifest");
+    }
+  }
+  if (!validPeerDependenciesMeta(
+    artifact.archive.package.peerDependenciesMeta,
+    artifact.archive.package.peerDependencies,
+  )) {
+    throw new Error("Packed package identity does not match the release manifest");
+  }
+  for (const target of new Set(Object.values(artifact.archive.package.bin))) {
+    const entry = artifact.archive.entries.find((candidate) => candidate.path === `package/${target}`);
+    if (entry === undefined || entry.mode !== 0o755) {
+      throw new Error("Packed package executable target is missing or not executable");
     }
   }
 
@@ -362,6 +375,15 @@ function validDependencyMap(dependencies) {
     Object.entries(dependencies).every(([name, version]) =>
       name.length <= 214 && NPM_PACKAGE_NAME.test(name) &&
       typeof version === "string" && version.length > 0 && version.length <= 256);
+}
+
+function validPeerDependenciesMeta(metadata, peerDependencies) {
+  return metadata !== null && typeof metadata === "object" && !Array.isArray(metadata) &&
+    Object.keys(metadata).length <= 1000 &&
+    Object.entries(metadata).every(([name, value]) =>
+      Object.hasOwn(peerDependencies, name) &&
+      value !== null && typeof value === "object" && !Array.isArray(value) &&
+      Object.keys(value).length === 1 && typeof value.optional === "boolean");
 }
 
 function safeByteCount(value, maximum) {

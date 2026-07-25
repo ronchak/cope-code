@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
 import {
+  chmod,
   copyFile,
   lstat,
   mkdir,
@@ -169,6 +170,69 @@ test("release evidence is canonical, reproducible, SPDX-correct, and explicit ab
     /does not resolve a runtime package: example/iu,
   );
 
+  for (const [name, resolvedVersion, dev, expected] of [
+    ["valid-transitive", "1.4.0", false, "success"],
+    ["missing-transitive", undefined, false, "missing"],
+    ["dev-only-transitive", "1.4.0", true, "missing"],
+    ["mismatched-transitive", "9.0.0", false, "mismatch"],
+  ] as const) {
+    const candidate = await fixture.emptyCandidate(name, "transitive");
+    const lockFile = path.join(fixture.root, `${name}.package-lock.json`);
+    const lockDocument = JSON.parse(await readFile(fixture.lockFile, "utf8")) as {
+      packages: Record<string, {
+        dependencies?: Record<string, string>;
+        dev?: boolean;
+        integrity?: string;
+        version?: string;
+      }>;
+    };
+    lockDocument.packages["node_modules/example"]!.dependencies = { transitive: "^1.0.0" };
+    if (resolvedVersion !== undefined) {
+      lockDocument.packages["node_modules/transitive"] = {
+        version: resolvedVersion,
+        dev,
+        integrity: lockDocument.packages["node_modules/example"]!.integrity!,
+      };
+    }
+    await writeFile(lockFile, JSON.stringify(lockDocument));
+    const arguments_ = generationArguments(fixture, candidate, "preview");
+    arguments_[arguments_.indexOf("--lock") + 1] = lockFile;
+    const result = invoke(generateScript, arguments_, { COPE_RELEASE_SIGNING_KEY_FILE: undefined });
+    if (expected === "success") {
+      expectSuccess(result);
+    } else if (expected === "missing") {
+      expectFailure(result, /does not resolve a runtime package: transitive/iu);
+    } else {
+      expectFailure(result, /resolved version 9\.0\.0 does not satisfy transitive@\^1\.0\.0/iu);
+    }
+  }
+
+  const optionalPeerCandidate = await fixture.emptyCandidate("optional-peer", "optional-peer");
+  const optionalPeerPackageJson = npmPackageJson("1.2.3", {
+    peerDependencies: { "optional-peer": "^4.0.0" },
+    peerDependenciesMeta: { "optional-peer": { optional: true } },
+  });
+  await writeFile(path.join(optionalPeerCandidate, "cope.tgz"), npmArchive([
+    { archivePath: "package/package.json", content: optionalPeerPackageJson },
+    { archivePath: "package/dist/src/cli/main.js", content: "cli", mode: 0o755 },
+  ]));
+  const optionalPeerPackageFile = path.join(fixture.root, "optional-peer.package.json");
+  const optionalPeerLockFile = path.join(fixture.root, "optional-peer.package-lock.json");
+  const optionalPeerLock = JSON.parse(await readFile(fixture.lockFile, "utf8")) as {
+    packages: Record<string, {
+      peerDependencies?: Record<string, string>;
+      peerDependenciesMeta?: Record<string, { optional: boolean }>;
+    }>;
+  };
+  optionalPeerLock.packages[""]!.peerDependencies = { "optional-peer": "^4.0.0" };
+  optionalPeerLock.packages[""]!.peerDependenciesMeta = { "optional-peer": { optional: true } };
+  await writeFile(optionalPeerPackageFile, optionalPeerPackageJson);
+  await writeFile(optionalPeerLockFile, JSON.stringify(optionalPeerLock));
+  const optionalPeerArguments = generationArguments(fixture, optionalPeerCandidate, "preview");
+  optionalPeerArguments[optionalPeerArguments.indexOf("--package") + 1] = optionalPeerPackageFile;
+  optionalPeerArguments[optionalPeerArguments.indexOf("--lock") + 1] = optionalPeerLockFile;
+  expectSuccess(invoke(generateScript, optionalPeerArguments, { COPE_RELEASE_SIGNING_KEY_FILE: undefined }));
+
   for (const [name, declaredSpec, resolvedVersion, resolvedName] of [
     ["exact", "2.0.0", "2.0.0", undefined],
     ["range", "^2.0.0", "2.9.1", undefined],
@@ -178,6 +242,7 @@ test("release evidence is canonical, reproducible, SPDX-correct, and explicit ab
     const packageJson = npmPackageJson("1.2.3", { dependencies: { example: declaredSpec } });
     await writeFile(path.join(candidate, "cope.tgz"), npmArchive([
       { archivePath: "package/package.json", content: packageJson },
+      { archivePath: "package/dist/src/cli/main.js", content: "cli", mode: 0o755 },
     ]));
     const packageFile = path.join(fixture.root, `satisfied-${name}.package.json`);
     const lockFile = path.join(fixture.root, `satisfied-${name}.package-lock.json`);
@@ -407,6 +472,20 @@ test("release generation rejects traversal, links, and non-regular payload bound
     /duplicate path/iu,
   );
 
+  for (const [name, mode] of [["missing-cli-target", undefined], ["non-executable-cli-target", 0o644]] as const) {
+    const candidate = await fixture.emptyCandidate(name, "bad");
+    await writeFile(path.join(candidate, "cope.tgz"), npmArchive([
+      { archivePath: "package/package.json", content: npmPackageJson("1.2.3") },
+      ...(mode === undefined
+        ? []
+        : [{ archivePath: "package/dist/src/cli/main.js", content: "cli", mode }]),
+    ]));
+    expectFailure(
+      invoke(generateScript, generationArguments(fixture, candidate, "preview")),
+      /missing its executable CLI target/iu,
+    );
+  }
+
   const invalidDependencyName = await fixture.emptyCandidate("invalid-dependency-name", "bad");
   await writeFile(path.join(invalidDependencyName, "cope.tgz"), npmArchive([
     {
@@ -465,6 +544,8 @@ test("activation is publisher-authenticated, locked, pointer-atomic, and explici
   const residueState = path.join(installRoot, ".activation-00000000-0000-4000-8000-000000000000.json");
   await mkdir(residueDirectory);
   await writeFile(path.join(residueDirectory, "partial"), "partial");
+  await chmod(path.join(residueDirectory, "partial"), 0o444);
+  await chmod(residueDirectory, 0o500);
   await writeFile(residueState, "partial");
   expectSuccess(invoke(activateScript, [
     second,
@@ -614,6 +695,7 @@ test("release evidence remains deliberately separate from current local installe
   assert.match(activationSource, /await syncDirectory\(releasesRoot\);\s+await syncDirectory\(installRoot\);/u);
   assert.match(activationSource, /rename\(temporary, path\.join\(installRoot, "activation\.json"\)\);\s+await syncDirectory\(installRoot\);/u);
   assert.match(activationSource, /await handle\.chmod\(0o444\);\s+await handle\.sync\(\);/u);
+  assert.match(activationSource, /await syncStoredBundle\(releasePath\);\s+await syncDirectory\(releasesRoot\);/u);
 });
 
 interface ReleaseFixture {
@@ -674,6 +756,7 @@ async function releaseFixture(context: { after(callback: () => Promise<void>): v
     await mkdir(output);
     await writeFile(path.join(output, "cope.tgz"), npmArchive([
       { archivePath: "package/package.json", content: npmPackageJson(version) },
+      { archivePath: "package/dist/src/cli/main.js", content: "cli", mode: 0o755 },
       { archivePath: "package/payload.txt", content },
     ]));
     return output;
@@ -794,6 +877,7 @@ function npmPackageJson(
     dependencies?: Record<string, string>;
     optionalDependencies?: Record<string, string>;
     peerDependencies?: Record<string, string>;
+    peerDependenciesMeta?: Record<string, { optional: boolean }>;
   } = {},
 ): string {
   return JSON.stringify({
@@ -806,12 +890,14 @@ function npmPackageJson(
     dependencies: overrides.dependencies ?? { example: "2.0.0" },
     ...(overrides.optionalDependencies === undefined ? {} : { optionalDependencies: overrides.optionalDependencies }),
     ...(overrides.peerDependencies === undefined ? {} : { peerDependencies: overrides.peerDependencies }),
+    ...(overrides.peerDependenciesMeta === undefined ? {} : { peerDependenciesMeta: overrides.peerDependenciesMeta }),
   });
 }
 
 function npmArchive(entries: Array<{
   archivePath: string;
   content: string;
+  mode?: number;
   type?: string;
   linkName?: string;
 }>): Buffer {
@@ -820,7 +906,7 @@ function npmArchive(entries: Array<{
     const content = Buffer.from(entry.content);
     const header = Buffer.alloc(512);
     writeField(header, 0, 100, entry.archivePath);
-    writeOctal(header, 100, 8, 0o644);
+    writeOctal(header, 100, 8, entry.mode ?? 0o644);
     writeOctal(header, 108, 8, 0);
     writeOctal(header, 116, 8, 0);
     writeOctal(header, 124, 12, entry.type === "2" ? 0 : content.length);

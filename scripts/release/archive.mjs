@@ -236,9 +236,11 @@ function packageIdentity(bytes) {
   const dependencies = document.dependencies ?? {};
   const optionalDependencies = document.optionalDependencies ?? {};
   const peerDependencies = document.peerDependencies ?? {};
+  const peerDependenciesMeta = document.peerDependenciesMeta ?? {};
   validateDependencyMap(dependencies);
   validateDependencyMap(optionalDependencies);
   validateDependencyMap(peerDependencies);
+  validatePeerDependenciesMeta(peerDependenciesMeta, peerDependencies);
   return {
     name: document.name,
     version: document.version,
@@ -249,6 +251,7 @@ function packageIdentity(bytes) {
     dependencies,
     optionalDependencies,
     peerDependencies,
+    peerDependenciesMeta,
   };
 }
 
@@ -259,6 +262,23 @@ function validateDependencyMap(dependencies) {
         name.length > 214 || !NPM_PACKAGE_NAME.test(name) ||
         typeof version !== "string" || version.length === 0 || version.length > 256)) {
     throw new Error("Packed package.json has invalid runtime dependency metadata");
+  }
+}
+
+function validatePeerDependenciesMeta(metadata, peerDependencies) {
+  if (metadata === null || typeof metadata !== "object" || Array.isArray(metadata) ||
+      Object.keys(metadata).length > 1000) {
+    throw new Error("Packed package.json has invalid peer dependency metadata");
+  }
+  for (const [name, value] of Object.entries(metadata)) {
+    if (!Object.hasOwn(peerDependencies, name) ||
+        value === null || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("Packed package.json has invalid peer dependency metadata");
+    }
+    exactObjectKeys(value, ["optional"], "Packed package peer dependency metadata");
+    if (typeof value.optional !== "boolean") {
+      throw new Error("Packed package.json has invalid peer dependency metadata");
+    }
   }
 }
 
