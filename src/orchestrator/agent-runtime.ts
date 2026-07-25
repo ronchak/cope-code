@@ -280,7 +280,9 @@ export class AgentRuntime {
       ) {
         return await this.pauseWithInterruptionPriority(error.message);
       }
-      return await this.fail(error);
+      const failed = await this.fail(error);
+      await this.cleanupTerminalArtifacts();
+      return failed;
     } finally {
       await this.dependencies.transport.close().catch(() => undefined);
     }
@@ -1367,6 +1369,7 @@ export class AgentRuntime {
   private async fail(error: unknown): Promise<AgentRunResult> {
     const message = errorMessage(error);
     if (!["completed", "rolled_back", "blocked", "aborted", "failed"].includes(this.state.status)) {
+      delete this.state.completionHandoff;
       transitionSession(this.state, "failed", this.now(), {
         reason: message,
         failure: { code: error instanceof AgentError ? error.code : "INTERNAL_ERROR", message },
@@ -1383,8 +1386,24 @@ export class AgentRuntime {
 
   private async move(status: SessionState["status"], reason?: string): Promise<void> {
     const from = this.state.status;
+    const priorUpdatedAt = this.state.updatedAt;
+    const priorPauseReason = this.state.pauseReason;
+    const priorFailure = this.state.failure;
+    const priorCompletedAt = this.state.completedAt;
     transitionSession(this.state, status, this.now(), reason === undefined ? {} : { reason });
-    await this.persist();
+    try {
+      await this.persist();
+    } catch (error) {
+      this.state.status = from;
+      this.state.updatedAt = priorUpdatedAt;
+      if (priorPauseReason === undefined) delete this.state.pauseReason;
+      else this.state.pauseReason = priorPauseReason;
+      if (priorFailure === undefined) delete this.state.failure;
+      else this.state.failure = priorFailure;
+      if (priorCompletedAt === undefined) delete this.state.completedAt;
+      else this.state.completedAt = priorCompletedAt;
+      throw error;
+    }
     await this.dependencies.audit.append({
       type: status === "completed" || status === "blocked" || status === "aborted" || status === "failed"
         ? "session.ended"
@@ -1427,15 +1446,16 @@ export class AgentRuntime {
   }
 
   private result(reason?: string): AgentRunResult {
+    const completed = this.state.status === "completed";
     return {
       status: this.state.status,
       sessionId: this.state.sessionId,
       taskId: this.state.taskId,
-      ...(this.state.status !== "completed" || this.lastCompletion === undefined
+      ...(!completed || this.lastCompletion === undefined
         ? {}
         : { completion: this.lastCompletion }),
-      ...(this.finalModelSummary === undefined ? {} : { modelSummary: this.finalModelSummary }),
-      ...(this.finalModelReport === undefined ? {} : { modelReport: this.finalModelReport }),
+      ...(!completed || this.finalModelSummary === undefined ? {} : { modelSummary: this.finalModelSummary }),
+      ...(!completed || this.finalModelReport === undefined ? {} : { modelReport: this.finalModelReport }),
       ...(reason === undefined ? {} : { reason }),
     };
   }

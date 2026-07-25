@@ -276,6 +276,18 @@ class CompletionWriteGateStore extends SessionStore {
   }
 }
 
+class FailingCompletionWriteStore extends SessionStore {
+  public completionWriteAttempts = 0;
+
+  public override async write(session: SessionState): Promise<void> {
+    if (session.status === "completed" && this.completionWriteAttempts === 0) {
+      this.completionWriteAttempts += 1;
+      throw new Error("completion state write failed");
+    }
+    await super.write(session);
+  }
+}
+
 class CompletionHandoffSaveGateStore extends CompletionHandoffStore {
   public saveCalls = 0;
   private markFirstSaveCompleted!: () => void;
@@ -779,6 +791,8 @@ test("runtime fails closed without retrying a non-repairable protocol violation"
       throw new ProtocolParseError("TASK_MISMATCH", "response belongs to another task", {}, false);
     },
   };
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
+  await artifacts.put("decision", "sentinel", "must be cleared on terminal failure");
   const runtime = new AgentRuntime({
     state: localState,
     store,
@@ -800,6 +814,7 @@ test("runtime fails closed without retrying a non-repairable protocol violation"
     completionRequirements: { requiredCommandIds: [], requireValidationAfterLastMutation: true, requireCleanPendingOperations: true },
     clock: { now: () => new Date("2026-01-01T00:01:00.000Z") },
     idFactory: () => "submission_1",
+    artifacts,
   });
 
   const result = await runtime.run();
@@ -807,6 +822,8 @@ test("runtime fails closed without retrying a non-repairable protocol violation"
   assert.match(result.reason ?? "", /Non-repairable protocol violation/u);
   assert.equal(transport.submittedContents.length, 1, "must not submit repair feedback");
   assert.equal(localState.budgetUsage.protocolRepairs, 0);
+  assert.equal(await artifacts.getOptional("response", "turn_0001"), undefined);
+  assert.equal(await artifacts.getOptional("decision", "sentinel"), undefined);
 });
 
 test("a live transport cannot opt into recovery replay through its response id", async () => {
@@ -1105,6 +1122,53 @@ test("interruption during completed-state persistence still clears terminal arti
   assert.equal(localState.status, "completed");
   assert.equal(await artifacts.getOptional("response", "turn_0001"), undefined);
   assert.equal(await artifacts.getOptional("decision", "sentinel"), undefined);
+});
+
+test("completion is not exposed when its durable state write fails", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-completion-write-failure-"));
+  const localState = state(root);
+  const store = new FailingCompletionWriteStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new QueueTransport([JSON.stringify([{
+    type: "complete_task",
+    operationId: "op_complete",
+    claim: {
+      summary: "This completion must not be reported without a durable state commit.",
+      acceptanceCriteria: [],
+      validation: [],
+      skippedValidation: [],
+      remainingRisks: [],
+      recommendedFollowUp: [],
+    },
+  }])]);
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
+  const completionHandoffs = new CompletionHandoffStore(
+    path.join(root, "handoff"),
+    localState.sessionId,
+    new SecretScanner(Buffer.alloc(32, 12)),
+  );
+  const runtime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+    completionHandoffs,
+  });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "failed");
+  assert.equal(result.reason, "completion state write failed");
+  assert.equal(result.completion, undefined);
+  assert.equal(result.modelSummary, undefined);
+  assert.equal(result.modelReport, undefined);
+  assert.equal(localState.status, "failed");
+  assert.equal(localState.completionHandoff, undefined);
+  assert.equal(store.completionWriteAttempts, 1);
+  const durableState = await store.read(localState.sessionId);
+  assert.equal(durableState.status, "failed");
+  assert.equal(durableState.completionHandoff, undefined);
+  assert.equal(await artifacts.getOptional("response", "turn_0001"), undefined);
 });
 
 test("resume reuses an accepted completion handoff saved before a pause", async () => {
