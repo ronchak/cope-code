@@ -1431,7 +1431,9 @@ export class AgentRuntime {
       status: this.state.status,
       sessionId: this.state.sessionId,
       taskId: this.state.taskId,
-      ...(this.lastCompletion === undefined ? {} : { completion: this.lastCompletion }),
+      ...(this.state.status !== "completed" || this.lastCompletion === undefined
+        ? {}
+        : { completion: this.lastCompletion }),
       ...(this.finalModelSummary === undefined ? {} : { modelSummary: this.finalModelSummary }),
       ...(this.finalModelReport === undefined ? {} : { modelReport: this.finalModelReport }),
       ...(reason === undefined ? {} : { reason }),

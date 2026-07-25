@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -7,8 +7,12 @@ import test from "node:test";
 import { executeCommand } from "../../src/cli/commands.js";
 import {
   SESSION_RUNTIME_MANIFEST_VERSION,
+  writeSessionGrant,
   writeRuntimeManifest,
 } from "../../src/cli/session-files.js";
+import { createDefaultSessionGrant } from "../../src/policy/index.js";
+import { SecretScanner } from "../../src/security/secrets.js";
+import { CompletionHandoffStore } from "../../src/session/completion-handoff-store.js";
 import { SessionStore } from "../../src/session/store.js";
 import {
   DEFAULT_BUDGET_LIMITS,
@@ -18,6 +22,72 @@ import {
 } from "../../src/session/types.js";
 import { AgentError } from "../../src/shared/errors.js";
 import { createStandardUserHost } from "../helpers/standard-user-host.js";
+
+test("status suppresses a provisional completion handoff for a paused session", async (context) => {
+  const stateHome = await mkdtemp(path.join(tmpdir(), "cope-status-provisional-handoff-"));
+  context.after(async () => rm(stateHome, { recursive: true, force: true }));
+  const now = "2026-07-24T12:00:00.000Z";
+  const state = sessionState("session_provisional_handoff", "paused", now);
+  state.pauseReason = "pause before completion handoff revalidation";
+  const store = new SessionStore(stateHome);
+  await store.create(state);
+  const sessionDirectory = store.sessionDirectory(state.sessionId);
+  const fingerprintKey = Buffer.alloc(32, 11);
+  await writeFile(path.join(sessionDirectory, "fingerprint.key"), fingerprintKey, { mode: 0o600 });
+  const handoffs = new CompletionHandoffStore(
+    path.join(sessionDirectory, "handoff"),
+    state.sessionId,
+    new SecretScanner(fingerprintKey),
+  );
+  state.completionHandoff = await handoffs.save({
+    summary: "This provisional report must remain hidden.",
+    acceptanceCriteria: [],
+    validation: [],
+    skippedValidation: [],
+    remainingRisks: [],
+    recommendedFollowUp: [],
+  }, {
+    accepted: true,
+    reasons: [],
+    actual: {
+      changedPaths: [],
+      agentChangedPaths: [],
+      preExistingPaths: [],
+      successfulCommands: [],
+      failedCommands: [],
+      gitStatusSummary: "clean",
+      repositoryFingerprint: "f".repeat(64),
+    },
+  }, now);
+  await store.write(state);
+  await writeSessionGrant(sessionDirectory, createDefaultSessionGrant({
+    grant_id: "grant_provisional_handoff",
+    task_id: state.taskId,
+    repository_root: state.repositoryRoot,
+    mode: state.mode,
+  }));
+
+  let stdout = "";
+  const exitCode = await executeCommand({
+    command: "status",
+    sessionId: state.sessionId,
+    stateHome,
+    json: true,
+  }, {
+    stdout: { write: (value) => { stdout += value; } },
+    stderr: { write: () => undefined },
+  }, {
+    host: createStandardUserHost(),
+  });
+
+  assert.equal(exitCode, 0);
+  const rendered = JSON.parse(stdout) as {
+    completionReport: unknown;
+  };
+  assert.equal(rendered.completionReport, null);
+  assert.doesNotMatch(stdout, /This provisional report must remain hidden/u);
+  await handoffs.read(state.completionHandoff);
+});
 
 test("resume reports missing pinned browser configuration without exposing raw ENOENT", async (context) => {
   const stateHome = await mkdtemp(path.join(tmpdir(), "cope-resume-recovery-"));

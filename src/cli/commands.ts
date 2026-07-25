@@ -1207,7 +1207,7 @@ async function readCompletionHandoff(
   state: SessionState,
   sessionDirectory: string,
 ): Promise<CompletionHandoffRecord | undefined> {
-  if (state.completionHandoff === undefined) return undefined;
+  if (state.status !== "completed" || state.completionHandoff === undefined) return undefined;
   const fingerprintKey = await loadFingerprintKey(path.join(sessionDirectory, "fingerprint.key"));
   return new CompletionHandoffStore(
     path.join(sessionDirectory, "handoff"),

@@ -1154,6 +1154,42 @@ test("resume reuses an accepted completion handoff saved before a pause", async 
     /accepted handoff must remain stable/u,
   );
 
+  let markInspectionStarted!: () => void;
+  const inspectionStarted = new Promise<void>((resolve) => { markInspectionStarted = resolve; });
+  let releaseInspection!: () => void;
+  const inspectionReleased = new Promise<void>((resolve) => { releaseInspection = resolve; });
+  const interruptedResumeRuntime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+    completionHandoffs,
+    inspectCompletionState: async () => {
+      markInspectionStarted();
+      await inspectionReleased;
+      return {
+        pathKey: completionPathKey,
+        known: true,
+        fingerprint: "d".repeat(64),
+        excludedStateFingerprint: "0".repeat(64),
+        hasConflicts: false,
+        changedPaths: [],
+        outOfScopePaths: [],
+        gitStatusSummary: "clean",
+      };
+    },
+  });
+  const interruptedResumeRun = interruptedResumeRuntime.run();
+  await inspectionStarted;
+  await interruptedResumeRuntime.requestPause("pause before handoff revalidation");
+  releaseInspection();
+  const interruptedResume = await interruptedResumeRun;
+  assert.equal(interruptedResume.status, "paused");
+  assert.equal(interruptedResume.completion, undefined);
+  assert.deepEqual(localState.completionHandoff, pausedReference);
+  assert.equal(completionHandoffs.saveCalls, 1);
+
   const resumed = await runtimeForTest({
     root,
     state: localState,
