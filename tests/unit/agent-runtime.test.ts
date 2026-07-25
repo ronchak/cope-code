@@ -31,6 +31,7 @@ import {
   type ModelTransport,
   type ReceiveResult,
   type ReceiveRequest,
+  type SubmissionReceipt,
   type SubmissionRequest,
 } from "../../src/transport/model-transport.js";
 
@@ -42,7 +43,7 @@ class QueueTransport implements ModelTransport {
   public constructor(private readonly responses: readonly string[]) {}
   private index = 0;
 
-  public async submit(request: SubmissionRequest) {
+  public async submit(request: SubmissionRequest): Promise<SubmissionReceipt> {
     this.submittedContents.push(request.content);
     return {
       contractVersion: MODEL_TRANSPORT_CONTRACT_VERSION,
@@ -175,6 +176,30 @@ class MismatchedResultTransport extends QueueTransport {
   }
 }
 
+class MissingConversationReceiptTransport extends QueueTransport {
+  public receiveCalls = 0;
+
+  public override async submit(request: SubmissionRequest) {
+    const receipt = await super.submit(request);
+    const { conversationId: _conversationId, ...withoutConversation } = receipt;
+    return withoutConversation;
+  }
+
+  public override async receive(request: ReceiveRequest): Promise<ReceiveResult> {
+    this.receiveCalls += 1;
+    return super.receive(request);
+  }
+}
+
+class MissingConversationResultTransport extends QueueTransport {
+  public override async receive(request: ReceiveRequest): Promise<ReceiveResult> {
+    const result = await super.receive(request);
+    if (result.status !== "completed") return result;
+    const { conversationId: _conversationId, ...withoutConversation } = result;
+    return withoutConversation;
+  }
+}
+
 class RecoveryProbeTransport extends QueueTransport {
   public resolveCalls = 0;
 
@@ -236,6 +261,7 @@ function runtimeForTest(input: {
   readonly protocol?: ProtocolAdapter;
   readonly artifacts?: SessionArtifactStore;
   readonly execute?: ToolExecutor["execute"];
+  readonly inspectCompletionState?: ToolExecutor["inspectCompletionState"];
   readonly idFactory?: (prefix: string) => string;
 }): AgentRuntime {
   return new AgentRuntime({
@@ -251,7 +277,7 @@ function runtimeForTest(input: {
     },
     tools: {
       execute: input.execute ?? (async () => { throw new Error("unused"); }),
-      inspectCompletionState: async () => ({
+      inspectCompletionState: input.inspectCompletionState ?? (async () => ({
         pathKey: completionPathKey,
         known: true,
         fingerprint: "d".repeat(64),
@@ -260,7 +286,7 @@ function runtimeForTest(input: {
         changedPaths: [],
         outOfScopePaths: [],
         gitStatusSummary: "clean",
-      }),
+      })),
     },
     transport: input.transport,
     disclosure: { inspectAndSerialize: async (message) => message },
@@ -594,6 +620,62 @@ test("user-requested pause wins when a completed response arrives during transpo
   assert.match(await artifacts.get("response", "turn_0001"), /Must remain cached until resume/u);
 });
 
+test("pause during completion inspection prevents completion and preserves the cached response", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-pause-completion-inspection-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new QueueTransport([JSON.stringify([{
+    type: "complete_task",
+    operationId: "op_complete",
+    claim: {
+      summary: "Must not complete after a racing pause.",
+      acceptanceCriteria: [],
+      validation: [],
+      skippedValidation: [],
+      remainingRisks: [],
+      recommendedFollowUp: [],
+    },
+  }])]);
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
+  let markInspectionStarted!: () => void;
+  const inspectionStarted = new Promise<void>((resolve) => { markInspectionStarted = resolve; });
+  let finishInspection!: () => void;
+  const inspectionReleased = new Promise<void>((resolve) => { finishInspection = resolve; });
+  const runtime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+    inspectCompletionState: async () => {
+      markInspectionStarted();
+      await inspectionReleased;
+      return {
+        pathKey: completionPathKey,
+        known: true,
+        fingerprint: "d".repeat(64),
+        excludedStateFingerprint: "0".repeat(64),
+        hasConflicts: false,
+        changedPaths: [],
+        outOfScopePaths: [],
+        gitStatusSummary: "clean",
+      };
+    },
+  });
+
+  const run = runtime.run();
+  await inspectionStarted;
+  await runtime.requestPause("pause during completion inspection");
+  finishInspection();
+  const result = await run;
+  assert.equal(result.status, "paused");
+  assert.equal(result.reason, "pause during completion inspection");
+  assert.equal(localState.lastModelSummaryHash, undefined);
+  assert.equal(localState.completionHandoff, undefined);
+  assert.match(await artifacts.get("response", "turn_0001"), /Must not complete after a racing pause/u);
+});
+
 test("abort cannot be downgraded by a racing pause request", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-abort-priority-"));
   const localState = state(root);
@@ -638,6 +720,49 @@ test("runtime pauses on a mismatched receive result without parsing or marking i
     operationId: "op_complete",
     claim: {
       summary: "Mismatched result must not be processed.",
+      acceptanceCriteria: [],
+      validation: [],
+      skippedValidation: [],
+      remainingRisks: [],
+      recommendedFollowUp: [],
+    },
+  }])]);
+  const runtime = runtimeForTest({ root, state: localState, store, transport });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "paused");
+  assert.match(result.reason ?? "", /receive result correlation mismatch/u);
+  assert.equal(localState.submission?.state, "submitted");
+  assert.equal(localState.lastModelSummaryHash, undefined);
+});
+
+test("runtime rejects a submitted receipt that omits the pinned conversation", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-receipt-conversation-omitted-"));
+  const localState = state(root);
+  localState.transportConversationId = "conversation_1";
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new MissingConversationReceiptTransport(["unused"]);
+  const runtime = runtimeForTest({ root, state: localState, store, transport });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "paused");
+  assert.match(result.reason ?? "", /submission receipt correlation mismatch/u);
+  assert.equal(transport.receiveCalls, 0);
+  assert.equal(localState.submission?.state, "prepared");
+});
+
+test("runtime rejects a completed result that omits the pinned conversation", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-result-conversation-omitted-"));
+  const localState = state(root);
+  localState.transportConversationId = "conversation_1";
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new MissingConversationResultTransport([JSON.stringify([{
+    type: "complete_task",
+    operationId: "op_complete",
+    claim: {
+      summary: "Missing conversation must not be processed.",
       acceptanceCriteria: [],
       validation: [],
       skippedValidation: [],

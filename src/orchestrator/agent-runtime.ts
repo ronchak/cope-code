@@ -186,6 +186,7 @@ export class AgentRuntime {
           status: "received",
           responseBytes: Buffer.byteLength(response.content),
         }, { turnId });
+        if (this.interruption !== undefined) return await this.finishInterruption();
 
         let messages: readonly NormalizedModelMessage[];
         try {
@@ -252,7 +253,9 @@ export class AgentRuntime {
         }
 
         const action = selectAction(messages);
+        if (this.interruption !== undefined) return await this.finishInterruption();
         const next = await this.handleAction(action, turnId);
+        if (this.interruption !== undefined) return await this.finishInterruption();
         if (next.terminal) {
           await this.dependencies.artifacts?.remove("response", turnId);
           await this.cleanupTerminalArtifacts();
@@ -604,6 +607,7 @@ export class AgentRuntime {
       readonly turnId: string;
       readonly submissionId: string;
       readonly conversationId?: string;
+      readonly status: string;
     },
     expected: {
       readonly taskId: string;
@@ -615,14 +619,21 @@ export class AgentRuntime {
   ): void {
     const expectedConversationId =
       expected.expectedConversationId ?? this.state.transportConversationId;
+    const trustedConversationRequired =
+      expectedConversationId !== undefined &&
+      (actual.status === "submitted" || actual.status === "completed");
+    const conversationMismatch =
+      expectedConversationId !== undefined &&
+      (
+        (trustedConversationRequired && actual.conversationId === undefined) ||
+        (actual.conversationId !== undefined && actual.conversationId !== expectedConversationId)
+      );
     if (
       actual.contractVersion !== MODEL_TRANSPORT_CONTRACT_VERSION ||
       actual.taskId !== expected.taskId ||
       actual.turnId !== expected.turnId ||
       actual.submissionId !== expected.submissionId ||
-      (expectedConversationId !== undefined &&
-        actual.conversationId !== undefined &&
-        actual.conversationId !== expectedConversationId)
+      conversationMismatch
     ) {
       throw new AgentError("TRANSPORT_INDETERMINATE", `${kind} correlation mismatch`, {
         expectedContractVersion: MODEL_TRANSPORT_CONTRACT_VERSION,
@@ -644,6 +655,9 @@ export class AgentRuntime {
     action: NormalizedModelMessage,
     turnId: string,
   ): Promise<{ readonly terminal: false; readonly outbound: string } | { readonly terminal: true; readonly result: AgentRunResult }> {
+    if (this.interruption !== undefined) {
+      return { terminal: true, result: await this.finishInterruption() };
+    }
     switch (action.type) {
       case "tool_request": {
         await this.move("executing_tools");
@@ -739,7 +753,13 @@ export class AgentRuntime {
           turnId,
           data: { summaryHash: sha256(action.claim.summary), riskCount: action.claim.remainingRisks.length },
         });
+        if (this.interruption !== undefined) {
+          return { terminal: true, result: await this.finishInterruption() };
+        }
         const repository = await this.dependencies.tools.inspectCompletionState();
+        if (this.interruption !== undefined) {
+          return { terminal: true, result: await this.finishInterruption() };
+        }
         const verification = verifyCompletion(
           this.state,
           action.claim,
@@ -753,6 +773,9 @@ export class AgentRuntime {
         if (completionHandoff !== undefined) {
           this.state.completionHandoff = completionHandoff;
         }
+        if (this.interruption !== undefined) {
+          return { terminal: true, result: await this.finishInterruption() };
+        }
         await this.dependencies.audit.append({
           type: "completion.verified",
           taskId: this.state.taskId,
@@ -764,6 +787,9 @@ export class AgentRuntime {
             ...(completionHandoff === undefined ? {} : { handoffIntegrity: completionHandoff.integrity }),
           },
         });
+        if (this.interruption !== undefined) {
+          return { terminal: true, result: await this.finishInterruption() };
+        }
         if (verification.accepted) {
           this.finalModelSummary = action.claim.summary;
           this.finalModelReport = action.claim;
