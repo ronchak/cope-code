@@ -1417,9 +1417,9 @@ test("resume fails closed when accepted completion evidence changed after handof
   assert.equal(completionHandoffs.saveCalls, 1, "mismatched evidence must not overwrite the handoff");
   assert.equal(localState.completionHandoff, undefined, "terminal failure must drop the stale handoff reference");
   await assert.rejects(
-    () => completionHandoffs.read(pausedReference),
+    () => completionHandoffs.read(),
     /Completion handoff is unavailable/u,
-    "terminal cleanup must remove the stale durable handoff",
+    "terminal cleanup must leave no separately readable stale handoff",
   );
 
   const repeated = await runtimeForTest({
