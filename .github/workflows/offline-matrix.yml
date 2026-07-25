@@ -46,6 +46,8 @@ jobs:
         env:
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
         run: npm run test:chromium-safety
+      - name: Build, verify, and reproduce unsigned preview release evidence
+        run: npm run release:ci
       - if: runner.os == 'Windows'
         name: Isolated install and local update smoke (not live certification)
         shell: powershell
