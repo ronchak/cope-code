@@ -230,6 +230,22 @@ class UntrustedConversationResultTransport extends QueueTransport {
   }
 }
 
+class TerminalBlockedTransport extends QueueTransport {
+  public override async receive(request: ReceiveRequest): Promise<ReceiveResult> {
+    return {
+      contractVersion: MODEL_TRANSPORT_CONTRACT_VERSION,
+      taskId: request.taskId,
+      turnId: request.turnId,
+      submissionId: request.submissionId,
+      observedAt: "2026-01-01T00:00:00.000Z",
+      status: "blocked",
+      reason: "service-error",
+      retryable: false,
+      diagnosticCode: "TERMINAL_TEST_BLOCK",
+    };
+  }
+}
+
 class StaleReceiptConversationTransport extends QueueTransport {
   public readonly receiveExpectedConversationIds: Array<string | undefined> = [];
   public resolveCalls = 0;
@@ -412,6 +428,7 @@ function runtimeForTest(input: {
   readonly inspectCompletionState?: ToolExecutor["inspectCompletionState"];
   readonly disclosure?: DisclosureGuard;
   readonly idFactory?: (prefix: string) => string;
+  readonly retainSourceArtifactsOnCompletion?: boolean;
 }): AgentRuntime {
   return new AgentRuntime({
     state: input.state,
@@ -452,6 +469,9 @@ function runtimeForTest(input: {
     idFactory: input.idFactory ?? (() => "submission_1"),
     ...(input.artifacts === undefined ? {} : { artifacts: input.artifacts }),
     ...(input.completionHandoffs === undefined ? {} : { completionHandoffs: input.completionHandoffs }),
+    ...(input.retainSourceArtifactsOnCompletion === undefined
+      ? {}
+      : { retainSourceArtifactsOnCompletion: input.retainSourceArtifactsOnCompletion }),
   });
 }
 
@@ -1346,7 +1366,9 @@ test("abort cannot be downgraded by a racing pause request", async () => {
   const store = new SessionStore(path.join(root, "state"));
   await store.create(localState);
   const transport = new CancelledOnStopTransport();
-  const runtime = runtimeForTest({ root, state: localState, store, transport });
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
+  await artifacts.put("decision", "sentinel", "must be cleared after abort");
+  const runtime = runtimeForTest({ root, state: localState, store, transport, artifacts });
 
   const run = runtime.run();
   await transport.receiveStarted;
@@ -1357,6 +1379,52 @@ test("abort cannot be downgraded by a racing pause request", async () => {
   const result = await run;
   assert.equal(result.status, "aborted");
   assert.equal(result.reason, "operator kill switch");
+  assert.equal(await artifacts.getOptional("outbox", "submission_1"), undefined);
+  assert.equal(await artifacts.getOptional("decision", "sentinel"), undefined);
+});
+
+test("terminal transport blocking clears source artifacts when retention is disabled", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-terminal-transport-block-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
+  await artifacts.put("decision", "sentinel", "must be cleared after terminal block");
+  const runtime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport: new TerminalBlockedTransport([]),
+    artifacts,
+  });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "blocked");
+  assert.equal(result.reason, "service-error");
+  assert.equal(await artifacts.getOptional("outbox", "submission_1"), undefined);
+  assert.equal(await artifacts.getOptional("decision", "sentinel"), undefined);
+});
+
+test("terminal cleanup preserves source artifacts when retention is enabled", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-terminal-retention-enabled-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
+  await artifacts.put("decision", "sentinel", "retained terminal evidence");
+  const runtime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport: new TerminalBlockedTransport([]),
+    artifacts,
+    retainSourceArtifactsOnCompletion: true,
+  });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "blocked");
+  assert.equal(await artifacts.get("outbox", "submission_1"), "bootstrap");
+  assert.equal(await artifacts.get("decision", "sentinel"), "retained terminal evidence");
 });
 
 test("abort upgrades a pause while the paused state is being persisted", async () => {

@@ -20,7 +20,7 @@ import type {
 } from "../session/completion-handoff-store.js";
 import type { OperationJournal, OperationRecord } from "../session/operation-journal.js";
 import type { SessionStore } from "../session/store.js";
-import { transitionSession } from "../session/state-machine.js";
+import { isTerminal, transitionSession } from "../session/state-machine.js";
 import type { SessionState } from "../session/types.js";
 import { isBatchableToolName, isReadOnlyToolName } from "../protocol/types.js";
 import {
@@ -260,7 +260,6 @@ export class AgentRuntime {
         if (next.terminal) {
           if (["completed", "rolled_back", "blocked", "aborted", "failed"].includes(this.state.status)) {
             await this.dependencies.artifacts?.remove("response", turnId);
-            await this.cleanupTerminalArtifacts();
           }
           return next.result;
         }
@@ -281,10 +280,13 @@ export class AgentRuntime {
         return await this.pauseWithInterruptionPriority(error.message);
       }
       const failed = await this.fail(error);
-      await this.cleanupTerminalArtifacts();
       return failed;
     } finally {
-      await this.dependencies.transport.close().catch(() => undefined);
+      try {
+        if (isTerminal(this.state.status)) await this.cleanupTerminalArtifacts();
+      } finally {
+        await this.dependencies.transport.close().catch(() => undefined);
+      }
     }
   }
 
