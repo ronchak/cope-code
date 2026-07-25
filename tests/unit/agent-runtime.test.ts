@@ -8,6 +8,10 @@ import { LOCAL_TOOL_NAMES, TOOL_REGISTRY } from "../../src/protocol/index.js";
 import { sha256, stableJson } from "../../src/shared/crypto.js";
 import { AgentRuntime } from "../../src/orchestrator/agent-runtime.js";
 import { CbaProtocolAdapter } from "../../src/orchestrator/cba-protocol-adapter.js";
+import type {
+  CompletionClaim,
+  CompletionVerification,
+} from "../../src/orchestrator/completion.js";
 import { ProtocolParseError } from "../../src/protocol/parser.js";
 import { serializeProtocolEnvelope } from "../../src/protocol/index.js";
 import type {
@@ -19,7 +23,10 @@ import type {
 } from "../../src/orchestrator/contracts.js";
 import { OperationJournal } from "../../src/session/operation-journal.js";
 import { SessionArtifactStore } from "../../src/session/artifact-store.js";
-import { CompletionHandoffStore } from "../../src/session/completion-handoff-store.js";
+import {
+  CompletionHandoffStore,
+  type CompletionHandoffReference,
+} from "../../src/session/completion-handoff-store.js";
 import { SessionStore } from "../../src/session/store.js";
 import { SecretScanner } from "../../src/security/secrets.js";
 import {
@@ -202,6 +209,27 @@ class MissingConversationResultTransport extends QueueTransport {
   }
 }
 
+class UntrustedConversationResultTransport extends QueueTransport {
+  public override async submit(request: SubmissionRequest) {
+    const receipt = await super.submit(request);
+    const { conversationId: _conversationId, ...withoutConversation } = receipt;
+    return withoutConversation;
+  }
+
+  public override async receive(request: ReceiveRequest): Promise<ReceiveResult> {
+    return {
+      contractVersion: MODEL_TRANSPORT_CONTRACT_VERSION,
+      taskId: request.taskId,
+      turnId: request.turnId,
+      submissionId: request.submissionId,
+      observedAt: "2026-01-01T00:00:00.000Z",
+      conversationId: "conversation_untrusted",
+      status: "indeterminate",
+      diagnosticCode: "CONVERSATION_CHANGED_DURING_RESPONSE",
+    };
+  }
+}
+
 class CompletionWriteGateStore extends SessionStore {
   private completionWriteSeen = false;
   private markCompletionWriteStarted!: () => void;
@@ -224,6 +252,40 @@ class CompletionWriteGateStore extends SessionStore {
       await this.completionWriteReleased;
     }
     await super.write(session);
+  }
+}
+
+class CompletionHandoffSaveGateStore extends CompletionHandoffStore {
+  public saveCalls = 0;
+  private markFirstSaveCompleted!: () => void;
+  private finishFirstSave!: () => void;
+  public readonly firstSaveCompleted = new Promise<void>((resolve) => {
+    this.markFirstSaveCompleted = resolve;
+  });
+  private readonly firstSaveReleased = new Promise<void>((resolve) => {
+    this.finishFirstSave = resolve;
+  });
+
+  public releaseFirstSave(): void {
+    this.finishFirstSave();
+  }
+
+  public override async save(
+    claim: CompletionClaim,
+    verification: CompletionVerification,
+    _createdAt?: string,
+  ): Promise<CompletionHandoffReference> {
+    this.saveCalls += 1;
+    const reference = await super.save(
+      claim,
+      verification,
+      `2026-01-01T00:0${this.saveCalls}:00.000Z`,
+    );
+    if (this.saveCalls === 1) {
+      this.markFirstSaveCompleted();
+      await this.firstSaveReleased;
+    }
+    return reference;
   }
 }
 
@@ -312,6 +374,7 @@ function runtimeForTest(input: {
   readonly transport: ModelTransport;
   readonly protocol?: ProtocolAdapter;
   readonly artifacts?: SessionArtifactStore;
+  readonly completionHandoffs?: CompletionHandoffStore;
   readonly execute?: ToolExecutor["execute"];
   readonly inspectCompletionState?: ToolExecutor["inspectCompletionState"];
   readonly disclosure?: DisclosureGuard;
@@ -355,6 +418,7 @@ function runtimeForTest(input: {
     clock: { now: () => new Date("2026-01-01T00:01:00.000Z") },
     idFactory: input.idFactory ?? (() => "submission_1"),
     ...(input.artifacts === undefined ? {} : { artifacts: input.artifacts }),
+    ...(input.completionHandoffs === undefined ? {} : { completionHandoffs: input.completionHandoffs }),
   });
 }
 
@@ -1022,6 +1086,67 @@ test("interruption during completed-state persistence still clears terminal arti
   assert.equal(await artifacts.getOptional("decision", "sentinel"), undefined);
 });
 
+test("resume reuses an accepted completion handoff saved before a pause", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-pause-after-handoff-save-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new QueueTransport([JSON.stringify([{
+    type: "complete_task",
+    operationId: "op_complete",
+    claim: {
+      summary: "The accepted handoff must remain stable across resume.",
+      acceptanceCriteria: [],
+      validation: [],
+      skippedValidation: [],
+      remainingRisks: [],
+      recommendedFollowUp: [],
+    },
+  }])]);
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
+  const completionHandoffs = new CompletionHandoffSaveGateStore(
+    path.join(root, "handoff"),
+    localState.sessionId,
+    new SecretScanner(Buffer.alloc(32, 9)),
+  );
+  const runtime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+    completionHandoffs,
+  });
+
+  const run = runtime.run();
+  await completionHandoffs.firstSaveCompleted;
+  await runtime.requestPause("pause after completion handoff save");
+  completionHandoffs.releaseFirstSave();
+  const paused = await run;
+  assert.equal(paused.status, "paused");
+  assert.equal(completionHandoffs.saveCalls, 1);
+  const pausedReference = localState.completionHandoff;
+  assert.notEqual(pausedReference, undefined);
+  await completionHandoffs.read(pausedReference);
+  assert.match(
+    await artifacts.get("response", "turn_0001"),
+    /accepted handoff must remain stable/u,
+  );
+
+  const resumed = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+    completionHandoffs,
+  }).run();
+  assert.equal(resumed.status, "completed", resumed.reason);
+  assert.equal(completionHandoffs.saveCalls, 1, "resume must not overwrite the referenced handoff");
+  assert.deepEqual(localState.completionHandoff, pausedReference);
+  await completionHandoffs.read(pausedReference);
+});
+
 test("abort cannot be downgraded by a racing pause request", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-abort-priority-"));
   const localState = state(root);
@@ -1119,6 +1244,21 @@ test("runtime pauses on a mismatched receive result without parsing or marking i
   assert.match(result.reason ?? "", /receive result correlation mismatch/u);
   assert.equal(localState.submission?.state, "submitted");
   assert.equal(localState.lastModelSummaryHash, undefined);
+});
+
+test("runtime does not pin a conversation from an indeterminate receive result", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-untrusted-result-conversation-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new UntrustedConversationResultTransport([]);
+  const runtime = runtimeForTest({ root, state: localState, store, transport });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "paused");
+  assert.equal(result.reason, "CONVERSATION_CHANGED_DURING_RESPONSE");
+  assert.equal(localState.transportConversationId, undefined);
+  assert.equal(localState.submission?.state, "submitted");
 });
 
 test("runtime rejects a submitted receipt that omits the pinned conversation", async () => {

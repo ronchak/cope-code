@@ -14,7 +14,10 @@ import type { Clock } from "../shared/time.js";
 import { systemClock } from "../shared/time.js";
 import { BudgetMeter } from "../session/budgets.js";
 import type { SessionArtifactStore } from "../session/artifact-store.js";
-import type { CompletionHandoffStore } from "../session/completion-handoff-store.js";
+import type {
+  CompletionHandoffReference,
+  CompletionHandoffStore,
+} from "../session/completion-handoff-store.js";
 import type { OperationJournal, OperationRecord } from "../session/operation-journal.js";
 import type { SessionStore } from "../session/store.js";
 import { transitionSession } from "../session/state-machine.js";
@@ -416,8 +419,8 @@ export class AgentRuntime {
       { signal: this.controller.signal },
     );
     this.assertTransportCorrelation(result, request, "receive result");
-    this.bindConversation(result);
     if (result.status === "completed") {
+      this.bindConversation(result);
       await this.dependencies.artifacts?.put("response", turnId, result.content);
       if (this.state.submission?.submissionId === submissionId) {
         this.state.submission = {
@@ -563,6 +566,32 @@ export class AgentRuntime {
     if (this.dependencies.retainSourceArtifactsOnCompletion !== true) {
       await this.dependencies.artifacts?.clear();
     }
+  }
+
+  private async prepareCompletionHandoff(
+    claim: CompletionClaim,
+    verification: CompletionVerification,
+  ): Promise<CompletionHandoffReference | undefined> {
+    if (!verification.accepted) {
+      delete this.state.completionHandoff;
+      return undefined;
+    }
+    const existing = this.state.completionHandoff;
+    const store = this.dependencies.completionHandoffs;
+    if (store === undefined) {
+      if (existing !== undefined) {
+        throw new AgentError(
+          "RECOVERY_REQUIRED",
+          "Completion handoff state exists without its durable store",
+        );
+      }
+      return undefined;
+    }
+    if (existing !== undefined) {
+      await store.read(existing);
+      return existing;
+    }
+    return store.save(claim, verification, this.now());
   }
 
   private async resolveReceipt(
@@ -765,9 +794,7 @@ export class AgentRuntime {
           this.dependencies.completionRequirements,
         );
         this.lastCompletion = verification;
-        const completionHandoff = verification.accepted
-          ? await this.dependencies.completionHandoffs?.save(action.claim, verification, this.now())
-          : undefined;
+        const completionHandoff = await this.prepareCompletionHandoff(action.claim, verification);
         if (completionHandoff !== undefined) {
           this.state.completionHandoff = completionHandoff;
         }
