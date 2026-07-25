@@ -124,7 +124,11 @@ export class CompletionHandoffStore {
   }
 
   public async remove(): Promise<void> {
-    await rm(this.filename(), { force: true });
+    await CompletionHandoffStore.removeAt(this.directory);
+  }
+
+  public static async removeAt(directory: string): Promise<void> {
+    await rm(path.join(directory, "completion.json"), { force: true });
   }
 
   private filename(): string {

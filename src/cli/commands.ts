@@ -44,8 +44,16 @@ import {
   CompletionHandoffStore,
   type CompletionHandoffRecord,
 } from "../session/completion-handoff-store.js";
-import { allowedTransitions, isTerminal, transitionSession } from "../session/state-machine.js";
+import { SessionArtifactStore } from "../session/artifact-store.js";
+import {
+  allowedTransitions,
+  isTerminal,
+  restoreSessionLifecycle,
+  snapshotSessionLifecycle,
+  transitionSession,
+} from "../session/state-machine.js";
 import { SessionStore, type WorkspaceLock } from "../session/store.js";
+import { cleanupTerminalRecoveryArtifacts } from "../session/terminal-cleanup.js";
 import {
   SESSION_SCHEMA_VERSION,
   type SessionState,
@@ -371,7 +379,15 @@ async function runNewSession(
       command.approveGrant,
     );
     if (!approved) {
-      await moveState(newState, "aborted", store, sessionAudit, "Initial session grant was declined");
+      await moveState(
+        newState,
+        "aborted",
+        store,
+        sessionAudit,
+        "Initial session grant was declined",
+        undefined,
+        configuration.repository.retention.retain_source_artifacts_on_completion,
+      );
       output(command.json, io, sessionResult(newState, "Initial session grant was declined"));
       return 2;
     }
@@ -431,7 +447,15 @@ async function runNewSession(
       const requested = setupControl.requestedAction;
       const target = requested === "pause" ? "paused" : requested === "abort" ? "aborted" : "failed";
       if (allowedTransitions(state.status).includes(target)) {
-        await moveState(state, target, store, audit, errorMessage(error), error);
+        await moveState(
+          state,
+          target,
+          store,
+          audit,
+          errorMessage(error),
+          error,
+          configuration.repository.retention.retain_source_artifacts_on_completion,
+        );
       }
     }
     throw error;
@@ -530,7 +554,15 @@ async function resumeSession(
         command.approveGrant,
       );
       if (!approved) {
-        await moveState(state, "aborted", store, audit, "Initial session grant was declined");
+        await moveState(
+          state,
+          "aborted",
+          store,
+          audit,
+          "Initial session grant was declined",
+          undefined,
+          configuration.repository.retention.retain_source_artifacts_on_completion,
+        );
         output(command.json, io, sessionResult(state, "Initial session grant was declined"));
         return 2;
       }
@@ -597,7 +629,15 @@ async function resumeSession(
       const target = requested === "pause" ? "paused" : requested === "abort" ? "aborted" : "paused";
       if (allowedTransitions(state.status).includes(target)) {
         const audit = new AuditLog(path.join(sessionDirectory, "audit.jsonl"), state.sessionId);
-        await moveState(state, target, store, audit, errorMessage(error), error);
+        await moveState(
+          state,
+          target,
+          store,
+          audit,
+          errorMessage(error),
+          error,
+          configuration.repository.retention.retain_source_artifacts_on_completion,
+        );
       }
     }
     throw error;
@@ -645,7 +685,8 @@ async function controlSession(
   io: CliIo,
   host: HostPlatform,
 ): Promise<number> {
-  const store = new SessionStore(await verifiedStateHome(command.stateHome, host));
+  const stateHome = await verifiedStateHome(command.stateHome, host);
+  const store = new SessionStore(stateHome);
   let state = await store.read(command.sessionId);
   if (isTerminal(state.status)) {
     output(command.json, io, sessionResult(state, `Session is already ${state.status}`));
@@ -682,7 +723,29 @@ async function controlSession(
       throw new AgentError("RECOVERY_REQUIRED", `Session state '${state.status}' is not actively running and cannot be paused`);
     }
     const audit = new AuditLog(path.join(store.sessionDirectory(state.sessionId), "audit.jsonl"), state.sessionId);
-    await moveState(state, action === "pause" ? "paused" : "aborted", store, audit, reason);
+    let retainSourceArtifacts = false;
+    try {
+      const configuration = await loadRuntimeConfiguration({
+        repositoryRoot: state.repositoryRoot,
+        stateHome,
+        requireBrowser: false,
+        host,
+      });
+      retainSourceArtifacts =
+        configuration.repository.retention.retain_source_artifacts_on_completion;
+    } catch {
+      // Abort must remain configuration-independent. When retention cannot be
+      // proven, default to removing source-bearing recovery data.
+    }
+    await moveState(
+      state,
+      action === "pause" ? "paused" : "aborted",
+      store,
+      audit,
+      reason,
+      undefined,
+      retainSourceArtifacts,
+    );
     output(command.json, io, sessionResult(state, reason));
     return 0;
   } finally {
@@ -743,7 +806,15 @@ async function rollbackSession(
       data: { checkpointId, paths: summary.paths, totalBytes: summary.totalBytes, forced: command.force },
     });
     if (state.status !== "rolled_back") {
-      await moveState(state, "rolled_back", store, audit, "Completion invalidated by explicit checkpoint rollback");
+      await moveState(
+        state,
+        "rolled_back",
+        store,
+        audit,
+        "Completion invalidated by explicit checkpoint rollback",
+        undefined,
+        configuration.repository.retention.retain_source_artifacts_on_completion,
+      );
     }
     output(command.json, io, {
       rolledBack: true,
@@ -1036,8 +1107,10 @@ async function moveState(
   audit: AuditLog,
   reason?: string,
   failure?: unknown,
+  retainSourceArtifacts = false,
 ): Promise<void> {
   const from = state.status;
+  const prior = snapshotSessionLifecycle(state);
   const now = new Date().toISOString();
   transitionSession(state, next, now, {
     ...(reason === undefined ? {} : { reason }),
@@ -1050,14 +1123,34 @@ async function moveState(
         }
       : {}),
   });
-  await store.write(state);
-  await audit.append({
-    type: next === "completed" || next === "rolled_back" || next === "blocked" || next === "aborted" || next === "failed"
-      ? "session.ended"
-      : "session.transition",
-    taskId: state.taskId,
-    data: { from, to: next, ...(reason === undefined ? {} : { reason }) },
-  });
+  if (isTerminal(next) && next !== "completed") delete state.completionHandoff;
+  try {
+    await store.write(state);
+  } catch (error) {
+    restoreSessionLifecycle(state, prior);
+    throw error;
+  }
+  try {
+    await audit.append({
+      type: next === "completed" || next === "rolled_back" || next === "blocked" || next === "aborted" || next === "failed"
+        ? "session.ended"
+        : "session.transition",
+      taskId: state.taskId,
+      data: { from, to: next, ...(reason === undefined ? {} : { reason }) },
+    });
+  } finally {
+    if (isTerminal(next)) {
+      const sessionDirectory = store.sessionDirectory(state.sessionId);
+      await cleanupTerminalRecoveryArtifacts({
+        status: next,
+        retainSourceArtifacts,
+        artifacts: new SessionArtifactStore(path.join(sessionDirectory, "artifacts")),
+        completionHandoffs: {
+          remove: () => CompletionHandoffStore.removeAt(path.join(sessionDirectory, "handoff")),
+        },
+      });
+    }
+  }
 }
 
 async function waitForControlResult(
