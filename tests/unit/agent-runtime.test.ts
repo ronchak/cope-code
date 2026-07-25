@@ -217,6 +217,91 @@ test("runtime completes a multi-turn autonomous tool loop", async () => {
   assert.equal(durableHandoff.verification.accepted, true);
 });
 
+test("runtime executes read-only batches concurrently with bounded, ordered outcomes", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-parallel-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const calls = Array.from({ length: 9 }, (_, index) => ({
+    operationId: `op_read_${index}`,
+    name: "read_file" as const,
+    arguments: { path: `src/file-${index}.ts` },
+  }));
+  const transport = new QueueTransport([
+    JSON.stringify([{ type: "tool_request", calls }]),
+    JSON.stringify([{
+      type: "complete_task",
+      operationId: "op_complete",
+      claim: {
+        summary: "Parallel reads completed.",
+        acceptanceCriteria: [], validation: [], skippedValidation: [], remainingRisks: [], recommendedFollowUp: [],
+      },
+    }]),
+  ]);
+  let active = 0;
+  let peakActive = 0;
+  const completionOrder: string[] = [];
+  let releaseFirstWave!: () => void;
+  const firstWaveReady = new Promise<void>((resolve) => { releaseFirstWave = resolve; });
+  const journal = new OperationJournal(path.join(root, "operations"), localState.sessionId);
+  const auditFilename = path.join(root, "audit.jsonl");
+  const runtime = new AgentRuntime({
+    state: localState,
+    store,
+    journal,
+    audit: new AuditLog(auditFilename, localState.sessionId),
+    protocol,
+    policy: {
+      summarize: () => ({}),
+      authorize: () => ({ outcome: "allow", reasonCode: "OK", explanation: "ok" }),
+      expandSessionGrant: async () => false,
+    },
+    tools: {
+      execute: async (call) => {
+        active += 1;
+        peakActive = Math.max(peakActive, active);
+        const index = Number(call.operationId.slice("op_read_".length));
+        if (active === 4) releaseFirstWave();
+        await firstWaveReady;
+        await new Promise<void>((resolve) => setTimeout(resolve, (9 - index) * 2));
+        completionOrder.push(call.operationId);
+        active -= 1;
+        return {
+          operationId: call.operationId,
+          tool: call.name,
+          status: "success",
+          data: { index },
+          safeMetadata: { index },
+        };
+      },
+      inspectCompletionState: async () => ({
+        pathKey: completionPathKey, known: true, fingerprint: "d".repeat(64),
+        excludedStateFingerprint: "0".repeat(64), hasConflicts: false, changedPaths: [],
+        outOfScopePaths: [], gitStatusSummary: "clean",
+      }),
+    },
+    transport,
+    disclosure: { inspectAndSerialize: async (message) => message },
+    user: { requestInput: async () => ({}), requestCapability: async () => ({ decision: "deny" }) },
+    completionRequirements: { requiredCommandIds: [], requireValidationAfterLastMutation: true, requireCleanPendingOperations: true },
+    clock: { now: () => new Date("2026-01-01T00:01:00.000Z") },
+    idFactory: (() => { let value = 0; return () => `submission_${++value}`; })(),
+  });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "completed", result.reason);
+  assert.equal(peakActive, 4);
+  assert.notDeepEqual(completionOrder, calls.map((call) => call.operationId));
+  const rendered = JSON.parse(transport.submittedContents[1] ?? "[]") as Array<{ operationId: string }>;
+  assert.deepEqual(rendered.map((outcome) => outcome.operationId), calls.map((call) => call.operationId));
+  assert.equal(localState.budgetUsage.operations, calls.length);
+  assert.equal(localState.budgetUsage.readFiles, calls.length);
+  assert.deepEqual(localState.completedOperationIds.toSorted(), calls.map((call) => call.operationId).toSorted());
+  for (const call of calls) assert.equal((await journal.read(call.operationId)).status, "completed");
+  assert.equal((await AuditLog.verify(auditFilename, localState.sessionId)).length > calls.length * 2, true);
+  assert.deepEqual((await store.read(localState.sessionId)).pendingOperations, []);
+});
+
 test("runtime sends protocol repair feedback and continues", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-"));
   const localState = state(root);
