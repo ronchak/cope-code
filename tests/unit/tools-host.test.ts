@@ -16,12 +16,38 @@ import { ContentSecurity } from "../../src/security/content-security.js";
 import { DisclosureLedger } from "../../src/security/disclosure-ledger.js";
 import { ProtectedPathPolicy } from "../../src/security/protected-paths.js";
 import { SecretScanner } from "../../src/security/secrets.js";
+import { ORCHESTRATOR_TOOL_NAMES } from "../../src/protocol/index.js";
 import { sha256 } from "../../src/shared/crypto.js";
+import { AgentError } from "../../src/shared/errors.js";
 import { CommandCatalog } from "../../src/tools/command-catalog.js";
 import { ProcessRunner } from "../../src/tools/process-runner.js";
 import { ToolHost, type ToolPolicyEvaluator } from "../../src/tools/tool-host.js";
 
 const execFileAsync = promisify(execFile);
+
+test("ToolHost rejects every registry orchestrator tool and unknown runtime name", async () => {
+  const host = new ToolHost({
+    repository: {} as never,
+    git: {} as never,
+    patchEngine: {} as never,
+    processRunner: {} as never,
+    policy: { authorize: () => ({ outcome: "allow" }) },
+  });
+  for (const tool of [...ORCHESTRATOR_TOOL_NAMES, "not_a_tool"]) {
+    await assert.rejects(
+      host.dispatch({
+        operationId: `reject_${tool}`,
+        name: tool as never,
+        arguments: {},
+      }),
+      (error: unknown) =>
+        error instanceof AgentError &&
+        error.code === "PROTOCOL_INVALID" &&
+        error.message === "Tool name is not supported",
+      `${tool} must not cross the local ToolHost boundary`,
+    );
+  }
+});
 
 test("ToolHost dispatches the cba/1 wire arguments, applies policy, and never replays an operation", async (context) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-tool-host-"));

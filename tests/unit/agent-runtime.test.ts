@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { AuditLog } from "../../src/audit/audit-log.js";
+import { LOCAL_TOOL_NAMES, TOOL_REGISTRY } from "../../src/protocol/index.js";
 import { sha256, stableJson } from "../../src/shared/crypto.js";
 import { AgentRuntime } from "../../src/orchestrator/agent-runtime.js";
 import type {
@@ -215,6 +216,169 @@ test("runtime completes a multi-turn autonomous tool loop", async () => {
   const durableHandoff = await completionHandoffs.read(localState.completionHandoff);
   assert.equal(durableHandoff.claim.summary, "Repository inspected.");
   assert.equal(durableHandoff.verification.accepted, true);
+});
+
+test("runtime journals every local tool according to registry read-only metadata", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-registry-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const journal = new OperationJournal(path.join(root, "operations"), localState.sessionId);
+  const responses = [
+    ...LOCAL_TOOL_NAMES.map((tool) => JSON.stringify([{
+      type: "tool_request",
+      calls: [{ operationId: `op_${tool}`, name: tool, arguments: {} }],
+    }])),
+    JSON.stringify([{
+      type: "blocked",
+      reason: "Registry classification test complete.",
+      recoverable: false,
+    }]),
+  ];
+  const runtime = new AgentRuntime({
+    state: localState,
+    store,
+    journal,
+    audit: new AuditLog(path.join(root, "audit.jsonl"), localState.sessionId),
+    protocol,
+    policy: {
+      summarize: () => ({}),
+      authorize: () => ({ outcome: "allow", reasonCode: "OK", explanation: "ok" }),
+      expandSessionGrant: async () => false,
+    },
+    tools: {
+      execute: async (call) => ({
+        operationId: call.operationId,
+        tool: call.name,
+        status: "failure",
+        data: { code: "EXPECTED_TEST_FAILURE", message: "No tool side effect is needed." },
+        safeMetadata: {},
+      }),
+      inspectCompletionState: async () => ({
+        pathKey: completionPathKey,
+        known: false,
+        fingerprint: "unknown",
+        excludedStateFingerprint: "0".repeat(64),
+        hasConflicts: false,
+        changedPaths: [],
+        outOfScopePaths: [],
+        gitStatusSummary: "unused",
+      }),
+    },
+    transport: new QueueTransport(responses),
+    disclosure: { inspectAndSerialize: async (message) => message },
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => ({ decision: "deny" }),
+    },
+    completionRequirements: {
+      requiredCommandIds: [],
+      requireValidationAfterLastMutation: true,
+      requireCleanPendingOperations: true,
+    },
+    clock: { now: () => new Date("2026-01-01T00:01:00.000Z") },
+    idFactory: (() => {
+      let value = 0;
+      return () => `submission_registry_${++value}`;
+    })(),
+  });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "blocked");
+  for (const tool of LOCAL_TOOL_NAMES) {
+    const record = await journal.read(`op_${tool}`);
+    assert.equal(
+      record.mutating,
+      !TOOL_REGISTRY[tool].read_only,
+      `${tool} journal mutation classification must match the registry`,
+    );
+  }
+});
+
+test("runtime independently enforces registry batchability before policy or execution", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-batchability-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [
+        { operationId: "op_batch_read", name: "list_files", arguments: {} },
+        { operationId: "op_batch_patch", name: "apply_patch", arguments: {} },
+      ],
+    }]),
+    JSON.stringify([{
+      type: "blocked",
+      reason: "Batchability test complete.",
+      recoverable: false,
+    }]),
+  ]);
+  let policyChecks = 0;
+  let executions = 0;
+  const runtime = new AgentRuntime({
+    state: localState,
+    store,
+    journal: new OperationJournal(path.join(root, "operations"), localState.sessionId),
+    audit: new AuditLog(path.join(root, "audit.jsonl"), localState.sessionId),
+    protocol,
+    policy: {
+      summarize: () => ({}),
+      authorize: () => {
+        policyChecks += 1;
+        return { outcome: "allow", reasonCode: "OK", explanation: "ok" };
+      },
+      expandSessionGrant: async () => false,
+    },
+    tools: {
+      execute: async (call) => {
+        executions += 1;
+        return {
+          operationId: call.operationId,
+          tool: call.name,
+          status: "success",
+          data: {},
+          safeMetadata: {},
+        };
+      },
+      inspectCompletionState: async () => ({
+        pathKey: completionPathKey,
+        known: false,
+        fingerprint: "unknown",
+        excludedStateFingerprint: "0".repeat(64),
+        hasConflicts: false,
+        changedPaths: [],
+        outOfScopePaths: [],
+        gitStatusSummary: "unused",
+      }),
+    },
+    transport,
+    disclosure: { inspectAndSerialize: async (message) => message },
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => ({ decision: "deny" }),
+    },
+    completionRequirements: {
+      requiredCommandIds: [],
+      requireValidationAfterLastMutation: true,
+      requireCleanPendingOperations: true,
+    },
+    clock: { now: () => new Date("2026-01-01T00:01:00.000Z") },
+    idFactory: (() => {
+      let value = 0;
+      return () => `submission_batch_${++value}`;
+    })(),
+  });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "blocked");
+  assert.equal(policyChecks, 0);
+  assert.equal(executions, 0);
+  const outcomes = JSON.parse(transport.submittedContents[1] ?? "[]") as ReadonlyArray<{
+    readonly data?: { readonly code?: string };
+  }>;
+  assert.equal(outcomes.length, 2);
+  assert.equal(outcomes.every((outcome) => outcome.data?.code === "SEQUENCING_REQUIRED"), true);
 });
 
 test("runtime sends protocol repair feedback and continues", async () => {

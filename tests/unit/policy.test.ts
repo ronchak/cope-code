@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { TOOL_NAMES, TOOL_REGISTRY } from "../../src/protocol/index.js";
 import {
   DEFAULT_ORGANIZATION_POLICY,
   DEFAULT_POLICY_BUDGETS,
@@ -257,6 +258,22 @@ test("invalid or incomplete deterministic facts fail closed instead of bypassing
   );
   assert.equal(invalidUsage.decision, "deny");
   assert.ok(invalidUsage.reasons.some((reason) => reason.reason_code === "INVALID_OPERATION_CONTEXT"));
+});
+
+test("every registry-required policy context fails closed when omitted", () => {
+  const evaluator = engine();
+  for (const tool of TOOL_NAMES) {
+    const result = evaluator.evaluate(operation({ tool }));
+    const missingDimensions = result.reasons
+      .filter((reason) => reason.reason_code === "OPERATION_CONTEXT_MISSING")
+      .map((reason) => reason.dimension)
+      .sort();
+    assert.deepEqual(
+      missingDimensions,
+      [...TOOL_REGISTRY[tool].required_context].sort(),
+      `${tool} must enforce exactly its registry-required contexts`,
+    );
+  }
 });
 
 function emptyChange() {
