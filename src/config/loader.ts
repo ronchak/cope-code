@@ -17,6 +17,7 @@ import {
 import { assertValidPolicyDocument, type PolicyDocument } from "../policy/index.js";
 import { sha256, stableJson } from "../shared/crypto.js";
 import { AgentError, errorMessage } from "../shared/errors.js";
+import { MAX_MUTATION_FILE_BYTES } from "../shared/mutation-limits.js";
 import { CURRENT_HOST_PLATFORM, type HostPlatform } from "../platform/index.js";
 import { CommandCatalog } from "../tools/index.js";
 import {
@@ -248,6 +249,17 @@ export function parseRepositoryConfig(value: unknown): RepositoryAgentConfig {
       ),
     },
   };
+  if (config.limits.max_file_bytes > MAX_MUTATION_FILE_BYTES) {
+    throw new AgentError(
+      "CONFIG_INVALID",
+      "max_file_bytes exceeds the pinned mutation and rollback protocol limit",
+      {
+        maxFileBytes: config.limits.max_file_bytes,
+        protocolLimit: MAX_MUTATION_FILE_BYTES,
+        diagnosticCode: "MUTATION_FILE_LIMIT_UNSUPPORTED",
+      },
+    );
+  }
   for (const required of config.completion.required_command_ids) {
     if (!config.commands.some((command) => command.id === required)) {
       throw new AgentError("CONFIG_INVALID", `Required completion command '${required}' is absent from the catalog`);

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -147,6 +147,31 @@ test("layered runtime policy returns conflicts for stale edit hashes and occurre
     assert.equal(decision.outcome, "conflict");
     assert.equal(decision.reasonCode, "STALE_STATE");
   }
+});
+
+test("layered runtime policy returns a conflict when an edit target was deleted", async () => {
+  const { root, policy } = await harness();
+  const before = "old\nvalue\n";
+  await rm(path.join(root, "src", "a.txt"));
+  const decision = await policy.authorize({
+    operationId: "op_edit_deleted",
+    name: "edit_text",
+    arguments: {
+      path: "src/a.txt",
+      base_sha256: sha256(before),
+      old_text: "old",
+      new_text: "new",
+      expected_occurrences: 1,
+    },
+  });
+  assert.equal(decision.outcome, "conflict");
+  assert.equal(decision.reasonCode, "STALE_STATE");
+});
+
+test("completion path scope accepts an edit_text-only session grant", async () => {
+  const { policy } = await harness("auto", { tools: ["edit_text"] });
+  assert.equal(policy.isPathInScope("src/a.txt"), true);
+  assert.equal(policy.isPathInScope("README.md"), false);
 });
 
 test("layered runtime policy rejects edit no-ops and byte expansion before authorization", async () => {

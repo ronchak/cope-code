@@ -8,7 +8,7 @@ import {
   type SessionCapabilityExpansion,
   type SessionGrant,
 } from "../policy/index.js";
-import { BUDGET_METRICS, isToolName, toolRequiresContext } from "../protocol/index.js";
+import { BUDGET_METRICS, isToolName, TOOL_NAMES, toolRequiresContext } from "../protocol/index.js";
 import type { RepositoryBoundary } from "../repository/boundary.js";
 import { countChangedLines, planExactTextEdit } from "../repository/exact-text-edit.js";
 import type { RepositoryReadOperation } from "../repository/repository-tools.js";
@@ -150,20 +150,24 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
   public isPathInScope(path: string): boolean {
     const normalized = normalizeRepositoryPath(path);
     if (normalized === undefined) return false;
-    const operation: PolicyOperation = {
-      tool: "apply_patch",
-      paths: [{ path: normalized, access: "write" }],
-      change: {
-        files_changed: 1,
-        changed_lines: 0,
-        creates: 0,
-        deletes: 0,
-        dependency_manifest: false,
-        local_commit: false,
-      },
-      projected_usage: this.options.currentUsage(),
-    };
-    return this.engineValue.evaluate(operation).decision === "allow";
+    return TOOL_NAMES.filter(
+      (tool) => toolRequiresContext(tool, "path") && toolRequiresContext(tool, "change"),
+    ).some((tool) => {
+      const operation: PolicyOperation = {
+        tool,
+        paths: [{ path: normalized, access: "write" }],
+        change: {
+          files_changed: 1,
+          changed_lines: 0,
+          creates: 0,
+          deletes: 0,
+          dependency_manifest: false,
+          local_commit: false,
+        },
+        projected_usage: this.options.currentUsage(),
+      };
+      return this.engineValue.evaluate(operation).decision === "allow";
+    });
   }
 
   /**
@@ -284,6 +288,12 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
   }
 
   private async countExactEditLines(edit: EditTextInput): Promise<number> {
+    const resolved = await this.options.boundary.resolve(edit.path, { allowMissingLeaf: true });
+    if (!resolved.exists) {
+      throw new AgentError("STALE_STATE", "Edit target no longer exists", {
+        path: edit.path,
+      });
+    }
     const existing = await this.options.boundary.resolveExistingFile(edit.path);
     const maxFileBytes = this.options.maxMutationFileBytes ?? 1024 * 1024;
     const snapshot = await readTextFile(existing.absolutePath, edit.path, maxFileBytes);

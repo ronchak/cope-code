@@ -238,7 +238,10 @@ test("renderer stalls terminate bounded snapshots, fills, and clicks in persiste
       const tracked = new ContextSemanticPage(context, {
         entryUrl: "https://m365.cloud.microsoft/chat",
         approvedHosts: [{ hostname: "m365.cloud.microsoft" }],
-      }, page, 100);
+      // Hosted macOS runners can spend more than 100 ms in the setup reads
+      // before the deliberately stalled operation begins. Keep the production
+      // barrier short but leave enough headroom to test the intended timeout.
+      }, page, 1_000);
       assert.equal(await tracked.currentUrl(), chatUrl);
 
       if (operation === "click") {
@@ -267,7 +270,7 @@ test("renderer stalls terminate bounded snapshots, fills, and clicks in persiste
       // the missing BROWSER_OPERATION_TIMEOUT diagnostic.
       const watchdog = setTimeout(() => {
         void browser!.close().catch(() => undefined);
-      }, 2_000);
+      }, 4_000);
       try {
         if (operation === "snapshot") {
           await tracked.snapshot(composerGroup);
@@ -292,7 +295,7 @@ test("renderer stalls terminate bounded snapshots, fills, and clicks in persiste
         (observedError as AgentError).details.dispatchAttempted,
         operation !== "snapshot",
       );
-      assert.ok(elapsedMs < 2_000, `${operation} exceeded its bounded teardown window`);
+      assert.ok(elapsedMs < 3_000, `${operation} exceeded its bounded teardown window`);
       await disconnected;
       assert.equal(browser!.isConnected(), false);
     } finally {

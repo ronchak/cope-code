@@ -714,7 +714,10 @@ async function rollbackSession(
       host,
     });
     const sessionDirectory = store.sessionDirectory(state.sessionId);
-    await AuditLog.verify(path.join(sessionDirectory, "audit.jsonl"), state.sessionId);
+    let auditEvents = await AuditLog.verify(
+      path.join(sessionDirectory, "audit.jsonl"),
+      state.sessionId,
+    );
     const checkpoints = await CheckpointStore.create(boundary, path.join(sessionDirectory, "checkpoints"), {
       maxCheckpointBytes: configuration.repository.limits.max_checkpoint_bytes,
       maxFiles: state.budgetLimits.maxChangedFiles,
@@ -739,13 +742,65 @@ async function rollbackSession(
     }
     const summary = await checkpoints.rollback(checkpointId, { force: command.force });
     const audit = new AuditLog(path.join(sessionDirectory, "audit.jsonl"), state.sessionId);
-    await audit.append({
-      type: "checkpoint.rolled_back",
-      taskId: state.taskId,
-      data: { checkpointId, paths: summary.paths, totalBytes: summary.totalBytes, forced: command.force },
-    });
+    const priorRollbackEvent = auditEvents.find(
+      (event) =>
+        event.type === "checkpoint.rolled_back" &&
+        event.data.checkpointId === checkpointId,
+    );
+    const fromStatus =
+      typeof priorRollbackEvent?.data.fromStatus === "string"
+        ? priorRollbackEvent.data.fromStatus
+        : state.status;
+    if (priorRollbackEvent === undefined) {
+      await audit.append({
+        type: "checkpoint.rolled_back",
+        taskId: state.taskId,
+        data: {
+          checkpointId,
+          paths: summary.paths,
+          totalBytes: summary.totalBytes,
+          forced: summary.rollbackForced ?? command.force,
+          fromStatus,
+        },
+      });
+    }
+    const rollbackReason = "Completion invalidated by explicit checkpoint rollback";
     if (state.status !== "rolled_back") {
-      await moveState(state, "rolled_back", store, audit, "Completion invalidated by explicit checkpoint rollback");
+      if (priorRollbackEvent !== undefined && fromStatus !== state.status) {
+        throw new AgentError(
+          "RECOVERY_REQUIRED",
+          "Rollback audit intent does not match the current session state",
+          { checkpointId, auditedFrom: fromStatus, currentStatus: state.status },
+        );
+      }
+      transitionSession(state, "rolled_back", new Date().toISOString(), {
+        reason: rollbackReason,
+      });
+      await store.write(state);
+    }
+    auditEvents = await AuditLog.verify(
+      path.join(sessionDirectory, "audit.jsonl"),
+      state.sessionId,
+    );
+    if (
+      !auditEvents.some(
+        (event) =>
+          event.type === "session.ended" &&
+          event.data.to === "rolled_back" &&
+          (event.data.checkpointId === undefined ||
+            event.data.checkpointId === checkpointId),
+      )
+    ) {
+      await audit.append({
+        type: "session.ended",
+        taskId: state.taskId,
+        data: {
+          from: fromStatus,
+          to: "rolled_back",
+          reason: rollbackReason,
+          checkpointId,
+        },
+      });
     }
     output(command.json, io, {
       rolledBack: true,

@@ -13,7 +13,7 @@ import {
   prepareDedicatedProfile,
   resolveSafeEdgeProfileDirectory,
 } from "../../src/browser/profile-lock.js";
-import { loadRuntimeConfiguration } from "../../src/config/loader.js";
+import { loadRuntimeConfiguration, parseRepositoryConfig } from "../../src/config/loader.js";
 import { launchDedicatedPersistentContext } from "../../src/browser/edge-launcher.js";
 import type { BrowserContext } from "playwright-core";
 import {
@@ -23,6 +23,39 @@ import {
 import { AgentError } from "../../src/shared/errors.js";
 import { sha256, stableJson } from "../../src/shared/crypto.js";
 import { createFilesystemIdentity } from "../../src/shared/filesystem-identity.js";
+
+test("repository configuration rejects files above the pinned mutation ceiling", () => {
+  assert.throws(
+    () => parseRepositoryConfig({
+      schema_version: "cba-repository-config/1",
+      classification: "internal",
+      policy: DEFAULT_REPOSITORY_POLICY,
+      grant_defaults: {
+        readable_paths: ["**"],
+        writable_paths: [],
+        disclosure_classifications: ["internal"],
+      },
+      commands: [],
+      completion: {
+        required_command_ids: [],
+        require_validation_after_last_mutation: true,
+      },
+      limits: {
+        max_file_bytes: 16 * 1024 * 1024 + 1,
+        max_read_bytes: 131_072,
+        max_search_output_bytes: 131_072,
+        max_diff_bytes: 524_288,
+        max_checkpoint_bytes: 64 * 1024 * 1024,
+        max_patch_bytes: 4_194_304,
+      },
+      retention: { retain_source_artifacts_on_completion: false },
+    }),
+    (error: unknown) =>
+      error instanceof AgentError &&
+      error.code === "CONFIG_INVALID" &&
+      error.details.diagnosticCode === "MUTATION_FILE_LIMIT_UNSUPPORTED",
+  );
+});
 
 test("profile configuration rejects UNC, device, and shared path forms", () => {
   for (const candidate of [

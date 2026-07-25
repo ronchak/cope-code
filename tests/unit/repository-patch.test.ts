@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   access,
   chmod,
+  link,
   mkdtemp,
   mkdir,
   readFile,
   readdir,
   rename,
   rm,
+  stat,
   symlink,
   unlink,
   writeFile,
@@ -15,9 +18,10 @@ import {
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { AgentError } from "../../src/shared/errors.js";
-import { sha256 } from "../../src/shared/crypto.js";
+import { sha256, stableJson } from "../../src/shared/crypto.js";
 import { RepositoryBoundary } from "../../src/repository/boundary.js";
 import {
   CheckpointStore,
@@ -26,6 +30,31 @@ import {
 import { PatchEngine } from "../../src/repository/patch-engine.js";
 import { ProtectedPathPolicy } from "../../src/security/protected-paths.js";
 import { CURRENT_HOST_PLATFORM } from "../../src/platform/index.js";
+import {
+  MAX_PINNED_FILE_BYTES,
+  isPinnedIdentity,
+  pinnedIdentityFromBigInts,
+  runPinnedMutation,
+} from "../../src/repository/pinned-mutation-fs.js";
+import { readRegularFile } from "../../src/repository/text-file.js";
+
+async function pinnedIdentityAt(filename: string) {
+  const state = await stat(filename, { bigint: true });
+  return pinnedIdentityFromBigInts(state.dev, state.ino);
+}
+
+test("pinned filesystem identities preserve integers above JavaScript's safe range", () => {
+  const first = pinnedIdentityFromBigInts(9_007_199_254_740_993n, 18_446_744_073_709_551_615n);
+  const adjacent = pinnedIdentityFromBigInts(9_007_199_254_740_994n, 18_446_744_073_709_551_614n);
+  assert.deepEqual(first, {
+    device: "9007199254740993",
+    inode: "18446744073709551615",
+  });
+  assert.notDeepEqual(first, adjacent);
+  assert.ok(isPinnedIdentity(first));
+  assert.equal(isPinnedIdentity({ device: 9_007_199_254_740_993, inode: "1" }), false);
+  assert.equal(isPinnedIdentity({ device: "01", inode: "1" }), false);
+});
 
 test("targeted edit is hash- and occurrence-guarded and uses atomic checkpoints", async (context) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-edit-text-"));
@@ -89,6 +118,38 @@ test("targeted edit preserves exact Unicode and CRLF bytes while supporting dele
     expected_occurrences: 1,
   });
   assert.equal(await readFile(target, "utf8"), "🐙 \r\nsecond \r\n");
+});
+
+test("targeted edit and rollback preserve a UTF-8 BOM with CRLF bytes", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-edit-bom-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  const target = path.join(root, "file.txt");
+  const before = Buffer.concat([
+    Buffer.from([0xef, 0xbb, 0xbf]),
+    Buffer.from("alpha\r\nsecond alpha\r\n", "utf8"),
+  ]);
+  await writeFile(target, before);
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(boundary, path.join(temporary, "checkpoints"));
+  const engine = new PatchEngine(boundary, checkpoints, new ProtectedPathPolicy());
+  const result = await engine.editText({
+    path: "file.txt",
+    base_sha256: sha256(before),
+    old_text: "alpha",
+    new_text: "β",
+    expected_occurrences: 2,
+  });
+  const expected = Buffer.concat([
+    Buffer.from([0xef, 0xbb, 0xbf]),
+    Buffer.from("β\r\nsecond β\r\n", "utf8"),
+  ]);
+  assert.deepEqual(await readFile(target), expected);
+  assert.equal(result.totalBytes, expected.length);
+  assert.equal(result.changedLines, 4);
+  await checkpoints.rollback(result.checkpointId);
+  assert.deepEqual(await readFile(target), before);
 });
 
 test("targeted edit occurrence guards use deterministic non-overlapping matches", async (context) => {
@@ -175,6 +236,119 @@ test("targeted edit rejects no-ops, invalid UTF-8, non-scalar input, and expansi
   );
 });
 
+test("mutation and checkpoint reads reject growth after preliminary size checks", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-bounded-read-race-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  const target = path.join(root, "file.txt");
+  const before = "before\n";
+  await writeFile(target, before);
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpointRoot = path.join(temporary, "checkpoints");
+  const checkpoints = await CheckpointStore.create(boundary, checkpointRoot);
+  const engine = new PatchEngine(
+    boundary,
+    checkpoints,
+    new ProtectedPathPolicy(),
+    { maxFileBytes: 16 },
+    { beforeSourceRead: async () => writeFile(target, "x".repeat(17)) },
+  );
+
+  await assert.rejects(
+    engine.editText({
+      path: "file.txt",
+      base_sha256: sha256(before),
+      old_text: "before",
+      new_text: "after",
+      expected_occurrences: 1,
+    }),
+    (error: unknown) => error instanceof AgentError && error.code === "BUDGET_EXCEEDED",
+  );
+  assert.equal((await readFile(target)).length, 17);
+  assert.equal(await checkpoints.latest(), undefined);
+
+  await writeFile(target, "small\n");
+  const racingCheckpoints = await CheckpointStore.create(
+    boundary,
+    path.join(temporary, "racing-checkpoints"),
+    {
+      hooks: {
+        beforeCheckpointFileRead: async () =>
+          writeFile(target, Buffer.alloc(MAX_PINNED_FILE_BYTES + 1, 0x61)),
+      },
+    },
+  );
+  await assert.rejects(
+    racingCheckpoints.createCheckpoint(["file.txt"]),
+    (error: unknown) => error instanceof AgentError && error.code === "BUDGET_EXCEEDED",
+  );
+  assert.equal(await racingCheckpoints.latest(), undefined);
+});
+
+test("descriptor readers reject raced FIFOs without blocking", {
+  skip: process.platform === "win32",
+}, async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-fifo-read-race-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const probe = path.join(temporary, "probe-fifo");
+  const available = spawnSync("mkfifo", [probe], { encoding: "utf8", timeout: 2_000 });
+  if (available.error !== undefined || available.status !== 0) {
+    context.skip("mkfifo is unavailable on this POSIX host");
+    return;
+  }
+  await unlink(probe);
+
+  const raced = path.join(temporary, "raced.txt");
+  await writeFile(raced, "regular\n");
+  const startedAt = Date.now();
+  await assert.rejects(
+    readRegularFile(raced, "raced.txt", 1024, {
+      testAfterStat: async () => {
+        await unlink(raced);
+        const created = spawnSync("mkfifo", [raced], { encoding: "utf8", timeout: 2_000 });
+        assert.equal(created.status, 0, created.stderr);
+      },
+    }),
+    (error: unknown) => error instanceof AgentError && error.code === "STALE_STATE",
+  );
+  assert.ok(Date.now() - startedAt < 2_000);
+
+  const directory = await pinnedIdentityAt(temporary);
+  const child = spawnSync(
+    process.execPath,
+    ["--input-type=module", "--eval", `
+      const { runPinnedMutation } = await import(process.env.CBA_PINNED_URL);
+      try {
+        runPinnedMutation(
+          process.env.CBA_DIRECTORY,
+          JSON.parse(process.env.CBA_IDENTITY),
+          { kind: "read", name: "raced.txt" },
+        );
+        process.stdout.write("unexpected");
+      } catch {
+        process.stdout.write("rejected");
+      }
+    `],
+    {
+      encoding: "utf8",
+      timeout: 2_000,
+      env: {
+        ...process.env,
+        CBA_PINNED_URL: new URL(
+          "../../src/repository/pinned-mutation-fs.js",
+          import.meta.url,
+        ).href,
+        CBA_DIRECTORY: temporary,
+        CBA_IDENTITY: JSON.stringify(directory),
+      },
+    },
+  );
+  assert.notEqual((child.error as NodeJS.ErrnoException | undefined)?.code, "ETIMEDOUT");
+  assert.equal(child.status, 0, child.stderr);
+  assert.equal(child.stdout, "rejected");
+});
+
 test("targeted edit charges line-ending-only changes against changed-line budgets", async (context) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-edit-line-endings-"));
   context.after(async () => rm(temporary, { recursive: true, force: true }));
@@ -234,6 +408,27 @@ test("targeted edit rejects protected, binary, packaged, and executable files", 
       candidate,
     );
   }
+});
+
+test("targeted edit reports a deleted target as stale state", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-edit-deleted-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(boundary, path.join(temporary, "checkpoints"));
+  const engine = new PatchEngine(boundary, checkpoints, new ProtectedPathPolicy());
+
+  await assert.rejects(
+    engine.editText({
+      path: "deleted.txt",
+      base_sha256: sha256("before\n"),
+      old_text: "before",
+      new_text: "after",
+      expected_occurrences: 1,
+    }),
+    (error: unknown) => error instanceof AgentError && error.code === "STALE_STATE",
+  );
 });
 
 test("patch commit captures concurrent writes and never overwrites them during recovery", async (context) => {
@@ -366,51 +561,83 @@ test("ancestor-directory replacement is detected before mutation syscalls reach 
   assert.equal(await readFile(path.join(sourceDirectory, "file.txt"), "utf8"), before);
 });
 
-test("transaction-directory replacement is detected before staging can follow it", async (context) => {
-  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-patch-transaction-race-"));
+test("pinned leaf operations preserve concurrent replacements at validation boundaries", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-patch-leaf-race-"));
   context.after(async () => rm(temporary, { recursive: true, force: true }));
-  const root = path.join(temporary, "repo");
-  const outside = path.join(temporary, "outside");
-  await mkdir(root);
-  await mkdir(outside);
-  const target = path.join(root, "file.txt");
-  const before = "before\n";
-  await writeFile(target, before);
-  const boundary = await RepositoryBoundary.create(root);
-  const checkpoints = await CheckpointStore.create(boundary, path.join(temporary, "checkpoints"));
-  let transactionDirectory: string | undefined;
-  let parkedDirectory: string | undefined;
-  const engine = new PatchEngine(
-    boundary,
-    checkpoints,
-    new ProtectedPathPolicy(),
-    {},
-    {
-      afterTransactionDirectory: async (_path, directory) => {
-        transactionDirectory = directory;
-        parkedDirectory = `${directory}.parked`;
-        await rename(directory, parkedDirectory);
-        await symlink(outside, directory, "dir");
-      },
-    },
-  );
+  const source = path.join(temporary, "source.txt");
+  const parked = path.join(temporary, "parked.txt");
+  const destination = path.join(temporary, "destination.txt");
+  await writeFile(source, "original\n");
+  const directoryIdentity = await pinnedIdentityAt(temporary);
+  const sourceIdentity = await pinnedIdentityAt(source);
 
-  await assert.rejects(
-    engine.editText({
-      path: "file.txt",
-      base_sha256: sha256(before),
-      old_text: "before",
-      new_text: "after",
-      expected_occurrences: 1,
+  assert.throws(
+    () => runPinnedMutation(temporary, directoryIdentity, {
+      kind: "remove",
+      name: path.basename(source),
+      identity: sourceIdentity,
+      testReplaceAfterValidation: {
+        parked: path.basename(parked),
+        bytes: Buffer.from("concurrent\n").toString("base64"),
+        mode: 0o600,
+      },
     }),
     (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
   );
-  assert.deepEqual(await readdir(outside), []);
-  assert.equal(await readFile(target, "utf8"), before);
-  assert.ok(transactionDirectory);
-  assert.ok(parkedDirectory);
-  await unlink(transactionDirectory);
-  await rename(parkedDirectory, transactionDirectory);
+  assert.equal(await readFile(source, "utf8"), "concurrent\n");
+  assert.equal(await readFile(parked, "utf8"), "original\n");
+  const concurrentMode = (await stat(source)).mode & 0o777;
+
+  assert.throws(
+    () => runPinnedMutation(temporary, directoryIdentity, {
+      kind: "capture",
+      source: path.basename(source),
+      destination: path.basename(destination),
+      expectedSha256: sha256("concurrent\n"),
+      expectedMode: concurrentMode,
+      testCreateDestinationAfterValidation: Buffer.from("destination race\n").toString("base64"),
+    }),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  assert.equal(await readFile(source, "utf8"), "concurrent\n");
+  assert.equal(await readFile(destination, "utf8"), "destination race\n");
+
+  await unlink(destination);
+  assert.throws(
+    () => runPinnedMutation(temporary, directoryIdentity, {
+      kind: "capture",
+      source: path.basename(source),
+      destination: path.basename(destination),
+      expectedSha256: sha256("concurrent\n"),
+      expectedMode: concurrentMode,
+      testWriteAfterCaptureValidation: Buffer.from("tail race\n").toString("base64"),
+    }),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  assert.equal(await readFile(source, "utf8"), "tail race\n");
+  assert.equal(await readFile(destination, "utf8"), "tail race\n");
+});
+
+test("pinned workers execute the payload captured before helper-path replacement", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-patch-worker-trust-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const workerPath = fileURLToPath(
+    new URL("../../src/repository/pinned-mutation-worker.js", import.meta.url),
+  );
+  const workerBytes = await readFile(workerPath);
+  context.after(async () => writeFile(workerPath, workerBytes));
+  await writeFile(workerPath, "throw new Error('replaced worker must not execute');\n");
+  runPinnedMutation(
+    temporary,
+    await pinnedIdentityAt(temporary),
+    {
+      kind: "write",
+      name: "result.txt",
+      bytes: Buffer.from("trusted\n").toString("base64"),
+      mode: 0o600,
+    },
+  );
+  assert.equal(await readFile(path.join(temporary, "result.txt"), "utf8"), "trusted\n");
 });
 
 test("recovery preserves a concurrent deletion of an installed result", async (context) => {
@@ -438,6 +665,311 @@ test("recovery preserves a concurrent deletion of an installed result", async (c
       old_text: "before",
       new_text: "after",
       expected_occurrences: 1,
+    }),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  await assert.rejects(readFile(target), (error: unknown) =>
+    (error as NodeJS.ErrnoException).code === "ENOENT");
+});
+
+test("recovery preserves a deletion before the install worker acknowledges", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-patch-unacked-delete-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  const target = path.join(root, "file.txt");
+  const before = "before\n";
+  await writeFile(target, before);
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(boundary, path.join(temporary, "checkpoints"));
+  const engine = new PatchEngine(
+    boundary,
+    checkpoints,
+    new ProtectedPathPolicy(),
+    {},
+    { deleteAfterLinkBeforeResponse: () => true },
+  );
+
+  await assert.rejects(
+    engine.editText({
+      path: "file.txt",
+      base_sha256: sha256(before),
+      old_text: "before",
+      new_text: "after",
+      expected_occurrences: 1,
+    }),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  await assert.rejects(readFile(target), (error: unknown) =>
+    (error as NodeJS.ErrnoException).code === "ENOENT");
+});
+
+test("pinned install exposes deterministic deletion-before-ack evidence", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-worker-unacked-delete-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const directory = await pinnedIdentityAt(temporary);
+  const staged = runPinnedMutation(temporary, directory, {
+    kind: "write",
+    name: "staged",
+    bytes: Buffer.from("after\n").toString("base64"),
+    mode: 0o600,
+  });
+  assert.ok(isPinnedIdentity(staged));
+
+  assert.throws(
+    () => runPinnedMutation(temporary, directory, {
+      kind: "install",
+      source: "staged",
+      destination: "target",
+      sourceIdentity: staged,
+      sourceSha256: sha256("after\n"),
+      sourceMode: 0o600,
+      testDeleteDestinationAfterLink: true,
+    }),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  await assert.rejects(readFile(path.join(temporary, "target")));
+  assert.equal(await readFile(path.join(temporary, "staged"), "utf8"), "after\n");
+});
+
+test("pinned reads reject a file that grows after descriptor stat", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-worker-read-growth-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const target = path.join(temporary, "target");
+  await writeFile(target, "before");
+  const directory = await pinnedIdentityAt(temporary);
+
+  assert.throws(
+    () => runPinnedMutation(
+      temporary,
+      directory,
+      {
+        kind: "read",
+        name: "target",
+        testAppendAfterStat: "!",
+      },
+    ),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  assert.equal(await readFile(target, "utf8"), "before!");
+});
+
+test("forward mutation hard-link preflight fails before capture and cleans reserved leaves", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-patch-link-preflight-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  const target = path.join(root, "file.txt");
+  const before = "before\n";
+  await writeFile(target, before, { mode: 0o640 });
+  const modeBefore = (await stat(target)).mode & 0o777;
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(boundary, path.join(temporary, "checkpoints"));
+  const engine = new PatchEngine(
+    boundary,
+    checkpoints,
+    new ProtectedPathPolicy(),
+    {},
+    { failHardLinkProbe: () => true },
+  );
+
+  await assert.rejects(
+    engine.editText({
+      path: "file.txt",
+      base_sha256: sha256(before),
+      old_text: "before",
+      new_text: "after",
+      expected_occurrences: 1,
+    }),
+    (error: unknown) => error instanceof AgentError && error.code === "UNSUPPORTED_FILE",
+  );
+  assert.equal(await readFile(target, "utf8"), before);
+  assert.equal((await stat(target)).mode & 0o777, modeBefore);
+  assert.deepEqual((await readdir(root)).filter((name) => name.startsWith(".cba-")), []);
+});
+
+test("rollback hard-link preflight covers every target before capture", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-rollback-link-preflight-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  const first = path.join(root, "first.txt");
+  const second = path.join(root, "second.txt");
+  await writeFile(first, "first before\n", { mode: 0o640 });
+  await writeFile(second, "second before\n", { mode: 0o600 });
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpointRoot = path.join(temporary, "checkpoints");
+  const checkpoints = await CheckpointStore.create(boundary, checkpointRoot);
+  const engine = new PatchEngine(boundary, checkpoints, new ProtectedPathPolicy());
+  const result = await engine.applyPatch({
+    changes: [
+      {
+        kind: "update",
+        path: "first.txt",
+        base_sha256: sha256("first before\n"),
+        content: "first after\n",
+      },
+      {
+        kind: "update",
+        path: "second.txt",
+        base_sha256: sha256("second before\n"),
+        content: "second after\n",
+      },
+    ],
+  });
+  const firstMode = (await stat(first)).mode & 0o777;
+  const secondMode = (await stat(second)).mode & 0o777;
+  const unsupported = await CheckpointStore.create(boundary, checkpointRoot, {
+    hooks: { failRollbackHardLinkProbe: (candidate) => candidate === "second.txt" },
+  });
+
+  await assert.rejects(
+    unsupported.rollback(result.checkpointId),
+    (error: unknown) => error instanceof AgentError && error.code === "UNSUPPORTED_FILE",
+  );
+  assert.equal(await readFile(first, "utf8"), "first after\n");
+  assert.equal(await readFile(second, "utf8"), "second after\n");
+  assert.equal((await stat(first)).mode & 0o777, firstMode);
+  assert.equal((await stat(second)).mode & 0o777, secondMode);
+  assert.deepEqual((await readdir(root)).filter((name) => name.startsWith(".cba-")), []);
+});
+
+test("rollback authenticates and cleans an interrupted forward delete probe", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-delete-probe-recovery-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  const target = path.join(root, "delete.txt");
+  const before = "before delete\n";
+  await writeFile(target, before, { mode: 0o640 });
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpointRoot = path.join(temporary, "checkpoints");
+  const checkpoints = await CheckpointStore.create(boundary, checkpointRoot);
+  const checkpoint = await checkpoints.createCheckpoint(["delete.txt"]);
+  const targetIdentity = await pinnedIdentityAt(target);
+  const directory = await pinnedIdentityAt(root);
+  const targetMode = (await stat(target)).mode & 0o777;
+  await checkpoints.recordMutationArtifacts(checkpoint.id, [{
+    path: "delete.txt",
+    directory,
+    probe: {
+      ...targetIdentity,
+      sha256: sha256(before),
+      mode: targetMode,
+    },
+  }]);
+  const probe = checkpointMutationArtifactPaths(
+    target,
+    "delete.txt",
+    checkpoint.id,
+  ).probePath;
+  await link(target, probe);
+
+  assert.equal((await stat(target)).nlink, 2);
+  await checkpoints.verify(checkpoint.id);
+  await checkpoints.rollback(checkpoint.id, { force: true });
+  assert.equal(await readFile(target, "utf8"), before);
+  assert.deepEqual((await readdir(root)).filter((name) => name.startsWith(".cba-")), []);
+});
+
+test("rollback resumes an exact created-target probe and rejects a different-inode probe", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-rollback-probe-recovery-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+
+  async function seedProbe(caseName: string, exactProbe: boolean) {
+    const root = path.join(temporary, caseName);
+    const checkpointRoot = path.join(temporary, `${caseName}-checkpoints`);
+    await mkdir(root);
+    const boundary = await RepositoryBoundary.create(root);
+    const checkpoints = await CheckpointStore.create(boundary, checkpointRoot);
+    const checkpoint = await checkpoints.createCheckpoint(["created.txt"]);
+    const target = path.join(root, "created.txt");
+    const content = "created later\n";
+    await writeFile(target, content, { mode: 0o640 });
+    const targetState = await stat(target, { bigint: true });
+    await checkpoints.seal(checkpoint.id, [{
+      path: "created.txt",
+      sha256: sha256(content),
+      mode: Number(targetState.mode & 0o777n),
+    }]);
+    const rollbackProbe = `${checkpointMutationArtifactPaths(
+      target,
+      "created.txt",
+      checkpoint.id,
+    ).probePath}.rollback`;
+    if (exactProbe) {
+      await link(target, rollbackProbe);
+    } else {
+      await link(target, path.join(root, "unrelated-hard-link"));
+      await writeFile(rollbackProbe, content, { mode: 0o640 });
+    }
+    const manifestPath = path.join(checkpointRoot, checkpoint.id, "manifest.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+      integrity: string;
+      rollback?: unknown;
+      [key: string]: unknown;
+    };
+    manifest.rollback = {
+      startedAt: "2026-07-25T00:00:00.000Z",
+      forced: false,
+      phase: "applying",
+      entries: [{
+        path: "created.txt",
+        directory: await pinnedIdentityAt(root),
+        current: {
+          ...pinnedIdentityFromBigInts(targetState.dev, targetState.ino),
+          sha256: sha256(content),
+          mode: Number(targetState.mode & 0o777n),
+        },
+        temporary: null,
+        backup: null,
+        installed: null,
+      }],
+    };
+    const { integrity: _integrity, ...body } = manifest;
+    await writeFile(
+      manifestPath,
+      `${stableJson({ ...body, integrity: sha256(stableJson(body)) })}\n`,
+    );
+    return { checkpoints, checkpoint, root, target };
+  }
+
+  const exact = await seedProbe("exact", true);
+  await exact.checkpoints.verify(exact.checkpoint.id);
+  await exact.checkpoints.rollback(exact.checkpoint.id);
+  await assert.rejects(readFile(exact.target));
+  assert.deepEqual(
+    (await readdir(exact.root)).filter((name) => name.startsWith(".cba-")),
+    [],
+  );
+
+  const inauthentic = await seedProbe("inauthentic", false);
+  await assert.rejects(
+    inauthentic.checkpoints.verify(inauthentic.checkpoint.id),
+    (error: unknown) => error instanceof AgentError && error.code === "UNSUPPORTED_FILE",
+  );
+  assert.equal(await readFile(inauthentic.target, "utf8"), "created later\n");
+});
+
+test("create recovery removes an installed result when failure follows the final link", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-patch-create-link-failure-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  const target = path.join(root, "created.txt");
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(boundary, path.join(temporary, "checkpoints"));
+  const engine = new PatchEngine(
+    boundary,
+    checkpoints,
+    new ProtectedPathPolicy(),
+    { allowCreate: true },
+    { failAfterLink: () => true },
+  );
+
+  await assert.rejects(
+    engine.applyPatch({
+      changes: [{ kind: "create", path: "created.txt", content: "created\n" }],
     }),
     (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
   );
@@ -474,6 +1006,36 @@ test("patch recovery fails closed when a concurrent path appears after capture",
     (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
   );
   assert.equal(await readFile(target, "utf8"), "concurrent\n");
+});
+
+test("post-install chmod race is detected before mutation success is sealed", async (context) => {
+  if (!CURRENT_HOST_PLATFORM.supportsPosixModes) return;
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-patch-mode-race-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  const target = path.join(root, "file.txt");
+  await writeFile(target, "before\n");
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(boundary, path.join(temporary, "checkpoints"));
+  const engine = new PatchEngine(
+    boundary,
+    checkpoints,
+    new ProtectedPathPolicy(),
+    {},
+    { afterInstall: async () => chmod(target, 0o755) },
+  );
+  await assert.rejects(
+    engine.editText({
+      path: "file.txt",
+      base_sha256: sha256("before\n"),
+      old_text: "before",
+      new_text: "after",
+      expected_occurrences: 1,
+    }),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  assert.equal((await stat(target)).mode & 0o777, 0o755);
 });
 
 test("full-text patch transaction updates, creates, deletes, verifies, and rolls back", async (context) => {
@@ -609,6 +1171,108 @@ test("checkpoint verification detects manifest corruption before rollback", asyn
   assert.equal(await readFile(path.join(root, "file.txt"), "utf8"), "original\n");
 });
 
+test("checkpoint manifest reads enforce the descriptor allocation cap", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-checkpoint-manifest-cap-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  const checkpointRoot = path.join(temporary, "checkpoints");
+  await mkdir(root);
+  await writeFile(path.join(root, "file.txt"), "original\n");
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(boundary, checkpointRoot);
+  const checkpoint = await checkpoints.createCheckpoint(["file.txt"]);
+  await writeFile(
+    path.join(checkpointRoot, checkpoint.id, "manifest.json"),
+    Buffer.alloc(1024 * 1024 + 1, 0x20),
+  );
+
+  await assert.rejects(
+    checkpoints.verify(checkpoint.id),
+    (error: unknown) => error instanceof AgentError && error.code === "CHECKPOINT_CORRUPT",
+  );
+});
+
+test("rollback revalidates a checkpoint blob immediately before staging it", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-checkpoint-blob-race-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  const checkpointRoot = path.join(temporary, "checkpoints");
+  await mkdir(root);
+  const target = path.join(root, "file.txt");
+  await writeFile(target, "before\n");
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(boundary, checkpointRoot);
+  const engine = new PatchEngine(boundary, checkpoints, new ProtectedPathPolicy());
+  const result = await engine.editText({
+    path: "file.txt",
+    base_sha256: sha256("before\n"),
+    old_text: "before",
+    new_text: "after",
+    expected_occurrences: 1,
+  });
+  const manifest = JSON.parse(
+    await readFile(
+      path.join(checkpointRoot, result.checkpointId, "manifest.json"),
+      "utf8",
+    ),
+  ) as { entries: Array<{ blob: string | null }> };
+  const blob = manifest.entries[0]?.blob;
+  assert.ok(blob);
+  const racingStore = await CheckpointStore.create(boundary, checkpointRoot, {
+    hooks: {
+      beforeRestoreTarget: async () => {
+        await writeFile(
+          path.join(checkpointRoot, result.checkpointId, "blobs", blob),
+          Buffer.alloc(MAX_PINNED_FILE_BYTES + 1, 0x61),
+        );
+      },
+    },
+  });
+
+  await assert.rejects(
+    racingStore.rollback(result.checkpointId),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  assert.equal(await readFile(target, "utf8"), "after\n");
+});
+
+test("checkpoint manifest rejects malformed post-state mode evidence", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-checkpoint-mode-shape-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  const checkpointRoot = path.join(temporary, "checkpoints");
+  await mkdir(root);
+  await writeFile(path.join(root, "file.txt"), "before\n");
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(boundary, checkpointRoot);
+  const engine = new PatchEngine(boundary, checkpoints, new ProtectedPathPolicy());
+  const result = await engine.editText({
+    path: "file.txt",
+    base_sha256: sha256("before\n"),
+    old_text: "before",
+    new_text: "after",
+    expected_occurrences: 1,
+  });
+  const manifestPath = path.join(checkpointRoot, result.checkpointId, "manifest.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+    integrity: string;
+    entries: Array<{ expectedAfter?: { existed: boolean; sha256: string | null; mode?: unknown } }>;
+    [key: string]: unknown;
+  };
+  if (manifest.entries[0]?.expectedAfter !== undefined) {
+    manifest.entries[0].expectedAfter.mode = "0755";
+  }
+  const { integrity: _integrity, ...body } = manifest;
+  await writeFile(
+    manifestPath,
+    `${stableJson({ ...body, integrity: sha256(stableJson(body)) })}\n`,
+  );
+  await assert.rejects(
+    checkpoints.verify(result.checkpointId),
+    (error: unknown) => error instanceof AgentError && error.code === "CHECKPOINT_CORRUPT",
+  );
+});
+
 test("mutation engine rejects executable and packaged file types even when their bytes look textual", async (context) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-patch-types-"));
   context.after(async () => rm(temporary, { recursive: true, force: true }));
@@ -626,7 +1290,7 @@ test("mutation engine rejects executable and packaged file types even when their
   }
 });
 
-test("checkpoint rollback removes deterministic transaction artifacts left by an interrupted mutation", async (context) => {
+test("checkpoint rollback removes identity-bound artifacts left by an interrupted mutation", async (context) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-checkpoint-artifacts-"));
   context.after(async () => rm(temporary, { recursive: true, force: true }));
   const root = path.join(temporary, "repo");
@@ -637,15 +1301,23 @@ test("checkpoint rollback removes deterministic transaction artifacts left by an
   const checkpoints = await CheckpointStore.create(boundary, path.join(temporary, "checkpoints"));
   const checkpoint = await checkpoints.createCheckpoint(["file.txt"]);
   const artifacts = checkpointMutationArtifactPaths(target, "file.txt", checkpoint.id);
-  const legacyPrefix = `.cba-${checkpoint.id}-${sha256("file.txt").slice(0, 20)}`;
-  const legacyTemporary = path.join(root, `${legacyPrefix}.new`);
-  const legacyBackup = path.join(root, `${legacyPrefix}.old`);
-  await mkdir(artifacts.transactionDirectory);
   await writeFile(target, "partially updated\n");
   await writeFile(artifacts.temporaryPath, "staged\n");
   await writeFile(artifacts.backupPath, "original\n");
-  await writeFile(legacyTemporary, "legacy staged\n");
-  await writeFile(legacyBackup, "legacy original\n");
+  const temporaryState = await stat(artifacts.temporaryPath);
+  const backupState = await stat(artifacts.backupPath);
+  await checkpoints.recordMutationArtifacts(checkpoint.id, [{
+    path: "file.txt",
+    directory: await pinnedIdentityAt(root),
+    temporary: {
+      ...await pinnedIdentityAt(artifacts.temporaryPath),
+      sha256: sha256("staged\n"), mode: temporaryState.mode & 0o777,
+    },
+    backup: {
+      ...await pinnedIdentityAt(artifacts.backupPath),
+      sha256: sha256("original\n"), mode: backupState.mode & 0o777,
+    },
+  }]);
   await assert.rejects(
     checkpoints.rollback(checkpoint.id),
     (error: unknown) => error instanceof AgentError && error.code === "STALE_STATE",
@@ -655,11 +1327,9 @@ test("checkpoint rollback removes deterministic transaction artifacts left by an
   assert.equal(await readFile(target, "utf8"), "original\n");
   await assert.rejects(readFile(artifacts.temporaryPath));
   await assert.rejects(readFile(artifacts.backupPath));
-  await assert.rejects(readFile(legacyTemporary));
-  await assert.rejects(readFile(legacyBackup));
 });
 
-test("checkpoint cleanup refuses a replaced transaction directory before touching its children", async (context) => {
+test("checkpoint cleanup refuses a symlink replacement before touching its target", async (context) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-checkpoint-artifact-race-"));
   context.after(async () => rm(temporary, { recursive: true, force: true }));
   const root = path.join(temporary, "repo");
@@ -672,19 +1342,376 @@ test("checkpoint cleanup refuses a replaced transaction directory before touchin
   const checkpoints = await CheckpointStore.create(boundary, path.join(temporary, "checkpoints"));
   const checkpoint = await checkpoints.createCheckpoint(["file.txt"]);
   const artifacts = checkpointMutationArtifactPaths(target, "file.txt", checkpoint.id);
+  await writeFile(artifacts.temporaryPath, "staged\n");
+  const temporaryState = await stat(artifacts.temporaryPath);
+  await checkpoints.recordMutationArtifacts(checkpoint.id, [{
+    path: "file.txt",
+    directory: await pinnedIdentityAt(root),
+    temporary: {
+      ...await pinnedIdentityAt(artifacts.temporaryPath),
+      sha256: sha256("staged\n"), mode: temporaryState.mode & 0o777,
+    },
+  }]);
+  const parkedArtifact = `${artifacts.temporaryPath}.parked`;
+  await rename(artifacts.temporaryPath, parkedArtifact);
   await writeFile(target, "partial\n");
-  await writeFile(path.join(outside, "new"), "outside new\n");
-  await writeFile(path.join(outside, "old"), "outside old\n");
-  await symlink(outside, artifacts.transactionDirectory, "dir");
+  const outsideArtifact = path.join(outside, "outside-new");
+  await writeFile(outsideArtifact, "outside new\n");
+  await symlink(outsideArtifact, artifacts.temporaryPath);
 
   await assert.rejects(
     checkpoints.rollback(checkpoint.id, { force: true }),
     (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
   );
   assert.equal(await readFile(target, "utf8"), "partial\n");
-  assert.equal(await readFile(path.join(outside, "new"), "utf8"), "outside new\n");
-  assert.equal(await readFile(path.join(outside, "old"), "utf8"), "outside old\n");
-  await unlink(artifacts.transactionDirectory);
+  assert.equal(await readFile(outsideArtifact, "utf8"), "outside new\n");
+  await unlink(artifacts.temporaryPath);
+  await rename(parkedArtifact, artifacts.temporaryPath);
+});
+
+test("checkpoint cleanup refuses an ordinary artifact replacement", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-checkpoint-artifact-identity-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  const target = path.join(root, "file.txt");
+  await writeFile(target, "original\n");
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(boundary, path.join(temporary, "checkpoints"));
+  const checkpoint = await checkpoints.createCheckpoint(["file.txt"]);
+  const artifacts = checkpointMutationArtifactPaths(target, "file.txt", checkpoint.id);
+  await writeFile(artifacts.temporaryPath, "staged\n");
+  const temporaryState = await stat(artifacts.temporaryPath);
+  await checkpoints.recordMutationArtifacts(checkpoint.id, [{
+    path: "file.txt",
+    directory: await pinnedIdentityAt(root),
+    temporary: {
+      ...await pinnedIdentityAt(artifacts.temporaryPath),
+      sha256: sha256("staged\n"), mode: temporaryState.mode & 0o777,
+    },
+  }]);
+  const parkedArtifact = `${artifacts.temporaryPath}.parked`;
+  await rename(artifacts.temporaryPath, parkedArtifact);
+  await writeFile(artifacts.temporaryPath, "replacement new\n");
+  await writeFile(target, "partial\n");
+
+  await assert.rejects(
+    checkpoints.rollback(checkpoint.id, { force: true }),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  assert.equal(await readFile(target, "utf8"), "partial\n");
+  assert.equal(await readFile(artifacts.temporaryPath, "utf8"), "replacement new\n");
+});
+
+test("checkpoint rollback pins the target parent before restoring", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-checkpoint-parent-race-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  const sourceDirectory = path.join(root, "src");
+  const parkedDirectory = path.join(root, "src-parked");
+  const outside = path.join(temporary, "outside");
+  await mkdir(sourceDirectory, { recursive: true });
+  await mkdir(outside);
+  const target = path.join(sourceDirectory, "file.txt");
+  const outsideTarget = path.join(outside, "file.txt");
+  await writeFile(target, "original\n");
+  await writeFile(outsideTarget, "outside\n");
+  const boundary = await RepositoryBoundary.create(root);
+  let swapped = false;
+  const checkpoints = await CheckpointStore.create(
+    boundary,
+    path.join(temporary, "checkpoints"),
+    {
+      hooks: {
+        beforeRestoreTarget: async () => {
+          if (swapped) return;
+          swapped = true;
+          await rename(sourceDirectory, parkedDirectory);
+          await symlink(outside, sourceDirectory, "dir");
+        },
+      },
+    },
+  );
+  const checkpoint = await checkpoints.createCheckpoint(["src/file.txt"]);
+  await checkpoints.recordMutationArtifacts(checkpoint.id, [{
+    path: "src/file.txt",
+    directory: await pinnedIdentityAt(sourceDirectory),
+  }]);
+  await writeFile(target, "partial\n");
+
+  await assert.rejects(
+    checkpoints.rollback(checkpoint.id, { force: true }),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  assert.equal(await readFile(outsideTarget, "utf8"), "outside\n");
+  await unlink(sourceDirectory);
+  await rename(parkedDirectory, sourceDirectory);
+  assert.equal(await readFile(target, "utf8"), "partial\n");
+});
+
+test("rollback preflights every artifact before changing a target", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-checkpoint-snapshot-race-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  const sourceDirectory = path.join(root, "src");
+  await mkdir(sourceDirectory, { recursive: true });
+  const target = path.join(sourceDirectory, "file.txt");
+  await writeFile(target, "original\n");
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(
+    boundary,
+    path.join(temporary, "checkpoints"),
+  );
+  const checkpoint = await checkpoints.createCheckpoint(["src/file.txt"]);
+  const artifacts = checkpointMutationArtifactPaths(target, "src/file.txt", checkpoint.id);
+  await writeFile(artifacts.temporaryPath, "staged\n");
+  const temporaryState = await stat(artifacts.temporaryPath);
+  await checkpoints.recordMutationArtifacts(checkpoint.id, [{
+    path: "src/file.txt",
+    directory: await pinnedIdentityAt(sourceDirectory),
+    temporary: {
+      ...await pinnedIdentityAt(artifacts.temporaryPath),
+      sha256: sha256("staged\n"), mode: temporaryState.mode & 0o777,
+    },
+  }]);
+  const parkedArtifact = `${artifacts.temporaryPath}.parked`;
+  await rename(artifacts.temporaryPath, parkedArtifact);
+  await writeFile(artifacts.temporaryPath, "replacement artifact\n");
+  await writeFile(target, "partial\n");
+
+  await assert.rejects(
+    checkpoints.rollback(checkpoint.id, { force: true }),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  assert.equal(await readFile(target, "utf8"), "partial\n");
+  assert.equal(await readFile(artifacts.temporaryPath, "utf8"), "replacement artifact\n");
+});
+
+test("rollback preflights reserved rollback artifacts for every file", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-checkpoint-rollback-artifact-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  const first = path.join(root, "a.txt");
+  const second = path.join(root, "b.txt");
+  await writeFile(first, "a before\n");
+  await writeFile(second, "b before\n");
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(boundary, path.join(temporary, "checkpoints"));
+  const engine = new PatchEngine(boundary, checkpoints, new ProtectedPathPolicy());
+  const result = await engine.applyPatch({
+    changes: [
+      { kind: "update", path: "a.txt", base_sha256: sha256("a before\n"), content: "a after\n" },
+      { kind: "update", path: "b.txt", base_sha256: sha256("b before\n"), content: "b after\n" },
+    ],
+  });
+  const secondArtifacts = checkpointMutationArtifactPaths(second, "b.txt", result.checkpointId);
+  await writeFile(`${secondArtifacts.temporaryPath}.rollback`, "unexpected\n");
+  await assert.rejects(
+    checkpoints.rollback(result.checkpointId),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  assert.equal(await readFile(first, "utf8"), "a after\n");
+  assert.equal(await readFile(second, "utf8"), "b after\n");
+});
+
+test("rollback-of-rollback pins an earlier target after a later restore fails", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-checkpoint-fallback-parent-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  const firstDirectory = path.join(root, "a");
+  const parkedDirectory = path.join(root, "a-parked");
+  const secondDirectory = path.join(root, "b");
+  const outside = path.join(temporary, "outside");
+  await mkdir(firstDirectory, { recursive: true });
+  await mkdir(secondDirectory);
+  await mkdir(outside);
+  const first = path.join(firstDirectory, "file.txt");
+  const second = path.join(secondDirectory, "file.txt");
+  const outsideTarget = path.join(outside, "file.txt");
+  await writeFile(first, "first original\n");
+  await writeFile(second, "second original\n");
+  await writeFile(outsideTarget, "outside\n");
+  const boundary = await RepositoryBoundary.create(root);
+  let swapFallback = false;
+  const checkpoints = await CheckpointStore.create(
+    boundary,
+    path.join(temporary, "checkpoints"),
+    {
+      hooks: {
+        afterRollbackCapture: async (candidate) => {
+          if (candidate === "b/file.txt") throw new Error("injected later restore failure");
+        },
+        beforeRestoreSnapshot: async (candidate) => {
+          if (candidate !== "a/file.txt" || swapFallback) return;
+          swapFallback = true;
+          await rename(firstDirectory, parkedDirectory);
+          await symlink(outside, firstDirectory, "dir");
+        },
+      },
+    },
+  );
+  const checkpoint = await checkpoints.createCheckpoint(["a/file.txt", "b/file.txt"]);
+  await checkpoints.recordMutationArtifacts(checkpoint.id, [
+    {
+      path: "a/file.txt",
+      directory: await pinnedIdentityAt(firstDirectory),
+    },
+    {
+      path: "b/file.txt",
+      directory: await pinnedIdentityAt(secondDirectory),
+    },
+  ]);
+  await writeFile(first, "first partial\n");
+  await writeFile(second, "second partial\n");
+
+  await assert.rejects(
+    checkpoints.rollback(checkpoint.id, { force: true }),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  assert.equal(await readFile(outsideTarget, "utf8"), "outside\n");
+  await unlink(firstDirectory);
+  await rename(parkedDirectory, firstDirectory);
+  assert.equal(await readFile(first, "utf8"), "first original\n");
+  assert.equal(await readFile(second, "utf8"), "second partial\n");
+});
+
+test("sealed rollback preserves leaf replacements made after exact preflight", async (context) => {
+  for (const raceKind of ["new-inode", "same-inode"] as const) {
+    await context.test(raceKind, async () => {
+      const temporary = await mkdtemp(path.join(os.tmpdir(), `cba-checkpoint-leaf-${raceKind}-`));
+      context.after(async () => rm(temporary, { recursive: true, force: true }));
+      const root = path.join(temporary, "repo");
+      await mkdir(root);
+      const target = path.join(root, "file.txt");
+      await writeFile(target, "before\n");
+      const boundary = await RepositoryBoundary.create(root);
+      let inject = false;
+      const checkpoints = await CheckpointStore.create(
+        boundary,
+        path.join(temporary, "checkpoints"),
+        {
+          hooks: {
+            beforeRestoreTarget: async () => {
+              if (!inject) return;
+              if (raceKind === "new-inode") {
+                await rename(target, `${target}.agent`);
+              }
+              await writeFile(target, "concurrent\n");
+            },
+          },
+        },
+      );
+      const engine = new PatchEngine(boundary, checkpoints, new ProtectedPathPolicy());
+      const result = await engine.editText({
+        path: "file.txt",
+        base_sha256: sha256("before\n"),
+        old_text: "before",
+        new_text: "after",
+        expected_occurrences: 1,
+      });
+      inject = true;
+
+      await assert.rejects(
+        checkpoints.rollback(result.checkpointId),
+        (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+      );
+      assert.equal(await readFile(target, "utf8"), "concurrent\n");
+    });
+  }
+});
+
+test("rollback verifies same-inode and replacement races after install", async (context) => {
+  for (const raceKind of ["same-inode", "new-inode"] as const) {
+    await context.test(raceKind, async () => {
+      const temporary = await mkdtemp(path.join(os.tmpdir(), `cba-rollback-post-${raceKind}-`));
+      context.after(async () => rm(temporary, { recursive: true, force: true }));
+      const root = path.join(temporary, "repo");
+      await mkdir(root);
+      const target = path.join(root, "file.txt");
+      await writeFile(target, "before\n");
+      const boundary = await RepositoryBoundary.create(root);
+      let inject = false;
+      const checkpoints = await CheckpointStore.create(
+        boundary,
+        path.join(temporary, "checkpoints"),
+        {
+          hooks: {
+            afterRollbackInstall: async () => {
+              if (!inject) return;
+              if (raceKind === "new-inode") await rename(target, `${target}.rollback`);
+              await writeFile(target, "concurrent\n");
+            },
+          },
+        },
+      );
+      const engine = new PatchEngine(boundary, checkpoints, new ProtectedPathPolicy());
+      const result = await engine.editText({
+        path: "file.txt",
+        base_sha256: sha256("before\n"),
+        old_text: "before",
+        new_text: "after",
+        expected_occurrences: 1,
+      });
+      inject = true;
+      await assert.rejects(
+        checkpoints.rollback(result.checkpointId),
+        (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+      );
+      assert.equal(await readFile(target, "utf8"), "concurrent\n");
+    });
+  }
+});
+
+test("legacy v1 checkpoints roll back safely and refuse unauthenticated artifacts", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-checkpoint-legacy-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  const target = path.join(root, "file.txt");
+  await writeFile(target, "before\n");
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpointRoot = path.join(temporary, "checkpoints");
+  const checkpoints = await CheckpointStore.create(boundary, checkpointRoot);
+  const sealed = await checkpoints.createCheckpoint(["file.txt"]);
+  await writeFile(target, "after\n");
+  await checkpoints.seal(sealed.id, [{
+    path: "file.txt",
+    sha256: sha256("after\n"),
+    mode: 0o644,
+  }]);
+  const manifestPath = path.join(checkpointRoot, sealed.id, "manifest.json");
+  const parsed = JSON.parse(await readFile(manifestPath, "utf8")) as {
+    integrity: string;
+    entries: Array<{ expectedAfter?: { mode?: number } }>;
+    [key: string]: unknown;
+  };
+  if (parsed.entries[0]?.expectedAfter !== undefined) {
+    delete parsed.entries[0].expectedAfter.mode;
+  }
+  const { integrity: _integrity, ...legacyBody } = parsed;
+  await writeFile(
+    manifestPath,
+    `${stableJson({ ...legacyBody, integrity: sha256(stableJson(legacyBody)) })}\n`,
+  );
+  await assert.rejects(
+    checkpoints.rollback(sealed.id),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  await checkpoints.rollback(sealed.id, { force: true });
+  assert.equal(await readFile(target, "utf8"), "before\n");
+
+  await writeFile(target, "legacy before\n");
+  const interrupted = await checkpoints.createCheckpoint(["file.txt"]);
+  const artifacts = checkpointMutationArtifactPaths(target, "file.txt", interrupted.id);
+  await writeFile(artifacts.temporaryPath, "unauthenticated\n");
+  await writeFile(target, "legacy partial\n");
+  await assert.rejects(
+    checkpoints.rollback(interrupted.id, { force: true }),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  assert.equal(await readFile(target, "utf8"), "legacy partial\n");
+  assert.equal(await readFile(artifacts.temporaryPath, "utf8"), "unauthenticated\n");
 });
 
 test("sealed checkpoint rollback refuses to overwrite later user edits", async (context) => {
@@ -716,6 +1743,468 @@ test("sealed checkpoint rollback refuses to overwrite later user edits", async (
 
   await checkpoints.rollback(result.checkpointId, { force: true });
   assert.equal(await readFile(target, "utf8"), "before\n");
+});
+
+test("sealed rollback treats chmod-only changes as stale and returns current integrity", async (context) => {
+  if (!CURRENT_HOST_PLATFORM.supportsPosixModes) return;
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-checkpoint-mode-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  const target = path.join(root, "file.txt");
+  await writeFile(target, "before\n");
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(boundary, path.join(temporary, "checkpoints"));
+  const engine = new PatchEngine(boundary, checkpoints, new ProtectedPathPolicy());
+  const result = await engine.editText({
+    path: "file.txt",
+    base_sha256: sha256("before\n"),
+    old_text: "before",
+    new_text: "after",
+    expected_occurrences: 1,
+  });
+  await chmod(target, 0o600);
+  await assert.rejects(
+    checkpoints.rollback(result.checkpointId),
+    (error: unknown) => error instanceof AgentError && error.code === "STALE_STATE",
+  );
+  await chmod(target, 0o644);
+  const rolledBack = await checkpoints.rollback(result.checkpointId);
+  const verified = await checkpoints.verify(result.checkpointId);
+  assert.equal(rolledBack.integrity, verified.integrity);
+  assert.equal(await readFile(target, "utf8"), "before\n");
+});
+
+test("persisted rollback resumes after process loss at each target phase", async (context) => {
+  for (const hook of [
+    "afterRollbackStage",
+    "afterRollbackCapture",
+    "afterRollbackInstall",
+  ] as const) {
+    await context.test(hook, async () => {
+      const temporary = await mkdtemp(path.join(os.tmpdir(), `cba-rollback-crash-${hook}-`));
+      context.after(async () => rm(temporary, { recursive: true, force: true }));
+      const root = path.join(temporary, "repo");
+      const checkpointRoot = path.join(temporary, "checkpoints");
+      await mkdir(root);
+      const target = path.join(root, "file.txt");
+      await writeFile(target, "before\n");
+      const boundary = await RepositoryBoundary.create(root);
+      const checkpoints = await CheckpointStore.create(boundary, checkpointRoot);
+      const engine = new PatchEngine(boundary, checkpoints, new ProtectedPathPolicy());
+      const result = await engine.editText({
+        path: "file.txt",
+        base_sha256: sha256("before\n"),
+        old_text: "before",
+        new_text: "after",
+        expected_occurrences: 1,
+      });
+
+      const child = spawnSync(
+        process.execPath,
+        ["--input-type=module", "--eval", `
+          const { RepositoryBoundary } = await import(process.env.CBA_BOUNDARY_URL);
+          const { CheckpointStore } = await import(process.env.CBA_CHECKPOINT_URL);
+          const boundary = await RepositoryBoundary.create(process.env.CBA_REPOSITORY_ROOT);
+          const hooks = {
+            [process.env.CBA_ROLLBACK_HOOK]: async () => process.exit(73),
+          };
+          const store = await CheckpointStore.create(
+            boundary,
+            process.env.CBA_CHECKPOINT_ROOT,
+            { hooks },
+          );
+          await store.rollback(process.env.CBA_CHECKPOINT_ID);
+        `],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            CBA_BOUNDARY_URL: new URL("../../src/repository/boundary.js", import.meta.url).href,
+            CBA_CHECKPOINT_URL: new URL("../../src/repository/checkpoint.js", import.meta.url).href,
+            CBA_REPOSITORY_ROOT: root,
+            CBA_CHECKPOINT_ROOT: checkpointRoot,
+            CBA_CHECKPOINT_ID: result.checkpointId,
+            CBA_ROLLBACK_HOOK: hook,
+          },
+        },
+      );
+      assert.equal(child.status, 73, child.stderr);
+
+      const reopenedBoundary = await RepositoryBoundary.create(root);
+      const reopened = await CheckpointStore.create(reopenedBoundary, checkpointRoot);
+      await reopened.rollback(result.checkpointId);
+      assert.equal(await readFile(target, "utf8"), "before\n");
+      assert.deepEqual(
+        (await readdir(root)).filter((entry) => entry.endsWith(".rollback")),
+        [],
+      );
+    });
+  }
+});
+
+test("restored terminal marker survives cleanup and makes rollback idempotent", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-rollback-created-cleanup-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  const checkpointRoot = path.join(temporary, "checkpoints");
+  await mkdir(root);
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(boundary, checkpointRoot);
+  const engine = new PatchEngine(boundary, checkpoints, new ProtectedPathPolicy());
+  const result = await engine.applyPatch({
+    changes: [{ kind: "create", path: "created.txt", content: "created\n" }],
+  });
+  const child = spawnSync(
+    process.execPath,
+    ["--input-type=module", "--eval", `
+      const { RepositoryBoundary } = await import(process.env.CBA_BOUNDARY_URL);
+      const { CheckpointStore } = await import(process.env.CBA_CHECKPOINT_URL);
+      const boundary = await RepositoryBoundary.create(process.env.CBA_REPOSITORY_ROOT);
+      const store = await CheckpointStore.create(
+        boundary,
+        process.env.CBA_CHECKPOINT_ROOT,
+        { hooks: { afterRollbackCleanup: async () => process.exit(76) } },
+      );
+      await store.rollback(process.env.CBA_CHECKPOINT_ID);
+    `],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CBA_BOUNDARY_URL: new URL("../../src/repository/boundary.js", import.meta.url).href,
+        CBA_CHECKPOINT_URL: new URL("../../src/repository/checkpoint.js", import.meta.url).href,
+        CBA_REPOSITORY_ROOT: root,
+        CBA_CHECKPOINT_ROOT: checkpointRoot,
+        CBA_CHECKPOINT_ID: result.checkpointId,
+      },
+    },
+  );
+  assert.equal(child.status, 76, child.stderr);
+
+  const reopenedBoundary = await RepositoryBoundary.create(root);
+  const reopened = await CheckpointStore.create(reopenedBoundary, checkpointRoot);
+  const firstRetry = await reopened.rollback(result.checkpointId);
+  const secondRetry = await reopened.rollback(result.checkpointId);
+  assert.equal(secondRetry.integrity, firstRetry.integrity);
+  await assert.rejects(readFile(path.join(root, "created.txt")));
+});
+
+test("rollback preserves a deletion before its install worker acknowledges", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-rollback-unacked-delete-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  const checkpointRoot = path.join(temporary, "checkpoints");
+  await mkdir(root);
+  const target = path.join(root, "file.txt");
+  await writeFile(target, "before\n");
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(boundary, checkpointRoot);
+  const engine = new PatchEngine(boundary, checkpoints, new ProtectedPathPolicy());
+  const result = await engine.editText({
+    path: "file.txt",
+    base_sha256: sha256("before\n"),
+    old_text: "before",
+    new_text: "after",
+    expected_occurrences: 1,
+  });
+  const racingStore = await CheckpointStore.create(boundary, checkpointRoot, {
+    hooks: { deleteRollbackInstallBeforeResponse: () => true },
+  });
+
+  await assert.rejects(
+    racingStore.rollback(result.checkpointId),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  await assert.rejects(readFile(target));
+  const reopened = await CheckpointStore.create(boundary, checkpointRoot);
+  await assert.rejects(
+    reopened.rollback(result.checkpointId),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  await assert.rejects(readFile(target));
+});
+
+test("force recovery reopens interrupted patch and artifact-consumption phases", async (context) => {
+  for (const hook of [
+    "afterStage",
+    "afterCapture",
+    "afterInstall",
+    "afterTemporaryCleanup",
+    "afterBackupCleanup",
+  ] as const) {
+    await context.test(hook, async () => {
+      const temporary = await mkdtemp(path.join(os.tmpdir(), `cba-patch-crash-${hook}-`));
+      context.after(async () => rm(temporary, { recursive: true, force: true }));
+      const root = path.join(temporary, "repo");
+      const checkpointRoot = path.join(temporary, "checkpoints");
+      await mkdir(root);
+      const target = path.join(root, "file.txt");
+      await writeFile(target, "before\n");
+      const child = spawnSync(
+        process.execPath,
+        ["--input-type=module", "--eval", `
+          const { RepositoryBoundary } = await import(process.env.CBA_BOUNDARY_URL);
+          const { CheckpointStore } = await import(process.env.CBA_CHECKPOINT_URL);
+          const { PatchEngine } = await import(process.env.CBA_PATCH_URL);
+          const { ProtectedPathPolicy } = await import(process.env.CBA_PROTECTED_URL);
+          const { sha256 } = await import(process.env.CBA_CRYPTO_URL);
+          const boundary = await RepositoryBoundary.create(process.env.CBA_REPOSITORY_ROOT);
+          const store = await CheckpointStore.create(boundary, process.env.CBA_CHECKPOINT_ROOT);
+          const hooks = {
+            [process.env.CBA_PATCH_HOOK]: async () => process.exit(74),
+          };
+          const engine = new PatchEngine(boundary, store, new ProtectedPathPolicy(), {}, hooks);
+          await engine.editText({
+            path: "file.txt",
+            base_sha256: sha256("before\\n"),
+            old_text: "before",
+            new_text: "after",
+            expected_occurrences: 1,
+            operationId: "op_patch_crash",
+          });
+        `],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            CBA_BOUNDARY_URL: new URL("../../src/repository/boundary.js", import.meta.url).href,
+            CBA_CHECKPOINT_URL: new URL("../../src/repository/checkpoint.js", import.meta.url).href,
+            CBA_PATCH_URL: new URL("../../src/repository/patch-engine.js", import.meta.url).href,
+            CBA_PROTECTED_URL: new URL("../../src/security/protected-paths.js", import.meta.url).href,
+            CBA_CRYPTO_URL: new URL("../../src/shared/crypto.js", import.meta.url).href,
+            CBA_REPOSITORY_ROOT: root,
+            CBA_CHECKPOINT_ROOT: checkpointRoot,
+            CBA_PATCH_HOOK: hook,
+          },
+        },
+      );
+      assert.equal(child.status, 74, child.stderr);
+
+      const boundary = await RepositoryBoundary.create(root);
+      const checkpoints = await CheckpointStore.create(boundary, checkpointRoot);
+      const interrupted = await checkpoints.latest("op_patch_crash");
+      assert.ok(interrupted);
+      await checkpoints.rollback(interrupted.id, { force: true });
+      assert.equal(await readFile(target, "utf8"), "before\n");
+    });
+  }
+});
+
+test("persisted reverting phase resumes after process loss following fallback install", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-rollback-revert-crash-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  const checkpointRoot = path.join(temporary, "checkpoints");
+  await mkdir(root);
+  await writeFile(path.join(root, "a.txt"), "a before\n");
+  await writeFile(path.join(root, "b.txt"), "b before\n");
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(boundary, checkpointRoot);
+  const engine = new PatchEngine(boundary, checkpoints, new ProtectedPathPolicy());
+  const result = await engine.applyPatch({
+    changes: [
+      {
+        kind: "update",
+        path: "a.txt",
+        base_sha256: sha256("a before\n"),
+        content: "a after\n",
+      },
+      {
+        kind: "update",
+        path: "b.txt",
+        base_sha256: sha256("b before\n"),
+        content: "b after\n",
+      },
+    ],
+  });
+  const child = spawnSync(
+    process.execPath,
+    ["--input-type=module", "--eval", `
+      const { RepositoryBoundary } = await import(process.env.CBA_BOUNDARY_URL);
+      const { CheckpointStore } = await import(process.env.CBA_CHECKPOINT_URL);
+      const boundary = await RepositoryBoundary.create(process.env.CBA_REPOSITORY_ROOT);
+      const store = await CheckpointStore.create(
+        boundary,
+        process.env.CBA_CHECKPOINT_ROOT,
+        {
+          hooks: {
+            afterRollbackCapture: async (candidate) => {
+              if (candidate === "b.txt") throw new Error("injected later rollback failure");
+            },
+            afterRollbackRevertInstall: async (candidate) => {
+              if (candidate === "a.txt") process.exit(75);
+            },
+          },
+        },
+      );
+      await store.rollback(process.env.CBA_CHECKPOINT_ID);
+    `],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CBA_BOUNDARY_URL: new URL("../../src/repository/boundary.js", import.meta.url).href,
+        CBA_CHECKPOINT_URL: new URL("../../src/repository/checkpoint.js", import.meta.url).href,
+        CBA_REPOSITORY_ROOT: root,
+        CBA_CHECKPOINT_ROOT: checkpointRoot,
+        CBA_CHECKPOINT_ID: result.checkpointId,
+      },
+    },
+  );
+  assert.equal(child.status, 75, child.stderr);
+
+  const reopenedBoundary = await RepositoryBoundary.create(root);
+  const reopened = await CheckpointStore.create(reopenedBoundary, checkpointRoot);
+  await assert.rejects(
+    reopened.rollback(result.checkpointId),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  assert.equal(await readFile(path.join(root, "a.txt"), "utf8"), "a after\n");
+  assert.equal(await readFile(path.join(root, "b.txt"), "utf8"), "b after\n");
+  await reopened.rollback(result.checkpointId);
+  assert.equal(await readFile(path.join(root, "a.txt"), "utf8"), "a before\n");
+  assert.equal(await readFile(path.join(root, "b.txt"), "utf8"), "b before\n");
+});
+
+test("rollback fallback preserves a deletion before recovery install acknowledgment", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-rollback-revert-unacked-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  const checkpointRoot = path.join(temporary, "checkpoints");
+  await mkdir(root);
+  await writeFile(path.join(root, "a.txt"), "a before\n");
+  await writeFile(path.join(root, "b.txt"), "b before\n");
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(boundary, checkpointRoot);
+  const engine = new PatchEngine(boundary, checkpoints, new ProtectedPathPolicy());
+  const result = await engine.applyPatch({
+    changes: [
+      {
+        kind: "update",
+        path: "a.txt",
+        base_sha256: sha256("a before\n"),
+        content: "a after\n",
+      },
+      {
+        kind: "update",
+        path: "b.txt",
+        base_sha256: sha256("b before\n"),
+        content: "b after\n",
+      },
+    ],
+  });
+  const racingStore = await CheckpointStore.create(boundary, checkpointRoot, {
+    hooks: {
+      afterRollbackCapture: async (candidate) => {
+        if (candidate === "b.txt") throw new Error("injected later rollback failure");
+      },
+      deleteRollbackRevertInstallBeforeResponse: (candidate) => candidate === "a.txt",
+    },
+  });
+
+  await assert.rejects(
+    racingStore.rollback(result.checkpointId),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  await assert.rejects(readFile(path.join(root, "a.txt")));
+  assert.equal(await readFile(path.join(root, "b.txt"), "utf8"), "b after\n");
+  const reopened = await CheckpointStore.create(boundary, checkpointRoot);
+  await assert.rejects(
+    reopened.rollback(result.checkpointId),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  await assert.rejects(readFile(path.join(root, "a.txt")));
+});
+
+test("pinned rollback protocol supports a seven MiB deleted text file", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-checkpoint-large-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  const target = path.join(root, "large.txt");
+  const before = `${"a".repeat(7 * 1024 * 1024 - 1)}\n`;
+  await writeFile(target, before);
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(boundary, path.join(temporary, "checkpoints"));
+  const engine = new PatchEngine(
+    boundary,
+    checkpoints,
+    new ProtectedPathPolicy(),
+    {
+      maxFileBytes: 8 * 1024 * 1024,
+      maxTotalBytes: 8 * 1024 * 1024,
+      maxChangedLines: 2,
+      allowDelete: true,
+    },
+  );
+  const result = await engine.applyPatch({
+    changes: [{
+      kind: "delete",
+      path: "large.txt",
+      base_sha256: sha256(before),
+    }],
+  });
+  await assert.rejects(readFile(target));
+  await checkpoints.rollback(result.checkpointId);
+  assert.equal((await readFile(target)).length, Buffer.byteLength(before));
+  assert.equal(sha256(await readFile(target)), sha256(before));
+});
+
+test("checkpoint.v1 fails closed before rolling back an oversized legacy entry", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-checkpoint-legacy-oversized-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  const target = path.join(root, "large.txt");
+  const before = Buffer.alloc(MAX_PINNED_FILE_BYTES + 1, 0x61);
+  await writeFile(target, "small before\n");
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpointRoot = path.join(temporary, "checkpoints");
+  const checkpoints = await CheckpointStore.create(
+    boundary,
+    checkpointRoot,
+    { maxCheckpointBytes: before.length + 1024 },
+  );
+  const checkpoint = await checkpoints.createCheckpoint(["large.txt"]);
+  const manifestPath = path.join(checkpointRoot, checkpoint.id, "manifest.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+    integrity: string;
+    entries: Array<{
+      blob: string | null;
+      sizeBytes: number;
+      sha256: string | null;
+    }>;
+    totalBytes: number;
+    [key: string]: unknown;
+  };
+  const entry = manifest.entries[0];
+  assert.ok(entry?.blob);
+  await writeFile(path.join(checkpointRoot, checkpoint.id, "blobs", entry.blob), before);
+  entry.sizeBytes = before.length;
+  entry.sha256 = sha256(before);
+  manifest.totalBytes = before.length;
+  const { integrity: _integrity, ...legacyBody } = manifest;
+  await writeFile(
+    manifestPath,
+    `${stableJson({ ...legacyBody, integrity: sha256(stableJson(legacyBody)) })}\n`,
+  );
+  const after = Buffer.from("after\n");
+  await writeFile(target, after);
+  await checkpoints.seal(checkpoint.id, [{
+    path: "large.txt",
+    sha256: sha256(after),
+    mode: (await stat(target)).mode & 0o777,
+  }]);
+
+  await assert.rejects(
+    checkpoints.rollback(checkpoint.id),
+    (error: unknown) =>
+      error instanceof AgentError &&
+      error.code === "RECOVERY_REQUIRED" &&
+      error.details.protocolLimit === MAX_PINNED_FILE_BYTES,
+  );
+  assert.equal(await readFile(target, "utf8"), "after\n");
 });
 
 test("checkpoint storage is outside the working tree by default", async (context) => {

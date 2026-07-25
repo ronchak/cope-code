@@ -606,6 +606,87 @@ test("runtime reserves exact mutation budgets before invoking a tool", async () 
   assert.equal((await journal.read("op_edit_budget")).status, "failed");
 });
 
+test("mutation accounting mismatch preserves checkpoint recovery metadata", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-accounting-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const auditPath = path.join(root, "audit.jsonl");
+  const journal = new OperationJournal(path.join(root, "operations"), localState.sessionId);
+  const runtime = new AgentRuntime({
+    state: localState,
+    store,
+    journal,
+    audit: new AuditLog(auditPath, localState.sessionId),
+    protocol,
+    policy: {
+      summarize: () => ({}),
+      authorize: () => ({
+        outcome: "allow",
+        reasonCode: "ALLOWED",
+        explanation: "allowed",
+        plannedMutation: { changedFiles: 1, changedLines: 1 },
+      }),
+      expandSessionGrant: async () => false,
+    },
+    tools: {
+      execute: async (call) => ({
+        operationId: call.operationId,
+        tool: call.name,
+        status: "success",
+        data: {},
+        safeMetadata: {
+          changedFileCount: 1,
+          changedLines: 2,
+          checkpointId: "checkpoint_12345678",
+          changedPaths: ["src/index.ts"],
+          repositoryFingerprint: "e".repeat(64),
+        },
+      }),
+      inspectCompletionState: async () => ({
+        pathKey: completionPathKey,
+        known: false,
+        fingerprint: "unknown",
+        excludedStateFingerprint: "0".repeat(64),
+        hasConflicts: false,
+        changedPaths: [],
+        outOfScopePaths: [],
+        gitStatusSummary: "unused",
+      }),
+    },
+    transport: new QueueTransport([
+      JSON.stringify([{
+        type: "tool_request",
+        calls: [{ operationId: "op_accounting", name: "edit_text", arguments: {} }],
+      }]),
+    ]),
+    disclosure: { inspectAndSerialize: async (message) => message },
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => ({ decision: "deny" }),
+    },
+    completionRequirements: {
+      requiredCommandIds: [],
+      requireValidationAfterLastMutation: true,
+      requireCleanPendingOperations: true,
+    },
+    clock: { now: () => new Date("2026-01-01T00:01:00.000Z") },
+    idFactory: () => "submission_accounting",
+  });
+
+  assert.equal((await runtime.run()).status, "paused");
+  const record = await journal.read("op_accounting");
+  assert.equal(record.status, "indeterminate");
+  assert.equal(record.safeResult?.checkpointId, "checkpoint_12345678");
+  assert.deepEqual(record.safeResult?.changedPaths, ["src/index.ts"]);
+  const events = await AuditLog.verify(auditPath, localState.sessionId);
+  const completed = events.find(
+    (event) => event.type === "tool.completed" && event.operationId === "op_accounting",
+  );
+  assert.equal(completed?.data.checkpointId, "checkpoint_12345678");
+  assert.deepEqual(completed?.data.changedPaths, ["src/index.ts"]);
+});
+
 test("runtime sends protocol repair feedback and continues", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-"));
   const localState = state(root);

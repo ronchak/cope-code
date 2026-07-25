@@ -1059,6 +1059,7 @@ export class AgentRuntime {
           actualChangedLines !== policy.plannedMutation.changedLines
         ) {
           const safe = {
+            ...outcome.safeMetadata,
             recoveryRequired: true,
             reasonCode: "MUTATION_ACCOUNTING_MISMATCH",
             plannedChangedFiles: policy.plannedMutation.changedFiles,

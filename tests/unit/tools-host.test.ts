@@ -172,6 +172,20 @@ test("ToolHost dispatches the cba/1 wire arguments, applies policy, and never re
   assert.equal(edit.safeMetadata.changedFileCount, 1);
   assert.equal(await readFile(path.join(root, "src", "main.ts"), "utf8"), "export const value = 2;\n");
 
+  const deleteReplacement = await host.dispatch({
+    operationId: "edit_delete_replacement",
+    name: "edit_text",
+    arguments: {
+      path: "src/main.ts",
+      base_sha256: sha256("export const value = 2;\n"),
+      old_text: "value = 2",
+      new_text: "",
+      expected_occurrences: 1,
+    },
+  });
+  assert.equal(deleteReplacement.status, "success");
+  assert.equal(await readFile(path.join(root, "src", "main.ts"), "utf8"), "export const ;\n");
+
   const command = await host.dispatch({
     operationId: "command_validate",
     name: "run_command",
