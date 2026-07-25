@@ -117,10 +117,14 @@ export class CompletionHandoffStore {
       stableJson(record.verification) !== stableJson(safe.verification)
     ) {
       throw new AgentError(
-        "RECOVERY_REQUIRED",
+        "STALE_STATE",
         "Completion handoff does not match the current accepted completion evidence",
       );
     }
+  }
+
+  public async remove(): Promise<void> {
+    await rm(this.filename(), { force: true });
   }
 
   private filename(): string {

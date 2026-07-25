@@ -81,6 +81,15 @@ export interface AgentRunResult {
   readonly reason?: string;
 }
 
+interface LifecycleSnapshot {
+  readonly status: SessionState["status"];
+  readonly updatedAt: string;
+  readonly pauseReason: SessionState["pauseReason"];
+  readonly failure: SessionState["failure"];
+  readonly completedAt: SessionState["completedAt"];
+  readonly completionHandoff: SessionState["completionHandoff"];
+}
+
 export class AgentRuntime {
   private readonly state: SessionState;
   private readonly meter: BudgetMeter;
@@ -567,6 +576,9 @@ export class AgentRuntime {
   private async cleanupTerminalArtifacts(): Promise<void> {
     if (this.dependencies.retainSourceArtifactsOnCompletion !== true) {
       await this.dependencies.artifacts?.clear();
+      if (this.state.status !== "completed") {
+        await this.dependencies.completionHandoffs?.remove();
+      }
     }
   }
 
@@ -590,12 +602,7 @@ export class AgentRuntime {
       return undefined;
     }
     if (existing !== undefined) {
-      try {
-        await store.assertReusable(existing, claim, verification);
-      } catch (error) {
-        delete this.state.completionHandoff;
-        throw error;
-      }
+      await store.assertReusable(existing, claim, verification);
       return existing;
     }
     return store.save(claim, verification, this.now());
@@ -1371,12 +1378,18 @@ export class AgentRuntime {
   private async fail(error: unknown): Promise<AgentRunResult> {
     const message = errorMessage(error);
     if (!["completed", "rolled_back", "blocked", "aborted", "failed"].includes(this.state.status)) {
+      const prior = this.snapshotLifecycle();
       delete this.state.completionHandoff;
       transitionSession(this.state, "failed", this.now(), {
         reason: message,
         failure: { code: error instanceof AgentError ? error.code : "INTERNAL_ERROR", message },
       });
-      await this.persist();
+      try {
+        await this.persist();
+      } catch (persistError) {
+        this.restoreLifecycle(prior);
+        throw persistError;
+      }
       await this.dependencies.audit.append({
         type: "session.ended",
         taskId: this.state.taskId,
@@ -1388,22 +1401,15 @@ export class AgentRuntime {
 
   private async move(status: SessionState["status"], reason?: string): Promise<void> {
     const from = this.state.status;
-    const priorUpdatedAt = this.state.updatedAt;
-    const priorPauseReason = this.state.pauseReason;
-    const priorFailure = this.state.failure;
-    const priorCompletedAt = this.state.completedAt;
+    const prior = this.snapshotLifecycle();
     transitionSession(this.state, status, this.now(), reason === undefined ? {} : { reason });
+    if (isTerminal(status) && status !== "completed") {
+      delete this.state.completionHandoff;
+    }
     try {
       await this.persist();
     } catch (error) {
-      this.state.status = from;
-      this.state.updatedAt = priorUpdatedAt;
-      if (priorPauseReason === undefined) delete this.state.pauseReason;
-      else this.state.pauseReason = priorPauseReason;
-      if (priorFailure === undefined) delete this.state.failure;
-      else this.state.failure = priorFailure;
-      if (priorCompletedAt === undefined) delete this.state.completedAt;
-      else this.state.completedAt = priorCompletedAt;
+      this.restoreLifecycle(prior);
       throw error;
     }
     await this.dependencies.audit.append({
@@ -1418,6 +1424,34 @@ export class AgentRuntime {
       to: status,
       ...(reason === undefined ? {} : { reason }),
     });
+  }
+
+  private snapshotLifecycle(): LifecycleSnapshot {
+    return {
+      status: this.state.status,
+      updatedAt: this.state.updatedAt,
+      pauseReason: this.state.pauseReason,
+      failure: this.state.failure,
+      completedAt: this.state.completedAt,
+      completionHandoff: this.state.completionHandoff,
+    };
+  }
+
+  private restoreLifecycle(snapshot: LifecycleSnapshot): void {
+    this.state.status = snapshot.status;
+    this.state.updatedAt = snapshot.updatedAt;
+    this.restoreOptional("pauseReason", snapshot.pauseReason);
+    this.restoreOptional("failure", snapshot.failure);
+    this.restoreOptional("completedAt", snapshot.completedAt);
+    this.restoreOptional("completionHandoff", snapshot.completionHandoff);
+  }
+
+  private restoreOptional<Key extends "pauseReason" | "failure" | "completedAt" | "completionHandoff">(
+    key: Key,
+    value: SessionState[Key],
+  ): void {
+    if (value === undefined) delete this.state[key];
+    else this.state[key] = value;
   }
 
   private async persist(): Promise<void> {

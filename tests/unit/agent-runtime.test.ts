@@ -49,6 +49,7 @@ const completionPathKey = (value: string): string => value.replaceAll("\\", "/")
 class QueueTransport implements ModelTransport {
   public readonly transportKind = "test";
   public readonly submittedContents: string[] = [];
+  public closeCalls = 0;
   public constructor(private readonly responses: readonly string[]) {}
   private index = 0;
 
@@ -91,7 +92,9 @@ class QueueTransport implements ModelTransport {
     };
   }
   public async emergencyStop() {}
-  public async close() {}
+  public async close() {
+    this.closeCalls += 1;
+  }
 }
 
 class CancelledOnStopTransport extends QueueTransport {
@@ -299,6 +302,18 @@ class FailingCompletionWriteStore extends SessionStore {
     if (session.status === "completed" && this.completionWriteAttempts === 0) {
       this.completionWriteAttempts += 1;
       throw new Error("completion state write failed");
+    }
+    await super.write(session);
+  }
+}
+
+class FailingFailureWriteStore extends SessionStore {
+  public failureWriteAttempts = 0;
+
+  public override async write(session: SessionState): Promise<void> {
+    if (session.status === "failed") {
+      this.failureWriteAttempts += 1;
+      throw new Error("failure state write failed");
     }
     await super.write(session);
   }
@@ -846,6 +861,47 @@ test("runtime fails closed without retrying a non-repairable protocol violation"
   assert.equal(await artifacts.getOptional("decision", "sentinel"), undefined);
 });
 
+test("failed failure-state persistence preserves the recoverable response and lifecycle", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-failure-write-failure-"));
+  const localState = state(root);
+  const handoffReference: CompletionHandoffReference = {
+    version: "completion-handoff/1",
+    integrity: "a".repeat(64),
+    createdAt: "2026-01-01T00:00:30.000Z",
+    redactionCount: 0,
+  };
+  localState.completionHandoff = handoffReference;
+  const store = new FailingFailureWriteStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new QueueTransport(["untrusted response"]);
+  const nonRepairableProtocol: ProtocolAdapter = {
+    ...protocol,
+    parseModelTurn: () => {
+      throw new ProtocolParseError("TASK_MISMATCH", "response belongs to another task", {}, false);
+    },
+  };
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
+  const runtime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    protocol: nonRepairableProtocol,
+    artifacts,
+  });
+
+  await assert.rejects(() => runtime.run(), /failure state write failed/u);
+  assert.equal(store.failureWriteAttempts, 1);
+  assert.equal(transport.closeCalls, 1, "transport cleanup must still run");
+  assert.equal(localState.status, "awaiting_model");
+  assert.deepEqual(localState.completionHandoff, handoffReference);
+  assert.match(await artifacts.get("response", "turn_0001"), /untrusted response/u);
+  const durableState = await store.read(localState.sessionId);
+  assert.equal(durableState.status, "awaiting_model");
+  assert.deepEqual(durableState.completionHandoff, handoffReference);
+  assert.equal(durableState.submission?.state, "answered");
+});
+
 test("a live transport cannot opt into recovery replay through its response id", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-untrusted-recovery-id-"));
   const localState = state(root);
@@ -1189,6 +1245,11 @@ test("completion is not exposed when its durable state write fails", async () =>
   assert.equal(durableState.status, "failed");
   assert.equal(durableState.completionHandoff, undefined);
   assert.equal(await artifacts.getOptional("response", "turn_0001"), undefined);
+  await assert.rejects(
+    () => completionHandoffs.read(),
+    /Completion handoff is unavailable/u,
+    "terminal failure cleanup must remove the unreferenced provisional handoff",
+  );
 });
 
 test("resume reuses an accepted completion handoff saved before a pause", async () => {
@@ -1347,17 +1408,30 @@ test("resume fails closed when accepted completion evidence changed after handof
       gitStatusSummary: " M src/new-state.ts",
     }),
   }).run();
-  assert.equal(resumed.status, "paused", resumed.reason);
+  assert.equal(resumed.status, "failed", resumed.reason);
   assert.match(
     resumed.reason ?? "",
     /Completion handoff does not match the current accepted completion evidence/u,
   );
   assert.equal(resumed.completion, undefined, "rejected handoff evidence must not be reported as accepted");
   assert.equal(completionHandoffs.saveCalls, 1, "mismatched evidence must not overwrite the handoff");
-  assert.equal(localState.completionHandoff, undefined, "stale handoff reference must be quarantined");
-  const durable = await completionHandoffs.read(pausedReference);
-  assert.equal(durable.verification.actual.repositoryFingerprint, "d".repeat(64));
-  assert.deepEqual(durable.verification.actual.changedPaths, []);
+  assert.equal(localState.completionHandoff, undefined, "terminal failure must drop the stale handoff reference");
+  await assert.rejects(
+    () => completionHandoffs.read(pausedReference),
+    /Completion handoff is unavailable/u,
+    "terminal cleanup must remove the stale durable handoff",
+  );
+
+  const repeated = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+    completionHandoffs,
+  }).run();
+  assert.equal(repeated.status, "failed");
+  assert.equal(completionHandoffs.saveCalls, 1, "a stale handoff cannot become fresh on another resume");
 });
 
 test("abort cannot be downgraded by a racing pause request", async () => {
@@ -1379,6 +1453,28 @@ test("abort cannot be downgraded by a racing pause request", async () => {
   const result = await run;
   assert.equal(result.status, "aborted");
   assert.equal(result.reason, "operator kill switch");
+  assert.equal(await artifacts.getOptional("outbox", "submission_1"), undefined);
+  assert.equal(await artifacts.getOptional("decision", "sentinel"), undefined);
+});
+
+test("abort clears a completed response received during transport shutdown", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-abort-completed-race-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new CompletedOnStopTransport("completed response during abort");
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
+  await artifacts.put("decision", "sentinel", "must be cleared after abort");
+  const runtime = runtimeForTest({ root, state: localState, store, transport, artifacts });
+
+  const run = runtime.run();
+  await transport.receiveStarted;
+  await runtime.emergencyStop("operator kill switch");
+  const result = await run;
+  assert.equal(result.status, "aborted");
+  assert.equal(result.reason, "operator kill switch");
+  assert.equal(localState.submission?.state, "answered");
+  assert.equal(await artifacts.getOptional("response", "turn_0001"), undefined);
   assert.equal(await artifacts.getOptional("outbox", "submission_1"), undefined);
   assert.equal(await artifacts.getOptional("decision", "sentinel"), undefined);
 });
