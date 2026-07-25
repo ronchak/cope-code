@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -87,6 +87,74 @@ test("status suppresses a provisional completion handoff for a paused session", 
   assert.equal(rendered.completionReport, null);
   assert.doesNotMatch(stdout, /This provisional report must remain hidden/u);
   await handoffs.read(state.completionHandoff);
+});
+
+test("status migrates a legacy handoff from a non-completed terminal session", async (context) => {
+  const stateHome = await mkdtemp(path.join(tmpdir(), "cope-status-legacy-terminal-handoff-"));
+  context.after(async () => rm(stateHome, { recursive: true, force: true }));
+  const now = "2026-07-24T12:00:00.000Z";
+  const state = sessionState("session_legacy_terminal_handoff", "rolled_back", now);
+  state.completedAt = now;
+  const store = new SessionStore(stateHome);
+  await store.create(state);
+  const sessionDirectory = store.sessionDirectory(state.sessionId);
+  const fingerprintKey = Buffer.alloc(32, 13);
+  await writeFile(path.join(sessionDirectory, "fingerprint.key"), fingerprintKey, { mode: 0o600 });
+  const handoffs = new CompletionHandoffStore(
+    path.join(sessionDirectory, "handoff"),
+    state.sessionId,
+    new SecretScanner(fingerprintKey),
+  );
+  state.completionHandoff = await handoffs.save({
+    summary: "This legacy terminal report must be removed.",
+    acceptanceCriteria: [],
+    validation: [],
+    skippedValidation: [],
+    remainingRisks: [],
+    recommendedFollowUp: [],
+  }, {
+    accepted: true,
+    reasons: [],
+    actual: {
+      changedPaths: [],
+      agentChangedPaths: [],
+      preExistingPaths: [],
+      successfulCommands: [],
+      failedCommands: [],
+      gitStatusSummary: "clean",
+      repositoryFingerprint: "f".repeat(64),
+    },
+  }, now);
+  await store.write(state);
+  await writeSessionGrant(sessionDirectory, createDefaultSessionGrant({
+    grant_id: "grant_legacy_terminal_handoff",
+    task_id: state.taskId,
+    repository_root: state.repositoryRoot,
+    mode: state.mode,
+  }));
+
+  let stdout = "";
+  const exitCode = await executeCommand({
+    command: "status",
+    sessionId: state.sessionId,
+    stateHome,
+    json: true,
+  }, {
+    stdout: { write: (value) => { stdout += value; } },
+    stderr: { write: () => undefined },
+  }, {
+    host: createStandardUserHost(),
+  });
+
+  assert.equal(exitCode, 0);
+  const rendered = JSON.parse(stdout) as { completionReport: unknown };
+  assert.equal(rendered.completionReport, null);
+  assert.doesNotMatch(stdout, /This legacy terminal report must be removed/u);
+  await assert.rejects(() => handoffs.read(), /unavailable/u);
+  const durable = JSON.parse(
+    await readFile(path.join(sessionDirectory, "session.json"), "utf8"),
+  ) as SessionState;
+  assert.equal(durable.completionHandoff, undefined);
 });
 
 test("resume reports missing pinned browser configuration without exposing raw ENOENT", async (context) => {

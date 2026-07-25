@@ -6,8 +6,11 @@ import { newId, stableJson } from "../shared/crypto.js";
 import { isOperationId } from "../shared/operation-id.js";
 import { currentHost, workspaceKey } from "./paths.js";
 import { SESSION_SCHEMA_VERSION, type SessionState } from "./types.js";
-import { allowedTransitions } from "./state-machine.js";
-import { COMPLETION_HANDOFF_VERSION } from "./completion-handoff-store.js";
+import { allowedTransitions, isTerminal } from "./state-machine.js";
+import {
+  COMPLETION_HANDOFF_VERSION,
+  CompletionHandoffStore,
+} from "./completion-handoff-store.js";
 import { CURRENT_HOST_PLATFORM } from "../platform/index.js";
 
 const MAX_SESSION_BYTES = 4 * 1024 * 1024;
@@ -131,6 +134,25 @@ export class SessionStore {
       });
     }
     assertValidSessionState(parsed);
+    if (isTerminal(parsed.status) && parsed.status !== "completed") {
+      try {
+        // Legacy rollback paths could leave a completion report attached to a
+        // later non-completed terminal state. Remove the report before clearing
+        // its reference so an interrupted migration is retried.
+        await CompletionHandoffStore.removeAt(path.join(this.sessionDirectory(sessionId), "handoff"));
+        if (parsed.completionHandoff !== undefined) {
+          delete parsed.completionHandoff;
+          await this.write(parsed);
+        }
+      } catch (error) {
+        throw new AgentError(
+          "RECOVERY_REQUIRED",
+          "Cannot remove a legacy completion handoff from a non-completed terminal session",
+          { sessionId, status: parsed.status },
+          { cause: error },
+        );
+      }
+    }
     return parsed;
   }
 

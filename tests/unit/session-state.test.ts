@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -85,6 +85,32 @@ test("session store writes atomically and rejects mismatched identity", async ()
   parsed.sessionId = "session_tampered";
   await writeFile(filename, `${JSON.stringify(parsed)}\n`, "utf8");
   await assert.rejects(() => store.read(state.sessionId), /does not match/);
+});
+
+test("session store migrates legacy non-completed terminal handoffs on load", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-session-legacy-handoff-"));
+  const store = new SessionStore(root);
+  const state = makeState({
+    status: "rolled_back",
+    completedAt: "2026-01-01T00:00:03.000Z",
+    completionHandoff: {
+      version: "completion-handoff/1",
+      integrity: "e".repeat(64),
+      createdAt: "2026-01-01T00:00:02.000Z",
+      redactionCount: 0,
+    },
+  });
+  await store.create(state);
+  const sessionDirectory = store.sessionDirectory(state.sessionId);
+  const handoffFilename = path.join(sessionDirectory, "handoff", "completion.json");
+  await mkdir(path.dirname(handoffFilename), { recursive: true, mode: 0o700 });
+  await writeFile(handoffFilename, "legacy sensitive report\n", "utf8");
+
+  const migrated = await store.read(state.sessionId);
+  assert.equal(migrated.completionHandoff, undefined);
+  await assert.rejects(() => readFile(handoffFilename, "utf8"), { code: "ENOENT" });
+  const durable = JSON.parse(await readFile(path.join(sessionDirectory, "session.json"), "utf8")) as SessionState;
+  assert.equal(durable.completionHandoff, undefined);
 });
 
 test("session store rejects unknown fields and partial durable state", async () => {
