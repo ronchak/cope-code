@@ -45,12 +45,15 @@ export async function activateRelease(candidateInput, installRootInput, options)
       const releaseReference = { manifestSha256: releaseId, version: verification.version };
       const prior = await readActivationState(installRoot);
       if (prior !== undefined) {
+        for (const remembered of [prior.current, prior.previous].filter((value) => value !== null)) {
+          if (compareReleaseVersions(releaseReference.version, remembered.version) === 0 &&
+              releaseReference.manifestSha256 !== remembered.manifestSha256) {
+            throw new Error("Ordinary activation refuses same-version release equivocation");
+          }
+        }
         const precedence = compareReleaseVersions(releaseReference.version, prior.current.version);
         if (precedence < 0) {
           throw new Error("Ordinary activation refuses a signed downgrade; use the explicit authenticated rollback path");
-        }
-        if (precedence === 0 && releaseReference.manifestSha256 !== prior.current.manifestSha256) {
-          throw new Error("Ordinary activation refuses same-version release equivocation");
         }
       }
 

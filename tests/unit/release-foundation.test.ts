@@ -7,6 +7,7 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -106,6 +107,58 @@ test("release evidence is canonical, reproducible, SPDX-correct, and explicit ab
     { COPE_RELEASE_SIGNING_KEY_FILE: undefined },
   ), /requires COPE_RELEASE_SIGNING_KEY_FILE/iu);
 
+  for (const [name, dependencies] of [
+    ["missing-lock-dependency", { example: "2.0.0", "not-in-lock": "1.0.0" }],
+    ["changed-lock-dependency", { example: "9.0.0" }],
+  ] as const) {
+    const candidate = await fixture.emptyCandidate(name, "dependency-drift");
+    const packageJson = npmPackageJson("1.2.3", { dependencies });
+    await writeFile(path.join(candidate, "cope.tgz"), npmArchive([
+      { archivePath: "package/package.json", content: packageJson },
+      { archivePath: "package/payload.txt", content: "dependency-drift" },
+    ]));
+    const packageFile = path.join(fixture.root, `${name}.package.json`);
+    await writeFile(packageFile, packageJson);
+    const arguments_ = generationArguments(fixture, candidate, "preview");
+    arguments_[arguments_.indexOf("--package") + 1] = packageFile;
+    expectFailure(
+      invoke(generateScript, arguments_, { COPE_RELEASE_SIGNING_KEY_FILE: undefined }),
+      /root dependencies do not match package\.json/iu,
+    );
+  }
+
+  const unresolvedCandidate = await fixture.emptyCandidate("unresolved-lock-dependency", "dependency-drift");
+  const unresolvedPackageJson = npmPackageJson("1.2.3", {
+    dependencies: { example: "2.0.0", "not-resolved": "1.0.0" },
+  });
+  await writeFile(path.join(unresolvedCandidate, "cope.tgz"), npmArchive([
+    { archivePath: "package/package.json", content: unresolvedPackageJson },
+  ]));
+  const unresolvedPackageFile = path.join(fixture.root, "unresolved.package.json");
+  const unresolvedLockFile = path.join(fixture.root, "unresolved.package-lock.json");
+  const unresolvedLock = JSON.parse(await readFile(fixture.lockFile, "utf8")) as {
+    packages: Record<string, { dependencies?: Record<string, string> }>;
+  };
+  unresolvedLock.packages[""]!.dependencies = { example: "2.0.0", "not-resolved": "1.0.0" };
+  await writeFile(unresolvedPackageFile, unresolvedPackageJson);
+  await writeFile(unresolvedLockFile, JSON.stringify(unresolvedLock));
+  const unresolvedArguments = generationArguments(fixture, unresolvedCandidate, "preview");
+  unresolvedArguments[unresolvedArguments.indexOf("--package") + 1] = unresolvedPackageFile;
+  unresolvedArguments[unresolvedArguments.indexOf("--lock") + 1] = unresolvedLockFile;
+  expectFailure(
+    invoke(generateScript, unresolvedArguments, { COPE_RELEASE_SIGNING_KEY_FILE: undefined }),
+    /does not resolve runtime dependency: not-resolved/iu,
+  );
+
+  const largeLeft = path.join(fixture.root, "large-compare-left");
+  const largeRight = path.join(fixture.root, "large-compare-right");
+  await mkdir(largeLeft);
+  await mkdir(largeRight);
+  const largeArtifact = Buffer.alloc(3 * 1024 * 1024, 0x5a);
+  await writeFile(path.join(largeLeft, "large.tgz"), largeArtifact);
+  await writeFile(path.join(largeRight, "large.tgz"), largeArtifact);
+  expectSuccess(invoke(compareScript, [largeLeft, largeRight]));
+
   await writeFile(path.join(first, "channel.json"), `${await readFile(path.join(first, "channel.json"), "utf8")} `);
   expectFailure(invoke(verifyScript, [first]), /canonical key-sorted JSON/iu);
   expectFailure(invoke(buildScript, [repositoryRoot, "preview"]), /outside the source checkout/iu);
@@ -133,6 +186,18 @@ test("release generation rejects traversal, links, and non-regular payload bound
   expectFailure(
     invoke(generateScript, generationArguments(fixture, nonZeroPadding, "preview")),
     /non-zero entry padding/iu,
+  );
+
+  const hiddenNumericData = await fixture.emptyCandidate("hidden-numeric-data", "bad");
+  const hiddenNumericTar = gunzipSync(await readFile(path.join(hiddenNumericData, "cope.tgz")));
+  hiddenNumericTar.fill(0, 108, 116);
+  hiddenNumericTar[108] = 0x30;
+  hiddenNumericTar[110] = 0x41;
+  rewriteTarChecksum(hiddenNumericTar.subarray(0, 512));
+  await writeFile(path.join(hiddenNumericData, "cope.tgz"), deterministicGzip(hiddenNumericTar));
+  expectFailure(
+    invoke(generateScript, generationArguments(fixture, hiddenNumericData, "preview")),
+    /hidden data in its numeric uid field/iu,
   );
 
   const collidingPaths = await fixture.emptyCandidate("colliding-paths", "bad");
@@ -211,6 +276,15 @@ test("release generation rejects traversal, links, and non-regular payload bound
     invoke(generateScript, generationArguments(fixture, invalidDependencyName, "preview")),
     /invalid runtime dependency metadata/iu,
   );
+
+  for (const artifactName of ["CON.tgz", "cope.tgz."]) {
+    const candidate = await fixture.emptyCandidate(`top-level-${artifactName.replaceAll(".", "-")}`, "bad");
+    const artifactPath = path.join(candidate, artifactName);
+    await rename(path.join(candidate, "cope.tgz"), artifactPath);
+    const arguments_ = generationArguments(fixture, candidate, "preview");
+    arguments_[arguments_.indexOf("--artifact") + 1] = artifactPath;
+    expectFailure(invoke(generateScript, arguments_), /Unsafe artifact filename/iu);
+  }
 
   if (process.platform !== "win32") {
     const filesystemLink = await fixture.emptyCandidate("filesystem-link", "bad");
@@ -300,6 +374,20 @@ test("activation is publisher-authenticated, locked, pointer-atomic, and explici
     fixture.publicKeyFile,
   ]), /refuses same-version release equivocation/iu);
 
+  const rememberedEquivocation = await fixture.candidate(
+    "remembered-version-different-release",
+    "stable",
+    "different-remembered",
+    true,
+    "1.2.4",
+  );
+  expectFailure(invoke(activateScript, [
+    rememberedEquivocation,
+    installRoot,
+    "--trusted-public-key",
+    fixture.publicKeyFile,
+  ]), /refuses same-version release equivocation/iu);
+
   await writeFile(path.join(second, "cope.tgz"), Buffer.from("tampered"));
   expectFailure(invoke(activateScript, [
     second,
@@ -380,7 +468,11 @@ async function releaseFixture(context: { after(callback: () => Promise<void>): v
       name: "@local/copilot-browser-agent",
       version,
       packages: {
-        "": { name: "@local/copilot-browser-agent", version },
+        "": {
+          name: "@local/copilot-browser-agent",
+          version,
+          dependencies: { example: "2.0.0" },
+        },
         "node_modules/example": { version: "2.0.0", integrity: `sha512-${integrity}` },
         "node_modules/dev-only": { version: "3.0.0", dev: true, integrity: `sha512-${integrity}` },
       },
@@ -512,7 +604,13 @@ async function activationState(installRoot: string): Promise<{
 
 function npmPackageJson(
   version: string,
-  overrides: { name?: string; copeBin?: string; dependencies?: Record<string, string> } = {},
+  overrides: {
+    name?: string;
+    copeBin?: string;
+    dependencies?: Record<string, string>;
+    optionalDependencies?: Record<string, string>;
+    peerDependencies?: Record<string, string>;
+  } = {},
 ): string {
   return JSON.stringify({
     name: overrides.name ?? "@local/copilot-browser-agent",
@@ -522,6 +620,8 @@ function npmPackageJson(
       "copilot-agent": "dist/src/cli/main.js",
     },
     dependencies: overrides.dependencies ?? { example: "2.0.0" },
+    ...(overrides.optionalDependencies === undefined ? {} : { optionalDependencies: overrides.optionalDependencies }),
+    ...(overrides.peerDependencies === undefined ? {} : { peerDependencies: overrides.peerDependencies }),
   });
 }
 
@@ -577,4 +677,12 @@ function writeField(buffer: Buffer, offset: number, length: number, value: strin
 
 function writeOctal(buffer: Buffer, offset: number, length: number, value: number): void {
   writeField(buffer, offset, length, `${value.toString(8).padStart(length - 1, "0")}\0`);
+}
+
+function rewriteTarChecksum(header: Buffer): void {
+  header.fill(0x20, 148, 156);
+  let checksum = 0;
+  for (const byte of header) checksum += byte;
+  header.fill(0, 148, 156);
+  writeField(header, 148, 8, `${checksum.toString(8).padStart(6, "0")}\0 `);
 }

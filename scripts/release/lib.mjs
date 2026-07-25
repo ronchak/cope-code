@@ -15,6 +15,7 @@ export const SIGNATURE_VERSION = "cope-release-signature/2";
 export const ACTIVATION_VERSION = "cope-release-activation/2";
 export const MAX_ARTIFACT_BYTES = 128 * 1024 * 1024;
 export const MAX_METADATA_BYTES = 2 * 1024 * 1024;
+const WINDOWS_RESERVED_NAME = /^(?:AUX|CON|NUL|PRN|COM[1-9]|LPT[1-9])(?:\..*)?$/iu;
 
 export function canonicalJson(value) {
   return JSON.stringify(sortJson(value, new Set()));
@@ -84,6 +85,7 @@ export function safeTopLevelFilename(value, label = "release filename") {
   if (typeof value !== "string" || value.length === 0 || value.length > 180 ||
       value === "." || value === ".." || value.startsWith(".") ||
       value.includes("/") || value.includes("\\") ||
+      /[. ]$/u.test(value) || WINDOWS_RESERVED_NAME.test(value) ||
       !/^[A-Za-z0-9][A-Za-z0-9._+-]*$/u.test(value)) {
     throw new Error(`Unsafe ${label}`);
   }

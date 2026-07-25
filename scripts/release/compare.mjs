@@ -4,7 +4,13 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { compareText, readRegularFile, sha256Bytes } from "./lib.mjs";
+import {
+  MAX_ARTIFACT_BYTES,
+  compareText,
+  readRegularFile,
+  safeTopLevelFilename,
+  sha256Bytes,
+} from "./lib.mjs";
 
 export async function compareReleaseDirectories(leftInput, rightInput) {
   const left = await realpath(path.resolve(leftInput));
@@ -16,9 +22,10 @@ export async function compareReleaseDirectories(leftInput, rightInput) {
     throw new Error("Release directories contain different file inventories");
   }
   for (const name of leftEntries) {
+    const maximumBytes = name.endsWith(".tgz") ? MAX_ARTIFACT_BYTES : undefined;
     const [leftBytes, rightBytes] = await Promise.all([
-      readRegularFile(path.join(left, name)),
-      readRegularFile(path.join(right, name)),
+      readRegularFile(path.join(left, name), maximumBytes),
+      readRegularFile(path.join(right, name), maximumBytes),
     ]);
     if (leftBytes.length !== rightBytes.length || sha256Bytes(leftBytes) !== sha256Bytes(rightBytes)) {
       throw new Error(`Release outputs are not byte-for-byte reproducible: ${name}`);
@@ -32,7 +39,7 @@ async function releaseEntries(root) {
   if (entries.some((entry) => !entry.isFile() || entry.isSymbolicLink())) {
     throw new Error("Release comparison accepts regular files only");
   }
-  return entries.map((entry) => entry.name).sort(compareText);
+  return entries.map((entry) => safeTopLevelFilename(entry.name, "release comparison filename")).sort(compareText);
 }
 
 if (process.argv[1] !== undefined && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

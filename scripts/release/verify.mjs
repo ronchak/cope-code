@@ -216,20 +216,25 @@ function validateManifest(manifest) {
     }
     archivePaths.add(entry.path);
   }
-  exactObjectKeys(artifact.archive.package, ["bin", "dependencies", "name", "version"], "Packed package identity");
+  exactObjectKeys(artifact.archive.package, [
+    "bin",
+    "dependencies",
+    "name",
+    "optionalDependencies",
+    "peerDependencies",
+    "version",
+  ], "Packed package identity");
   exactObjectKeys(artifact.archive.package.bin, ["cope", "copilot-agent"], "Packed package executable mapping");
   if (artifact.archive.package.name !== manifest.packageName ||
       artifact.archive.package.version !== manifest.version ||
       artifact.archive.package.bin.cope !== "dist/src/cli/main.js" ||
-      artifact.archive.package.bin["copilot-agent"] !== "dist/src/cli/main.js" ||
-      artifact.archive.package.dependencies === null ||
-      typeof artifact.archive.package.dependencies !== "object" ||
-      Array.isArray(artifact.archive.package.dependencies) ||
-      Object.keys(artifact.archive.package.dependencies).length > 1000 ||
-      Object.entries(artifact.archive.package.dependencies).some(([name, version]) =>
-        name.length > 214 || !NPM_PACKAGE_NAME.test(name) ||
-        typeof version !== "string" || version.length === 0 || version.length > 256)) {
+      artifact.archive.package.bin["copilot-agent"] !== "dist/src/cli/main.js") {
     throw new Error("Packed package identity does not match the release manifest");
+  }
+  for (const field of ["dependencies", "optionalDependencies", "peerDependencies"]) {
+    if (!validDependencyMap(artifact.archive.package[field])) {
+      throw new Error("Packed package identity does not match the release manifest");
+    }
   }
 
   exactObjectKeys(manifest.sbom, [
@@ -349,6 +354,14 @@ function validateSpdxChecksums(checksums) {
       !new RegExp(`^[a-f0-9]{${expectedLength}}$`, "u").test(checksum.checksumValue)) {
     throw new Error("SPDX checksum must use lowercase hexadecimal SHA-256 or SHA-512");
   }
+}
+
+function validDependencyMap(dependencies) {
+  return dependencies !== null && typeof dependencies === "object" && !Array.isArray(dependencies) &&
+    Object.keys(dependencies).length <= 1000 &&
+    Object.entries(dependencies).every(([name, version]) =>
+      name.length <= 214 && NPM_PACKAGE_NAME.test(name) &&
+      typeof version === "string" && version.length > 0 && version.length <= 256);
 }
 
 function safeByteCount(value, maximum) {

@@ -163,7 +163,7 @@ function validateChecksum(header) {
 function octalNumber(buffer, offset, length, label) {
   const bytes = buffer.subarray(offset, offset + length);
   if ((bytes[0] & 0x80) !== 0) throw new Error(`Release archive uses unsupported base-256 ${label}`);
-  const value = byteString(buffer, offset, length).trim();
+  const value = tarNumericString(buffer, offset, length, label).trim();
   if (value === "") return 0;
   if (!/^[0-7]+$/u.test(value)) throw new Error(`Release archive contains an invalid octal ${label}`);
   const parsed = Number.parseInt(value, 8);
@@ -171,9 +171,13 @@ function octalNumber(buffer, offset, length, label) {
   return parsed;
 }
 
-function byteString(buffer, offset, length) {
+function tarNumericString(buffer, offset, length, label) {
   const field = buffer.subarray(offset, offset + length);
   const terminator = field.indexOf(0);
+  if (terminator >= 0 &&
+      field.subarray(terminator).some((value) => value !== 0 && value !== 0x20)) {
+    throw new Error(`Release archive contains hidden data in its numeric ${label} field`);
+  }
   const bytes = terminator < 0 ? field : field.subarray(0, terminator);
   return utf8.decode(bytes);
 }
@@ -209,13 +213,11 @@ function packageIdentity(bytes) {
     throw new Error("Packed package.json has an unexpected name, version, or executable mapping");
   }
   const dependencies = document.dependencies ?? {};
-  if (dependencies === null || typeof dependencies !== "object" || Array.isArray(dependencies) ||
-      Object.keys(dependencies).length > 1000 ||
-      Object.entries(dependencies).some(([name, version]) =>
-        name.length > 214 || !NPM_PACKAGE_NAME.test(name) ||
-        typeof version !== "string" || version.length === 0 || version.length > 256)) {
-    throw new Error("Packed package.json has invalid runtime dependency metadata");
-  }
+  const optionalDependencies = document.optionalDependencies ?? {};
+  const peerDependencies = document.peerDependencies ?? {};
+  validateDependencyMap(dependencies);
+  validateDependencyMap(optionalDependencies);
+  validateDependencyMap(peerDependencies);
   return {
     name: document.name,
     version: document.version,
@@ -224,7 +226,19 @@ function packageIdentity(bytes) {
       "copilot-agent": document.bin["copilot-agent"],
     },
     dependencies,
+    optionalDependencies,
+    peerDependencies,
   };
+}
+
+function validateDependencyMap(dependencies) {
+  if (dependencies === null || typeof dependencies !== "object" || Array.isArray(dependencies) ||
+      Object.keys(dependencies).length > 1000 ||
+      Object.entries(dependencies).some(([name, version]) =>
+        name.length > 214 || !NPM_PACKAGE_NAME.test(name) ||
+        typeof version !== "string" || version.length === 0 || version.length > 256)) {
+    throw new Error("Packed package.json has invalid runtime dependency metadata");
+  }
 }
 
 function crc32(bytes) {

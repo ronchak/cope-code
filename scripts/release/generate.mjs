@@ -57,6 +57,24 @@ export async function generateRelease(options, environment = process.env, capabi
       lockDocument?.packages?.[""]?.version !== packageDocument.version) {
     throw new Error("package-lock.json release identity does not match package.json");
   }
+  for (const field of ["dependencies", "optionalDependencies", "peerDependencies"]) {
+    if (canonicalJson(packageDocument[field] ?? {}) !==
+        canonicalJson(lockDocument.packages[""][field] ?? {})) {
+      throw new Error(`package-lock.json root ${field} do not match package.json`);
+    }
+  }
+  const runtimeDeclarations = {
+    ...(packageDocument.dependencies ?? {}),
+    ...(packageDocument.optionalDependencies ?? {}),
+    ...(packageDocument.peerDependencies ?? {}),
+  };
+  for (const dependencyName of Object.keys(runtimeDeclarations)) {
+    const resolved = lockDocument.packages[`node_modules/${dependencyName}`];
+    if (resolved === null || typeof resolved !== "object" ||
+        typeof resolved.version !== "string" || resolved.version.length === 0) {
+      throw new Error(`package-lock.json does not resolve runtime dependency: ${dependencyName}`);
+    }
+  }
 
   const artifactBytes = await readRegularFile(artifactInput, 128 * 1024 * 1024);
   const archiveInspection = inspectNpmArchive(artifactBytes);
@@ -65,6 +83,8 @@ export async function generateRelease(options, environment = process.env, capabi
     version: packageDocument.version,
     bin: packageDocument.bin,
     dependencies: packageDocument.dependencies ?? {},
+    optionalDependencies: packageDocument.optionalDependencies ?? {},
+    peerDependencies: packageDocument.peerDependencies ?? {},
   };
   if (canonicalJson(archiveInspection.package) !== canonicalJson(expectedPackageIdentity)) {
     throw new Error("Packed package.json identity does not match the source package metadata");
