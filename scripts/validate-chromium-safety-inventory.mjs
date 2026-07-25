@@ -27,11 +27,14 @@ function namedImportsRuntimeChromium(clause) {
       continue;
     }
     const typeOnly = specifier[0]?.kind === SyntaxKind.TypeKeyword &&
-      specifier[1]?.kind === SyntaxKind.Identifier;
+      specifier.length > 1 &&
+      specifier[1]?.kind !== SyntaxKind.AsKeyword;
     const imported = typeOnly ? undefined : specifier[0];
     if (
       (imported?.kind === SyntaxKind.Identifier && imported.text === "chromium") ||
-      (imported?.kind === SyntaxKind.StringLiteral && imported.value === "chromium")
+      imported?.kind === SyntaxKind.DefaultKeyword ||
+      (imported?.kind === SyntaxKind.StringLiteral &&
+        (imported.value === "chromium" || imported.value === "default"))
     ) {
       return true;
     }
@@ -57,7 +60,14 @@ function staticImportUsesRuntimeChromium(statement) {
     });
   }
   if (clause[0]?.kind === SyntaxKind.StringLiteral) return true;
-  if (clause[0]?.kind === SyntaxKind.TypeKeyword && clause.length > 1) return false;
+  if (
+    clause[0]?.kind === SyntaxKind.TypeKeyword &&
+    clause.length > 1 &&
+    clause[1]?.kind !== SyntaxKind.CommaToken
+  ) {
+    return false;
+  }
+  if (clause[0]?.kind === SyntaxKind.TypeKeyword) return true;
   if (clause[0]?.kind === SyntaxKind.Identifier) return true;
   if (clause.some((token) => token.kind === SyntaxKind.AsteriskToken)) return true;
   return namedImportsRuntimeChromium(clause);

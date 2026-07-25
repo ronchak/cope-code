@@ -134,16 +134,39 @@ test("Chromium inventory validation rejects an omitted runtime test file", async
     "})",
     "",
   ].join("\n");
+  const defaultSpecifierRuntimeImport = [
+    'import test from "node:test"',
+    'import { default as playwright } from "playwright-core"',
+    "void playwright.chromium",
+    'test("must run with Chromium", () => {})',
+    "",
+  ].join("\n");
+  const typeDefaultRuntimeImport = [
+    'import test from "node:test"',
+    'import type from "playwright-core"',
+    "void type.chromium",
+    'test("must run with Chromium", () => {})',
+    "",
+  ].join("\n");
+  const typeMixedRuntimeImport = [
+    'import test from "node:test"',
+    'import type, { chromium as testChromium } from "playwright-core"',
+    "void type",
+    "void testChromium",
+    'test("must run with Chromium", () => {})',
+    "",
+  ].join("\n");
   const nonRuntimeImportText = [
     'import test from "node:test"',
     'import type { Browser, chromium } from "playwright-core"',
     'import { type chromium as ChromiumType } from "playwright-core"',
+    'import { type default as DefaultType } from "playwright-core"',
     'const pattern = /import("playwright-core")/',
     'const text = `import("playwright-core")`',
     'const loader = { import: (_value: string) => undefined }',
     'loader.import("playwright-core")',
     "void import.meta",
-    "void (undefined as Browser | ChromiumType)",
+    "void (undefined as Browser | ChromiumType | DefaultType)",
     'test("does not use Chromium", () => void [pattern, text])',
     "",
   ].join("\n");
@@ -151,6 +174,12 @@ test("Chromium inventory validation rejects an omitted runtime test file", async
   await writeFile(path.join(unitDirectory, "omitted-late.test.ts"), lateRuntimeImport);
   await writeFile(path.join(unitDirectory, "omitted-dynamic.test.ts"), dynamicRuntimeImport);
   await writeFile(path.join(unitDirectory, "omitted-template.test.ts"), templateRuntimeImport);
+  await writeFile(
+    path.join(unitDirectory, "omitted-default-specifier.test.ts"),
+    defaultSpecifierRuntimeImport,
+  );
+  await writeFile(path.join(unitDirectory, "omitted-type-default.test.ts"), typeDefaultRuntimeImport);
+  await writeFile(path.join(unitDirectory, "omitted-type-mixed.test.ts"), typeMixedRuntimeImport);
   await writeFile(path.join(unitDirectory, "non-runtime.test.ts"), nonRuntimeImportText);
   await writeFile(
     path.join(temporary, "manifest.json"),
@@ -169,7 +198,7 @@ test("Chromium inventory validation rejects an omitted runtime test file", async
   assert.equal(validation.status, 1);
   assert.match(
     validation.stderr,
-    /manifest omits runtime Chromium test files: tests\/unit\/omitted-dynamic\.test\.ts, tests\/unit\/omitted-late\.test\.ts, tests\/unit\/omitted-template\.test\.ts/u,
+    /manifest omits runtime Chromium test files: tests\/unit\/omitted-default-specifier\.test\.ts, tests\/unit\/omitted-dynamic\.test\.ts, tests\/unit\/omitted-late\.test\.ts, tests\/unit\/omitted-template\.test\.ts, tests\/unit\/omitted-type-default\.test\.ts, tests\/unit\/omitted-type-mixed\.test\.ts/u,
   );
 });
 
