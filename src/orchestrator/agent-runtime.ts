@@ -1297,7 +1297,7 @@ export class AgentRuntime {
   }
 
   private async finishInterruption(): Promise<AgentRunResult> {
-    const interruption = this.interruption ?? {
+    let interruption = this.interruption ?? {
       status: "aborted" as const,
       reason: "User or caller cancelled the session",
     };
@@ -1306,6 +1306,8 @@ export class AgentRuntime {
       return this.result(interruption.reason);
     }
     if (this.state.status !== "paused") await this.move("paused", interruption.reason);
+    interruption = this.interruption ?? interruption;
+    if (interruption.status === "aborted") return this.abort(interruption.reason);
     return this.result(interruption.reason);
   }
 

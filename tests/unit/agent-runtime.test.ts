@@ -227,6 +227,31 @@ class CompletionWriteGateStore extends SessionStore {
   }
 }
 
+class PauseWriteGateStore extends SessionStore {
+  private pauseWriteSeen = false;
+  private markPauseWriteStarted!: () => void;
+  private finishPauseWrite!: () => void;
+  public readonly pauseWriteStarted = new Promise<void>((resolve) => {
+    this.markPauseWriteStarted = resolve;
+  });
+  private readonly pauseWriteReleased = new Promise<void>((resolve) => {
+    this.finishPauseWrite = resolve;
+  });
+
+  public releasePauseWrite(): void {
+    this.finishPauseWrite();
+  }
+
+  public override async write(session: SessionState): Promise<void> {
+    if (session.status === "paused" && !this.pauseWriteSeen) {
+      this.pauseWriteSeen = true;
+      this.markPauseWriteStarted();
+      await this.pauseWriteReleased;
+    }
+    await super.write(session);
+  }
+}
+
 class RecoveryProbeTransport extends QueueTransport {
   public resolveCalls = 0;
 
@@ -1014,6 +1039,26 @@ test("abort cannot be downgraded by a racing pause request", async () => {
   const result = await run;
   assert.equal(result.status, "aborted");
   assert.equal(result.reason, "operator kill switch");
+});
+
+test("abort upgrades a pause while the paused state is being persisted", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-abort-during-pause-persist-"));
+  const localState = state(root);
+  const store = new PauseWriteGateStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new CancelledOnStopTransport();
+  const runtime = runtimeForTest({ root, state: localState, store, transport });
+
+  const run = runtime.run();
+  await transport.receiveStarted;
+  await runtime.requestPause("initial operator pause");
+  await store.pauseWriteStarted;
+  await runtime.emergencyStop("operator kill switch");
+  store.releasePauseWrite();
+  const result = await run;
+  assert.equal(result.status, "aborted");
+  assert.equal(result.reason, "operator kill switch");
+  assert.equal(localState.status, "aborted");
 });
 
 test("runtime pauses on a mismatched submission receipt without attempting receive", async () => {
