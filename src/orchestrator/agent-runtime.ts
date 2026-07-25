@@ -275,8 +275,7 @@ export class AgentRuntime {
         (error.code === "TRANSPORT_INDETERMINATE" || error.code === "RECOVERY_REQUIRED") &&
         !["completed", "rolled_back", "blocked", "aborted", "failed", "paused"].includes(this.state.status)
       ) {
-        await this.move("paused", error.message);
-        return this.result(error.message);
+        return await this.pauseWithInterruptionPriority(error.message);
       }
       return await this.fail(error);
     } finally {
@@ -309,11 +308,9 @@ export class AgentRuntime {
     }
     const uncertainMutation = await this.findUncertainMutation();
     if (uncertainMutation !== undefined) {
-      await this.move(
-        "paused",
+      return this.pauseWithInterruptionPriority(
         `Mutation ${uncertainMutation.operationId} may have executed before interruption; rollback or reconcile before resuming`,
       );
-      return this.result(this.state.pauseReason);
     }
     if (this.state.status === "initializing_model" || this.state.status === "recovering") {
       await this.move("awaiting_model");
@@ -1280,8 +1277,9 @@ export class AgentRuntime {
       return this.result(result.reason);
     }
     if (result.status === "blocked" || result.status === "timed-out") {
-      await this.move("paused", result.status === "blocked" ? result.reason : result.diagnosticCode);
-      return this.result(result.status === "blocked" ? result.reason : result.diagnosticCode);
+      return this.pauseWithInterruptionPriority(
+        result.status === "blocked" ? result.reason : result.diagnosticCode,
+      );
     }
     if (result.status === "indeterminate") {
       throw new AgentError("TRANSPORT_INDETERMINATE", result.diagnosticCode);
@@ -1296,8 +1294,23 @@ export class AgentRuntime {
     return this.result(reason);
   }
 
+  private async pauseWithInterruptionPriority(reason: string): Promise<AgentRunResult> {
+    const interruption = this.interruption;
+    if (interruption?.status === "aborted") return this.abort(interruption.reason);
+    const effectiveReason = interruption?.status === "paused" ? interruption.reason : reason;
+    if (["completed", "rolled_back", "blocked", "aborted", "failed"].includes(this.state.status)) {
+      return this.result(effectiveReason);
+    }
+    if (this.state.status !== "paused") await this.move("paused", effectiveReason);
+    const currentInterruption = this.interruption;
+    if (currentInterruption?.status === "aborted") {
+      return this.abort(currentInterruption.reason);
+    }
+    return this.result(currentInterruption?.reason ?? effectiveReason);
+  }
+
   private async finishInterruption(): Promise<AgentRunResult> {
-    let interruption = this.interruption ?? {
+    const interruption = this.interruption ?? {
       status: "aborted" as const,
       reason: "User or caller cancelled the session",
     };
@@ -1305,10 +1318,7 @@ export class AgentRuntime {
     if (["completed", "rolled_back", "blocked", "aborted", "failed"].includes(this.state.status)) {
       return this.result(interruption.reason);
     }
-    if (this.state.status !== "paused") await this.move("paused", interruption.reason);
-    interruption = this.interruption ?? interruption;
-    if (interruption.status === "aborted") return this.abort(interruption.reason);
-    return this.result(interruption.reason);
+    return this.pauseWithInterruptionPriority(interruption.reason);
   }
 
   private recordInterruption(

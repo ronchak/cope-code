@@ -1061,6 +1061,25 @@ test("abort upgrades a pause while the paused state is being persisted", async (
   assert.equal(localState.status, "aborted");
 });
 
+test("abort upgrades a recovery-error pause while the paused state is being persisted", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-abort-during-recovery-pause-"));
+  const localState = state(root);
+  const store = new PauseWriteGateStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new MismatchedReceiptTransport(["unused"]);
+  const runtime = runtimeForTest({ root, state: localState, store, transport });
+
+  const run = runtime.run();
+  await store.pauseWriteStarted;
+  await runtime.emergencyStop("operator kill switch");
+  store.releasePauseWrite();
+  const result = await run;
+  assert.equal(result.status, "aborted");
+  assert.equal(result.reason, "operator kill switch");
+  assert.equal(localState.status, "aborted");
+  assert.equal(transport.receiveCalls, 0);
+});
+
 test("runtime pauses on a mismatched submission receipt without attempting receive", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-receipt-correlation-"));
   const localState = state(root);
