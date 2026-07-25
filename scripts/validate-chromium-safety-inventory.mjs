@@ -4,114 +4,88 @@ import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
+import { init, parse } from "es-module-lexer";
 import {
   createScanner,
   LanguageVariant,
   SyntaxKind,
 } from "typescript/unstable/ast";
 
-function importsRuntimeChromium(source) {
+await init;
+
+function namedImportsRuntimeChromium(clause) {
+  const openBrace = clause.findIndex((token) => token.kind === SyntaxKind.OpenBraceToken);
+  const closeBrace = clause.findIndex((token) => token.kind === SyntaxKind.CloseBraceToken);
+  if (openBrace === -1 || closeBrace < openBrace) return false;
+  let specifier = [];
+  for (const token of clause.slice(openBrace + 1, closeBrace + 1)) {
+    if (
+      token.kind !== SyntaxKind.CommaToken &&
+      token.kind !== SyntaxKind.CloseBraceToken
+    ) {
+      specifier.push(token);
+      continue;
+    }
+    const typeOnly = specifier[0]?.kind === SyntaxKind.TypeKeyword &&
+      specifier[1]?.kind === SyntaxKind.Identifier;
+    const imported = typeOnly ? undefined : specifier[0];
+    if (
+      (imported?.kind === SyntaxKind.Identifier && imported.text === "chromium") ||
+      (imported?.kind === SyntaxKind.StringLiteral && imported.value === "chromium")
+    ) {
+      return true;
+    }
+    specifier = [];
+  }
+  return false;
+}
+
+function staticImportUsesRuntimeChromium(statement) {
   const scanner = createScanner(
     true,
     LanguageVariant.Standard,
-    source,
+    statement,
   );
-  const tokens = [];
-  const templateContexts = [];
-  for (let kind = scanner.scan(); kind !== SyntaxKind.EndOfFile;) {
-    if (
-      kind === SyntaxKind.CloseBraceToken &&
-      templateContexts.at(-1)?.braceDepth === 0
-    ) {
-      kind = scanner.reScanTemplateToken(false);
-      tokens.push({
-        kind,
-        text: scanner.getTokenText(),
-        value: scanner.getTokenValue(),
-      });
-      if (kind === SyntaxKind.TemplateTail) {
-        templateContexts.pop();
-      }
-      kind = scanner.scan();
-      continue;
-    }
-    tokens.push({
+  if (scanner.scan() !== SyntaxKind.ImportKeyword) return false;
+  const clause = [];
+  for (let kind = scanner.scan(); kind !== SyntaxKind.EndOfFile; kind = scanner.scan()) {
+    if (kind === SyntaxKind.FromKeyword) break;
+    clause.push({
       kind,
       text: scanner.getTokenText(),
       value: scanner.getTokenValue(),
     });
-    if (kind === SyntaxKind.TemplateHead) {
-      templateContexts.push({ braceDepth: 0 });
-    } else if (kind === SyntaxKind.OpenBraceToken && templateContexts.length > 0) {
-      templateContexts[templateContexts.length - 1].braceDepth += 1;
-    } else if (kind === SyntaxKind.CloseBraceToken && templateContexts.length > 0) {
-      templateContexts[templateContexts.length - 1].braceDepth -= 1;
-    }
-    kind = scanner.scan();
   }
+  if (clause[0]?.kind === SyntaxKind.StringLiteral) return true;
+  if (clause[0]?.kind === SyntaxKind.TypeKeyword && clause.length > 1) return false;
+  if (clause[0]?.kind === SyntaxKind.Identifier) return true;
+  if (clause.some((token) => token.kind === SyntaxKind.AsteriskToken)) return true;
+  return namedImportsRuntimeChromium(clause);
+}
 
-  for (let importIndex = 0; importIndex < tokens.length; importIndex += 1) {
-    if (tokens[importIndex]?.kind !== SyntaxKind.ImportKeyword) continue;
+function importsRuntimeChromium(source, sourcePath) {
+  let imports;
+  try {
+    [imports] = parse(source);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Unable to classify imports in ${sourcePath}: ${message}`);
+  }
+  for (const record of imports) {
+    if (record.d >= 0 && record.n === undefined) {
+      throw new Error(
+        `Chromium inventory cannot classify a non-literal dynamic import in ${sourcePath}; ` +
+        "use a static string or no-substitution template specifier",
+      );
+    }
+    if (record.n !== "playwright-core") continue;
+    if (record.d >= 0) return true;
     if (
-      tokens[importIndex - 1]?.kind === SyntaxKind.DotToken ||
-      tokens[importIndex - 1]?.kind === SyntaxKind.QuestionDotToken
+      record.d === -1 &&
+      staticImportUsesRuntimeChromium(source.slice(record.ss, record.se))
     ) {
-      continue;
-    }
-
-    const first = tokens[importIndex + 1];
-    if (first?.kind === SyntaxKind.OpenParenToken) {
-      if (
-        tokens[importIndex + 2]?.kind === SyntaxKind.StringLiteral &&
-        tokens[importIndex + 2]?.value === "playwright-core"
-      ) {
-        return true;
-      }
-      continue;
-    }
-    if (first?.kind === SyntaxKind.StringLiteral) {
-      if (first.value === "playwright-core") return true;
-      continue;
-    }
-
-    const clause = [];
-    let moduleSpecifier;
-    for (let tokenIndex = importIndex + 1; tokenIndex < tokens.length; tokenIndex += 1) {
-      const token = tokens[tokenIndex];
-      if (
-        token?.kind === SyntaxKind.SemicolonToken ||
-        token?.kind === SyntaxKind.ImportKeyword
-      ) {
-        break;
-      }
-      if (token?.kind === SyntaxKind.FromKeyword) {
-        moduleSpecifier = tokens[tokenIndex + 1];
-        break;
-      }
-      if (
-        token?.kind === SyntaxKind.EqualsToken &&
-        tokens[tokenIndex + 1]?.kind === SyntaxKind.Identifier &&
-        tokens[tokenIndex + 1]?.text === "require" &&
-        tokens[tokenIndex + 2]?.kind === SyntaxKind.OpenParenToken
-      ) {
-        moduleSpecifier = tokens[tokenIndex + 3];
-        break;
-      }
-      clause.push(token);
-    }
-    if (
-      moduleSpecifier?.kind !== SyntaxKind.StringLiteral ||
-      moduleSpecifier.value !== "playwright-core"
-    ) {
-      continue;
-    }
-    if (clause[0]?.kind === SyntaxKind.TypeKeyword) continue;
-    if (clause.some((token) => token.kind === SyntaxKind.AsteriskToken)) return true;
-    if (clause.some((token) =>
-      token.kind === SyntaxKind.Identifier && token.text === "chromium")) {
       return true;
     }
-    if (clause[0]?.kind === SyntaxKind.Identifier) return true;
   }
   return false;
 }
@@ -123,9 +97,10 @@ async function discoverRuntimeChromiumTests(rootDirectory) {
   for (const entry of entries) {
     if (!entry.isFile() || !entry.name.endsWith(".test.ts")) continue;
     const absolute = path.join(entry.parentPath, entry.name);
+    const relative = path.relative(rootDirectory, absolute).split(path.sep).join("/");
     const source = await readFile(absolute, "utf8");
-    if (importsRuntimeChromium(source)) {
-      discovered.push(path.relative(rootDirectory, absolute).split(path.sep).join("/"));
+    if (importsRuntimeChromium(source, relative)) {
+      discovered.push(relative);
     }
   }
   return discovered.sort();

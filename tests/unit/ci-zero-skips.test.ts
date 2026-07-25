@@ -125,9 +125,33 @@ test("Chromium inventory validation rejects an omitted runtime test file", async
     "})",
     "",
   ].join("\n");
+  const templateRuntimeImport = [
+    'import test from "node:test"',
+    "const browserUnavailable = true",
+    'test("must run with Chromium", { skip: browserUnavailable }, async () => {',
+    "  const { chromium } = await import(`playwright-core`)",
+    "  void chromium",
+    "})",
+    "",
+  ].join("\n");
+  const nonRuntimeImportText = [
+    'import test from "node:test"',
+    'import type { Browser, chromium } from "playwright-core"',
+    'import { type chromium as ChromiumType } from "playwright-core"',
+    'const pattern = /import("playwright-core")/',
+    'const text = `import("playwright-core")`',
+    'const loader = { import: (_value: string) => undefined }',
+    'loader.import("playwright-core")',
+    "void import.meta",
+    "void (undefined as Browser | ChromiumType)",
+    'test("does not use Chromium", () => void [pattern, text])',
+    "",
+  ].join("\n");
   await writeFile(path.join(unitDirectory, "listed.test.ts"), listedRuntimeImport);
   await writeFile(path.join(unitDirectory, "omitted-late.test.ts"), lateRuntimeImport);
   await writeFile(path.join(unitDirectory, "omitted-dynamic.test.ts"), dynamicRuntimeImport);
+  await writeFile(path.join(unitDirectory, "omitted-template.test.ts"), templateRuntimeImport);
+  await writeFile(path.join(unitDirectory, "non-runtime.test.ts"), nonRuntimeImportText);
   await writeFile(
     path.join(temporary, "manifest.json"),
     `${JSON.stringify({
@@ -145,8 +169,35 @@ test("Chromium inventory validation rejects an omitted runtime test file", async
   assert.equal(validation.status, 1);
   assert.match(
     validation.stderr,
-    /manifest omits runtime Chromium test files: tests\/unit\/omitted-dynamic\.test\.ts, tests\/unit\/omitted-late\.test\.ts/u,
+    /manifest omits runtime Chromium test files: tests\/unit\/omitted-dynamic\.test\.ts, tests\/unit\/omitted-late\.test\.ts, tests\/unit\/omitted-template\.test\.ts/u,
   );
+});
+
+test("Chromium inventory rejects unclassifiable dynamic imports", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cope-chromium-dynamic-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const unitDirectory = path.join(temporary, "tests", "unit");
+  await mkdir(unitDirectory, { recursive: true });
+  await writeFile(
+    path.join(unitDirectory, "unknown.test.ts"),
+    'const moduleName = "./fixture.js";\nvoid import(moduleName);\n',
+  );
+  await writeFile(
+    path.join(temporary, "manifest.json"),
+    `${JSON.stringify({
+      sourceFiles: ["tests/unit/unknown.test.ts"],
+      expectedTestCount: 1,
+    })}\n`,
+  );
+
+  const validator = path.resolve("scripts/validate-chromium-safety-inventory.mjs");
+  const validation = spawnSync(
+    process.execPath,
+    [validator, path.join(temporary, "manifest.json"), temporary],
+    { encoding: "utf8" },
+  );
+  assert.equal(validation.status, 1);
+  assert.match(validation.stderr, /cannot classify a non-literal dynamic import/u);
 });
 
 test("manifested zero-skip runner rejects fewer tests than declared", async (context) => {
