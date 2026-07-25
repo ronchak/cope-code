@@ -1232,8 +1232,9 @@ test("resume fails closed when accepted completion evidence changed after handof
     resumed.reason ?? "",
     /Completion handoff does not match the current accepted completion evidence/u,
   );
+  assert.equal(resumed.completion, undefined, "rejected handoff evidence must not be reported as accepted");
   assert.equal(completionHandoffs.saveCalls, 1, "mismatched evidence must not overwrite the handoff");
-  assert.deepEqual(localState.completionHandoff, pausedReference);
+  assert.equal(localState.completionHandoff, undefined, "stale handoff reference must be quarantined");
   const durable = await completionHandoffs.read(pausedReference);
   assert.equal(durable.verification.actual.repositoryFingerprint, "d".repeat(64));
   assert.deepEqual(durable.verification.actual.changedPaths, []);

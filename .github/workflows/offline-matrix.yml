@@ -2,15 +2,23 @@ name: offline-matrix
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+concurrency:
+  group: offline-matrix-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   offline:
     name: offline-${{ matrix.tuple }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         include:
+          - tuple: linux-x64
+            os: ubuntu-24.04
           - tuple: windows-x64
             os: windows-2025
           - tuple: macos-arm64
@@ -26,7 +34,18 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci --no-audit --no-fund
-      - run: npm run check
+      - name: Run full check suite before browser provisioning
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+        run: npm run check
+      - name: Install pinned Chromium for browser safety tests
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+        run: npx --no-install playwright-core install --no-shell chromium
+      - name: Run Chromium safety tests with zero skips
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright-browsers
+        run: npm run test:chromium-safety
       - if: runner.os == 'Windows'
         name: Isolated install and local update smoke (not live certification)
         shell: powershell

@@ -586,7 +586,12 @@ export class AgentRuntime {
       return undefined;
     }
     if (existing !== undefined) {
-      await store.assertReusable(existing, claim, verification);
+      try {
+        await store.assertReusable(existing, claim, verification);
+      } catch (error) {
+        delete this.state.completionHandoff;
+        throw error;
+      }
       return existing;
     }
     return store.save(claim, verification, this.now());
@@ -791,8 +796,8 @@ export class AgentRuntime {
           repository,
           this.dependencies.completionRequirements,
         );
-        this.lastCompletion = verification;
         const completionHandoff = await this.prepareCompletionHandoff(action.claim, verification);
+        this.lastCompletion = verification;
         if (completionHandoff !== undefined) {
           this.state.completionHandoff = completionHandoff;
         }
