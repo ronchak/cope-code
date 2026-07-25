@@ -1,5 +1,17 @@
 import assert from "node:assert/strict";
-import { access, chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  chmod,
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -263,6 +275,129 @@ test("patch commit captures concurrent writes and never overwrites them during r
   assert.equal(await readFile(target, "utf8"), "concurrent\n");
 });
 
+test("checkpoint ABA races cannot seal a before-image that differs from the mutation plan", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-patch-checkpoint-aba-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  const target = path.join(root, "file.txt");
+  const before = "before\n";
+  await writeFile(target, before);
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(boundary, path.join(temporary, "checkpoints"));
+  const engine = new PatchEngine(
+    boundary,
+    checkpoints,
+    new ProtectedPathPolicy(),
+    {},
+    {
+      beforeCheckpoint: async () => writeFile(target, "intermediate\n").then(() => undefined),
+      afterCheckpoint: async () => writeFile(target, before).then(() => undefined),
+    },
+  );
+
+  await assert.rejects(
+    engine.editText({
+      path: "file.txt",
+      base_sha256: sha256(before),
+      old_text: "before",
+      new_text: "after",
+      expected_occurrences: 1,
+    }),
+    (error: unknown) => error instanceof AgentError && error.code === "STALE_STATE",
+  );
+  assert.equal(await readFile(target, "utf8"), before);
+  const checkpoint = await checkpoints.latest();
+  assert.ok(checkpoint);
+  assert.equal(checkpoint.sealed, false);
+  assert.equal((await checkpoints.snapshot(checkpoint.id)).entries[0]?.sha256, sha256("intermediate\n"));
+  await assert.rejects(
+    checkpoints.rollback(checkpoint.id),
+    (error: unknown) => error instanceof AgentError && error.code === "STALE_STATE",
+  );
+  assert.equal(await readFile(target, "utf8"), before);
+});
+
+test("ancestor-directory replacement is detected before mutation syscalls reach the replacement", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-patch-parent-race-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  const sourceDirectory = path.join(root, "src");
+  const parkedDirectory = path.join(root, "src-parked");
+  const outside = path.join(temporary, "outside");
+  await mkdir(sourceDirectory, { recursive: true });
+  await mkdir(outside);
+  const before = "before\n";
+  await writeFile(path.join(sourceDirectory, "file.txt"), before);
+  await writeFile(path.join(outside, "file.txt"), "outside\n");
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(boundary, path.join(temporary, "checkpoints"));
+  let swapped = false;
+  const engine = new PatchEngine(
+    boundary,
+    checkpoints,
+    new ProtectedPathPolicy(),
+    {},
+    {
+      beforeCapture: async () => {
+        if (swapped) return;
+        swapped = true;
+        await rename(sourceDirectory, parkedDirectory);
+        await symlink(outside, sourceDirectory, "dir");
+      },
+    },
+  );
+
+  await assert.rejects(
+    engine.editText({
+      path: "src/file.txt",
+      base_sha256: sha256(before),
+      old_text: "before",
+      new_text: "after",
+      expected_occurrences: 1,
+    }),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  assert.equal(await readFile(path.join(outside, "file.txt"), "utf8"), "outside\n");
+  assert.deepEqual(await readdir(outside), ["file.txt"]);
+
+  await unlink(sourceDirectory);
+  await rename(parkedDirectory, sourceDirectory);
+  assert.equal(await readFile(path.join(sourceDirectory, "file.txt"), "utf8"), before);
+});
+
+test("recovery preserves a concurrent deletion of an installed result", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-patch-delete-race-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  const target = path.join(root, "file.txt");
+  const before = "before\n";
+  await writeFile(target, before);
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(boundary, path.join(temporary, "checkpoints"));
+  const engine = new PatchEngine(
+    boundary,
+    checkpoints,
+    new ProtectedPathPolicy(),
+    {},
+    { afterInstall: async () => unlink(target) },
+  );
+
+  await assert.rejects(
+    engine.editText({
+      path: "file.txt",
+      base_sha256: sha256(before),
+      old_text: "before",
+      new_text: "after",
+      expected_occurrences: 1,
+    }),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  await assert.rejects(readFile(target), (error: unknown) =>
+    (error as NodeJS.ErrnoException).code === "ENOENT");
+});
+
 test("patch recovery fails closed when a concurrent path appears after capture", async (context) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-patch-race-install-"));
   context.after(async () => rm(temporary, { recursive: true, force: true }));
@@ -455,9 +590,15 @@ test("checkpoint rollback removes deterministic transaction artifacts left by an
   const checkpoints = await CheckpointStore.create(boundary, path.join(temporary, "checkpoints"));
   const checkpoint = await checkpoints.createCheckpoint(["file.txt"]);
   const artifacts = checkpointMutationArtifactPaths(target, "file.txt", checkpoint.id);
+  const legacyPrefix = `.cba-${checkpoint.id}-${sha256("file.txt").slice(0, 20)}`;
+  const legacyTemporary = path.join(root, `${legacyPrefix}.new`);
+  const legacyBackup = path.join(root, `${legacyPrefix}.old`);
+  await mkdir(artifacts.transactionDirectory);
   await writeFile(target, "partially updated\n");
   await writeFile(artifacts.temporaryPath, "staged\n");
   await writeFile(artifacts.backupPath, "original\n");
+  await writeFile(legacyTemporary, "legacy staged\n");
+  await writeFile(legacyBackup, "legacy original\n");
   await assert.rejects(
     checkpoints.rollback(checkpoint.id),
     (error: unknown) => error instanceof AgentError && error.code === "STALE_STATE",
@@ -467,6 +608,8 @@ test("checkpoint rollback removes deterministic transaction artifacts left by an
   assert.equal(await readFile(target, "utf8"), "original\n");
   await assert.rejects(readFile(artifacts.temporaryPath));
   await assert.rejects(readFile(artifacts.backupPath));
+  await assert.rejects(readFile(legacyTemporary));
+  await assert.rejects(readFile(legacyBackup));
 });
 
 test("sealed checkpoint rollback refuses to overwrite later user edits", async (context) => {

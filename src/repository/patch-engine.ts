@@ -1,4 +1,17 @@
-import { chmod, link, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  link,
+  lstat,
+  mkdir,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  rmdir,
+  stat,
+  writeFile,
+} from "node:fs/promises";
+import path from "node:path";
 
 import { AgentError } from "../shared/errors.js";
 import { sha256 } from "../shared/crypto.js";
@@ -47,10 +60,16 @@ export interface PatchBudgets {
 }
 
 export interface PatchEngineHooks {
+  /** @internal Deterministic checkpoint race injection point. */
+  readonly beforeCheckpoint?: () => Promise<void>;
+  /** @internal Deterministic checkpoint race injection point. */
+  readonly afterCheckpoint?: () => Promise<void>;
   /** @internal Deterministic fault/race injection point used by repository tests. */
   readonly beforeCapture?: (path: string) => Promise<void>;
   /** @internal Deterministic fault/race injection point used by repository tests. */
   readonly afterCapture?: (path: string) => Promise<void>;
+  /** @internal Deterministic post-install race injection point. */
+  readonly afterInstall?: (path: string) => Promise<void>;
 }
 
 export interface AppliedPath {
@@ -75,12 +94,20 @@ interface MutationPlan {
   readonly oldMode: number | null;
   readonly newBytes: Buffer | null;
   readonly expectedSha256: string | null;
+  readonly directoryIdentities: readonly MutationDirectoryIdentity[];
+  transactionDirectory: string | null;
   temporaryPath: string | null;
   backupPath: string | null;
   temporaryCreated: boolean;
   backupCreated: boolean;
   backupDeleted: boolean;
   finalInstalled: boolean;
+}
+
+interface MutationDirectoryIdentity {
+  readonly absolutePath: string;
+  readonly device: number;
+  readonly inode: number;
 }
 
 export class PatchEngine {
@@ -249,6 +276,11 @@ export class PatchEngine {
       }
       totalBytes += newBytes?.length ?? 0;
       changedLines += countChangedLines(oldBytes?.toString("utf8") ?? "", newBytes?.toString("utf8") ?? "");
+      const directoryIdentities = await captureMutationDirectoryIdentities(
+        this.boundary.root,
+        path.dirname(resolved.absolutePath),
+        normalizedPath,
+      );
       plans.push({
         path: normalizedPath,
         absolutePath: resolved.absolutePath,
@@ -257,6 +289,8 @@ export class PatchEngine {
         oldMode,
         newBytes,
         expectedSha256: oldBytes === null ? null : sha256(oldBytes),
+        directoryIdentities,
+        transactionDirectory: null,
         temporaryPath: null,
         backupPath: null,
         temporaryCreated: false,
@@ -275,16 +309,20 @@ export class PatchEngine {
       });
     }
 
+    await this.hooks.beforeCheckpoint?.();
     const checkpoint = await this.checkpoints.createCheckpoint(
       plans.map((plan) => plan.path),
       request.operationId,
     );
+    await this.hooks.afterCheckpoint?.();
+    await this.assertCheckpointMatchesPlans(checkpoint.id, plans);
     for (const plan of plans) {
       const artifacts = checkpointMutationArtifactPaths(
         plan.absolutePath,
         plan.path,
         checkpoint.id,
       );
+      plan.transactionDirectory = artifacts.transactionDirectory;
       plan.temporaryPath = plan.newBytes === null ? null : artifacts.temporaryPath;
       plan.backupPath = plan.oldBytes === null ? null : artifacts.backupPath;
     }
@@ -355,7 +393,27 @@ export class PatchEngine {
 
   private async commit(plans: readonly MutationPlan[]): Promise<void> {
     for (const plan of plans) {
+      if (plan.transactionDirectory === null) {
+        throw new AgentError("INTERNAL_ERROR", "Mutation transaction directory is missing");
+      }
+      await assertMutationDirectoriesStable(plan);
+      await mkdir(plan.transactionDirectory, { mode: 0o700 });
+      await assertMutationDirectoriesStable(plan);
+      const transactionStat = await lstat(plan.transactionDirectory);
+      if (
+        transactionStat.isSymbolicLink() ||
+        !transactionStat.isDirectory() ||
+        (await realpath(plan.transactionDirectory)) !== plan.transactionDirectory
+      ) {
+        throw new AgentError("STALE_STATE", "Mutation transaction directory changed", {
+          path: plan.path,
+        });
+      }
+    }
+
+    for (const plan of plans) {
       if (plan.newBytes !== null && plan.temporaryPath !== null) {
+        await assertMutationDirectoriesStable(plan);
         await writeFile(plan.temporaryPath, plan.newBytes, {
           flag: "wx",
           mode: 0o600,
@@ -382,9 +440,11 @@ export class PatchEngine {
           throw new AgentError("INTERNAL_ERROR", "Mutation backup path is missing");
         }
         await this.hooks.beforeCapture?.(plan.path);
+        await assertMutationDirectoriesStable(plan);
         await rename(plan.absolutePath, plan.backupPath);
         plan.backupCreated = true;
         await this.hooks.afterCapture?.(plan.path);
+        await assertMutationDirectoriesStable(plan);
         const captured = await readFile(plan.backupPath);
         const capturedStat = await stat(plan.backupPath);
         if (
@@ -401,6 +461,7 @@ export class PatchEngine {
         if (plan.temporaryPath === null) {
           throw new AgentError("INTERNAL_ERROR", "Mutation temporary path is missing");
         }
+        await assertMutationDirectoriesStable(plan);
         await link(plan.temporaryPath, plan.absolutePath);
         await rm(plan.temporaryPath, { force: false });
         plan.temporaryCreated = false;
@@ -408,11 +469,13 @@ export class PatchEngine {
         if (plan.oldMode !== null && CURRENT_HOST_PLATFORM.supportsPosixModes) {
           await chmod(plan.absolutePath, plan.oldMode);
         }
+        await this.hooks.afterInstall?.(plan.path);
       }
     }
 
     for (const plan of plans) {
       if (plan.backupPath !== null) {
+        await assertMutationDirectoriesStable(plan);
         const captured = await readFile(plan.backupPath);
         if (plan.expectedSha256 === null || sha256(captured) !== plan.expectedSha256) {
           throw new AgentError("STALE_STATE", "Captured file changed during patch commit", {
@@ -423,6 +486,7 @@ export class PatchEngine {
         plan.backupCreated = false;
         plan.backupDeleted = true;
       }
+      await this.removeTransactionDirectory(plan);
     }
   }
 
@@ -431,13 +495,18 @@ export class PatchEngine {
     for (const plan of [...plans].reverse()) {
       try {
         if (plan.temporaryCreated && plan.temporaryPath !== null) {
+          await assertMutationDirectoriesStable(plan);
           await rm(plan.temporaryPath, { force: true });
           plan.temporaryCreated = false;
         }
         if (!plan.finalInstalled && !plan.backupCreated && !plan.backupDeleted) {
+          await this.removeTransactionDirectory(plan);
           continue;
         }
         const current = await this.boundary.resolve(plan.path, { allowMissingLeaf: true });
+        if (plan.finalInstalled && plan.newBytes !== null && !current.exists) {
+          throw new Error("Installed result was removed during transaction recovery");
+        }
         if (plan.finalInstalled && current.exists) {
           const currentBytes = await readFile(current.absolutePath);
           if (plan.newBytes === null || sha256(currentBytes) !== sha256(plan.newBytes)) {
@@ -446,6 +515,7 @@ export class PatchEngine {
           await rm(current.absolutePath, { force: false });
         }
         if (plan.backupCreated && plan.backupPath !== null) {
+          await assertMutationDirectoriesStable(plan);
           await link(plan.backupPath, plan.absolutePath);
           await rm(plan.backupPath, { force: false });
           plan.backupCreated = false;
@@ -464,6 +534,7 @@ export class PatchEngine {
           }
         }
         plan.finalInstalled = false;
+        await this.removeTransactionDirectory(plan);
       } catch (error) {
         restorationErrors.push(`${plan.path}: ${String(error)}`);
       }
@@ -471,6 +542,38 @@ export class PatchEngine {
     if (restorationErrors.length > 0) {
       throw new Error(restorationErrors.join("; "));
     }
+  }
+
+  private async assertCheckpointMatchesPlans(
+    checkpointId: string,
+    plans: readonly MutationPlan[],
+  ): Promise<void> {
+    const checkpoint = await this.checkpoints.snapshot(checkpointId);
+    const entries = new Map(
+      checkpoint.entries.map((entry) => [this.boundary.pathKey(entry.path), entry]),
+    );
+    for (const plan of plans) {
+      const entry = entries.get(this.boundary.pathKey(plan.path));
+      if (
+        entry === undefined ||
+        entry.existed !== (plan.oldBytes !== null) ||
+        entry.sha256 !== plan.expectedSha256 ||
+        entry.mode !== plan.oldMode
+      ) {
+        throw new AgentError(
+          "STALE_STATE",
+          "Checkpoint before-image does not match the validated mutation plan",
+          { checkpointId, path: plan.path },
+        );
+      }
+    }
+  }
+
+  private async removeTransactionDirectory(plan: MutationPlan): Promise<void> {
+    if (plan.transactionDirectory === null) return;
+    await assertMutationDirectoriesStable(plan);
+    await rmdir(plan.transactionDirectory);
+    plan.transactionDirectory = null;
   }
 }
 
@@ -507,5 +610,70 @@ function assertSupportedMutationPath(repositoryPath: string): void {
     throw new AgentError("UNSUPPORTED_FILE", "Executable, archive, key, and database files cannot be modified", {
       path: repositoryPath,
     });
+  }
+}
+
+async function captureMutationDirectoryIdentities(
+  repositoryRoot: string,
+  targetParent: string,
+  repositoryPath: string,
+): Promise<readonly MutationDirectoryIdentity[]> {
+  const relative = path.relative(repositoryRoot, targetParent);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new AgentError("PATH_OUTSIDE_REPOSITORY", "Mutation parent escapes the repository", {
+      path: repositoryPath,
+    });
+  }
+  const directories = [
+    repositoryRoot,
+    ...(relative === "" ? [] : relative.split(path.sep).map(
+      (_segment, index, segments) =>
+        path.join(repositoryRoot, ...segments.slice(0, index + 1)),
+    )),
+  ];
+  const identities: MutationDirectoryIdentity[] = [];
+  for (const absolutePath of directories) {
+    const linkState = await lstat(absolutePath);
+    const state = await stat(absolutePath);
+    if (
+      linkState.isSymbolicLink() ||
+      !state.isDirectory() ||
+      (await realpath(absolutePath)) !== absolutePath
+    ) {
+      throw new AgentError("UNSUPPORTED_FILE", "Mutation parent must be a stable directory", {
+        path: repositoryPath,
+      });
+    }
+    identities.push({
+      absolutePath,
+      device: state.dev,
+      inode: state.ino,
+    });
+  }
+  return identities;
+}
+
+async function assertMutationDirectoriesStable(plan: MutationPlan): Promise<void> {
+  for (const expected of plan.directoryIdentities) {
+    try {
+      const linkState = await lstat(expected.absolutePath);
+      const current = await stat(expected.absolutePath);
+      if (
+        linkState.isSymbolicLink() ||
+        !current.isDirectory() ||
+        current.dev !== expected.device ||
+        current.ino !== expected.inode ||
+        (await realpath(expected.absolutePath)) !== expected.absolutePath
+      ) {
+        throw new Error("directory identity mismatch");
+      }
+    } catch (error) {
+      throw new AgentError(
+        "STALE_STATE",
+        "Mutation parent directory changed before a filesystem operation",
+        { path: plan.path },
+        { cause: error },
+      );
+    }
   }
 }

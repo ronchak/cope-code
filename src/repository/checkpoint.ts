@@ -8,6 +8,7 @@ import {
   realpath,
   rename,
   rm,
+  rmdir,
   stat,
   writeFile,
 } from "node:fs/promises";
@@ -675,12 +676,20 @@ export function checkpointMutationArtifactPaths(
   absoluteTarget: string,
   relativePath: string,
   checkpointId: string,
-): { readonly temporaryPath: string; readonly backupPath: string } {
+): {
+  readonly transactionDirectory: string;
+  readonly temporaryPath: string;
+  readonly backupPath: string;
+} {
   const key = sha256(relativePath).slice(0, 20);
-  const prefix = `.cba-${checkpointId}-${key}`;
+  const transactionDirectory = path.join(
+    path.dirname(absoluteTarget),
+    `.cba-${checkpointId}-${key}`,
+  );
   return {
-    temporaryPath: path.join(path.dirname(absoluteTarget), `${prefix}.new`),
-    backupPath: path.join(path.dirname(absoluteTarget), `${prefix}.old`),
+    transactionDirectory,
+    temporaryPath: path.join(transactionDirectory, "new"),
+    backupPath: path.join(transactionDirectory, "old"),
   };
 }
 
@@ -692,6 +701,20 @@ async function cleanupMutationArtifacts(
   const artifacts = checkpointMutationArtifactPaths(absoluteTarget, relativePath, checkpointId);
   for (const artifact of [artifacts.temporaryPath, artifacts.backupPath]) {
     await rm(artifact, { force: true });
+  }
+  try {
+    await rmdir(artifacts.transactionDirectory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+
+  const legacyKey = sha256(relativePath).slice(0, 20);
+  const legacyPrefix = `.cba-${checkpointId}-${legacyKey}`;
+  for (const legacyArtifact of [
+    path.join(path.dirname(absoluteTarget), `${legacyPrefix}.new`),
+    path.join(path.dirname(absoluteTarget), `${legacyPrefix}.old`),
+  ]) {
+    await rm(legacyArtifact, { force: true });
   }
 }
 
