@@ -26,7 +26,10 @@ import {
   snapshotSessionLifecycle,
   transitionSession,
 } from "../session/state-machine.js";
-import { cleanupTerminalRecoveryArtifacts } from "../session/terminal-cleanup.js";
+import {
+  cleanupTerminalRecoveryArtifacts,
+  setTerminalCleanupPolicy,
+} from "../session/terminal-cleanup.js";
 import type { SessionState } from "../session/types.js";
 import { isBatchableToolName, isReadOnlyToolName } from "../protocol/types.js";
 import {
@@ -1383,6 +1386,10 @@ export class AgentRuntime {
         reason: message,
         failure: { code: error instanceof AgentError ? error.code : "INTERNAL_ERROR", message },
       });
+      setTerminalCleanupPolicy(
+        this.state,
+        this.dependencies.retainSourceArtifactsOnCompletion === true,
+      );
       try {
         await this.persist();
       } catch (persistError) {
@@ -1404,6 +1411,12 @@ export class AgentRuntime {
     transitionSession(this.state, status, this.now(), reason === undefined ? {} : { reason });
     if (isTerminal(status) && status !== "completed") {
       delete this.state.completionHandoff;
+    }
+    if (isTerminal(status)) {
+      setTerminalCleanupPolicy(
+        this.state,
+        this.dependencies.retainSourceArtifactsOnCompletion === true,
+      );
     }
     try {
       await this.persist();

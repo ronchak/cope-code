@@ -139,6 +139,9 @@ export interface SessionState {
   lastCheckpointId?: string;
   lastModelSummaryHash?: string;
   completionHandoff?: import("./completion-handoff-store.js").CompletionHandoffReference;
+  terminalCleanup?: {
+    readonly sourceArtifacts: "remove" | "retain";
+  };
   protocolRepairStreak: number;
 }
 

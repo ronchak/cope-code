@@ -27,7 +27,7 @@ The Windows default state root is `%LOCALAPPDATA%\CopilotBrowserAgent`. The expe
 
 Exact filenames beyond the public CLI contract are implementation details; use CLI status/verify/rollback rather than editing records. State and recovery roots must remain outside repositories.
 
-Every row requires an explicit handling decision; “no raw file bodies” does not mean public. Verified completion clears the transient `artifacts` directory—including outbox, response, and decision files—unless `retain_source_artifacts_on_completion` is true. Pause, failure, interruption, and some recovery states can retain those files. Checkpoints, `fingerprint.key`, completion handoff, ledgers, audit, and review exports are outside that cleanup switch and remain subject to their own approved retention/deletion procedures. Each product-specific dedicated browser profile is credential-equivalent and requires the strongest handling.
+Every row requires an explicit handling decision; “no raw file bodies” does not mean public. Paused and otherwise nonterminal sessions retain transient `artifacts` for recovery. A terminal commit records the effective remove/retain decision; when removal is required, every later terminal load retries cleanup after transient failure or directory-entry resurrection. Checkpoints, `fingerprint.key`, completion handoff, ledgers, audit, and review exports are outside that cleanup switch and remain subject to their own approved retention/deletion procedures. Each product-specific dedicated browser profile is credential-equivalent and requires the strongest handling.
 
 ## Commit points
 

@@ -8,6 +8,7 @@ export interface SessionLifecycleSnapshot {
   readonly failure: SessionState["failure"];
   readonly completedAt: SessionState["completedAt"];
   readonly completionHandoff: SessionState["completionHandoff"];
+  readonly terminalCleanup: SessionState["terminalCleanup"];
 }
 
 const terminal = new Set<SessionStatus>(["completed", "rolled_back", "blocked", "aborted", "failed"]);
@@ -111,6 +112,7 @@ export function snapshotSessionLifecycle(state: SessionState): SessionLifecycleS
     failure: state.failure,
     completedAt: state.completedAt,
     completionHandoff: state.completionHandoff,
+    terminalCleanup: state.terminalCleanup,
   };
 }
 
@@ -124,13 +126,16 @@ export function restoreSessionLifecycle(
   restoreOptional(state, "failure", snapshot.failure);
   restoreOptional(state, "completedAt", snapshot.completedAt);
   restoreOptional(state, "completionHandoff", snapshot.completionHandoff);
+  restoreOptional(state, "terminalCleanup", snapshot.terminalCleanup);
 }
 
 export function allowedTransitions(status: SessionStatus): readonly SessionStatus[] {
   return [...transitions[status]];
 }
 
-function restoreOptional<Key extends "pauseReason" | "failure" | "completedAt" | "completionHandoff">(
+function restoreOptional<
+  Key extends "pauseReason" | "failure" | "completedAt" | "completionHandoff" | "terminalCleanup",
+>(
   state: SessionState,
   key: Key,
   value: SessionState[Key],

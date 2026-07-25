@@ -53,7 +53,10 @@ import {
   transitionSession,
 } from "../session/state-machine.js";
 import { SessionStore, type WorkspaceLock } from "../session/store.js";
-import { cleanupTerminalRecoveryArtifacts } from "../session/terminal-cleanup.js";
+import {
+  cleanupTerminalRecoveryArtifacts,
+  setTerminalCleanupPolicy,
+} from "../session/terminal-cleanup.js";
 import {
   SESSION_SCHEMA_VERSION,
   type SessionState,
@@ -1124,6 +1127,7 @@ async function moveState(
       : {}),
   });
   if (isTerminal(next) && next !== "completed") delete state.completionHandoff;
+  if (isTerminal(next)) setTerminalCleanupPolicy(state, retainSourceArtifacts);
   try {
     await store.write(state);
   } catch (error) {

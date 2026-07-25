@@ -7,6 +7,7 @@ import { isOperationId } from "../shared/operation-id.js";
 import { currentHost, workspaceKey } from "./paths.js";
 import { SESSION_SCHEMA_VERSION, type SessionState } from "./types.js";
 import { allowedTransitions, isTerminal } from "./state-machine.js";
+import { SessionArtifactStore } from "./artifact-store.js";
 import {
   CompletionHandoffStore,
   isCompletionHandoffReference,
@@ -52,6 +53,7 @@ const SESSION_KEYS = [
   "lastCheckpointId",
   "lastModelSummaryHash",
   "completionHandoff",
+  "terminalCleanup",
   "protocolRepairStreak",
 ] as const;
 
@@ -92,7 +94,10 @@ export class SessionStore {
   public async read(sessionId: string): Promise<SessionState> {
     const parsed = await this.readValidated(sessionId);
     if (!isTerminal(parsed.status)) return parsed;
-    if (parsed.status === "completed" && parsed.completionHandoff?.inlineRecord === undefined) return parsed;
+    const removeSourceArtifacts = parsed.terminalCleanup?.sourceArtifacts === "remove";
+    const removeSeparateHandoff =
+      parsed.status !== "completed" || parsed.completionHandoff?.inlineRecord !== undefined;
+    if (!removeSourceArtifacts && !removeSeparateHandoff) return parsed;
 
     try {
       // Legacy rollback paths could leave a completion report attached to a
@@ -101,7 +106,18 @@ export class SessionStore {
       // completion. Removing the separate report is sufficient to retire the
       // sensitive artifact and deliberately avoids rewriting a possibly newer
       // state snapshot.
-      await CompletionHandoffStore.removeAt(path.join(this.sessionDirectory(sessionId), "handoff"));
+      const sessionDirectory = this.sessionDirectory(sessionId);
+      const cleanup: Promise<void>[] = [];
+      if (removeSourceArtifacts) {
+        cleanup.push(new SessionArtifactStore(path.join(sessionDirectory, "artifacts")).clear());
+      }
+      if (removeSeparateHandoff) {
+        cleanup.push(CompletionHandoffStore.removeAt(path.join(sessionDirectory, "handoff")));
+      }
+      // Start independent cleanup operations before awaiting so one transient
+      // failure cannot suppress another. The durable terminal policy retries
+      // the entire idempotent set on the next load.
+      await Promise.all(cleanup);
       const current = await this.readValidated(sessionId);
       // Suppress the obsolete reference in memory. A later legitimate state
       // transition persists the already-established terminal invariant.
@@ -110,7 +126,7 @@ export class SessionStore {
     } catch (error) {
       throw new AgentError(
         "RECOVERY_REQUIRED",
-        "Cannot remove a legacy completion handoff from a terminal session",
+        "Cannot finish terminal recovery artifact cleanup",
         { sessionId, status: parsed.status },
         { cause: error },
       );
@@ -395,9 +411,19 @@ function assertValidSessionState(value: Partial<SessionState>): asserts value is
   ) {
     throw new AgentError("RECOVERY_REQUIRED", "Session completion-handoff reference is malformed");
   }
+  if (
+    value.terminalCleanup !== undefined &&
+    (!hasExactKeys(value.terminalCleanup, ["sourceArtifacts"]) ||
+      !["remove", "retain"].includes(value.terminalCleanup.sourceArtifacts))
+  ) {
+    throw new AgentError("RECOVERY_REQUIRED", "Session terminal-cleanup policy is malformed");
+  }
   // This also guarantees that a status is a recognized key in the transition table.
   const status = value.status;
   allowedTransitions(status);
+  if (value.terminalCleanup !== undefined && !isTerminal(status)) {
+    throw new AgentError("RECOVERY_REQUIRED", "A nonterminal session cannot have a terminal-cleanup policy");
+  }
   const operationIds = value.pendingOperations.map((operation) => operation.operationId);
   if (new Set(operationIds).size !== operationIds.length) {
     throw new AgentError("RECOVERY_REQUIRED", "Session contains duplicate pending operation identifiers");

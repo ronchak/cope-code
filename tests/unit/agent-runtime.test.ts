@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -1497,7 +1497,43 @@ test("terminal transport blocking clears source artifacts when retention is disa
   const result = await runtime.run();
   assert.equal(result.status, "blocked");
   assert.equal(result.reason, "service-error");
+  assert.deepEqual(localState.terminalCleanup, { sourceArtifacts: "remove" });
   assert.equal(await artifacts.getOptional("outbox", "submission_1"), undefined);
+  assert.equal(await artifacts.getOptional("decision", "sentinel"), undefined);
+});
+
+test("failed terminal artifact cleanup is retried from durable state on a later load", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-terminal-cleanup-retry-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  class RejectingClearArtifactStore extends SessionArtifactStore {
+    public override async clear(): Promise<void> {
+      throw new Error("transient artifact cleanup failure");
+    }
+  }
+  const artifactRoot = path.join(store.sessionDirectory(localState.sessionId), "artifacts");
+  const artifacts = new RejectingClearArtifactStore(artifactRoot);
+  await artifacts.put("decision", "sentinel", "retry cleanup after terminal commit");
+  const runtime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport: new TerminalBlockedTransport([]),
+    artifacts,
+  });
+
+  await assert.rejects(() => runtime.run(), /transient artifact cleanup failure/u);
+  const persisted = JSON.parse(
+    await readFile(path.join(store.sessionDirectory(localState.sessionId), "session.json"), "utf8"),
+  ) as SessionState;
+  assert.equal(persisted.status, "blocked");
+  assert.deepEqual(persisted.terminalCleanup, { sourceArtifacts: "remove" });
+  assert.equal(await artifacts.get("decision", "sentinel"), "retry cleanup after terminal commit");
+
+  const recovered = await store.read(localState.sessionId);
+  assert.equal(recovered.status, "blocked");
+  assert.deepEqual(recovered.terminalCleanup, { sourceArtifacts: "remove" });
   assert.equal(await artifacts.getOptional("decision", "sentinel"), undefined);
 });
 
@@ -1519,6 +1555,7 @@ test("terminal cleanup preserves source artifacts when retention is enabled", as
 
   const result = await runtime.run();
   assert.equal(result.status, "blocked");
+  assert.deepEqual(localState.terminalCleanup, { sourceArtifacts: "retain" });
   assert.equal(await artifacts.get("outbox", "submission_1"), "bootstrap");
   assert.equal(await artifacts.get("decision", "sentinel"), "retained terminal evidence");
 });
