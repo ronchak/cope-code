@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { BudgetMeter } from "../../src/session/budgets.js";
+import { CompletionHandoffStore } from "../../src/session/completion-handoff-store.js";
 import { SessionStore } from "../../src/session/store.js";
 import { allowedTransitions, isTerminal, transitionSession } from "../../src/session/state-machine.js";
 import {
@@ -110,6 +111,88 @@ test("session store migrates legacy non-completed terminal handoffs on load", as
   assert.equal(migrated.completionHandoff, undefined);
   await assert.rejects(() => readFile(handoffFilename, "utf8"), { code: "ENOENT" });
   const durable = JSON.parse(await readFile(path.join(sessionDirectory, "session.json"), "utf8")) as SessionState;
+  assert.equal(durable.completionHandoff, undefined);
+});
+
+test("session store removes an orphaned legacy terminal handoff without a state reference", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-session-orphaned-handoff-"));
+  const store = new SessionStore(root);
+  const state = makeState({
+    status: "failed",
+    completedAt: "2026-01-01T00:00:03.000Z",
+    failure: { code: "INTERNAL_ERROR", message: "legacy failure" },
+  });
+  await store.create(state);
+  const handoffFilename = path.join(store.sessionDirectory(state.sessionId), "handoff", "completion.json");
+  await mkdir(path.dirname(handoffFilename), { recursive: true, mode: 0o700 });
+  await writeFile(handoffFilename, "orphaned legacy report\n", "utf8");
+
+  const migrated = await store.read(state.sessionId);
+  assert.equal(migrated.status, "failed");
+  assert.equal(migrated.completionHandoff, undefined);
+  await assert.rejects(() => readFile(handoffFilename, "utf8"), { code: "ENOENT" });
+});
+
+test("legacy handoff migration cannot overwrite a concurrent terminal state write", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-session-handoff-race-"));
+  const store = new SessionStore(root);
+  const state = makeState({
+    status: "blocked",
+    completedAt: "2026-01-01T00:00:03.000Z",
+    pauseReason: "legacy block",
+    completionHandoff: {
+      version: "completion-handoff/1",
+      integrity: "e".repeat(64),
+      createdAt: "2026-01-01T00:00:02.000Z",
+      redactionCount: 0,
+    },
+  });
+  await store.create(state);
+  const handoffFilename = path.join(store.sessionDirectory(state.sessionId), "handoff", "completion.json");
+  await mkdir(path.dirname(handoffFilename), { recursive: true, mode: 0o700 });
+  await writeFile(handoffFilename, "legacy report\n", "utf8");
+
+  const originalRemoveAt = CompletionHandoffStore.removeAt;
+  let releaseRemoval!: () => void;
+  const removalReleased = new Promise<void>((resolve) => {
+    releaseRemoval = resolve;
+  });
+  let removalEnteredResolve!: () => void;
+  const removalEntered = new Promise<void>((resolve) => {
+    removalEnteredResolve = resolve;
+  });
+  CompletionHandoffStore.removeAt = async (directory: string): Promise<void> => {
+    removalEnteredResolve();
+    await removalReleased;
+    await originalRemoveAt(directory);
+  };
+
+  let writerSettled = false;
+  try {
+    const migration = store.read(state.sessionId);
+    await removalEntered;
+    const rolledBack: SessionState = {
+      ...state,
+      status: "rolled_back",
+      updatedAt: "2026-01-01T00:00:04.000Z",
+      completedAt: "2026-01-01T00:00:04.000Z",
+    };
+    delete rolledBack.pauseReason;
+    delete rolledBack.completionHandoff;
+    const concurrentWrite = store.write(rolledBack).finally(() => {
+      writerSettled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(writerSettled, false, "the concurrent writer must wait for migration serialization");
+    releaseRemoval();
+    await Promise.all([migration, concurrentWrite]);
+  } finally {
+    releaseRemoval();
+    CompletionHandoffStore.removeAt = originalRemoveAt;
+  }
+
+  const durable = await store.read(state.sessionId);
+  assert.equal(durable.status, "rolled_back");
   assert.equal(durable.completionHandoff, undefined);
 });
 

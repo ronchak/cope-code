@@ -1,7 +1,9 @@
-import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
+import { constants } from "node:fs";
+import { mkdir, open, readFile, rename, rm, unlink } from "node:fs/promises";
 import path from "node:path";
 
 import type { CompletionClaim, CompletionVerification } from "../orchestrator/completion.js";
+import { CURRENT_HOST_PLATFORM } from "../platform/index.js";
 import { SecretScanner } from "../security/secrets.js";
 import { newId, sha256, stableJson } from "../shared/crypto.js";
 import { AgentError } from "../shared/errors.js";
@@ -128,7 +130,13 @@ export class CompletionHandoffStore {
   }
 
   public static async removeAt(directory: string): Promise<void> {
-    await rm(path.join(directory, "completion.json"), { force: true });
+    try {
+      await unlink(path.join(directory, "completion.json"));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    await syncDirectory(directory);
   }
 
   private filename(): string {
@@ -283,7 +291,18 @@ async function atomicWrite(filename: string, content: string): Promise<void> {
   }
   try {
     await rename(temporary, filename);
+    await syncDirectory(path.dirname(filename));
   } finally {
     await rm(temporary, { force: true });
+  }
+}
+
+async function syncDirectory(directory: string): Promise<void> {
+  if (!CURRENT_HOST_PLATFORM.supportsDirectoryFsync) return;
+  const handle = await open(directory, constants.O_RDONLY);
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
   }
 }
