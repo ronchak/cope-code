@@ -2,7 +2,7 @@ import { AgentError, errorMessage } from "../shared/errors.js";
 import { sha256, stableJson } from "../shared/crypto.js";
 import { isOperationId } from "../shared/operation-id.js";
 import type { GitInspector, GitStatusResult } from "../repository/git.js";
-import type { PatchEngine } from "../repository/patch-engine.js";
+import type { ApplyPatchResult, PatchEngine } from "../repository/patch-engine.js";
 import type { RepositoryTools } from "../repository/repository-tools.js";
 import type { RepositoryContext } from "../repository/context.js";
 import type {
@@ -358,27 +358,21 @@ export class ToolHost {
           changes: args.changes as never,
           operationId: call.operationId,
         });
-        let repositoryFingerprint = "unknown";
-        let repositoryStateKnown = false;
-        let repositoryHasConflicts = true;
-        try {
-          const repositoryStatus = await this.git.status();
-          repositoryFingerprint = repositoryStatus.snapshotSha256;
-          repositoryStateKnown = true;
-          repositoryHasConflicts = repositoryStatus.hasConflicts;
-        } catch {
-          // The patch remains committed and recoverable, but completion will
-          // fail closed until repository state can be reconciled.
-        }
-        return successOutcome(call, asRecord(result), {
-          checkpointId: result.checkpointId,
-          changedFileCount: result.changedPaths.length,
-          changedPaths: result.changedPaths.map((entry) => entry.path),
-          changedLines: result.changedLines,
-          repositoryFingerprint,
-          repositoryStateKnown,
-          repositoryHasConflicts,
+        return this.mutationOutcome(call, result);
+      }
+      case "edit_text": {
+        const args = checkedObject(call.arguments, [
+          "path", "base_sha256", "old_text", "new_text", "expected_occurrences",
+        ]);
+        const result = await this.patchEngine.editText({
+          path: requiredString(args, "path"),
+          base_sha256: requiredString(args, "base_sha256"),
+          old_text: requiredString(args, "old_text"),
+          new_text: requiredString(args, "new_text"),
+          expected_occurrences: requiredNumber(args, "expected_occurrences"),
+          operationId: call.operationId,
         });
+        return this.mutationOutcome(call, result);
       }
       case "run_command": {
         const args = checkedObject(call.arguments, ["command_id", "parameters", "timeout_ms"]);
@@ -471,6 +465,33 @@ export class ToolHost {
     }
   }
 
+  private async mutationOutcome(
+    call: ToolHostCall,
+    result: ApplyPatchResult,
+  ): Promise<ToolHostOutcome> {
+    let repositoryFingerprint = "unknown";
+    let repositoryStateKnown = false;
+    let repositoryHasConflicts = true;
+    try {
+      const repositoryStatus = await this.git.status();
+      repositoryFingerprint = repositoryStatus.snapshotSha256;
+      repositoryStateKnown = true;
+      repositoryHasConflicts = repositoryStatus.hasConflicts;
+    } catch {
+      // The mutation remains committed and recoverable, but completion fails
+      // closed until repository state can be reconciled.
+    }
+    return successOutcome(call, asRecord(result), {
+      checkpointId: result.checkpointId,
+      changedFileCount: result.changedPaths.length,
+      changedPaths: result.changedPaths.map((entry) => entry.path),
+      changedLines: result.changedLines,
+      repositoryFingerprint,
+      repositoryStateKnown,
+      repositoryHasConflicts,
+    });
+  }
+
   private async checkpointDiff(
     requestedBaseline: string | undefined,
     paths: { readonly paths?: readonly string[] },
@@ -559,6 +580,14 @@ function requiredString(value: Readonly<Record<string, unknown>>, key: string): 
   const entry = value[key];
   if (typeof entry !== "string") {
     throw new AgentError("PROTOCOL_INVALID", `${key} must be a string`);
+  }
+  return entry;
+}
+
+function requiredNumber(value: Readonly<Record<string, unknown>>, key: string): number {
+  const entry = value[key];
+  if (typeof entry !== "number") {
+    throw new AgentError("PROTOCOL_INVALID", `${key} must be a number`);
   }
   return entry;
 }

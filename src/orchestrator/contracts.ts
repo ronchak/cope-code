@@ -90,13 +90,26 @@ export interface ProtocolAdapter {
 }
 
 export type AuthorizationDecision =
-  | { readonly outcome: "allow"; readonly reasonCode: string; readonly explanation: string }
+  | {
+      readonly outcome: "allow";
+      readonly reasonCode: string;
+      readonly explanation: string;
+      readonly plannedMutation?: {
+        readonly changedFiles: number;
+        readonly changedLines: number;
+      };
+    }
   | { readonly outcome: "ask"; readonly reasonCode: string; readonly explanation: string; readonly capability: Readonly<Record<string, unknown>> }
-  | { readonly outcome: "deny"; readonly reasonCode: string; readonly explanation: string };
+  | { readonly outcome: "deny"; readonly reasonCode: string; readonly explanation: string }
+  | { readonly outcome: "conflict"; readonly reasonCode: string; readonly explanation: string };
 
 export interface RuntimePolicy {
   summarize(): Readonly<Record<string, unknown>>;
   authorize(call: NormalizedToolCall): AuthorizationDecision | Promise<AuthorizationDecision>;
+  authorizeOnce?(
+    call: NormalizedToolCall,
+    capability: Readonly<Record<string, unknown>>,
+  ): AuthorizationDecision | Promise<AuthorizationDecision>;
   expandSessionGrant(capability: Readonly<Record<string, unknown>>): Promise<boolean>;
 }
 

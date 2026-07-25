@@ -1,4 +1,4 @@
-import { chmod, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, link, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 
 import { AgentError } from "../shared/errors.js";
 import { sha256 } from "../shared/crypto.js";
@@ -6,7 +6,8 @@ import type { PathProtectionPolicy } from "../security/protected-paths.js";
 import type { RepositoryBoundary } from "./boundary.js";
 import { normalizeRepositoryPath } from "./boundary.js";
 import { checkpointMutationArtifactPaths, type CheckpointStore } from "./checkpoint.js";
-import { looksBinary } from "./text-file.js";
+import { countChangedLines, planExactTextEdit } from "./exact-text-edit.js";
+import { looksBinary, readTextFile } from "./text-file.js";
 import type { FileState } from "./types.js";
 import { CURRENT_HOST_PLATFORM } from "../platform/index.js";
 
@@ -26,6 +27,16 @@ export interface ApplyPatchRequest {
   readonly operationId?: string;
 }
 
+export interface EditTextRequest {
+  readonly path: string;
+  readonly base_sha256: string;
+  readonly old_text: string;
+  readonly new_text: string;
+  readonly expected_occurrences: number;
+  /** Journal operation associated with the pre-mutation checkpoint. */
+  readonly operationId?: string;
+}
+
 export interface PatchBudgets {
   readonly maxFiles?: number;
   readonly maxFileBytes?: number;
@@ -33,6 +44,13 @@ export interface PatchBudgets {
   readonly maxChangedLines?: number;
   readonly allowCreate?: boolean;
   readonly allowDelete?: boolean;
+}
+
+export interface PatchEngineHooks {
+  /** @internal Deterministic fault/race injection point used by repository tests. */
+  readonly beforeCapture?: (path: string) => Promise<void>;
+  /** @internal Deterministic fault/race injection point used by repository tests. */
+  readonly afterCapture?: (path: string) => Promise<void>;
 }
 
 export interface AppliedPath {
@@ -78,6 +96,7 @@ export class PatchEngine {
     private readonly checkpoints: CheckpointStore,
     private readonly protectedPaths: PathProtectionPolicy,
     budgets: PatchBudgets = {},
+    private readonly hooks: PatchEngineHooks = {},
   ) {
     this.maxFiles = budgets.maxFiles ?? 50;
     this.maxFileBytes = budgets.maxFileBytes ?? 1024 * 1024;
@@ -85,6 +104,53 @@ export class PatchEngine {
     this.maxChangedLines = budgets.maxChangedLines ?? 2_000;
     this.allowCreate = budgets.allowCreate ?? true;
     this.allowDelete = budgets.allowDelete ?? false;
+  }
+
+  /**
+   * Builds a targeted update from an exact, hash-guarded before-image, then
+   * delegates commit/checkpoint/rollback/post-state verification to applyPatch.
+   */
+  public async editText(request: EditTextRequest): Promise<ApplyPatchResult> {
+    const normalizedPath = normalizeRepositoryPath(request.path);
+    assertSupportedMutationPath(normalizedPath);
+    this.protectedPaths.assertAllowed(normalizedPath, "update");
+    const existing = await this.boundary.resolveExistingFile(normalizedPath);
+    const existingStat = await stat(existing.absolutePath);
+    if (existingStat.size > this.maxFileBytes) {
+      throw new AgentError("BUDGET_EXCEEDED", "Existing file exceeds the mutation size limit", {
+        path: normalizedPath,
+        sizeBytes: existingStat.size,
+      });
+    }
+    const mode = existingStat.mode & 0o777;
+    if (CURRENT_HOST_PLATFORM.supportsPosixModes && (mode & 0o111) !== 0) {
+      throw new AgentError("UNSUPPORTED_FILE", "Executable files cannot be modified", { path: normalizedPath });
+    }
+    const snapshot = await readTextFile(existing.absolutePath, normalizedPath, this.maxFileBytes);
+    const edit = planExactTextEdit(
+      {
+        content: snapshot.content,
+        bytes: snapshot.bytes,
+        sha256: snapshot.state.sha256,
+      },
+      {
+        path: normalizedPath,
+        baseSha256: request.base_sha256,
+        oldText: request.old_text,
+        newText: request.new_text,
+        expectedOccurrences: request.expected_occurrences,
+      },
+      Math.min(this.maxFileBytes, this.maxTotalBytes),
+    );
+    return this.applyPatch({
+      changes: [{
+        kind: "update",
+        path: normalizedPath,
+        base_sha256: snapshot.state.sha256,
+        content: edit.content,
+      }],
+      ...(request.operationId === undefined ? {} : { operationId: request.operationId }),
+    });
   }
 
   public async applyPatch(request: ApplyPatchRequest): Promise<ApplyPatchResult> {
@@ -161,7 +227,10 @@ export class PatchEngine {
             path: normalizedPath,
           });
         }
-        if (!/^[0-9a-f]{64}$/u.test(change.base_sha256) || sha256(oldBytes) !== change.base_sha256) {
+        if (
+          !/^[0-9a-f]{64}$/iu.test(change.base_sha256) ||
+          sha256(oldBytes) !== change.base_sha256.toLowerCase()
+        ) {
           throw new AgentError("STALE_STATE", "Patch base hash does not match current file state", {
             path: normalizedPath,
             expectedSha256: change.base_sha256,
@@ -312,14 +381,28 @@ export class PatchEngine {
         if (plan.backupPath === null) {
           throw new AgentError("INTERNAL_ERROR", "Mutation backup path is missing");
         }
+        await this.hooks.beforeCapture?.(plan.path);
         await rename(plan.absolutePath, plan.backupPath);
         plan.backupCreated = true;
+        await this.hooks.afterCapture?.(plan.path);
+        const captured = await readFile(plan.backupPath);
+        const capturedStat = await stat(plan.backupPath);
+        if (
+          plan.expectedSha256 === null ||
+          sha256(captured) !== plan.expectedSha256 ||
+          (plan.oldMode !== null && (capturedStat.mode & 0o777) !== plan.oldMode)
+        ) {
+          throw new AgentError("STALE_STATE", "File changed before patch commit", {
+            path: plan.path,
+          });
+        }
       }
       if (plan.newBytes !== null) {
         if (plan.temporaryPath === null) {
           throw new AgentError("INTERNAL_ERROR", "Mutation temporary path is missing");
         }
-        await rename(plan.temporaryPath, plan.absolutePath);
+        await link(plan.temporaryPath, plan.absolutePath);
+        await rm(plan.temporaryPath, { force: false });
         plan.temporaryCreated = false;
         plan.finalInstalled = true;
         if (plan.oldMode !== null && CURRENT_HOST_PLATFORM.supportsPosixModes) {
@@ -330,6 +413,12 @@ export class PatchEngine {
 
     for (const plan of plans) {
       if (plan.backupPath !== null) {
+        const captured = await readFile(plan.backupPath);
+        if (plan.expectedSha256 === null || sha256(captured) !== plan.expectedSha256) {
+          throw new AgentError("STALE_STATE", "Captured file changed during patch commit", {
+            path: plan.path,
+          });
+        }
         await rm(plan.backupPath, { force: false });
         plan.backupCreated = false;
         plan.backupDeleted = true;
@@ -357,7 +446,8 @@ export class PatchEngine {
           await rm(current.absolutePath, { force: false });
         }
         if (plan.backupCreated && plan.backupPath !== null) {
-          await rename(plan.backupPath, plan.absolutePath);
+          await link(plan.backupPath, plan.absolutePath);
+          await rm(plan.backupPath, { force: false });
           plan.backupCreated = false;
         } else if (plan.oldBytes !== null && (plan.finalInstalled || plan.backupDeleted)) {
           try {
@@ -418,26 +508,4 @@ function assertSupportedMutationPath(repositoryPath: string): void {
       path: repositoryPath,
     });
   }
-}
-
-function countChangedLines(before: string, after: string): number {
-  const beforeLines = before === "" ? [] : before.split(/\r?\n/u);
-  const afterLines = after === "" ? [] : after.split(/\r?\n/u);
-  let prefix = 0;
-  while (
-    prefix < beforeLines.length &&
-    prefix < afterLines.length &&
-    beforeLines[prefix] === afterLines[prefix]
-  ) {
-    prefix += 1;
-  }
-  let suffix = 0;
-  while (
-    suffix < beforeLines.length - prefix &&
-    suffix < afterLines.length - prefix &&
-    beforeLines[beforeLines.length - suffix - 1] === afterLines[afterLines.length - suffix - 1]
-  ) {
-    suffix += 1;
-  }
-  return beforeLines.length - prefix - suffix + (afterLines.length - prefix - suffix);
 }

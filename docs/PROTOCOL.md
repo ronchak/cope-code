@@ -36,7 +36,7 @@ The normal model request is:
 {"protocol":"cba/1","message_type":"tool_request","message_id":"m_17","task_id":"task_example","turn_id":1,"operations":[{"operation_id":"op_17_list","tool":"list_files","arguments":{"path":"src","max_depth":2,"max_results":100}}]}
 ```
 
-Only independent read-only operations may be batched: `list_files`, `search_text`, `read_file`, `git_status`, and `git_diff`. `apply_patch`, `run_command`, `request_user_input`, `request_capability`, and `complete_task` must be alone so Copilot observes each material outcome before planning a dependent action.
+Only independent read-only operations may be batched: `list_files`, `search_text`, `read_file`, `git_status`, and `git_diff`. `edit_text`, `apply_patch`, `run_command`, `request_user_input`, `request_capability`, and `complete_task` must be alone so Copilot observes each material outcome before planning a dependent action.
 
 ## V1 tools
 
@@ -47,6 +47,7 @@ Only independent read-only operations may be batched: `list_files`, `search_text
 | `read_file` | bounded text/file-range read with state metadata | read-only; content enters the disclosure ledger |
 | `git_status` | branch, revision, conflicts, and working-tree facts | read-only; distinguishes pre-existing state |
 | `git_diff` | bounded approved diff against a local scope/baseline | read-only; exclusions and truncation are explicit |
+| `edit_text` | exact old-to-new replacement in one existing text file | base hash, occurrence count, policy, checkpoint, rollback, and post-state verification |
 | `apply_patch` | one atomic create/update/delete transaction | exact hashes, policy, checkpoint, rollback, and post-state verification |
 | `run_command` | invoke one catalog ID with typed parameters | no shell; controlled cwd, environment, time, output, cancellation; repository integrity is checked before and after every command |
 | `request_user_input` | ask for unavailable information or judgment | pauses; not routine confirmation |
@@ -77,6 +78,12 @@ An update supplies the SHA-256 of the exact bytes returned by the prior read:
 ```
 
 The request conflicts if the file changed after it was read. A transaction cannot contain two changes whose normalized paths collide.
+
+For a small replacement, prefer `edit_text`. It treats `old_text` literally and succeeds only when both the exact byte hash and the number of non-overlapping occurrences match. It uses the same atomic `PatchEngine` checkpoint, rollback, budget, and post-state verification path as `apply_patch`:
+
+```cba/1
+{"protocol":"cba/1","message_type":"tool_request","message_id":"m_21","task_id":"task_example","turn_id":3,"operations":[{"operation_id":"op_21_edit","tool":"edit_text","arguments":{"path":"src/parser.ts","base_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","old_text":"return value;","new_text":"return value.trim();","expected_occurrences":1}}]}
+```
 
 ## Catalog command example and current boundary
 

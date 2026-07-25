@@ -34,6 +34,7 @@ test("canonical tool registry drives names, capabilities, schemas, and bootstrap
     "read_file",
     "git_status",
     "git_diff",
+    "edit_text",
     "apply_patch",
     "run_command",
     "request_user_input",
@@ -127,6 +128,26 @@ test("parses one exact cba/1 envelope with prose and CRLF", () => {
 test("strict tool argument schemas reject additions and accept the catalog shape", () => {
   assert.equal(validateToolArguments("read_file", { path: "src/a.ts", start_line: 1, end_line: 2 }).valid, true);
   assert.equal(validateToolArguments("read_file", { path: "src/a.ts", shell: "oops" }).valid, false);
+  assert.equal(
+    validateToolArguments("edit_text", {
+      path: "src/a.ts",
+      base_sha256: "A".repeat(64),
+      old_text: "old",
+      new_text: "",
+      expected_occurrences: 1,
+    }).valid,
+    true,
+  );
+  assert.equal(
+    validateToolArguments("edit_text", {
+      path: "src/a.ts",
+      base_sha256: "a".repeat(64),
+      old_text: "",
+      new_text: "new",
+      expected_occurrences: 0,
+    }).valid,
+    false,
+  );
   assert.equal(
     validateToolArguments("apply_patch", {
       changes: [{ kind: "update", path: "src/a.ts", base_sha256: "a".repeat(64), content: "next" }],

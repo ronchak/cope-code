@@ -8,9 +8,11 @@ import {
   type SessionCapabilityExpansion,
   type SessionGrant,
 } from "../policy/index.js";
-import { BUDGET_METRICS, isToolName } from "../protocol/index.js";
+import { BUDGET_METRICS, isToolName, toolRequiresContext } from "../protocol/index.js";
 import type { RepositoryBoundary } from "../repository/boundary.js";
+import { countChangedLines, planExactTextEdit } from "../repository/exact-text-edit.js";
 import type { RepositoryReadOperation } from "../repository/repository-tools.js";
+import { readTextFile } from "../repository/text-file.js";
 import { AgentError, errorMessage } from "../shared/errors.js";
 import type { CommandCatalog } from "../tools/command-catalog.js";
 import type {
@@ -28,6 +30,8 @@ export interface LayeredRuntimePolicyOptions {
   readonly defaultReadBytes?: number;
   readonly defaultSearchBytes?: number;
   readonly defaultDiffBytes?: number;
+  readonly maxMutationFileBytes?: number;
+  readonly maxPatchBytes?: number;
   readonly persistGrant?: (grant: SessionGrant) => Promise<void>;
 }
 
@@ -66,17 +70,46 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
   }
 
   public async authorize(call: NormalizedToolCall): Promise<AuthorizationDecision> {
+    return this.authorizeAgainst(this.engineValue, call);
+  }
+
+  public async authorizeOnce(
+    call: NormalizedToolCall,
+    capability: Readonly<Record<string, unknown>>,
+  ): Promise<AuthorizationDecision> {
+    const engine = this.expandedEngine(capability);
+    if (engine === undefined) {
+      return {
+        outcome: "deny",
+        reasonCode: "CAPABILITY_EXPANSION_INVALID",
+        explanation: "The approved one-time capability could not be applied.",
+      };
+    }
+    return this.authorizeAgainst(engine, call);
+  }
+
+  private async authorizeAgainst(
+    engine: PolicyEngine,
+    call: NormalizedToolCall,
+  ): Promise<AuthorizationDecision> {
     try {
       const operation = await this.buildOperation(call, false);
-      const preliminary = this.engineValue.evaluate(operation);
-      if (preliminary.decision !== "allow" || call.name !== "apply_patch") {
+      const preliminary = engine.evaluate(operation);
+      if (preliminary.decision !== "allow" || !toolRequiresContext(call.name, "change")) {
         return decisionFor(preliminary, call, this.options.commandCatalog, operation);
       }
       // Exact line accounting requires local before-images. It is performed
       // only after all higher-layer path and change-kind checks allow access.
       const exact = await this.buildOperation(call, true);
-      return decisionFor(this.engineValue.evaluate(exact), call, this.options.commandCatalog, exact);
+      return decisionFor(engine.evaluate(exact), call, this.options.commandCatalog, exact);
     } catch (error) {
+      if (error instanceof AgentError && error.code === "STALE_STATE") {
+        return {
+          outcome: "conflict",
+          reasonCode: error.code,
+          explanation: errorMessage(error),
+        };
+      }
       return {
         outcome: "deny",
         reasonCode: error instanceof AgentError ? error.code : "OPERATION_CONTEXT_INVALID",
@@ -86,25 +119,32 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
   }
 
   public async expandSessionGrant(capability: Readonly<Record<string, unknown>>): Promise<boolean> {
-    const expansions = parseExpansions(capability, this.options.commandCatalog);
-    if (expansions.length === 0) return false;
-
-    let engine = this.engineValue;
-    let grant = engine.session;
-    for (const expansion of expansions) {
-      const result = engine.expandSessionGrant(expansion);
-      if (result.decision === "deny") return false;
-      grant = result.grant;
-      engine = new PolicyEngine({
-        organization: engine.organization,
-        repository: engine.repository,
-        session: grant,
-        pathKey: this.options.boundary.pathKey.bind(this.options.boundary),
-      });
-    }
+    const engine = this.expandedEngine(capability);
+    if (engine === undefined) return false;
+    const grant = engine.session;
     await this.options.persistGrant?.(grant);
     this.engineValue = engine;
     return true;
+  }
+
+  private expandedEngine(
+    capability: Readonly<Record<string, unknown>>,
+  ): PolicyEngine | undefined {
+    const expansions = parseExpansions(capability, this.options.commandCatalog);
+    if (expansions.length === 0) return undefined;
+
+    let engine = this.engineValue;
+    for (const expansion of expansions) {
+      const result = engine.expandSessionGrant(expansion);
+      if (result.decision === "deny") return undefined;
+      engine = new PolicyEngine({
+        organization: engine.organization,
+        repository: engine.repository,
+        session: result.grant,
+        pathKey: this.options.boundary.pathKey.bind(this.options.boundary),
+      });
+    }
+    return engine;
   }
 
   public isPathInScope(path: string): boolean {
@@ -203,6 +243,19 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
       };
       usage.changed_files += changes.length;
       usage.changed_lines += changedLines;
+    } else if (call.name === "edit_text") {
+      const edit = editTextInput(call.arguments);
+      const changedLines = exactPatchLines ? await this.countExactEditLines(edit) : 0;
+      change = {
+        files_changed: 1,
+        changed_lines: changedLines,
+        creates: 0,
+        deletes: 0,
+        dependency_manifest: isDependencyManifest(edit.path),
+        local_commit: false,
+      };
+      usage.changed_files += 1;
+      usage.changed_lines += changedLines;
     }
 
     return {
@@ -229,6 +282,35 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
     }
     return total;
   }
+
+  private async countExactEditLines(edit: EditTextInput): Promise<number> {
+    const existing = await this.options.boundary.resolveExistingFile(edit.path);
+    const maxFileBytes = this.options.maxMutationFileBytes ?? 1024 * 1024;
+    const snapshot = await readTextFile(existing.absolutePath, edit.path, maxFileBytes);
+    return planExactTextEdit(
+      {
+        content: snapshot.content,
+        bytes: snapshot.bytes,
+        sha256: snapshot.state.sha256,
+      },
+      {
+        path: edit.path,
+        baseSha256: edit.base_sha256,
+        oldText: edit.old_text,
+        newText: edit.new_text,
+        expectedOccurrences: edit.expected_occurrences,
+      },
+      Math.min(maxFileBytes, this.options.maxPatchBytes ?? 4 * 1024 * 1024),
+    ).changedLines;
+  }
+}
+
+interface EditTextInput {
+  readonly path: string;
+  readonly base_sha256: string;
+  readonly old_text: string;
+  readonly new_text: string;
+  readonly expected_occurrences: number;
 }
 
 type PatchInput =
@@ -254,7 +336,22 @@ function pathFacts(call: NormalizedToolCall): NonNullable<PolicyOperation["paths
       access: change.kind === "create" ? "create" : change.kind === "delete" ? "delete" : "write",
     }));
   }
+  if (call.name === "edit_text") {
+    return [{ path: requiredString(call.arguments.path, "path"), access: "write" }];
+  }
   return [];
+}
+
+function editTextInput(value: Readonly<Record<string, unknown>>): EditTextInput {
+  const expected = positiveInteger(value.expected_occurrences);
+  if (expected === undefined) throw new AgentError("PROTOCOL_INVALID", "expected_occurrences must be positive");
+  return {
+    path: requiredString(value.path, "path"),
+    base_sha256: requiredString(value.base_sha256, "base_sha256"),
+    old_text: requiredString(value.old_text, "old_text"),
+    new_text: requiredText(value.new_text, "new_text"),
+    expected_occurrences: expected,
+  };
 }
 
 function decisionFor(
@@ -264,7 +361,19 @@ function decisionFor(
   operation: PolicyOperation,
 ): AuthorizationDecision {
   if (policy.decision === "allow") {
-    return { outcome: "allow", reasonCode: "ALLOWED", explanation: "Operation is inside the effective grant." };
+    return {
+      outcome: "allow",
+      reasonCode: "ALLOWED",
+      explanation: "Operation is inside the effective grant.",
+      ...(operation.change === undefined
+        ? {}
+        : {
+            plannedMutation: {
+              changedFiles: operation.change.files_changed,
+              changedLines: operation.change.changed_lines,
+            },
+          }),
+    };
   }
   const strictReasons = policy.reasons.filter((reason) => reason.decision === policy.decision);
   const primary = strictReasons[0] ?? policy.reasons[0];
@@ -411,20 +520,6 @@ function disclosureFact(classification: string, byteCount: number, fileCount: nu
   return { classification, byte_count: byteCount, file_count: fileCount, contains_secret: false };
 }
 
-function countChangedLines(before: string, after: string): number {
-  const beforeLines = before === "" ? [] : before.split(/\r?\n/u);
-  const afterLines = after === "" ? [] : after.split(/\r?\n/u);
-  let prefix = 0;
-  while (prefix < beforeLines.length && prefix < afterLines.length && beforeLines[prefix] === afterLines[prefix]) prefix += 1;
-  let suffix = 0;
-  while (
-    suffix < beforeLines.length - prefix &&
-    suffix < afterLines.length - prefix &&
-    beforeLines[beforeLines.length - suffix - 1] === afterLines[afterLines.length - suffix - 1]
-  ) suffix += 1;
-  return beforeLines.length - prefix - suffix + afterLines.length - prefix - suffix;
-}
-
 function isDependencyManifest(path: string): boolean {
   const normalized = path.replaceAll("\\", "/").toLowerCase();
   return /(^|\/)(package(?:-lock)?\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|requirements[^/]*\.txt|pyproject\.toml|poetry\.lock|cargo\.toml|cargo\.lock|go\.mod|go\.sum|pom\.xml|build\.gradle(?:\.kts)?)$/u.test(normalized);
@@ -432,6 +527,11 @@ function isDependencyManifest(path: string): boolean {
 
 function requiredString(value: unknown, name: string): string {
   if (typeof value !== "string" || value.length === 0) throw new AgentError("PROTOCOL_INVALID", `${name} is required`);
+  return value;
+}
+
+function requiredText(value: unknown, name: string): string {
+  if (typeof value !== "string") throw new AgentError("PROTOCOL_INVALID", `${name} must be a string`);
   return value;
 }
 

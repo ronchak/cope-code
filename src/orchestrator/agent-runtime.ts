@@ -16,7 +16,11 @@ import type { OperationJournal, OperationRecord } from "../session/operation-jou
 import type { SessionStore } from "../session/store.js";
 import { transitionSession } from "../session/state-machine.js";
 import type { SessionState } from "../session/types.js";
-import { isBatchableToolName, isReadOnlyToolName } from "../protocol/types.js";
+import {
+  isBatchableToolName,
+  isReadOnlyToolName,
+  toolRequiresContext,
+} from "../protocol/types.js";
 import {
   verifyCompletion,
   type CompletionClaim,
@@ -25,6 +29,7 @@ import {
 } from "./completion.js";
 import type {
   DisclosureGuard,
+  AuthorizationDecision,
   NormalizedModelMessage,
   NormalizedToolCall,
   ProtocolAdapter,
@@ -889,7 +894,7 @@ export class AgentRuntime {
       operationId: call.operationId,
       data: { tool: call.name, requestHash: registration.record.requestHash },
     });
-    const policy = await this.dependencies.policy.authorize(call);
+    let policy: AuthorizationDecision = await this.dependencies.policy.authorize(call);
     await this.dependencies.audit.append({
       type: "policy.decision",
       taskId: this.state.taskId,
@@ -919,9 +924,35 @@ export class AgentRuntime {
         await this.requireArtifacts().put("decision", decisionArtifactId, stableJson(decision));
       }
       if (decision.decision === "allow_session") {
-        allowed = await this.dependencies.policy.expandSessionGrant(policy.capability);
+        const expanded = await this.dependencies.policy.expandSessionGrant(policy.capability);
+        policy = expanded
+          ? await this.dependencies.policy.authorize(call)
+          : {
+              outcome: "deny",
+              reasonCode: "CAPABILITY_EXPANSION_DENIED",
+              explanation: "The approved session capability could not be applied.",
+            };
+        allowed = policy.outcome === "allow";
+      } else if (decision.decision === "allow_once") {
+        policy = this.dependencies.policy.authorizeOnce === undefined
+          ? {
+              outcome: "deny",
+              reasonCode: "ONE_TIME_REAUTHORIZATION_UNSUPPORTED",
+              explanation: "This runtime cannot safely reauthorize a one-time capability.",
+            }
+          : await this.dependencies.policy.authorizeOnce(call, policy.capability);
+        allowed = policy.outcome === "allow";
       } else {
-        allowed = decision.decision === "allow_once";
+        allowed = false;
+      }
+      if (decision.decision !== "deny") {
+        await this.dependencies.audit.append({
+          type: "policy.decision",
+          taskId: this.state.taskId,
+          turnId,
+          operationId: call.operationId,
+          data: { tool: call.name, phase: "post_approval", ...policy },
+        });
       }
       await this.dependencies.audit.append({
         type: "capability.decided",
@@ -933,6 +964,7 @@ export class AgentRuntime {
       await this.move("executing_tools");
     }
     if (!allowed) {
+      const status = policy.outcome === "conflict" ? "conflict" : "denied";
       const failed = await this.dependencies.journal.markFailed(
         registration.record,
         this.now(),
@@ -947,12 +979,44 @@ export class AgentRuntime {
       return {
         operationId: call.operationId,
         tool: call.name,
-        status: "denied",
+        status,
         data: { code: policy.reasonCode, decision: policy.outcome, message: policy.explanation },
         safeMetadata: failed.safeResult ?? {},
       };
     }
 
+    if (policy.outcome === "allow" && policy.plannedMutation !== undefined) {
+      try {
+        this.meter.assertCanConsume("changedFiles", policy.plannedMutation.changedFiles);
+        this.meter.assertCanConsume("changedLines", policy.plannedMutation.changedLines);
+      } catch (error) {
+        const safe = {
+          reasonCode: error instanceof AgentError ? error.code : "BUDGET_EXCEEDED",
+        };
+        const failed = await this.dependencies.journal.markFailed(
+          registration.record,
+          this.now(),
+          "denied_before_execution",
+          safe,
+        );
+        this.clearPending(call.operationId);
+        if (!this.state.completedOperationIds.includes(call.operationId)) {
+          this.state.completedOperationIds.push(call.operationId);
+        }
+        await this.persist();
+        return {
+          operationId: call.operationId,
+          tool: call.name,
+          status: "denied",
+          data: {
+            code: safe.reasonCode,
+            decision: "deny",
+            message: errorMessage(error),
+          },
+          safeMetadata: failed.safeResult ?? safe,
+        };
+      }
+    }
     if (call.name === "run_command") this.meter.consume("commands");
     if (call.name === "read_file") this.meter.consume("readFiles");
     const executing = await this.dependencies.journal.markExecuting(registration.record, this.now());
@@ -981,6 +1045,47 @@ export class AgentRuntime {
           "RECOVERY_REQUIRED",
           `Mutating operation ${call.operationId} has an indeterminate outcome and requires rollback or reconciliation`,
         );
+      }
+      if (
+        outcome.status === "success" &&
+        policy.outcome === "allow" &&
+        policy.plannedMutation !== undefined &&
+        toolRequiresContext(call.name, "change")
+      ) {
+        const actualChangedFiles = numericMetadata(outcome.safeMetadata, "changedFileCount");
+        const actualChangedLines = numericMetadata(outcome.safeMetadata, "changedLines");
+        if (
+          actualChangedFiles !== policy.plannedMutation.changedFiles ||
+          actualChangedLines !== policy.plannedMutation.changedLines
+        ) {
+          const safe = {
+            recoveryRequired: true,
+            reasonCode: "MUTATION_ACCOUNTING_MISMATCH",
+            plannedChangedFiles: policy.plannedMutation.changedFiles,
+            plannedChangedLines: policy.plannedMutation.changedLines,
+            actualChangedFiles,
+            actualChangedLines,
+          };
+          const uncertain = await this.dependencies.journal.markIndeterminate(
+            executing,
+            this.now(),
+            "mutation_accounting_mismatch",
+            safe,
+          );
+          this.setPending(call, uncertain, "indeterminate");
+          await this.dependencies.audit.append({
+            type: "tool.completed",
+            taskId: this.state.taskId,
+            turnId,
+            operationId: call.operationId,
+            data: { tool: call.name, status: "indeterminate", ...safe },
+          });
+          await this.persist();
+          throw new AgentError(
+            "RECOVERY_REQUIRED",
+            `Mutation ${call.operationId} committed with unexpected budget accounting`,
+          );
+        }
       }
       await this.dependencies.journal.markCompleted(
         executing,
@@ -1067,7 +1172,7 @@ export class AgentRuntime {
   ): Promise<void> {
     const metadata = outcome.safeMetadata;
     if (
-      call.name === "apply_patch" &&
+      toolRequiresContext(call.name, "change") &&
       outcome.status === "success" &&
       !this.state.mutations.some((record) => record.operationId === call.operationId)
     ) {

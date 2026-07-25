@@ -149,6 +149,8 @@ export async function composeRuntime(options: ComposeRuntimeOptions): Promise<Co
     defaultReadBytes: configuration.repository.limits.max_read_bytes,
     defaultSearchBytes: configuration.repository.limits.max_search_output_bytes,
     defaultDiffBytes: configuration.repository.limits.max_diff_bytes,
+    maxMutationFileBytes: configuration.repository.limits.max_file_bytes,
+    maxPatchBytes: configuration.repository.limits.max_patch_bytes,
     persistGrant: async (grant) => {
       const grantHash = await writeSessionGrant(sessionDirectory, grant);
       state.policyHashes.grant = grantHash;
@@ -367,7 +369,7 @@ export function effectiveGrantSummary(
     },
     effective_budgets: engine.getEffectiveBudgetLimits(),
     checkpoint_and_rollback: {
-      patch_checkpoint: "durable before-image is written before every apply_patch mutation and sealed with verified post-state",
+      patch_checkpoint: "durable before-image is written before every edit_text or apply_patch mutation and sealed with verified post-state",
       commands: "granted sideEffects=true validation commands may create ordinary Git-ignored artifacts; every command must preserve Git-visible, protected, Git-control, and nested-repository state, and sideEffects=false commands additionally preserve bounded ignored-worktree state; intentional source-writing commands require a future versioned checkpointable write-scope contract",
       storage: "outside the repository in the protected session state directory",
       rollback: "sealed checkpoints use compare-and-restore; interrupted unsealed checkpoints require explicit --force",

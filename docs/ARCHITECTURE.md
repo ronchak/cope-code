@@ -103,7 +103,7 @@ The operation journal stores request integrity and lifecycle state. Completed op
 
 ### Atomic source changes
 
-`apply_patch` is one multi-file transaction. Paths and exact current-byte SHA-256 values are checked, a checkpoint is created outside the repository, all changes are staged and installed, and the post-change inventory is verified. Failure invokes restoration. If restoration itself cannot be proven, the session stops in recovery-required state.
+`edit_text` performs a literal old-to-new replacement in one file after checking its exact current-byte SHA-256 and non-overlapping occurrence count. `apply_patch` remains the create/delete and whole-file/multi-file transaction. Both converge on the same patch engine: a checkpoint is created outside the repository, changes are staged and installed, and the post-change inventory is verified. Failure invokes restoration. If restoration itself cannot be proven, the session stops in recovery-required state.
 
 Checkpoint-backed diffs remain inside the same repository boundary. `checkpoint` scope compares current bytes with one verified before-image; `session` scope receives a narrow mutation/checkpoint inventory from authoritative session state and selects the earliest before-image for each agent-mutated path. The repository diff inspector owns byte comparison, bounds, and concrete-path filtering. Tool orchestration supplies scope only; transports and the browser adapter have no checkpoint or filesystem knowledge.
 

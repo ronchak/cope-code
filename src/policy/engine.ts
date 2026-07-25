@@ -131,7 +131,10 @@ export class PolicyEngine {
 
   private evaluateMode(operation: PolicyOperation, checks: PolicyCheck[]): void {
     if (this.session.mode === "inspect") {
-      if (operation.tool === "apply_patch" || operation.paths?.some((path) => path.access !== "read") === true) {
+      if (
+        toolRequiresContext(operation.tool, "change") ||
+        operation.paths?.some((path) => path.access !== "read") === true
+      ) {
         checks.push({
           layer: "session",
           dimension: "mode",
@@ -273,7 +276,7 @@ export class PolicyEngine {
         invalid("change", "Change counts must be non-negative safe integers.");
       }
     }
-    if (operation.tool === "apply_patch" && operation.change !== undefined) {
+    if (toolRequiresContext(operation.tool, "change") && operation.change !== undefined) {
       const mutationPaths = operation.paths?.filter((path) => path.access !== "read") ?? [];
       const uniquePaths = new Set(
         mutationPaths.map((path) => {
@@ -290,7 +293,7 @@ export class PolicyEngine {
         operation.change.creates !== creates ||
         operation.change.deletes !== deletes
       ) {
-        invalid("change", "apply_patch path inventory and deterministic change counts do not agree.");
+        invalid("change", `${operation.tool} path inventory and deterministic change counts do not agree.`);
       }
     }
   }

@@ -276,6 +276,8 @@ async function runNewSession(
       defaultReadBytes: configuration.repository.limits.max_read_bytes,
       defaultSearchBytes: configuration.repository.limits.max_search_output_bytes,
       defaultDiffBytes: configuration.repository.limits.max_diff_bytes,
+      maxMutationFileBytes: configuration.repository.limits.max_file_bytes,
+      maxPatchBytes: configuration.repository.limits.max_patch_bytes,
     });
     const initialStatus = await new GitInspector(boundary, {
       gitExecutable,
