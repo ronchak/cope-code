@@ -255,15 +255,17 @@ export class AgentRuntime {
         const action = selectAction(messages);
         if (this.interruption !== undefined) return await this.finishInterruption();
         const next = await this.handleAction(action, turnId);
-        if (this.interruption !== undefined) return await this.finishInterruption();
         if (next.terminal) {
-          await this.dependencies.artifacts?.remove("response", turnId);
-          await this.cleanupTerminalArtifacts();
+          if (["completed", "rolled_back", "blocked", "aborted", "failed"].includes(this.state.status)) {
+            await this.dependencies.artifacts?.remove("response", turnId);
+            await this.cleanupTerminalArtifacts();
+          }
           return next.result;
         }
         outbound = next.outbound;
         await this.queueOutbound(outbound, nextTurnId(this.state.turnSequence));
         await this.dependencies.artifacts?.remove("response", turnId);
+        if (this.interruption !== undefined) return await this.finishInterruption();
       }
 
       return await this.finishInterruption();

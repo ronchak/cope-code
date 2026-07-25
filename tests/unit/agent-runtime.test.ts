@@ -10,6 +10,7 @@ import { CbaProtocolAdapter } from "../../src/orchestrator/cba-protocol-adapter.
 import { ProtocolParseError } from "../../src/protocol/parser.js";
 import { serializeProtocolEnvelope } from "../../src/protocol/index.js";
 import type {
+  DisclosureGuard,
   NormalizedModelMessage,
   ParsedModelTurn,
   ProtocolAdapter,
@@ -200,6 +201,31 @@ class MissingConversationResultTransport extends QueueTransport {
   }
 }
 
+class CompletionWriteGateStore extends SessionStore {
+  private completionWriteSeen = false;
+  private markCompletionWriteStarted!: () => void;
+  private finishCompletionWrite!: () => void;
+  public readonly completionWriteStarted = new Promise<void>((resolve) => {
+    this.markCompletionWriteStarted = resolve;
+  });
+  private readonly completionWriteReleased = new Promise<void>((resolve) => {
+    this.finishCompletionWrite = resolve;
+  });
+
+  public releaseCompletionWrite(): void {
+    this.finishCompletionWrite();
+  }
+
+  public override async write(session: SessionState): Promise<void> {
+    if (session.status === "completed" && !this.completionWriteSeen) {
+      this.completionWriteSeen = true;
+      this.markCompletionWriteStarted();
+      await this.completionWriteReleased;
+    }
+    await super.write(session);
+  }
+}
+
 class RecoveryProbeTransport extends QueueTransport {
   public resolveCalls = 0;
 
@@ -262,6 +288,7 @@ function runtimeForTest(input: {
   readonly artifacts?: SessionArtifactStore;
   readonly execute?: ToolExecutor["execute"];
   readonly inspectCompletionState?: ToolExecutor["inspectCompletionState"];
+  readonly disclosure?: DisclosureGuard;
   readonly idFactory?: (prefix: string) => string;
 }): AgentRuntime {
   return new AgentRuntime({
@@ -289,7 +316,7 @@ function runtimeForTest(input: {
       })),
     },
     transport: input.transport,
-    disclosure: { inspectAndSerialize: async (message) => message },
+    disclosure: input.disclosure ?? { inspectAndSerialize: async (message) => message },
     user: {
       requestInput: async () => ({}),
       requestCapability: async () => ({ decision: "deny" }),
@@ -674,6 +701,136 @@ test("pause during completion inspection prevents completion and preserves the c
   assert.equal(localState.lastModelSummaryHash, undefined);
   assert.equal(localState.completionHandoff, undefined);
   assert.match(await artifacts.get("response", "turn_0001"), /Must not complete after a racing pause/u);
+});
+
+test("pause after a nonterminal action durably queues its outbound without replaying the action", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-pause-after-action-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{ operationId: "op_once", name: "list_files", arguments: {} }],
+    }]),
+    JSON.stringify([{
+      type: "complete_task",
+      operationId: "op_complete",
+      claim: {
+        summary: "The queued result resumed without replay.",
+        acceptanceCriteria: [],
+        validation: [],
+        skippedValidation: [],
+        remainingRisks: [],
+        recommendedFollowUp: [],
+      },
+    }]),
+  ]);
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
+  let markToolResultSerializationStarted!: () => void;
+  const toolResultSerializationStarted = new Promise<void>((resolve) => {
+    markToolResultSerializationStarted = resolve;
+  });
+  let finishToolResultSerialization!: () => void;
+  const toolResultSerializationReleased = new Promise<void>((resolve) => {
+    finishToolResultSerialization = resolve;
+  });
+  let toolResultSerializations = 0;
+  const disclosure: DisclosureGuard = {
+    inspectAndSerialize: async (message, context) => {
+      if (context.kind === "tool_result") {
+        toolResultSerializations += 1;
+        markToolResultSerializationStarted();
+        await toolResultSerializationReleased;
+      }
+      return message;
+    },
+  };
+  let executions = 0;
+  let submissionSequence = 0;
+  const idFactory = (): string => `submission_${++submissionSequence}`;
+  const execute: ToolExecutor["execute"] = async (call) => {
+    executions += 1;
+    return {
+      operationId: call.operationId,
+      tool: call.name,
+      status: "success",
+      data: { entries: ["src/index.ts"] },
+      safeMetadata: { entryCount: 1 },
+    };
+  };
+  const runtime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+    disclosure,
+    execute,
+    idFactory,
+  });
+
+  const run = runtime.run();
+  await toolResultSerializationStarted;
+  await runtime.requestPause("pause after action result");
+  finishToolResultSerialization();
+  const paused = await run;
+  assert.equal(paused.status, "paused");
+  assert.equal(executions, 1);
+  assert.equal(toolResultSerializations, 1);
+  assert.equal(localState.queuedOutbound?.turnId, "turn_0002");
+  assert.equal(await artifacts.getOptional("response", "turn_0001"), undefined);
+  const queued = localState.queuedOutbound;
+  assert.notEqual(queued, undefined);
+  await artifacts.get("outbox", queued!.artifactId);
+  const disclosedBytesAtPause = localState.budgetUsage.disclosedBytes;
+
+  const resumed = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+    disclosure,
+    execute,
+    idFactory,
+  }).run();
+  assert.equal(resumed.status, "completed", resumed.reason);
+  assert.equal(executions, 1, "the completed action must not replay on resume");
+  assert.equal(toolResultSerializations, 1, "the queued outbound must not be serialized or charged again");
+  assert.equal(localState.budgetUsage.disclosedBytes, disclosedBytesAtPause);
+});
+
+test("interruption during completed-state persistence still clears terminal artifacts", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-pause-completed-persist-"));
+  const localState = state(root);
+  const store = new CompletionWriteGateStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new QueueTransport([JSON.stringify([{
+    type: "complete_task",
+    operationId: "op_complete",
+    claim: {
+      summary: "Completion is already committed.",
+      acceptanceCriteria: [],
+      validation: [],
+      skippedValidation: [],
+      remainingRisks: [],
+      recommendedFollowUp: [],
+    },
+  }])]);
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
+  await artifacts.put("decision", "sentinel", "must be cleared");
+  const runtime = runtimeForTest({ root, state: localState, store, transport, artifacts });
+
+  const run = runtime.run();
+  await store.completionWriteStarted;
+  await runtime.requestPause("pause after completion commit began");
+  store.releaseCompletionWrite();
+  const result = await run;
+  assert.equal(result.status, "completed");
+  assert.equal(localState.status, "completed");
+  assert.equal(await artifacts.getOptional("response", "turn_0001"), undefined);
+  assert.equal(await artifacts.getOptional("decision", "sentinel"), undefined);
 });
 
 test("abort cannot be downgraded by a racing pause request", async () => {
