@@ -184,6 +184,19 @@ function collectRuntimePackagePaths(packages, rootDeclarations) {
   for (const [name, spec] of Object.entries(rootDeclarations)) {
     pending.push(resolveLockDependency(packages, "", name, spec));
   }
+  const rootEntry = packages[""];
+  const rootPeers = rootEntry.peerDependencies ?? {};
+  const rootPeerMetadata = rootEntry.peerDependenciesMeta ?? {};
+  validateLockDependencyMap(rootPeers, "", "peerDependencies");
+  validatePeerDependenciesMeta(rootPeerMetadata, rootPeers, "package-lock.json root");
+  for (const [name, spec] of Object.entries(rootPeers)) {
+    if (rootPeerMetadata[name]?.optional !== true) continue;
+    const resolved = resolveLockDependency(packages, "", name, spec, {
+      allowAbsent: true,
+      peer: true,
+    });
+    if (resolved !== undefined) pending.push(resolved);
+  }
   while (pending.length > 0) {
     const packagePath = pending.pop();
     if (runtimePaths.has(packagePath)) continue;
@@ -196,12 +209,26 @@ function collectRuntimePackagePaths(packages, rootDeclarations) {
         pending.push(resolveLockDependency(packages, packagePath, name, spec));
       }
     }
+    const peerDependencies = entry.peerDependencies ?? {};
+    const peerDependenciesMeta = entry.peerDependenciesMeta ?? {};
+    validateLockDependencyMap(peerDependencies, packagePath, "peerDependencies");
+    validatePeerDependenciesMeta(peerDependenciesMeta, peerDependencies, `package-lock.json ${packagePath}`);
+    for (const [name, spec] of Object.entries(peerDependencies)) {
+      const optional = peerDependenciesMeta[name]?.optional === true;
+      const resolved = resolveLockDependency(packages, packagePath, name, spec, {
+        allowAbsent: optional,
+        peer: true,
+      });
+      if (resolved !== undefined) pending.push(resolved);
+    }
   }
   return runtimePaths;
 }
 
-function resolveLockDependency(packages, fromPackagePath, dependencyName, declaredSpec) {
-  const candidates = lockResolutionCandidates(fromPackagePath, dependencyName);
+function resolveLockDependency(packages, fromPackagePath, dependencyName, declaredSpec, options = {}) {
+  const candidates = options.peer === true
+    ? peerResolutionCandidates(fromPackagePath, dependencyName)
+    : lockResolutionCandidates(fromPackagePath, dependencyName);
   for (const candidate of candidates) {
     if (!Object.hasOwn(packages, candidate)) continue;
     const resolved = packages[candidate];
@@ -213,6 +240,10 @@ function resolveLockDependency(packages, fromPackagePath, dependencyName, declar
     validateResolvedDependency(dependencyName, declaredSpec, resolved);
     return candidate;
   }
+  if (options.allowAbsent === true &&
+      candidates.every((candidate) => !Object.hasOwn(packages, candidate))) {
+    return undefined;
+  }
   const context = fromPackagePath === "" ? dependencyName : `${dependencyName} from ${fromPackagePath}`;
   throw new Error(`package-lock.json does not resolve a runtime package: ${context}`);
 }
@@ -220,6 +251,22 @@ function resolveLockDependency(packages, fromPackagePath, dependencyName, declar
 function lockResolutionCandidates(fromPackagePath, dependencyName) {
   if (fromPackagePath === "") return [`node_modules/${dependencyName}`];
   const candidates = [`${fromPackagePath}/node_modules/${dependencyName}`];
+  let ancestor = fromPackagePath;
+  while (true) {
+    const marker = ancestor.lastIndexOf("/node_modules/");
+    if (marker < 0) {
+      candidates.push(`node_modules/${dependencyName}`);
+      break;
+    }
+    ancestor = ancestor.slice(0, marker);
+    candidates.push(`${ancestor}/node_modules/${dependencyName}`);
+  }
+  return [...new Set(candidates)];
+}
+
+function peerResolutionCandidates(fromPackagePath, dependencyName) {
+  if (fromPackagePath === "") return [`node_modules/${dependencyName}`];
+  const candidates = [];
   let ancestor = fromPackagePath;
   while (true) {
     const marker = ancestor.lastIndexOf("/node_modules/");
@@ -271,6 +318,9 @@ function validateResolvedDependency(dependencyName, declaredSpec, resolved) {
     if (typeof resolved.name !== "string" || resolved.name !== versionRequest.name) {
       throw new Error(`package-lock.json resolves runtime alias ${dependencyName} to the wrong package`);
     }
+  } else if (resolved.name !== undefined &&
+      (typeof resolved.name !== "string" || resolved.name !== dependencyName)) {
+    throw new Error(`package-lock.json resolves runtime dependency ${dependencyName} to the wrong package`);
   }
   if (versionRequest === undefined ||
       (versionRequest.type !== "version" && versionRequest.type !== "range")) {
@@ -349,8 +399,8 @@ function buildSpdxDocument({
         licenseDeclared: "NOASSERTION",
         copyrightText: "NOASSERTION",
         primaryPackagePurpose: "LIBRARY",
+        checksums: [integrityChecksum(entry.integrity, packagePath)],
       };
-      if (entry.integrity !== undefined) dependency.checksums = [integrityChecksum(entry.integrity, packagePath)];
       return dependency;
     });
 
@@ -387,7 +437,7 @@ export function expectedSpdxDocumentNamespace(document) {
 }
 
 function integrityChecksum(value, packagePath) {
-  if (typeof value !== "string") throw new Error(`Invalid dependency integrity for ${packagePath}`);
+  if (typeof value !== "string") throw new Error(`Runtime dependency lacks integrity evidence for ${packagePath}`);
   const sha512 = value.split(/\s+/u).find((entry) => entry.startsWith("sha512-"));
   if (sha512 === undefined) throw new Error(`Runtime dependency lacks a SHA-512 integrity for ${packagePath}`);
   const encoded = sha512.slice("sha512-".length);

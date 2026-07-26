@@ -207,6 +207,105 @@ test("release evidence is canonical, reproducible, SPDX-correct, and explicit ab
     }
   }
 
+  const peerIntegrity = Buffer.alloc(64, 0x6b).toString("base64");
+  for (const peerCase of [
+    {
+      name: "required-peer-hoisted",
+      peerName: "host",
+      peerVersion: "1.4.0",
+      expected: "success",
+    },
+    {
+      name: "required-peer-missing",
+      peerName: "host",
+      expected: "missing",
+    },
+    {
+      name: "required-peer-incompatible",
+      peerName: "host",
+      peerVersion: "9.0.0",
+      expected: "mismatch",
+    },
+    {
+      name: "optional-peer-absent-transitive",
+      peerName: "host",
+      optional: true,
+      expected: "success",
+    },
+    {
+      name: "optional-scoped-peer-present",
+      peerName: "@scope/host",
+      peerVersion: "1.4.0",
+      optional: true,
+      expected: "success",
+    },
+  ] as const) {
+    const candidate = await fixture.emptyCandidate(peerCase.name, "peer");
+    const lockFile = path.join(fixture.root, `${peerCase.name}.package-lock.json`);
+    const lockDocument = JSON.parse(await readFile(fixture.lockFile, "utf8")) as {
+      packages: Record<string, {
+        integrity?: string;
+        peerDependencies?: Record<string, string>;
+        peerDependenciesMeta?: Record<string, { optional: boolean }>;
+        version?: string;
+      }>;
+    };
+    lockDocument.packages["node_modules/example"]!.peerDependencies = { [peerCase.peerName]: "^1.0.0" };
+    if (peerCase.optional === true) {
+      lockDocument.packages["node_modules/example"]!.peerDependenciesMeta = {
+        [peerCase.peerName]: { optional: true },
+      };
+    }
+    if (peerCase.peerVersion !== undefined) {
+      lockDocument.packages[`node_modules/${peerCase.peerName}`] = {
+        version: peerCase.peerVersion,
+        integrity: `sha512-${peerIntegrity}`,
+      };
+    }
+    await writeFile(lockFile, JSON.stringify(lockDocument));
+    const arguments_ = generationArguments(fixture, candidate, "preview");
+    arguments_[arguments_.indexOf("--lock") + 1] = lockFile;
+    const result = invoke(generateScript, arguments_, { COPE_RELEASE_SIGNING_KEY_FILE: undefined });
+    if (peerCase.expected === "success") {
+      expectSuccess(result);
+      if (peerCase.peerVersion !== undefined) {
+        const sbom = JSON.parse(await readFile(path.join(candidate, "sbom.spdx.json"), "utf8")) as {
+          packages: Array<{ name: string }>;
+        };
+        assert.ok(sbom.packages.some((entry) => entry.name === peerCase.peerName));
+      }
+    } else if (peerCase.expected === "missing") {
+      expectFailure(result, /does not resolve a runtime package: host from node_modules\/example/iu);
+    } else {
+      expectFailure(result, /resolved version 9\.0\.0 does not satisfy host@\^1\.0\.0/iu);
+    }
+  }
+
+  const nestedPeerCandidate = await fixture.emptyCandidate("nested-peer", "peer");
+  const nestedPeerLockFile = path.join(fixture.root, "nested-peer.package-lock.json");
+  const nestedPeerLock = JSON.parse(await readFile(fixture.lockFile, "utf8")) as {
+    packages: Record<string, {
+      dependencies?: Record<string, string>;
+      integrity?: string;
+      peerDependencies?: Record<string, string>;
+      version?: string;
+    }>;
+  };
+  nestedPeerLock.packages["node_modules/example"]!.dependencies = { child: "^3.0.0" };
+  nestedPeerLock.packages["node_modules/example/node_modules/child"] = {
+    version: "3.1.0",
+    integrity: `sha512-${peerIntegrity}`,
+    peerDependencies: { host: "^1.0.0" },
+  };
+  nestedPeerLock.packages["node_modules/example/node_modules/host"] = {
+    version: "1.4.0",
+    integrity: `sha512-${peerIntegrity}`,
+  };
+  await writeFile(nestedPeerLockFile, JSON.stringify(nestedPeerLock));
+  const nestedPeerArguments = generationArguments(fixture, nestedPeerCandidate, "preview");
+  nestedPeerArguments[nestedPeerArguments.indexOf("--lock") + 1] = nestedPeerLockFile;
+  expectSuccess(invoke(generateScript, nestedPeerArguments, { COPE_RELEASE_SIGNING_KEY_FILE: undefined }));
+
   const optionalPeerCandidate = await fixture.emptyCandidate("optional-peer", "optional-peer");
   const optionalPeerPackageJson = npmPackageJson("1.2.3", {
     peerDependencies: { "optional-peer": "^4.0.0" },
@@ -297,6 +396,20 @@ test("release evidence is canonical, reproducible, SPDX-correct, and explicit ab
     /resolved version 9\.0\.0 does not satisfy example@\^2\.0\.0/iu,
   );
 
+  const wrongOrdinaryName = await fixture.emptyCandidate("wrong-ordinary-name", "dependency-drift");
+  const wrongOrdinaryLockFile = path.join(fixture.root, "wrong-ordinary-name.package-lock.json");
+  const wrongOrdinaryLock = JSON.parse(await readFile(fixture.lockFile, "utf8")) as {
+    packages: Record<string, { name?: string }>;
+  };
+  wrongOrdinaryLock.packages["node_modules/example"]!.name = "other-package";
+  await writeFile(wrongOrdinaryLockFile, JSON.stringify(wrongOrdinaryLock));
+  const wrongOrdinaryArguments = generationArguments(fixture, wrongOrdinaryName, "preview");
+  wrongOrdinaryArguments[wrongOrdinaryArguments.indexOf("--lock") + 1] = wrongOrdinaryLockFile;
+  expectFailure(
+    invoke(generateScript, wrongOrdinaryArguments, { COPE_RELEASE_SIGNING_KEY_FILE: undefined }),
+    /runtime dependency example to the wrong package/iu,
+  );
+
   for (const [name, declaredSpec, resolvedName, pattern] of [
     ["wrong-alias-target", "npm:real-example@^2.0.0", "other-example", /alias example to the wrong package/iu],
     ["unsupported-git-spec", "git+https://example.invalid/example.git", undefined, /unsupported runtime dependency spec/iu],
@@ -322,6 +435,54 @@ test("release evidence is canonical, reproducible, SPDX-correct, and explicit ab
     arguments_[arguments_.indexOf("--package") + 1] = packageFile;
     arguments_[arguments_.indexOf("--lock") + 1] = lockFile;
     expectFailure(invoke(generateScript, arguments_, { COPE_RELEASE_SIGNING_KEY_FILE: undefined }), pattern);
+  }
+
+  for (const integrityCase of ["direct", "transitive", "alias"] as const) {
+    const candidate = await fixture.emptyCandidate(`missing-${integrityCase}-integrity`, "dependency-drift");
+    const lockFile = path.join(fixture.root, `missing-${integrityCase}-integrity.package-lock.json`);
+    const lockDocument = JSON.parse(await readFile(fixture.lockFile, "utf8")) as {
+      packages: Record<string, {
+        dependencies?: Record<string, string>;
+        integrity?: string;
+        name?: string;
+        version?: string;
+      }>;
+    };
+    if (integrityCase === "direct") {
+      delete lockDocument.packages["node_modules/example"]!.integrity;
+    } else if (integrityCase === "transitive") {
+      lockDocument.packages["node_modules/example"]!.dependencies = { child: "1.0.0" };
+      lockDocument.packages["node_modules/child"] = { version: "1.0.0" };
+    } else {
+      const packageJson = npmPackageJson("1.2.3", {
+        dependencies: { example: "npm:real-example@2.0.0" },
+      });
+      await writeFile(path.join(candidate, "cope.tgz"), npmArchive([
+        { archivePath: "package/package.json", content: packageJson },
+        { archivePath: "package/dist/src/cli/main.js", content: "cli", mode: 0o755 },
+      ]));
+      const packageFile = path.join(fixture.root, "missing-alias-integrity.package.json");
+      await writeFile(packageFile, packageJson);
+      lockDocument.packages[""]!.dependencies = { example: "npm:real-example@2.0.0" };
+      lockDocument.packages["node_modules/example"]!.name = "real-example";
+      delete lockDocument.packages["node_modules/example"]!.integrity;
+      const arguments_ = generationArguments(fixture, candidate, "preview");
+      arguments_[arguments_.indexOf("--package") + 1] = packageFile;
+      arguments_[arguments_.indexOf("--lock") + 1] = lockFile;
+      await writeFile(lockFile, JSON.stringify(lockDocument));
+      expectFailure(
+        invoke(generateScript, arguments_, { COPE_RELEASE_SIGNING_KEY_FILE: undefined }),
+        /lacks integrity evidence/iu,
+      );
+      continue;
+    }
+    await writeFile(lockFile, JSON.stringify(lockDocument));
+    const arguments_ = generationArguments(fixture, candidate, "preview");
+    arguments_[arguments_.indexOf("--lock") + 1] = lockFile;
+    expectFailure(
+      invoke(generateScript, arguments_, { COPE_RELEASE_SIGNING_KEY_FILE: undefined }),
+      /lacks integrity evidence/iu,
+    );
   }
 
   const largeLeft = path.join(fixture.root, "large-compare-left");
@@ -547,6 +708,23 @@ test("activation is publisher-authenticated, locked, pointer-atomic, and explici
   await chmod(path.join(residueDirectory, "partial"), 0o444);
   await chmod(residueDirectory, 0o500);
   await writeFile(residueState, "partial");
+  let externalDirectory: string | undefined;
+  let externalFile: string | undefined;
+  let linkedResidueDirectory: string | undefined;
+  let childLinkedResidueDirectory: string | undefined;
+  if (process.platform !== "win32") {
+    externalDirectory = path.join(fixture.root, "external-residue-target");
+    externalFile = path.join(externalDirectory, "external.txt");
+    linkedResidueDirectory = path.join(installRoot, ".staged-11111111-1111-4111-8111-111111111111");
+    childLinkedResidueDirectory = path.join(installRoot, ".staged-22222222-2222-4222-8222-222222222222");
+    await mkdir(externalDirectory);
+    await writeFile(externalFile, "external");
+    await chmod(externalFile, 0o444);
+    await chmod(externalDirectory, 0o555);
+    await symlink(externalDirectory, linkedResidueDirectory);
+    await mkdir(childLinkedResidueDirectory);
+    await symlink(externalFile, path.join(childLinkedResidueDirectory, "external-link"));
+  }
   expectSuccess(invoke(activateScript, [
     second,
     installRoot,
@@ -560,6 +738,15 @@ test("activation is publisher-authenticated, locked, pointer-atomic, and explici
   });
   assert.equal((await readdir(installRoot)).includes(path.basename(residueDirectory)), false);
   assert.equal((await readdir(installRoot)).includes(path.basename(residueState)), false);
+  if (externalDirectory !== undefined && externalFile !== undefined &&
+      linkedResidueDirectory !== undefined && childLinkedResidueDirectory !== undefined) {
+    assert.equal((await lstat(externalDirectory)).mode & 0o777, 0o555);
+    assert.equal((await lstat(externalFile)).mode & 0o777, 0o444);
+    assert.equal((await readdir(installRoot)).includes(path.basename(linkedResidueDirectory)), false);
+    assert.equal((await readdir(installRoot)).includes(path.basename(childLinkedResidueDirectory)), false);
+    await chmod(externalDirectory, 0o700);
+    await chmod(externalFile, 0o600);
+  }
 
   expectFailure(invoke(activateScript, [
     first,

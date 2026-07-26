@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, rm } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -338,12 +338,46 @@ async function makeBundleReadOnly(directory) {
 }
 
 async function removeStaging(directory) {
+  let root;
   try {
+    root = await lstat(directory);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  if (root.isSymbolicLink() || !root.isDirectory()) {
+    await rm(directory, { force: true });
+    return;
+  }
+
+  const noFollow = fsConstants.O_NOFOLLOW ?? 0;
+  let directoryHandle;
+  try {
+    directoryHandle = await open(directory, fsConstants.O_RDONLY | noFollow);
+    const openedRoot = await directoryHandle.stat();
+    if (!openedRoot.isDirectory() || !sameFileIdentity(root, openedRoot)) {
+      throw new Error("Activation residue changed before cleanup");
+    }
+    await directoryHandle.chmod(0o700);
     const entries = await readdir(directory, { withFileTypes: true });
-    await chmod(directory, 0o700).catch(() => {});
-    for (const entry of entries) await chmod(path.join(directory, entry.name), 0o600).catch(() => {});
-  } catch {
-    // The staging path may not have been created yet or may be only partially present.
+    for (const entry of entries) {
+      if (!entry.isFile() || entry.isSymbolicLink()) continue;
+      const filename = path.join(directory, entry.name);
+      const before = await lstat(filename);
+      if (!before.isFile() || before.isSymbolicLink()) continue;
+      const handle = await open(filename, fsConstants.O_RDONLY | noFollow);
+      try {
+        const opened = await handle.stat();
+        if (!opened.isFile() || !sameFileIdentity(before, opened)) {
+          throw new Error("Activation residue changed before cleanup");
+        }
+        await handle.chmod(0o600);
+      } finally {
+        await handle.close();
+      }
+    }
+  } finally {
+    if (directoryHandle !== undefined) await directoryHandle.close();
   }
   await rm(directory, { recursive: true, force: true });
 }
