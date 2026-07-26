@@ -18,6 +18,7 @@ import {
   safeTopLevelFilename,
   sha256Bytes,
   signManifest,
+  validPackedCliMode,
 } from "./lib.mjs";
 
 const SEMVER = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u;
@@ -98,7 +99,7 @@ export async function generateRelease(options, environment = process.env, capabi
   const archiveEntries = new Map(archiveInspection.entries.map((entry) => [entry.path, entry]));
   for (const target of new Set(Object.values(archiveInspection.package.bin))) {
     const entry = archiveEntries.get(`package/${target}`);
-    if (entry === undefined || entry.mode !== 0o755) {
+    if (entry === undefined || !validPackedCliMode(entry.mode, builder.platform)) {
       throw new Error(`Packed package is missing its executable CLI target: ${target}`);
     }
   }

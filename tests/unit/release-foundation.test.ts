@@ -738,6 +738,16 @@ test("release generation rejects traversal, links, and non-regular payload bound
     );
   }
 
+  const windowsCliMode = await fixture.emptyCandidate("windows-cli-mode", "windows");
+  await writeFile(path.join(windowsCliMode, "cope.tgz"), npmArchive([
+    { archivePath: "package/package.json", content: npmPackageJson("1.2.3") },
+    { archivePath: "package/dist/src/cli/main.js", content: "cli", mode: 0o644 },
+  ]));
+  const windowsCliArguments = generationArguments(fixture, windowsCliMode, "preview");
+  windowsCliArguments[windowsCliArguments.indexOf("--platform") + 1] = "win32";
+  expectSuccess(invoke(generateScript, windowsCliArguments));
+  expectSuccess(invoke(verifyScript, [windowsCliMode]));
+
   const invalidDependencyName = await fixture.emptyCandidate("invalid-dependency-name", "bad");
   await writeFile(path.join(invalidDependencyName, "cope.tgz"), npmArchive([
     {

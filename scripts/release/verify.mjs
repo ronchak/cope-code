@@ -17,6 +17,7 @@ import {
   readRegularFile,
   safeTopLevelFilename,
   sha256Bytes,
+  validPackedCliMode,
   verifyManifestSignature,
 } from "./lib.mjs";
 
@@ -245,7 +246,7 @@ function validateManifest(manifest) {
   }
   for (const target of new Set(Object.values(artifact.archive.package.bin))) {
     const entry = artifact.archive.entries.find((candidate) => candidate.path === `package/${target}`);
-    if (entry === undefined || entry.mode !== 0o755) {
+    if (entry === undefined || !validPackedCliMode(entry.mode, manifest.builder.platform)) {
       throw new Error("Packed package executable target is missing or not executable");
     }
   }

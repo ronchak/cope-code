@@ -92,6 +92,10 @@ export function safeTopLevelFilename(value, label = "release filename") {
   return value;
 }
 
+export function validPackedCliMode(mode, builderPlatform) {
+  return mode === 0o755 || (builderPlatform === "win32" && mode === 0o644);
+}
+
 export function exactObjectKeys(value, expected, label) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`${label} must be an object`);

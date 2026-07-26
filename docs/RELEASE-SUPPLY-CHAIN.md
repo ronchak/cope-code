@@ -26,7 +26,11 @@ files, non-portable archive owners/modes/timestamps, non-canonical metadata, and
 digest or inventory drift. The manifest also binds the name, version, executable
 mapping, and runtime dependency declarations from the packed
 `package/package.json`, and requires the mapped CLI target to be present with an
-executable archive mode; those claims cannot diverge from what npm installs.
+executable archive mode on POSIX builders. npm's Windows packer records the
+JavaScript target as an ordinary `0644` file and installs a `.cmd` launcher, so
+Windows evidence accepts that platform-specific mode. Generation and verification
+bind the same rule to the recorded builder platform; those claims cannot diverge
+from what npm installs.
 
 The SPDX 2.3 JSON document describes the Cope artifact and the non-development
 runtime packages in `package-lock.json`. Generation requires the packed package,
