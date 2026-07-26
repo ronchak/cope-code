@@ -806,6 +806,862 @@ test("runtime independently enforces registry batchability before policy or exec
   assert.equal(outcomes.every((outcome) => outcome.data?.code === "SEQUENCING_REQUIRED"), true);
 });
 
+test("read batches cannot combine independent one-time approval ceilings", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-batch-approval-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [
+        { operationId: "op_batch_ask_1", name: "list_files", arguments: {} },
+        { operationId: "op_batch_ask_2", name: "list_files", arguments: {} },
+      ],
+    }]),
+    JSON.stringify([{ type: "blocked", reason: "done", recoverable: false }]),
+  ]);
+  let prompts = 0;
+  let executions = 0;
+  const runtime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts: new SessionArtifactStore(path.join(root, "artifacts")),
+    policy: {
+      summarize: () => ({}),
+      authorize: () => ({
+        outcome: "ask",
+        reasonCode: "BUDGET_EXCEEDED",
+        explanation: "approval required",
+        capability: {
+          expansion: {
+            kind: "budget",
+            metric: "disclosed_bytes",
+            requested_limit: 100_000,
+          },
+        },
+      }),
+      authorizeOnce: () => ({
+        outcome: "allow",
+        reasonCode: "ALLOWED",
+        explanation: "approved once",
+        plannedDisclosureBytes: 80_000,
+        oneTimeBudgetLimits: { disclosed_bytes: 100_000 },
+      }),
+      expandSessionGrant: async () => false,
+    },
+    execute: async (call) => {
+      executions += 1;
+      return {
+        operationId: call.operationId,
+        tool: call.name,
+        status: "success",
+        data: {},
+        safeMetadata: {},
+      };
+    },
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => {
+        prompts += 1;
+        return { decision: "allow_once" };
+      },
+    },
+  });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "blocked", result.reason);
+  assert.equal(prompts, 0);
+  assert.equal(executions, 0);
+  const outcomes = JSON.parse(transport.submittedContents[1] ?? "[]") as ReadonlyArray<{
+    readonly data?: { readonly code?: string };
+  }>;
+  assert.equal(outcomes.length, 2);
+  assert.equal(
+    outcomes.every((outcome) => outcome.data?.code === "SEQUENCING_REQUIRED"),
+    true,
+  );
+});
+
+test("read batches reserve aggregate disclosure before each execution", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-batch-reservation-"));
+  const localState = state(root);
+  localState.budgetLimits = {
+    ...localState.budgetLimits,
+    maxDisclosedBytes: 1_000_000,
+  };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [
+        { operationId: "op_batch_reserve_1", name: "list_files", arguments: {} },
+        { operationId: "op_batch_reserve_2", name: "list_files", arguments: {} },
+      ],
+    }]),
+    JSON.stringify([{ type: "blocked", reason: "done", recoverable: false }]),
+  ]);
+  let executions = 0;
+  const runtime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    policy: {
+      summarize: () => ({}),
+      authorize: () => ({
+        outcome: "allow",
+        reasonCode: "ALLOWED",
+        explanation: "allowed",
+        plannedDisclosureBytes: 600_000,
+      }),
+      expandSessionGrant: async () => false,
+    },
+    execute: async (call) => {
+      executions += 1;
+      return {
+        operationId: call.operationId,
+        tool: call.name,
+        status: "success",
+        data: { entries: ["src/a.txt"] },
+        safeMetadata: { entryCount: 1 },
+      };
+    },
+  });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "blocked", result.reason);
+  assert.equal(executions, 1);
+  const outcomes = JSON.parse(transport.submittedContents[1] ?? "[]") as ReadonlyArray<{
+    readonly status?: string;
+    readonly data?: { readonly code?: string };
+  }>;
+  assert.equal(outcomes[0]?.status, "success");
+  assert.equal(outcomes[1]?.status, "denied");
+  assert.equal(outcomes[1]?.data?.code, "BUDGET_EXCEEDED");
+});
+
+test("one-time disclosure approval covers the complete rendered tool result", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-disclosure-envelope-"));
+  const localState = state(root);
+  const bootstrapBytes = Buffer.byteLength("bootstrap");
+  localState.budgetLimits = {
+    ...localState.budgetLimits,
+    maxDisclosedBytes: bootstrapBytes,
+  };
+  let priorPersistedDisclosureBytes = 0;
+  let chargedResultCommitObserved = false;
+  class DisclosureBoundaryStore extends SessionStore {
+    public override async write(value: SessionState): Promise<void> {
+      if (
+        priorPersistedDisclosureBytes <= bootstrapBytes &&
+        value.budgetUsage.disclosedBytes > bootstrapBytes &&
+        value.completedOperationIds.includes("op_disclosure_once")
+      ) {
+        chargedResultCommitObserved = true;
+        assert.equal(value.queuedOutbound?.disclosure?.kind, "tool_result");
+        assert.equal(
+          value.unreturnedOperationIds?.includes("op_disclosure_once") ?? false,
+          false,
+        );
+      }
+      priorPersistedDisclosureBytes = value.budgetUsage.disclosedBytes;
+      await super.write(value);
+    }
+  }
+  const store = new DisclosureBoundaryStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{ operationId: "op_disclosure_once", name: "list_files", arguments: {} }],
+    }]),
+    JSON.stringify([{ type: "blocked", reason: "done", recoverable: false }]),
+  ]);
+  const plannedDisclosureBytes = 64 * 1024;
+  const approvedLimit =
+    bootstrapBytes + plannedDisclosureBytes;
+  let executions = 0;
+  const runtime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts: new SessionArtifactStore(path.join(root, "artifacts")),
+    protocol: {
+      ...protocol,
+      renderToolOutcomes: (input) => JSON.stringify({
+        protocol_version: "cba/1",
+        message_type: "tool_results",
+        task_id: input.taskId,
+        prior_turn_id: input.priorTurnId,
+        outcomes: input.outcomes,
+      }),
+    },
+    policy: {
+      summarize: () => ({}),
+      authorize: () => ({
+        outcome: "ask",
+        reasonCode: "BUDGET_EXCEEDED",
+        explanation: "approval required",
+        capability: {
+          expansion: {
+            kind: "budget",
+            metric: "disclosed_bytes",
+            requested_limit: approvedLimit,
+          },
+        },
+      }),
+      authorizeOnce: () => ({
+        outcome: "allow",
+        reasonCode: "ALLOWED",
+        explanation: "approved once",
+        plannedDisclosureBytes,
+        oneTimeBudgetLimits: { disclosed_bytes: approvedLimit },
+      }),
+      expandSessionGrant: async () => false,
+    },
+    execute: async (call) => {
+      executions += 1;
+      return {
+        operationId: call.operationId,
+        tool: call.name,
+        status: "success",
+        data: { entries: ["src/a.txt"] },
+        safeMetadata: { entryCount: 1 },
+      };
+    },
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => ({ decision: "allow_once" }),
+    },
+  });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "blocked", result.reason);
+  assert.equal(executions, 1);
+  assert.equal(chargedResultCommitObserved, true);
+  assert.equal(localState.budgetLimits.maxDisclosedBytes, bootstrapBytes);
+  assert.equal(localState.budgetUsage.disclosedBytes > localState.budgetLimits.maxDisclosedBytes, true);
+  assert.equal(localState.budgetUsage.disclosedBytes <= approvedLimit, true);
+});
+
+test("runtime reauthorizes allow-once and session-approved tool calls before execution", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-allow-once-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{
+        operationId: "op_edit_once",
+        name: "edit_text",
+        arguments: {
+          path: "src/a.txt",
+          base_sha256: "0".repeat(64),
+          old_text: "old",
+          new_text: "new",
+          expected_occurrences: 1,
+        },
+      }],
+    }]),
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{
+        operationId: "op_edit_session",
+        name: "edit_text",
+        arguments: {
+          path: "src/a.txt",
+          base_sha256: "0".repeat(64),
+          old_text: "old",
+          new_text: "new",
+          expected_occurrences: 1,
+        },
+      }],
+    }]),
+    JSON.stringify([{ type: "blocked", reason: "done", recoverable: false }]),
+  ]);
+  let executions = 0;
+  let oneTimeAuthorizations = 0;
+  let sessionExpanded = false;
+  let prompts = 0;
+  const journal = new OperationJournal(path.join(root, "operations"), localState.sessionId);
+  const runtime = new AgentRuntime({
+    state: localState,
+    store,
+    journal,
+    audit: new AuditLog(path.join(root, "audit.jsonl"), localState.sessionId),
+    protocol,
+    policy: {
+      summarize: () => ({}),
+      authorize: (call) => call.operationId === "op_edit_session" && sessionExpanded
+        ? {
+            outcome: "conflict",
+            reasonCode: "STALE_STATE",
+            explanation: "Edit base hash does not match current file state",
+          }
+        : {
+            outcome: "ask",
+            reasonCode: "PATH_REQUIRES_APPROVAL",
+            explanation: "approval required",
+            capability: { expansion: { kind: "path", access: "write", path: "src/a.txt" } },
+          },
+      authorizeOnce: () => {
+        oneTimeAuthorizations += 1;
+        return {
+          outcome: "conflict",
+          reasonCode: "STALE_STATE",
+          explanation: "Edit base hash does not match current file state",
+        };
+      },
+      expandSessionGrant: async () => {
+        sessionExpanded = true;
+        return true;
+      },
+    },
+    tools: {
+      execute: async (call) => {
+        executions += 1;
+        return {
+          operationId: call.operationId,
+          tool: call.name,
+          status: "success",
+          data: {},
+          safeMetadata: {},
+        };
+      },
+      inspectCompletionState: async () => ({
+        pathKey: completionPathKey,
+        known: false,
+        fingerprint: "unknown",
+        excludedStateFingerprint: "0".repeat(64),
+        hasConflicts: false,
+        changedPaths: [],
+        outOfScopePaths: [],
+        gitStatusSummary: "unused",
+      }),
+    },
+    transport,
+    disclosure: { inspectAndSerialize: async (message) => message },
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => ({
+        decision: prompts++ === 0 ? "allow_once" : "allow_session",
+      }),
+    },
+    completionRequirements: {
+      requiredCommandIds: [],
+      requireValidationAfterLastMutation: true,
+      requireCleanPendingOperations: true,
+    },
+    clock: { now: () => new Date("2026-01-01T00:01:00.000Z") },
+    artifacts: new SessionArtifactStore(path.join(root, "artifacts")),
+    idFactory: (() => {
+      let value = 0;
+      return () => `submission_allow_once_${++value}`;
+    })(),
+  });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "blocked", result.reason);
+  assert.equal(oneTimeAuthorizations, 1);
+  assert.equal(sessionExpanded, true);
+  assert.equal(prompts, 2);
+  assert.equal(executions, 0);
+  const oneTimeOutcomes = JSON.parse(transport.submittedContents[1] ?? "[]") as ReadonlyArray<{
+    readonly status?: string;
+    readonly data?: { readonly code?: string };
+  }>;
+  const sessionOutcomes = JSON.parse(transport.submittedContents[2] ?? "[]") as ReadonlyArray<{
+    readonly status?: string;
+    readonly data?: { readonly code?: string };
+  }>;
+  assert.equal(oneTimeOutcomes[0]?.status, "conflict");
+  assert.equal(oneTimeOutcomes[0]?.data?.code, "STALE_STATE");
+  assert.equal(sessionOutcomes[0]?.status, "conflict");
+  assert.equal(sessionOutcomes[0]?.data?.code, "STALE_STATE");
+  assert.equal((await journal.read("op_edit_once")).status, "failed");
+  assert.equal((await journal.read("op_edit_session")).status, "failed");
+});
+
+test("runtime reserves exact mutation budgets before invoking a tool", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-mutation-budget-"));
+  const localState = state(root);
+  localState.budgetLimits = { ...localState.budgetLimits, maxChangedLines: 1 };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{
+        operationId: "op_edit_budget",
+        name: "edit_text",
+        arguments: {},
+      }],
+    }]),
+    JSON.stringify([{ type: "blocked", reason: "done", recoverable: false }]),
+  ]);
+  let executions = 0;
+  const journal = new OperationJournal(path.join(root, "operations"), localState.sessionId);
+  const runtime = new AgentRuntime({
+    state: localState,
+    store,
+    journal,
+    audit: new AuditLog(path.join(root, "audit.jsonl"), localState.sessionId),
+    protocol,
+    policy: {
+      summarize: () => ({}),
+      authorize: () => ({
+        outcome: "allow",
+        reasonCode: "ALLOWED",
+        explanation: "allowed",
+        plannedMutation: { changedFiles: 1, changedLines: 2 },
+      }),
+      expandSessionGrant: async () => false,
+    },
+    tools: {
+      execute: async (call) => {
+        executions += 1;
+        return {
+          operationId: call.operationId,
+          tool: call.name,
+          status: "success",
+          data: {},
+          safeMetadata: {},
+        };
+      },
+      inspectCompletionState: async () => ({
+        pathKey: completionPathKey,
+        known: false,
+        fingerprint: "unknown",
+        excludedStateFingerprint: "0".repeat(64),
+        hasConflicts: false,
+        changedPaths: [],
+        outOfScopePaths: [],
+        gitStatusSummary: "unused",
+      }),
+    },
+    transport,
+    disclosure: { inspectAndSerialize: async (message) => message },
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => ({ decision: "deny" }),
+    },
+    completionRequirements: {
+      requiredCommandIds: [],
+      requireValidationAfterLastMutation: true,
+      requireCleanPendingOperations: true,
+    },
+    clock: { now: () => new Date("2026-01-01T00:01:00.000Z") },
+    idFactory: (() => {
+      let value = 0;
+      return () => `submission_mutation_budget_${++value}`;
+    })(),
+  });
+
+  assert.equal((await runtime.run()).status, "blocked");
+  assert.equal(executions, 0);
+  const outcomes = JSON.parse(transport.submittedContents[1] ?? "[]") as ReadonlyArray<{
+    readonly status?: string;
+    readonly data?: { readonly code?: string };
+  }>;
+  assert.equal(outcomes[0]?.status, "denied");
+  assert.equal(outcomes[0]?.data?.code, "BUDGET_EXCEEDED");
+  assert.equal((await journal.read("op_edit_budget")).status, "failed");
+});
+
+test("one-time mutation budget approval is scoped to the exact current operation", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-once-mutation-budget-"));
+  const localState = state(root);
+  localState.budgetLimits = { ...localState.budgetLimits, maxChangedLines: 0 };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{ operationId: "op_edit_once_budget", name: "edit_text", arguments: {} }],
+    }]),
+    JSON.stringify([{ type: "blocked", reason: "done", recoverable: false }]),
+  ]);
+  let executions = 0;
+  const runtime = new AgentRuntime({
+    state: localState,
+    store,
+    journal: new OperationJournal(path.join(root, "operations"), localState.sessionId),
+    audit: new AuditLog(path.join(root, "audit.jsonl"), localState.sessionId),
+    protocol,
+    policy: {
+      summarize: () => ({}),
+      authorize: () => ({
+        outcome: "ask",
+        reasonCode: "BUDGET_EXCEEDED",
+        explanation: "changed-line approval required",
+        capability: {
+          expansion: {
+            kind: "budget",
+            metric: "changed_lines",
+            requested_limit: 2,
+          },
+        },
+      }),
+      authorizeOnce: () => ({
+        outcome: "allow",
+        reasonCode: "ALLOWED",
+        explanation: "approved once",
+        plannedMutation: { changedFiles: 1, changedLines: 2 },
+        oneTimeBudgetLimits: { changed_lines: 2 },
+      }),
+      expandSessionGrant: async () => false,
+    },
+    tools: {
+      execute: async (call, _signal, executionContext) => {
+        executions += 1;
+        assert.deepEqual(executionContext?.plannedMutation, {
+          changedFiles: 1,
+          changedLines: 2,
+        });
+        return {
+          operationId: call.operationId,
+          tool: call.name,
+          status: "success",
+          data: {},
+          safeMetadata: {
+            changedFileCount: 1,
+            changedLines: 2,
+            checkpointId: "checkpoint_once_budget",
+            changedPaths: ["src/a.txt"],
+            repositoryFingerprint: "a".repeat(64),
+          },
+        };
+      },
+      inspectCompletionState: async () => ({
+        pathKey: completionPathKey,
+        known: false,
+        fingerprint: "unknown",
+        excludedStateFingerprint: "0".repeat(64),
+        hasConflicts: false,
+        changedPaths: [],
+        outOfScopePaths: [],
+        gitStatusSummary: "unused",
+      }),
+    },
+    transport,
+    disclosure: { inspectAndSerialize: async (message) => message },
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => ({ decision: "allow_once" }),
+    },
+    completionRequirements: {
+      requiredCommandIds: [],
+      requireValidationAfterLastMutation: true,
+      requireCleanPendingOperations: true,
+    },
+    clock: { now: () => new Date("2026-01-01T00:01:00.000Z") },
+    idFactory: (() => {
+      let value = 0;
+      return () => `submission_once_mutation_budget_${++value}`;
+    })(),
+    artifacts: new SessionArtifactStore(path.join(root, "artifacts")),
+  });
+
+  assert.equal((await runtime.run()).status, "blocked");
+  assert.equal(executions, 1);
+  assert.equal(localState.budgetLimits.maxChangedLines, 0);
+  assert.equal(localState.budgetUsage.changedLines, 2);
+});
+
+test("session mutation budget approval applies to the current live executor", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-session-mutation-budget-"));
+  const localState = state(root);
+  localState.budgetLimits = { ...localState.budgetLimits, maxChangedLines: 0 };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{ operationId: "op_edit_session_budget", name: "edit_text", arguments: {} }],
+    }]),
+    JSON.stringify([{ type: "blocked", reason: "done", recoverable: false }]),
+  ]);
+  let expanded = false;
+  let executions = 0;
+  const runtime = new AgentRuntime({
+    state: localState,
+    store,
+    journal: new OperationJournal(path.join(root, "operations"), localState.sessionId),
+    audit: new AuditLog(path.join(root, "audit.jsonl"), localState.sessionId),
+    protocol,
+    policy: {
+      summarize: () => ({}),
+      authorize: () => expanded
+        ? {
+            outcome: "allow",
+            reasonCode: "ALLOWED",
+            explanation: "approved for session",
+            plannedMutation: { changedFiles: 1, changedLines: 2 },
+          }
+        : {
+            outcome: "ask",
+            reasonCode: "BUDGET_EXCEEDED",
+            explanation: "changed-line approval required",
+            capability: {
+              expansion: {
+                kind: "budget",
+                metric: "changed_lines",
+                requested_limit: 2,
+              },
+            },
+          },
+      expandSessionGrant: async () => {
+        expanded = true;
+        localState.budgetLimits = {
+          ...localState.budgetLimits,
+          maxChangedLines: 2,
+        };
+        await store.write(localState);
+        return true;
+      },
+    },
+    tools: {
+      execute: async (call, _signal, executionContext) => {
+        executions += 1;
+        assert.deepEqual(executionContext?.plannedMutation, {
+          changedFiles: 1,
+          changedLines: 2,
+        });
+        return {
+          operationId: call.operationId,
+          tool: call.name,
+          status: "success",
+          data: {},
+          safeMetadata: {
+            changedFileCount: 1,
+            changedLines: 2,
+            checkpointId: "checkpoint_session_budget",
+            changedPaths: ["src/a.txt"],
+            repositoryFingerprint: "b".repeat(64),
+          },
+        };
+      },
+      inspectCompletionState: async () => ({
+        pathKey: completionPathKey,
+        known: false,
+        fingerprint: "unknown",
+        excludedStateFingerprint: "0".repeat(64),
+        hasConflicts: false,
+        changedPaths: [],
+        outOfScopePaths: [],
+        gitStatusSummary: "unused",
+      }),
+    },
+    transport,
+    disclosure: { inspectAndSerialize: async (message) => message },
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => ({ decision: "allow_session" }),
+    },
+    completionRequirements: {
+      requiredCommandIds: [],
+      requireValidationAfterLastMutation: true,
+      requireCleanPendingOperations: true,
+    },
+    clock: { now: () => new Date("2026-01-01T00:01:00.000Z") },
+    idFactory: (() => {
+      let value = 0;
+      return () => `submission_session_mutation_budget_${++value}`;
+    })(),
+    artifacts: new SessionArtifactStore(path.join(root, "artifacts")),
+  });
+
+  assert.equal((await runtime.run()).status, "blocked");
+  assert.equal(executions, 1);
+  assert.equal(localState.budgetLimits.maxChangedLines, 2);
+  assert.equal(localState.budgetUsage.changedLines, 2);
+});
+
+test("one-time command budget approval cannot throw after becoming effective", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-once-command-budget-"));
+  const localState = state(root);
+  localState.budgetLimits = { ...localState.budgetLimits, maxCommands: 0 };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  let executions = 0;
+  const runtime = new AgentRuntime({
+    state: localState,
+    store,
+    journal: new OperationJournal(path.join(root, "operations"), localState.sessionId),
+    audit: new AuditLog(path.join(root, "audit.jsonl"), localState.sessionId),
+    protocol,
+    policy: {
+      summarize: () => ({}),
+      authorize: () => ({
+        outcome: "ask",
+        reasonCode: "BUDGET_EXCEEDED",
+        explanation: "command approval required",
+        capability: {
+          expansion: {
+            kind: "budget",
+            metric: "commands",
+            requested_limit: 1,
+          },
+        },
+      }),
+      authorizeOnce: () => ({
+        outcome: "allow",
+        reasonCode: "ALLOWED",
+        explanation: "approved once",
+        oneTimeBudgetLimits: { commands: 1 },
+      }),
+      expandSessionGrant: async () => false,
+    },
+    tools: {
+      execute: async (call) => {
+        executions += 1;
+        return {
+          operationId: call.operationId,
+          tool: call.name,
+          status: "success",
+          data: {},
+          safeMetadata: {
+            commandId: "validate",
+            outcome: "success",
+            exitCode: 0,
+            outputBytes: 0,
+            repositoryFingerprint: "c".repeat(64),
+          },
+        };
+      },
+      inspectCompletionState: async () => ({
+        pathKey: completionPathKey,
+        known: false,
+        fingerprint: "unknown",
+        excludedStateFingerprint: "0".repeat(64),
+        hasConflicts: false,
+        changedPaths: [],
+        outOfScopePaths: [],
+        gitStatusSummary: "unused",
+      }),
+    },
+    transport: new QueueTransport([
+      JSON.stringify([{
+        type: "tool_request",
+        calls: [{
+          operationId: "op_command_once_budget",
+          name: "run_command",
+          arguments: { command_id: "validate" },
+        }],
+      }]),
+      JSON.stringify([{ type: "blocked", reason: "done", recoverable: false }]),
+    ]),
+    disclosure: { inspectAndSerialize: async (message) => message },
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => ({ decision: "allow_once" }),
+    },
+    completionRequirements: {
+      requiredCommandIds: [],
+      requireValidationAfterLastMutation: true,
+      requireCleanPendingOperations: true,
+    },
+    clock: { now: () => new Date("2026-01-01T00:01:00.000Z") },
+    idFactory: (() => {
+      let value = 0;
+      return () => `submission_once_command_budget_${++value}`;
+    })(),
+    artifacts: new SessionArtifactStore(path.join(root, "artifacts")),
+  });
+
+  assert.equal((await runtime.run()).status, "blocked");
+  assert.equal(executions, 1);
+  assert.equal(localState.budgetLimits.maxCommands, 0);
+  assert.equal(localState.budgetUsage.commands, 1);
+});
+
+test("mutation accounting mismatch preserves checkpoint recovery metadata", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-accounting-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const auditPath = path.join(root, "audit.jsonl");
+  const journal = new OperationJournal(path.join(root, "operations"), localState.sessionId);
+  const runtime = new AgentRuntime({
+    state: localState,
+    store,
+    journal,
+    audit: new AuditLog(auditPath, localState.sessionId),
+    protocol,
+    policy: {
+      summarize: () => ({}),
+      authorize: () => ({
+        outcome: "allow",
+        reasonCode: "ALLOWED",
+        explanation: "allowed",
+        plannedMutation: { changedFiles: 1, changedLines: 1 },
+      }),
+      expandSessionGrant: async () => false,
+    },
+    tools: {
+      execute: async (call) => ({
+        operationId: call.operationId,
+        tool: call.name,
+        status: "success",
+        data: {},
+        safeMetadata: {
+          changedFileCount: 1,
+          changedLines: 2,
+          checkpointId: "checkpoint_12345678",
+          changedPaths: ["src/index.ts"],
+          repositoryFingerprint: "e".repeat(64),
+        },
+      }),
+      inspectCompletionState: async () => ({
+        pathKey: completionPathKey,
+        known: false,
+        fingerprint: "unknown",
+        excludedStateFingerprint: "0".repeat(64),
+        hasConflicts: false,
+        changedPaths: [],
+        outOfScopePaths: [],
+        gitStatusSummary: "unused",
+      }),
+    },
+    transport: new QueueTransport([
+      JSON.stringify([{
+        type: "tool_request",
+        calls: [{ operationId: "op_accounting", name: "edit_text", arguments: {} }],
+      }]),
+    ]),
+    disclosure: { inspectAndSerialize: async (message) => message },
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => ({ decision: "deny" }),
+    },
+    completionRequirements: {
+      requiredCommandIds: [],
+      requireValidationAfterLastMutation: true,
+      requireCleanPendingOperations: true,
+    },
+    clock: { now: () => new Date("2026-01-01T00:01:00.000Z") },
+    idFactory: () => "submission_accounting",
+  });
+
+  assert.equal((await runtime.run()).status, "paused");
+  const record = await journal.read("op_accounting");
+  assert.equal(record.status, "indeterminate");
+  assert.equal(record.safeResult?.checkpointId, "checkpoint_12345678");
+  assert.deepEqual(record.safeResult?.changedPaths, ["src/index.ts"]);
+  const events = await AuditLog.verify(auditPath, localState.sessionId);
+  const completed = events.find(
+    (event) => event.type === "tool.completed" && event.operationId === "op_accounting",
+  );
+  assert.equal(completed?.data.checkpointId, "checkpoint_12345678");
+  assert.deepEqual(completed?.data.changedPaths, ["src/index.ts"]);
+});
+
 test("runtime sends protocol repair feedback and continues", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-"));
   const localState = state(root);
@@ -2646,7 +3502,7 @@ test("runtime pauses instead of replaying an indeterminate mutation", async () =
   assert.equal((await journal.read("op_mutate")).status, "indeterminate");
 });
 
-test("runtime replays a completed journal record while recovering an interrupted tool turn", async () => {
+test("delivered duplicate does not reuse a completed operation's one-time authority", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-tool-replay-"));
   const localState = state(root);
   localState.status = "executing_tools";
@@ -2665,13 +3521,34 @@ test("runtime replays a completed journal record while recovering an interrupted
   const journal = new OperationJournal(path.join(root, "operations"), localState.sessionId);
   const registered = await journal.register("op_list", "list_files", false, call, "2026-01-01T00:00:00.000Z");
   const executing = await journal.markExecuting(registered.record, "2026-01-01T00:00:01.000Z");
-  const completed = await journal.markCompleted(executing, "2026-01-01T00:00:02.000Z", "success", { entryCount: 1 });
+  await journal.markCompleted(executing, "2026-01-01T00:00:02.000Z", "success", {
+    entryCount: 1,
+    plannedDisclosureBytes: 64 * 1024,
+    runtimeBudgetLimits: { disclosedBytes: 800 },
+  });
   localState.pendingOperations = [];
   localState.completedOperationIds = ["op_list"];
+  localState.budgetUsage = {
+    ...localState.budgetUsage,
+    operations: 1,
+    disclosedBytes: 900,
+  };
   await store.create(localState);
   const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
   await artifacts.put("response", "turn_0001", JSON.stringify([{ type: "tool_request", calls: [call] }]));
   let unexpectedExecutions = 0;
+  const transport = new QueueTransport([JSON.stringify([{
+    type: "complete_task",
+    operationId: "op_complete",
+    claim: {
+      summary: "Recovered safely.",
+      acceptanceCriteria: [],
+      validation: [],
+      skippedValidation: [],
+      remainingRisks: [],
+      recommendedFollowUp: [],
+    },
+  }])]);
   const runtime = new AgentRuntime({
     state: localState,
     store,
@@ -2687,18 +3564,7 @@ test("runtime replays a completed journal record while recovering an interrupted
       execute: async () => { unexpectedExecutions += 1; throw new Error("must not execute"); },
       inspectCompletionState: async () => ({ pathKey: completionPathKey, known: true, fingerprint: "d".repeat(64), excludedStateFingerprint: "0".repeat(64), hasConflicts: false, changedPaths: [], outOfScopePaths: [], gitStatusSummary: "clean" }),
     },
-    transport: new QueueTransport([JSON.stringify([{
-      type: "complete_task",
-      operationId: "op_complete",
-      claim: {
-        summary: "Recovered safely.",
-        acceptanceCriteria: [],
-        validation: [],
-        skippedValidation: [],
-        remainingRisks: [],
-        recommendedFollowUp: [],
-      },
-    }])]),
+    transport,
     disclosure: { inspectAndSerialize: async (message) => message },
     user: {
       requestInput: async () => ({}),
@@ -2714,12 +3580,20 @@ test("runtime replays a completed journal record while recovering an interrupted
   assert.equal(result.status, "completed", result.reason);
   assert.equal(unexpectedExecutions, 0);
   assert.equal(localState.pendingOperations.length, 0);
+  assert.equal(localState.budgetUsage.disclosedBytes > 900, true);
+  const replayOutcome = JSON.parse(transport.submittedContents[0] ?? "[]") as ReadonlyArray<{
+    readonly status?: string;
+    readonly data?: { readonly code?: string };
+  }>;
+  assert.equal(replayOutcome[0]?.status, "denied");
+  assert.equal(replayOutcome[0]?.data?.code, "DUPLICATE_OPERATION");
 });
 
-test("completed mutation replay idempotently restores durable session effects without re-execution", async () => {
+test("completed mutation result replays after the post-persist pre-queue crash window", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-mutation-effects-"));
   const localState = state(root);
-  localState.status = "executing_tools";
+  localState.status = "returning_results";
+  localState.budgetLimits = { ...localState.budgetLimits, maxDisclosedBytes: 0 };
   localState.turnSequence = 1;
   localState.submission = {
     submissionId: "submission_1",
@@ -2745,7 +3619,13 @@ test("completed mutation replay idempotently restores durable session effects wi
     checkpointId: "checkpoint_12345678",
     changedPaths: ["src/index.ts"],
     repositoryFingerprint: "d".repeat(64),
+    plannedDisclosureBytes: 64 * 1024,
+    runtimeBudgetLimits: { disclosedBytes: 64 * 1024 },
   });
+  localState.budgetUsage = { ...localState.budgetUsage, operations: 1 };
+  localState.pendingOperations = [];
+  localState.completedOperationIds = [call.operationId];
+  localState.unreturnedOperationIds = [call.operationId];
   await store.create(localState);
   const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
   await artifacts.put("response", "turn_0001", JSON.stringify([{ type: "tool_request", calls: [call] }]));
@@ -2811,7 +3691,104 @@ test("completed mutation replay idempotently restores durable session effects wi
   assert.equal(localState.budgetUsage.operations, 1);
   assert.equal(localState.budgetUsage.changedFiles, 1);
   assert.equal(localState.budgetUsage.changedLines, 2);
+  assert.equal(localState.budgetUsage.disclosedBytes > 0, true);
+  assert.equal(localState.budgetUsage.disclosedBytes <= 64 * 1024, true);
   assert.deepEqual(localState.completedOperationIds, ["op_mutate"]);
+  assert.equal(localState.unreturnedOperationIds, undefined);
+});
+
+test("durably queued tool result resumes without replay, recharge, or duplicate audit", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-queued-result-recovery-"));
+  const localState = state(root);
+  const outbound = JSON.stringify([{
+    operationId: "op_queued_result",
+    tool: "list_files",
+    status: "success",
+    data: { entries: ["src/a.txt"] },
+    safeMetadata: { entryCount: 1 },
+  }]);
+  const outboundHash = sha256(outbound);
+  const outboundBytes = Buffer.byteLength(outbound);
+  localState.status = "awaiting_model";
+  localState.turnSequence = 1;
+  localState.budgetUsage = {
+    ...localState.budgetUsage,
+    operations: 1,
+    disclosedBytes: outboundBytes,
+  };
+  localState.completedOperationIds = ["op_queued_result"];
+  localState.submission = {
+    submissionId: "submission_1",
+    turnId: "turn_0001",
+    messageHash: "a".repeat(64),
+    marker: "marker",
+    state: "answered",
+    preparedAt: "2026-01-01T00:00:00.000Z",
+    submittedAt: "2026-01-01T00:00:01.000Z",
+    answeredAt: "2026-01-01T00:00:02.000Z",
+  };
+  localState.queuedOutbound = {
+    turnId: "turn_0002",
+    artifactId: "queued_turn_0002",
+    messageHash: outboundHash,
+    createdAt: "2026-01-01T00:00:03.000Z",
+    disclosure: {
+      kind: "tool_result",
+      disclosedBytes: outboundBytes,
+      sha256: outboundHash,
+    },
+  };
+  const store = new SessionStore(path.join(root, "state"));
+  const artifacts = new SessionArtifactStore(path.join(root, "artifacts"));
+  await artifacts.put("outbox", "queued_turn_0002", outbound);
+  await store.create(localState);
+  let policyChecks = 0;
+  let executions = 0;
+  const transport = new QueueTransport([
+    JSON.stringify([{ type: "blocked", reason: "done", recoverable: false }]),
+  ]);
+  const runtime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    artifacts,
+    transport,
+    policy: {
+      summarize: () => ({}),
+      authorize: () => {
+        policyChecks += 1;
+        return { outcome: "allow", reasonCode: "ALLOWED", explanation: "allowed" };
+      },
+      expandSessionGrant: async () => false,
+    },
+    execute: async (call) => {
+      executions += 1;
+      return {
+        operationId: call.operationId,
+        tool: call.name,
+        status: "success",
+        data: {},
+        safeMetadata: {},
+      };
+    },
+  });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "blocked", result.reason);
+  assert.equal(policyChecks, 0);
+  assert.equal(executions, 0);
+  assert.equal(localState.budgetUsage.disclosedBytes, outboundBytes);
+  assert.equal(transport.submittedContents[0], outbound);
+  const audit = await AuditLog.verify(
+    path.join(root, "audit.jsonl"),
+    localState.sessionId,
+  );
+  const disclosureEvents = audit.filter(
+    (event) => event.type === "disclosure.recorded",
+  );
+  assert.equal(disclosureEvents.length, 1);
+  assert.equal(disclosureEvents[0]?.data.sha256, outboundHash);
+  assert.equal(disclosureEvents[0]?.data.disclosedBytes, outboundBytes);
 });
 
 test("completed command replay restores validation evidence used by completion", async () => {
@@ -2840,6 +3817,19 @@ test("completed command replay restores validation evidence used by completion",
     outputBytes: 17,
     repositoryFingerprint: "e".repeat(64),
   });
+  localState.budgetUsage = {
+    ...localState.budgetUsage,
+    operations: 1,
+    commands: 1,
+  };
+  localState.pendingOperations = [{
+    operationId: call.operationId,
+    tool: call.name,
+    mutating: true,
+    requestHash: executing.requestHash,
+    status: "executing",
+    acceptedAt: executing.acceptedAt,
+  }];
   await store.create(localState);
   const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
   await artifacts.put("response", "turn_0001", JSON.stringify([{ type: "tool_request", calls: [call] }]));

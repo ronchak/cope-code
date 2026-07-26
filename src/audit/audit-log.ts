@@ -13,6 +13,7 @@ export class AuditLog {
   private sequence = 0;
   private previousHash = GENESIS_HASH;
   private initialized = false;
+  private readonly idempotencyKeys = new Set<string>();
 
   public constructor(
     private readonly filename: string,
@@ -33,6 +34,10 @@ export class AuditLog {
       const verification = verifyAuditText(content, this.sessionId);
       this.sequence = verification.events.length;
       this.previousHash = verification.finalHash;
+      for (const event of verification.events) {
+        const key = event.data.idempotencyKey;
+        if (typeof key === "string") this.idempotencyKeys.add(key);
+      }
     }
     this.initialized = true;
   }
@@ -63,7 +68,21 @@ export class AuditLog {
     }
     this.sequence = event.sequence;
     this.previousHash = event.eventHash;
+    const key = event.data.idempotencyKey;
+    if (typeof key === "string") this.idempotencyKeys.add(key);
     return event;
+  }
+
+  public async appendOnce(
+    input: AuditEventInput,
+    idempotencyKey: string,
+  ): Promise<AuditEvent | undefined> {
+    await this.initialize();
+    if (this.idempotencyKeys.has(idempotencyKey)) return undefined;
+    return this.append({
+      ...input,
+      data: { ...input.data, idempotencyKey },
+    });
   }
 
   public static async verify(filename: string, expectedSessionId: string): Promise<readonly AuditEvent[]> {

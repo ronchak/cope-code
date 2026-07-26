@@ -100,6 +100,20 @@ export const TOOL_REGISTRY = defineToolRegistry({
     required_context: [],
     bootstrap_example: { scope: "working_tree" },
   },
+  edit_text: {
+    purpose: "Atomically replace exact text in one hash-guarded approved text file with an occurrence-count guard.",
+    execution: "local",
+    read_only: false,
+    batchable: false,
+    required_context: ["path", "change"],
+    bootstrap_example: {
+      path: "src/file.ts",
+      base_sha256: "0".repeat(64),
+      old_text: "before",
+      new_text: "after",
+      expected_occurrences: 1,
+    },
+  },
   apply_patch: {
     purpose: "Atomically create, hash-guardedly update, or hash-guardedly delete approved text files.",
     execution: "local",
@@ -270,6 +284,17 @@ export interface ApplyPatchArguments {
   readonly changes: readonly AtomicFileChange[];
 }
 
+export interface EditTextArguments {
+  readonly path: string;
+  /** SHA-256 of the exact current file bytes the model observed. */
+  readonly base_sha256: string;
+  /** Exact text to replace; regular expressions are never interpreted. */
+  readonly old_text: string;
+  readonly new_text: string;
+  /** The edit proceeds only when old_text occurs exactly this many times. */
+  readonly expected_occurrences: number;
+}
+
 export type CommandParameterValue = string | number | boolean | readonly string[];
 
 export interface RunCommandArguments {
@@ -388,6 +413,7 @@ export interface ToolArgumentsByName {
   readonly read_file: ReadFileArguments;
   readonly git_status: GitStatusArguments;
   readonly git_diff: GitDiffArguments;
+  readonly edit_text: EditTextArguments;
   readonly apply_patch: ApplyPatchArguments;
   readonly run_command: RunCommandArguments;
   readonly request_user_input: RequestUserInputArguments;

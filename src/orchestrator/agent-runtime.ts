@@ -31,8 +31,16 @@ import {
   sessionRetainsSourceArtifacts,
   setTerminalCleanupPolicy,
 } from "../session/terminal-cleanup.js";
-import type { SessionState } from "../session/types.js";
-import { isBatchableToolName, isReadOnlyToolName } from "../protocol/types.js";
+import type {
+  BudgetCounter,
+  SessionState,
+} from "../session/types.js";
+import {
+  isBatchableToolName,
+  isReadOnlyToolName,
+  toolRequiresContext,
+  type BudgetMetric,
+} from "../protocol/types.js";
 import {
   verifyCompletion,
   type CompletionClaim,
@@ -41,6 +49,7 @@ import {
 } from "./completion.js";
 import type {
   DisclosureGuard,
+  AuthorizationDecision,
   NormalizedModelMessage,
   NormalizedToolCall,
   ProtocolAdapter,
@@ -49,6 +58,9 @@ import type {
   ToolOutcome,
   UserInteraction,
 } from "./contracts.js";
+import {
+  TOOL_RESULT_ENVELOPE_RESERVE_BYTES,
+} from "./disclosure-budget.js";
 
 export interface AgentRuntimeDependencies {
   readonly state: SessionState;
@@ -99,6 +111,8 @@ export class AgentRuntime {
   private finalModelSummary?: string;
   private finalModelReport?: CompletionClaim;
   private interruption?: { readonly status: "paused" | "aborted"; readonly reason: string };
+  private toolResultDisclosureLimit: number | undefined = undefined;
+  private toolResultDisclosureReservation = 0;
 
   public constructor(private readonly dependencies: AgentRuntimeDependencies) {
     this.state = dependencies.state;
@@ -294,7 +308,21 @@ export class AgentRuntime {
           return next.result;
         }
         outbound = next.outbound;
-        await this.queueOutbound(outbound, nextTurnId(this.state.turnSequence));
+        await this.queueOutbound(
+          outbound,
+          nextTurnId(this.state.turnSequence),
+          {
+            ...(next.returnedOperationIds === undefined
+              ? {}
+              : { returnedOperationIds: next.returnedOperationIds }),
+            ...(next.queueStatus === undefined
+              ? {}
+              : { nextStatus: next.queueStatus }),
+            ...(next.disclosureKind === undefined
+              ? {}
+              : { disclosureKind: next.disclosureKind }),
+          },
+        );
         await this.dependencies.artifacts?.remove("response", turnId);
         if (this.interruption !== undefined) return await this.finishInterruption();
       }
@@ -607,16 +635,55 @@ export class AgentRuntime {
     };
   }
 
-  private async queueOutbound(content: string, turnId: string): Promise<void> {
+  private async queueOutbound(
+    content: string,
+    turnId: string,
+    options: {
+      readonly returnedOperationIds?: readonly string[];
+      readonly nextStatus?: "awaiting_model";
+      readonly disclosureKind?: "tool_result";
+    } = {},
+  ): Promise<void> {
     const artifactId = `queued_${turnId}`;
     await this.dependencies.artifacts?.put("outbox", artifactId, content);
+    const from = this.state.status;
+    if (options.nextStatus !== undefined) {
+      transitionSession(this.state, options.nextStatus, this.now());
+    }
+    const messageHash = sha256(content);
     this.state.queuedOutbound = {
       turnId,
       artifactId,
-      messageHash: sha256(content),
+      messageHash,
       createdAt: this.now(),
+      ...(options.disclosureKind === undefined
+        ? {}
+        : {
+            disclosure: {
+              kind: options.disclosureKind,
+              disclosedBytes: Buffer.byteLength(content),
+              sha256: messageHash,
+            },
+          }),
     };
+    if ((options.returnedOperationIds?.length ?? 0) > 0) {
+      const returned = new Set(options.returnedOperationIds);
+      const remaining = (this.state.unreturnedOperationIds ?? []).filter(
+        (operationId) => !returned.has(operationId),
+      );
+      if (remaining.length === 0) delete this.state.unreturnedOperationIds;
+      else this.state.unreturnedOperationIds = remaining;
+    }
     await this.persist();
+    if (options.nextStatus !== undefined) {
+      await this.dependencies.audit.append({
+        type: "session.transition",
+        taskId: this.state.taskId,
+        data: { from, to: options.nextStatus },
+      });
+      this.emitProgress("state", { from, to: options.nextStatus });
+    }
+    await this.recordQueuedDisclosure(this.state.queuedOutbound);
   }
 
   private bindConversation(value: { readonly conversationId?: string }): void {
@@ -640,7 +707,49 @@ export class AgentRuntime {
     if (sha256(content) !== queued.messageHash) {
       throw new AgentError("RECOVERY_REQUIRED", "Queued message hash does not match session state");
     }
+    if (
+      queued.disclosure !== undefined &&
+      (
+        queued.disclosure.sha256 !== queued.messageHash ||
+        queued.disclosure.disclosedBytes !== Buffer.byteLength(content)
+      )
+    ) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Queued disclosure evidence does not match the outbound artifact",
+      );
+    }
+    await this.recordQueuedDisclosure(queued);
     return content;
+  }
+
+  private async recordQueuedDisclosure(
+    queued: NonNullable<SessionState["queuedOutbound"]>,
+  ): Promise<void> {
+    const disclosure = queued.disclosure;
+    if (disclosure === undefined) return;
+    try {
+      await this.dependencies.audit.appendOnce(
+        {
+          type: "disclosure.recorded",
+          taskId: this.state.taskId,
+          turnId: queued.turnId,
+          data: {
+            kind: disclosure.kind,
+            disclosedBytes: disclosure.disclosedBytes,
+            sha256: disclosure.sha256,
+          },
+        },
+        `disclosure:${this.state.taskId}:${queued.turnId}:${disclosure.sha256}`,
+      );
+    } catch (error) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Queued disclosure audit evidence could not be reconciled",
+        {},
+        { cause: error },
+      );
+    }
   }
 
   private requireArtifacts(): SessionArtifactStore {
@@ -774,7 +883,16 @@ export class AgentRuntime {
   private async handleAction(
     action: NormalizedModelMessage,
     turnId: string,
-  ): Promise<{ readonly terminal: false; readonly outbound: string } | { readonly terminal: true; readonly result: AgentRunResult }> {
+  ): Promise<
+    | {
+        readonly terminal: false;
+        readonly outbound: string;
+        readonly returnedOperationIds?: readonly string[];
+        readonly queueStatus?: "awaiting_model";
+        readonly disclosureKind?: "tool_result";
+      }
+    | { readonly terminal: true; readonly result: AgentRunResult }
+  > {
     if (this.interruption !== undefined) {
       return { terminal: true, result: await this.finishInterruption() };
     }
@@ -782,14 +900,29 @@ export class AgentRuntime {
       case "tool_request": {
         await this.move("executing_tools");
         this.throwIfInterrupted();
+        this.toolResultDisclosureLimit = undefined;
+        this.toolResultDisclosureReservation = 0;
         const outcomes = await this.executeCalls(action.calls, turnId);
         await this.move("returning_results");
-        const outbound = await this.serializeForDisclosure(
-          this.dependencies.protocol.renderToolOutcomes({ taskId: this.state.taskId, priorTurnId: turnId, outcomes }),
-          "tool_result",
-        );
-        await this.move("awaiting_model");
-        return { terminal: false, outbound };
+        let outbound: string;
+        try {
+          outbound = await this.serializeForDisclosure(
+            this.dependencies.protocol.renderToolOutcomes({ taskId: this.state.taskId, priorTurnId: turnId, outcomes }),
+            "tool_result",
+            this.toolResultDisclosureLimit,
+            true,
+          );
+        } finally {
+          this.toolResultDisclosureLimit = undefined;
+          this.toolResultDisclosureReservation = 0;
+        }
+        return {
+          terminal: false,
+          outbound,
+          returnedOperationIds: action.calls.map((call) => call.operationId),
+          queueStatus: "awaiting_model",
+          disclosureKind: "tool_result",
+        };
       }
       case "request_user_input": {
         await this.move("awaiting_user");
@@ -1089,7 +1222,7 @@ export class AgentRuntime {
     const outcomes: ToolOutcome[] = [];
     for (const call of calls) {
       this.throwIfInterrupted();
-      outcomes.push(await this.executeCall(call, turnId));
+      outcomes.push(await this.executeCall(call, turnId, calls.length === 1));
     }
     return outcomes;
   }
@@ -1097,29 +1230,83 @@ export class AgentRuntime {
   private async serializeForDisclosure(
     message: string,
     kind: "bootstrap" | "tool_result" | "repair" | "decision",
+    oneTimeDisclosedBytesLimit?: number,
+    deferAudit = false,
   ): Promise<string> {
     // Reserve against the unredacted upper bound before source-bearing data is
     // handed to the final disclosure guard. The exact serialized size is then
     // charged once, at the browser boundary, rather than per intermediate tool.
-    this.meter.assertCanConsume("disclosedBytes", Buffer.byteLength(message));
+    const unredactedBytes = Buffer.byteLength(message);
+    if (
+      kind === "tool_result" &&
+      this.toolResultDisclosureReservation > 0 &&
+      unredactedBytes > this.toolResultDisclosureReservation
+    ) {
+      throw new AgentError(
+        "BUDGET_EXCEEDED",
+        "Rendered tool result exceeded its authorized disclosure reservation",
+        {
+          actual: unredactedBytes,
+          reserved: this.toolResultDisclosureReservation,
+        },
+      );
+    }
+    this.meter.assertCanConsume(
+      "disclosedBytes",
+      unredactedBytes,
+      oneTimeDisclosedBytesLimit,
+    );
     const serialized = await this.dependencies.disclosure.inspectAndSerialize(message, { kind });
     const disclosedBytes = Buffer.byteLength(serialized);
-    this.meter.assertCanConsume("disclosedBytes", disclosedBytes);
-    this.meter.consume("disclosedBytes", disclosedBytes);
-    await this.dependencies.audit.append({
-      type: "disclosure.recorded",
-      taskId: this.state.taskId,
-      data: { kind, disclosedBytes, sha256: sha256(serialized) },
-    });
+    if (
+      kind === "tool_result" &&
+      this.toolResultDisclosureReservation > 0 &&
+      disclosedBytes > this.toolResultDisclosureReservation
+    ) {
+      throw new AgentError(
+        "BUDGET_EXCEEDED",
+        "Guarded tool result exceeded its authorized disclosure reservation",
+        {
+          actual: disclosedBytes,
+          reserved: this.toolResultDisclosureReservation,
+        },
+      );
+    }
+    this.meter.assertCanConsume(
+      "disclosedBytes",
+      disclosedBytes,
+      oneTimeDisclosedBytesLimit,
+    );
+    this.meter.consume(
+      "disclosedBytes",
+      disclosedBytes,
+      oneTimeDisclosedBytesLimit,
+    );
+    if (!deferAudit) {
+      await this.dependencies.audit.append({
+        type: "disclosure.recorded",
+        taskId: this.state.taskId,
+        data: { kind, disclosedBytes, sha256: sha256(serialized) },
+      });
+    }
     return serialized;
   }
 
-  private async executeCall(call: NormalizedToolCall, turnId: string): Promise<ToolOutcome> {
+  private async executeCall(
+    call: NormalizedToolCall,
+    turnId: string,
+    allowCapabilityPrompt = true,
+  ): Promise<ToolOutcome> {
     this.throwIfInterrupted();
     const mutating = !isReadOnlyToolName(call.name);
+    const wasPending = this.state.pendingOperations.some(
+      (operation) => operation.operationId === call.operationId,
+    );
+    const wasUnreturned =
+      this.state.unreturnedOperationIds?.includes(call.operationId) ?? false;
     const operationAlreadyAccounted =
       this.state.completedOperationIds.includes(call.operationId) ||
-      this.state.pendingOperations.some((operation) => operation.operationId === call.operationId);
+      wasPending;
     const registration = await this.dependencies.journal.register(
       call.operationId,
       call.name,
@@ -1132,14 +1319,37 @@ export class AgentRuntime {
     // tracks the operation, recovery must not charge it again.
     if (!operationAlreadyAccounted) this.meter.consume("operations");
     if (registration.kind === "replay_completed") {
+      if (!wasPending && !wasUnreturned) {
+        return {
+          operationId: call.operationId,
+          tool: call.name,
+          status: "denied",
+          data: {
+            code: "DUPLICATE_OPERATION",
+            message: "A completed operation cannot be replayed after its result was delivered.",
+          },
+          safeMetadata: { reasonCode: "DUPLICATE_OPERATION", replayed: false },
+        };
+      }
+      const replayBudgetLimits = storedRuntimeBudgetLimits(registration.record.safeResult);
+      const replayPlannedDisclosureBytes = storedPlannedDisclosureBytes(
+        registration.record.safeResult,
+      );
+      this.reserveToolResultDisclosure(
+        replayPlannedDisclosureBytes,
+        replayBudgetLimits,
+      );
       const outcome = outcomeFromRecord(call, registration.record);
       if (registration.record.status === "completed") {
-        await this.recordToolEffects(call, outcome, turnId);
+        await this.recordToolEffects(
+          call,
+          outcome,
+          turnId,
+          replayBudgetLimits,
+        );
       }
       this.clearPending(call.operationId);
-      if (!this.state.completedOperationIds.includes(call.operationId)) {
-        this.state.completedOperationIds.push(call.operationId);
-      }
+      this.markOperationAwaitingReturn(call.operationId);
       await this.persist();
       return outcome;
     }
@@ -1166,8 +1376,16 @@ export class AgentRuntime {
       data: { tool: call.name, requestHash: registration.record.requestHash },
     });
     this.throwIfInterrupted();
-    const policy = await this.dependencies.policy.authorize(call);
+    let policy: AuthorizationDecision = await this.dependencies.policy.authorize(call);
     this.throwIfInterrupted();
+    if (policy.outcome === "ask" && !allowCapabilityPrompt) {
+      policy = {
+        outcome: "deny",
+        reasonCode: "SEQUENCING_REQUIRED",
+        explanation:
+          "A capability approval must be requested in a single-call tool turn.",
+      };
+    }
     await this.dependencies.audit.append({
       type: "policy.decision",
       taskId: this.state.taskId,
@@ -1177,6 +1395,7 @@ export class AgentRuntime {
     });
     this.throwIfInterrupted();
     let allowed = policy.outcome === "allow";
+    let oneTimeBudgetLimits: RuntimeBudgetLimits = {};
     if (policy.outcome === "ask") {
       await this.move("awaiting_user", policy.explanation);
       this.throwIfInterrupted();
@@ -1205,10 +1424,57 @@ export class AgentRuntime {
       }
       if (decision.decision === "allow_session") {
         this.throwIfInterrupted();
-        allowed = await this.dependencies.policy.expandSessionGrant(policy.capability);
+        const expanded = await this.dependencies.policy.expandSessionGrant(policy.capability);
         this.throwIfInterrupted();
+        policy = expanded
+          ? await this.dependencies.policy.authorize(call)
+          : {
+              outcome: "deny",
+              reasonCode: "CAPABILITY_EXPANSION_DENIED",
+              explanation: "The approved session capability could not be applied.",
+            };
+        this.throwIfInterrupted();
+        allowed = policy.outcome === "allow";
+      } else if (decision.decision === "allow_once") {
+        this.throwIfInterrupted();
+        policy = this.dependencies.policy.authorizeOnce === undefined
+          ? {
+              outcome: "deny",
+              reasonCode: "ONE_TIME_REAUTHORIZATION_UNSUPPORTED",
+              explanation: "This runtime cannot safely reauthorize a one-time capability.",
+            }
+          : await this.dependencies.policy.authorizeOnce(call, policy.capability);
+        this.throwIfInterrupted();
+        allowed = policy.outcome === "allow";
+        oneTimeBudgetLimits = runtimeBudgetLimits(policy);
       } else {
-        allowed = decision.decision === "allow_once";
+        allowed = false;
+      }
+      if (allowed) {
+        try {
+          assertExecutionBudgets(
+            this.meter,
+            call,
+            policy,
+            oneTimeBudgetLimits,
+          );
+        } catch (error) {
+          policy = {
+            outcome: "deny",
+            reasonCode: error instanceof AgentError ? error.code : "BUDGET_EXCEEDED",
+            explanation: errorMessage(error),
+          };
+          allowed = false;
+        }
+      }
+      if (decision.decision !== "deny") {
+        await this.dependencies.audit.append({
+          type: "policy.decision",
+          taskId: this.state.taskId,
+          turnId,
+          operationId: call.operationId,
+          data: { tool: call.name, phase: "post_approval", ...policy },
+        });
       }
       await this.dependencies.audit.append({
         type: "capability.decided",
@@ -1223,6 +1489,7 @@ export class AgentRuntime {
     }
     this.throwIfInterrupted();
     if (!allowed) {
+      const status = policy.outcome === "conflict" ? "conflict" : "denied";
       const failed = await this.dependencies.journal.markFailed(
         registration.record,
         this.now(),
@@ -1230,21 +1497,69 @@ export class AgentRuntime {
         { reasonCode: policy.reasonCode },
       );
       this.clearPending(call.operationId);
-      if (!this.state.completedOperationIds.includes(call.operationId)) {
-        this.state.completedOperationIds.push(call.operationId);
-      }
+      this.markOperationAwaitingReturn(call.operationId);
       await this.persist();
       return {
         operationId: call.operationId,
         tool: call.name,
-        status: "denied",
+        status,
         data: { code: policy.reasonCode, decision: policy.outcome, message: policy.explanation },
         safeMetadata: failed.safeResult ?? {},
       };
     }
 
+    if (policy.outcome === "allow") {
+      try {
+        if (policy.plannedMutation !== undefined) {
+          this.meter.assertCanConsume(
+            "changedFiles",
+            policy.plannedMutation.changedFiles,
+            oneTimeBudgetLimits.changedFiles,
+          );
+          this.meter.assertCanConsume(
+            "changedLines",
+            policy.plannedMutation.changedLines,
+            oneTimeBudgetLimits.changedLines,
+          );
+        }
+        this.reserveToolResultDisclosure(
+          policy.plannedDisclosureBytes ?? TOOL_RESULT_ENVELOPE_RESERVE_BYTES,
+          oneTimeBudgetLimits,
+        );
+      } catch (error) {
+        const safe = {
+          reasonCode: error instanceof AgentError ? error.code : "BUDGET_EXCEEDED",
+        };
+        const failed = await this.dependencies.journal.markFailed(
+          registration.record,
+          this.now(),
+          "denied_before_execution",
+          safe,
+        );
+        this.clearPending(call.operationId);
+        this.markOperationAwaitingReturn(call.operationId);
+        await this.persist();
+        return {
+          operationId: call.operationId,
+          tool: call.name,
+          status: "denied",
+          data: {
+            code: safe.reasonCode,
+            decision: "deny",
+            message: errorMessage(error),
+          },
+          safeMetadata: failed.safeResult ?? safe,
+        };
+      }
+    }
     const specializedCounter = specializedBudgetCounter(call.name);
-    if (specializedCounter !== undefined) this.meter.consume(specializedCounter);
+    if (specializedCounter !== undefined) {
+      this.meter.consume(
+        specializedCounter,
+        1,
+        oneTimeBudgetLimits[specializedCounter],
+      );
+    }
     this.throwIfInterrupted();
     let executing: OperationRecord;
     try {
@@ -1266,7 +1581,13 @@ export class AgentRuntime {
     this.throwIfInterrupted();
     let operationWasCommitted = false;
     try {
-      const outcome = await this.dependencies.tools.execute(call, this.controller.signal);
+      const outcome = await this.dependencies.tools.execute(
+        call,
+        this.controller.signal,
+        policy.outcome === "allow" && policy.plannedMutation !== undefined
+          ? { plannedMutation: policy.plannedMutation }
+          : undefined,
+      );
       if (outcome.status === "indeterminate" && mutating) {
         const uncertain = await this.dependencies.journal.markIndeterminate(
           executing,
@@ -1288,18 +1609,70 @@ export class AgentRuntime {
           `Mutating operation ${call.operationId} has an indeterminate outcome and requires rollback or reconciliation`,
         );
       }
+      if (
+        outcome.status === "success" &&
+        policy.outcome === "allow" &&
+        policy.plannedMutation !== undefined &&
+        toolRequiresContext(call.name, "change")
+      ) {
+        const actualChangedFiles = numericMetadata(outcome.safeMetadata, "changedFileCount");
+        const actualChangedLines = numericMetadata(outcome.safeMetadata, "changedLines");
+        if (
+          actualChangedFiles !== policy.plannedMutation.changedFiles ||
+          actualChangedLines !== policy.plannedMutation.changedLines
+        ) {
+          const safe = {
+            ...outcome.safeMetadata,
+            recoveryRequired: true,
+            reasonCode: "MUTATION_ACCOUNTING_MISMATCH",
+            plannedChangedFiles: policy.plannedMutation.changedFiles,
+            plannedChangedLines: policy.plannedMutation.changedLines,
+            actualChangedFiles,
+            actualChangedLines,
+          };
+          const uncertain = await this.dependencies.journal.markIndeterminate(
+            executing,
+            this.now(),
+            "mutation_accounting_mismatch",
+            safe,
+          );
+          this.setPending(call, uncertain, "indeterminate");
+          await this.dependencies.audit.append({
+            type: "tool.completed",
+            taskId: this.state.taskId,
+            turnId,
+            operationId: call.operationId,
+            data: { tool: call.name, status: "indeterminate", ...safe },
+          });
+          await this.persist();
+          throw new AgentError(
+            "RECOVERY_REQUIRED",
+            `Mutation ${call.operationId} committed with unexpected budget accounting`,
+          );
+        }
+      }
+      const completedSafeResult = withRuntimeBudgetLimits(
+        outcome.safeMetadata,
+        oneTimeBudgetLimits,
+        policy.outcome === "allow"
+          ? policy.plannedDisclosureBytes ?? TOOL_RESULT_ENVELOPE_RESERVE_BYTES
+          : TOOL_RESULT_ENVELOPE_RESERVE_BYTES,
+      );
       await this.dependencies.journal.markCompleted(
         executing,
         this.now(),
         outcome.status,
-        outcome.safeMetadata,
+        completedSafeResult,
       );
       operationWasCommitted = true;
-      if (!this.state.completedOperationIds.includes(call.operationId)) {
-        this.state.completedOperationIds.push(call.operationId);
-      }
       this.clearPending(call.operationId);
-      await this.recordToolEffects(call, outcome, turnId);
+      this.markOperationAwaitingReturn(call.operationId);
+      await this.recordToolEffects(
+        call,
+        outcome,
+        turnId,
+        oneTimeBudgetLimits,
+      );
       await this.dependencies.audit.append({
         type: "tool.completed",
         taskId: this.state.taskId,
@@ -1321,18 +1694,14 @@ export class AgentRuntime {
       }
       if (operationWasCommitted) {
         this.clearPending(call.operationId);
-        if (!this.state.completedOperationIds.includes(call.operationId)) {
-          this.state.completedOperationIds.push(call.operationId);
-        }
+        this.markOperationAwaitingReturn(call.operationId);
         await this.persist();
         throw error;
       }
       const safe = { errorCode: error instanceof AgentError ? error.code : "INTERNAL_ERROR", message: errorMessage(error) };
       await this.dependencies.journal.markFailed(executing, this.now(), "failure", safe);
       this.clearPending(call.operationId);
-      if (!this.state.completedOperationIds.includes(call.operationId)) {
-        this.state.completedOperationIds.push(call.operationId);
-      }
+      this.markOperationAwaitingReturn(call.operationId);
       await this.persist();
       return {
         operationId: call.operationId,
@@ -1366,6 +1735,16 @@ export class AgentRuntime {
     );
   }
 
+  private markOperationAwaitingReturn(operationId: string): void {
+    if (!this.state.completedOperationIds.includes(operationId)) {
+      this.state.completedOperationIds.push(operationId);
+    }
+    const unreturned = this.state.unreturnedOperationIds ?? [];
+    if (!unreturned.includes(operationId)) {
+      this.state.unreturnedOperationIds = [...unreturned, operationId];
+    }
+  }
+
   private async restoreUnstartedOperation(
     call: { readonly operationId: string; readonly name: string },
     executing: OperationRecord,
@@ -1387,10 +1766,11 @@ export class AgentRuntime {
     call: NormalizedToolCall,
     outcome: ToolOutcome,
     turnId: string,
+    oneTimeBudgetLimits: RuntimeBudgetLimits = {},
   ): Promise<void> {
     const metadata = outcome.safeMetadata;
     if (
-      call.name === "apply_patch" &&
+      toolRequiresContext(call.name, "change") &&
       outcome.status === "success" &&
       !this.state.mutations.some((record) => record.operationId === call.operationId)
     ) {
@@ -1409,8 +1789,16 @@ export class AgentRuntime {
         completedAt: this.now(),
         repositoryFingerprint,
       });
-      this.meter.consume("changedFiles", changedFiles);
-      this.meter.consume("changedLines", changedLines);
+      this.meter.consume(
+        "changedFiles",
+        changedFiles,
+        oneTimeBudgetLimits.changedFiles,
+      );
+      this.meter.consume(
+        "changedLines",
+        changedLines,
+        oneTimeBudgetLimits.changedLines,
+      );
       await this.dependencies.audit.append({
         type: "checkpoint.created",
         taskId: this.state.taskId,
@@ -1458,7 +1846,65 @@ export class AgentRuntime {
         },
       });
       const outputBytes = numericMetadata(metadata, "outputBytes");
-      if (outputBytes > 0) this.meter.consume("commandOutputBytes", outputBytes);
+      if (outputBytes > 0) {
+        this.meter.consume(
+          "commandOutputBytes",
+          outputBytes,
+          oneTimeBudgetLimits.commandOutputBytes,
+        );
+      }
+    }
+  }
+
+  private reserveToolResultDisclosure(
+    plannedDisclosureBytes: number,
+    oneTimeBudgetLimits: RuntimeBudgetLimits,
+  ): void {
+    const approvedLimit = oneTimeBudgetLimits.disclosedBytes;
+    if (
+      !Number.isSafeInteger(plannedDisclosureBytes) ||
+      plannedDisclosureBytes < TOOL_RESULT_ENVELOPE_RESERVE_BYTES
+    ) {
+      throw new AgentError(
+        "INTERNAL_ERROR",
+        "Tool-result disclosure reservation is invalid",
+        { plannedDisclosureBytes },
+      );
+    }
+    if (
+      approvedLimit !== undefined &&
+      this.toolResultDisclosureReservation !== 0
+    ) {
+      throw new AgentError(
+        "BUDGET_EXCEEDED",
+        "One-time disclosure approval cannot be combined with another tool result",
+      );
+    }
+    if (
+      approvedLimit === undefined &&
+      this.toolResultDisclosureLimit !== undefined
+    ) {
+      throw new AgentError(
+        "BUDGET_EXCEEDED",
+        "A tool result cannot be added to a one-time disclosure approval",
+      );
+    }
+    const reservation =
+      this.toolResultDisclosureReservation + plannedDisclosureBytes;
+    if (!Number.isSafeInteger(reservation)) {
+      throw new AgentError(
+        "BUDGET_EXCEEDED",
+        "Combined tool-result disclosure reservation is invalid",
+      );
+    }
+    this.meter.assertCanConsume(
+      "disclosedBytes",
+      reservation,
+      approvedLimit,
+    );
+    this.toolResultDisclosureReservation = reservation;
+    if (approvedLimit !== undefined) {
+      this.toolResultDisclosureLimit = approvedLimit;
     }
   }
 
@@ -1639,14 +2085,119 @@ function specializedBudgetCounter(tool: string): "commands" | "readFiles" | unde
   return undefined;
 }
 
+type RuntimeBudgetLimits = Readonly<Partial<Record<BudgetCounter, number>>>;
+
+const POLICY_BUDGET_COUNTERS: Readonly<
+  Partial<Record<BudgetMetric, BudgetCounter>>
+> = {
+  read_files: "readFiles",
+  changed_files: "changedFiles",
+  changed_lines: "changedLines",
+  disclosed_bytes: "disclosedBytes",
+  commands: "commands",
+  command_output_bytes: "commandOutputBytes",
+};
+
+function runtimeBudgetLimits(policy: AuthorizationDecision): RuntimeBudgetLimits {
+  if (policy.outcome !== "allow" || policy.oneTimeBudgetLimits === undefined) return {};
+  const limits: Partial<Record<BudgetCounter, number>> = {};
+  for (const [metric, limit] of Object.entries(policy.oneTimeBudgetLimits)) {
+    const counter = POLICY_BUDGET_COUNTERS[metric as BudgetMetric];
+    if (
+      counter !== undefined &&
+      typeof limit === "number" &&
+      Number.isSafeInteger(limit) &&
+      limit >= 0
+    ) {
+      limits[counter] = limit;
+    }
+  }
+  return limits;
+}
+
+function assertExecutionBudgets(
+  meter: BudgetMeter,
+  call: NormalizedToolCall,
+  policy: AuthorizationDecision,
+  oneTimeBudgetLimits: RuntimeBudgetLimits,
+): void {
+  if (policy.outcome !== "allow") return;
+  if (policy.plannedMutation !== undefined) {
+    meter.assertCanConsume(
+      "changedFiles",
+      policy.plannedMutation.changedFiles,
+      oneTimeBudgetLimits.changedFiles,
+    );
+    meter.assertCanConsume(
+      "changedLines",
+      policy.plannedMutation.changedLines,
+      oneTimeBudgetLimits.changedLines,
+    );
+  }
+  const specializedCounter = specializedBudgetCounter(call.name);
+  if (specializedCounter !== undefined) {
+    meter.assertCanConsume(
+      specializedCounter,
+      1,
+      oneTimeBudgetLimits[specializedCounter],
+    );
+  }
+}
+
+function withRuntimeBudgetLimits(
+  safeMetadata: Readonly<Record<string, unknown>>,
+  oneTimeBudgetLimits: RuntimeBudgetLimits,
+  plannedDisclosureBytes: number,
+): Readonly<Record<string, unknown>> {
+  return {
+    ...safeMetadata,
+    plannedDisclosureBytes,
+    ...(Object.keys(oneTimeBudgetLimits).length === 0
+      ? {}
+      : { runtimeBudgetLimits: oneTimeBudgetLimits }),
+  };
+}
+
+function storedRuntimeBudgetLimits(
+  safeMetadata: Readonly<Record<string, unknown>> | undefined,
+): RuntimeBudgetLimits {
+  const value = safeMetadata?.runtimeBudgetLimits;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+  const limits: Partial<Record<BudgetCounter, number>> = {};
+  for (const counter of Object.values(POLICY_BUDGET_COUNTERS)) {
+    if (counter === undefined) continue;
+    const limit = (value as Readonly<Record<string, unknown>>)[counter];
+    if (typeof limit === "number" && Number.isSafeInteger(limit) && limit >= 0) {
+      limits[counter] = limit;
+    }
+  }
+  return limits;
+}
+
+function storedPlannedDisclosureBytes(
+  safeMetadata: Readonly<Record<string, unknown>> | undefined,
+): number {
+  const value = safeMetadata?.plannedDisclosureBytes;
+  return typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= TOOL_RESULT_ENVELOPE_RESERVE_BYTES
+    ? value
+    : TOOL_RESULT_ENVELOPE_RESERVE_BYTES;
+}
+
 function outcomeFromRecord(call: NormalizedToolCall, record: OperationRecord): ToolOutcome {
   const status = record.status === "completed" && record.outcome === "success" ? "success" : "failure";
+  const {
+    runtimeBudgetLimits: _runtimeBudgetLimits,
+    plannedDisclosureBytes: _plannedDisclosureBytes,
+    ...safeResult
+  } = record.safeResult ?? {};
   return {
     operationId: call.operationId,
     tool: call.name,
     status,
-    data: { replayed: true, outcome: record.outcome, ...(record.safeResult ?? {}) },
-    safeMetadata: { replayed: true, ...(record.safeResult ?? {}) },
+    data: { replayed: true, outcome: record.outcome, ...safeResult },
+    safeMetadata: { replayed: true, ...safeResult },
   };
 }
 

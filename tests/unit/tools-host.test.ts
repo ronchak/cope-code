@@ -17,8 +17,12 @@ import { DisclosureLedger } from "../../src/security/disclosure-ledger.js";
 import { ProtectedPathPolicy } from "../../src/security/protected-paths.js";
 import { SecretScanner } from "../../src/security/secrets.js";
 import { ORCHESTRATOR_TOOL_NAMES } from "../../src/protocol/index.js";
-import { sha256 } from "../../src/shared/crypto.js";
+import { sha256, stableJson } from "../../src/shared/crypto.js";
 import { AgentError } from "../../src/shared/errors.js";
+import {
+  GIT_STATUS_RESULT_BYTES,
+  LIST_FILES_RESULT_BYTES,
+} from "../../src/orchestrator/disclosure-budget.js";
 import { CommandCatalog } from "../../src/tools/command-catalog.js";
 import { ProcessRunner } from "../../src/tools/process-runner.js";
 import { ToolHost, type ToolPolicyEvaluator } from "../../src/tools/tool-host.js";
@@ -47,6 +51,134 @@ test("ToolHost rejects every registry orchestrator tool and unknown runtime name
       `${tool} must not cross the local ToolHost boundary`,
     );
   }
+});
+
+test("ToolHost bounds production-shaped list and status results at policy planning caps", async () => {
+  const listEntries = Array.from({ length: 500 }, (_, index) => ({
+    path: `src/${String(index).padStart(4, "0")}-${"l".repeat(1_024)}.txt`,
+    type: "file" as const,
+    sizeBytes: index,
+  }));
+  const statusEntries = Array.from({ length: 500 }, (_, index) => ({
+    path: `src/${String(index).padStart(4, "0")}-${"s".repeat(512)}.txt`,
+    kind: "ordinary" as const,
+    indexStatus: "M",
+    worktreeStatus: ".",
+    stateSha256: "a".repeat(64),
+  }));
+  const host = new ToolHost({
+    repository: {
+      listFiles: async () => ({
+        contractVersion: "repository/1",
+        root: "",
+        entries: listEntries,
+        truncated: false,
+        excludedCount: 0,
+      }),
+    } as never,
+    git: {
+      status: async () => ({
+        branch: "main",
+        head: "b".repeat(40),
+        entries: statusEntries,
+        hasConflicts: false,
+        excludedCount: 0,
+        excludedStateSha256: "c".repeat(64),
+        snapshotSha256: "d".repeat(64),
+      }),
+    } as never,
+    patchEngine: {} as never,
+    processRunner: {} as never,
+    policy: { authorize: () => ({ outcome: "allow" }) },
+  });
+
+  const listed = await host.dispatch({
+    operationId: "bounded_list",
+    name: "list_files",
+    arguments: {},
+  });
+  assert.equal(listed.status, "success");
+  assert.equal(listed.data.truncated, true);
+  assert.equal(
+    (listed.data.entries as readonly unknown[]).length < listEntries.length,
+    true,
+  );
+  const listedBytes = Buffer.byteLength(stableJson(listed.data));
+  assert.equal(listedBytes <= LIST_FILES_RESULT_BYTES, true);
+  assert.equal(listedBytes > LIST_FILES_RESULT_BYTES / 2, true);
+
+  const status = await host.dispatch({
+    operationId: "bounded_status",
+    name: "git_status",
+    arguments: {},
+  });
+  assert.equal(status.status, "success");
+  assert.equal(status.data.truncated, true);
+  assert.equal(
+    (status.data.entries as readonly unknown[]).length < statusEntries.length,
+    true,
+  );
+  const statusBytes = Buffer.byteLength(stableJson(status.data));
+  assert.equal(statusBytes <= GIT_STATUS_RESULT_BYTES, true);
+  assert.equal(statusBytes > GIT_STATUS_RESULT_BYTES / 2, true);
+  assert.equal(status.safeMetadata.changedFileCount, statusEntries.length);
+});
+
+test("ToolHost applies an exact runtime mutation reservation to the current call", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-tool-host-budget-reservation-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  const target = path.join(root, "file.txt");
+  await writeFile(target, "old\n");
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(
+    boundary,
+    path.join(temporary, "checkpoints"),
+  );
+  const patchEngine = new PatchEngine(
+    boundary,
+    checkpoints,
+    new ProtectedPathPolicy(),
+    { maxFiles: 1, maxChangedLines: 0 },
+  );
+  const repository = await RepositoryTools.create(boundary);
+  const host = new ToolHost({
+    repository,
+    git: new GitInspector(boundary),
+    patchEngine,
+    processRunner: new ProcessRunner(boundary, new CommandCatalog([])),
+    policy: { authorize: () => ({ outcome: "allow" }) },
+  });
+  const call = {
+    name: "edit_text" as const,
+    arguments: {
+      path: "file.txt",
+      base_sha256: sha256("old\n"),
+      old_text: "old",
+      new_text: "new",
+      expected_occurrences: 1,
+    },
+  };
+
+  const denied = await host.dispatch({
+    operationId: "edit_without_reservation",
+    ...call,
+  });
+  assert.equal(denied.status, "failure");
+  assert.equal(denied.data.code, "BUDGET_EXCEEDED");
+  assert.equal(await readFile(target, "utf8"), "old\n");
+
+  const approved = await host.dispatch(
+    {
+      operationId: "edit_with_reservation",
+      ...call,
+    },
+    undefined,
+    { plannedMutation: { changedFiles: 1, changedLines: 2 } },
+  );
+  assert.equal(approved.status, "success");
+  assert.equal(await readFile(target, "utf8"), "new\n");
 });
 
 test("ToolHost dispatches the cba/1 wire arguments, applies policy, and never replays an operation", async (context) => {
@@ -157,7 +289,35 @@ test("ToolHost dispatches the cba/1 wire arguments, applies policy, and never re
   assert.equal(stale.status, "conflict");
   assert.equal(stale.data.code, "STALE_STATE");
 
-  await writeFile(path.join(root, "src", "main.ts"), "export const value = 2;\n");
+  const edit = await host.dispatch({
+    operationId: "edit_exact",
+    name: "edit_text",
+    arguments: {
+      path: "src/main.ts",
+      base_sha256: sha256("export const value = 1;\n"),
+      old_text: "value = 1",
+      new_text: "value = 2",
+      expected_occurrences: 1,
+    },
+  });
+  assert.equal(edit.status, "success");
+  assert.equal(edit.safeMetadata.changedFileCount, 1);
+  assert.equal(await readFile(path.join(root, "src", "main.ts"), "utf8"), "export const value = 2;\n");
+
+  const deleteReplacement = await host.dispatch({
+    operationId: "edit_delete_replacement",
+    name: "edit_text",
+    arguments: {
+      path: "src/main.ts",
+      base_sha256: sha256("export const value = 2;\n"),
+      old_text: "value = 2",
+      new_text: "",
+      expected_occurrences: 1,
+    },
+  });
+  assert.equal(deleteReplacement.status, "success");
+  assert.equal(await readFile(path.join(root, "src", "main.ts"), "utf8"), "export const ;\n");
+
   const command = await host.dispatch({
     operationId: "command_validate",
     name: "run_command",

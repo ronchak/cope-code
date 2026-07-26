@@ -371,6 +371,8 @@ function assertSafeSessionState(state: SessionState): void {
     !Array.isArray(state.acceptanceCriteria) ||
     !Array.isArray(state.preExistingChanges) ||
     !Array.isArray(state.completedOperationIds) ||
+    (state.unreturnedOperationIds !== undefined &&
+      !Array.isArray(state.unreturnedOperationIds)) ||
     !Array.isArray(state.pendingOperations) ||
     !Array.isArray(state.mutations) ||
     !Array.isArray(state.validations)
@@ -379,6 +381,17 @@ function assertSafeSessionState(state: SessionState): void {
   }
   if (!state.completedOperationIds.every(isOperationId)) {
     throw new AgentError("RECOVERY_REQUIRED", "Review-package completed-operation metadata is unsafe");
+  }
+  if (
+    state.unreturnedOperationIds !== undefined &&
+    (
+      !state.unreturnedOperationIds.every(isOperationId) ||
+      state.unreturnedOperationIds.some(
+        (operationId) => !state.completedOperationIds.includes(operationId),
+      )
+    )
+  ) {
+    throw new AgentError("RECOVERY_REQUIRED", "Review-package unreturned-operation metadata is unsafe");
   }
   if (!Object.values(state.policyHashes).every((value) => HASH_PATTERN.test(value))) {
     throw new AgentError("RECOVERY_REQUIRED", "Review-package policy hashes are invalid");

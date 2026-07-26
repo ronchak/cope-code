@@ -163,6 +163,8 @@ test("offline fixture completes discovery, edit, failed validation, correction, 
     commandCatalog: catalog,
     currentUsage: () => policyUsage(state),
     classification: "internal",
+    maxMutationFileBytes: 64 * 1024,
+    maxPatchBytes: 256 * 1024,
   });
   const runner = new ProcessRunner(repository.boundary, catalog, { contentProcessor: contentSecurity });
   const tools = new ToolHost({
@@ -178,10 +180,11 @@ test("offline fixture completes discovery, edit, failed validation, correction, 
   const turns = scriptedTurns(taskId, sha256(initial), sha256(firstAttempt), firstAttempt, corrected, criterion);
   const transport = new ScriptedFixtureTransport(turns, { now: () => new Date("2026-01-01T00:00:01.000Z") });
   let submissionNumber = 0;
+  const journal = new OperationJournal(path.join(sessionDirectory, "operations"), sessionId);
   const runtime = new AgentRuntime({
     state,
     store,
-    journal: new OperationJournal(path.join(sessionDirectory, "operations"), sessionId),
+    journal,
     audit,
     protocol,
     policy,
@@ -209,12 +212,26 @@ test("offline fixture completes discovery, edit, failed validation, correction, 
   assert.equal(transport.remainingTurns, 0);
   assert.equal(await readFile(path.join(repositoryRoot, "src", "answer.js"), "utf8"), corrected);
   assert.equal(state.mutations.length, 2);
+  assert.deepEqual(state.mutations.map((mutation) => mutation.operationId), [
+    "op_patch_first",
+    "op_edit_correct",
+  ]);
+  assert.equal((await journal.read("op_edit_correct")).mutating, true);
+  assert.equal((await journal.read("op_edit_correct")).status, "completed");
   assert.equal(state.validations.length, 2);
   assert.equal(state.validations[0]?.outcome, "failure");
   assert.equal(state.validations[1]?.outcome, "success");
   assert.equal(state.validations[1]?.mutationSequence, 2);
   assert.equal(state.lastCheckpointId !== undefined, true);
-  assert.equal((await AuditLog.verify(path.join(sessionDirectory, "audit.jsonl"), sessionId)).length > 20, true);
+  const auditEvents = await AuditLog.verify(path.join(sessionDirectory, "audit.jsonl"), sessionId);
+  assert.equal(auditEvents.length > 20, true);
+  assert.deepEqual(
+    auditEvents
+      .filter((event) => event.operationId === "op_edit_correct")
+      .map((event) => event.type)
+      .filter((type) => type === "checkpoint.created" || type === "mutation.completed"),
+    ["checkpoint.created", "mutation.completed"],
+  );
   assert.equal(await DisclosureLedger.verifyFile(path.join(sessionDirectory, "disclosures.jsonl")), true);
 });
 
@@ -233,8 +250,12 @@ function scriptedTurns(
       changes: [{ kind: "update", path: "src/answer.js", base_sha256: initialHash, content: firstAttempt }],
     }),
     request(taskId, 4, "op_validate_fail", "run_command", { command_id: "validate-answer" }),
-    request(taskId, 5, "op_patch_correct", "apply_patch", {
-      changes: [{ kind: "update", path: "src/answer.js", base_sha256: firstAttemptHash, content: corrected }],
+    request(taskId, 5, "op_edit_correct", "edit_text", {
+      path: "src/answer.js",
+      base_sha256: firstAttemptHash,
+      old_text: "answer = 2",
+      new_text: "answer = 42",
+      expected_occurrences: 1,
     }),
     request(taskId, 6, "op_validate_pass", "run_command", { command_id: "validate-answer" }),
     request(taskId, 7, "op_diff", "git_diff", {
@@ -273,7 +294,7 @@ function request(
   taskId: string,
   turnId: number,
   operationId: string,
-  tool: "list_files" | "read_file" | "apply_patch" | "run_command" | "git_diff",
+  tool: "list_files" | "read_file" | "apply_patch" | "edit_text" | "run_command" | "git_diff",
   args: Readonly<Record<string, unknown>>,
 ): ProtocolMessage {
   return {

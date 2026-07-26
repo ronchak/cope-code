@@ -151,6 +151,8 @@ export interface PolicyOperation {
   readonly disclosure?: PolicyDisclosureContext;
   readonly network?: PolicyNetworkContext;
   readonly change?: PolicyChangeContext;
+  /** Conservative full protocol-boundary reservation for this tool result. */
+  readonly planned_disclosure_bytes?: number;
   /** Projected totals after the operation, not merely this operation's delta. */
   readonly projected_usage: BudgetUsage;
 }

@@ -47,6 +47,7 @@ const SESSION_KEYS = [
   "mutationSequence",
   "pendingOperations",
   "completedOperationIds",
+  "unreturnedOperationIds",
   "submission",
   "transportConversationId",
   "queuedOutbound",
@@ -392,6 +393,9 @@ function assertValidSessionState(value: Partial<SessionState>): asserts value is
     (value.mutationSequence ?? -1) < 0 ||
     !Array.isArray(value.pendingOperations) || value.pendingOperations.length > 100_000 ||
     !Array.isArray(value.completedOperationIds) || value.completedOperationIds.length > 100_000 ||
+    (value.unreturnedOperationIds !== undefined &&
+      (!Array.isArray(value.unreturnedOperationIds) ||
+        value.unreturnedOperationIds.length > 100_000)) ||
     !Array.isArray(value.mutations) || value.mutations.length > 100_000 ||
     !Array.isArray(value.validations) || value.validations.length > 100_000 ||
     !Number.isSafeInteger(value.protocolRepairStreak) ||
@@ -404,6 +408,12 @@ function assertValidSessionState(value: Partial<SessionState>): asserts value is
     !value.pendingOperations.every(isPendingOperation) ||
     !value.completedOperationIds.every(isOperationId) ||
     new Set(value.completedOperationIds).size !== value.completedOperationIds.length ||
+    (value.unreturnedOperationIds !== undefined &&
+      (!value.unreturnedOperationIds.every(isOperationId) ||
+        new Set(value.unreturnedOperationIds).size !== value.unreturnedOperationIds.length ||
+        value.unreturnedOperationIds.some(
+          (operationId) => !value.completedOperationIds?.includes(operationId),
+        ))) ||
     !value.mutations.every(isMutationRecord) ||
     !value.validations.every(isValidationRecord)
   ) {
@@ -457,11 +467,28 @@ function assertValidSessionState(value: Partial<SessionState>): asserts value is
   }
   if (
     value.queuedOutbound !== undefined &&
-    (!hasExactKeys(value.queuedOutbound, ["turnId", "artifactId", "messageHash", "createdAt"]) ||
+    (!hasExactKeys(
+      value.queuedOutbound,
+      ["turnId", "artifactId", "messageHash", "createdAt", "disclosure"],
+      true,
+    ) ||
       typeof value.queuedOutbound.turnId !== "string" ||
       typeof value.queuedOutbound.artifactId !== "string" ||
       !/^[a-f0-9]{64}$/u.test(value.queuedOutbound.messageHash) ||
-      !isIsoTimestamp(value.queuedOutbound.createdAt))
+      !isIsoTimestamp(value.queuedOutbound.createdAt) ||
+      (
+        value.queuedOutbound.disclosure !== undefined &&
+        (
+          !hasExactKeys(
+            value.queuedOutbound.disclosure,
+            ["kind", "disclosedBytes", "sha256"],
+          ) ||
+          value.queuedOutbound.disclosure.kind !== "tool_result" ||
+          !Number.isSafeInteger(value.queuedOutbound.disclosure.disclosedBytes) ||
+          value.queuedOutbound.disclosure.disclosedBytes < 0 ||
+          !HASH_PATTERN.test(value.queuedOutbound.disclosure.sha256)
+        )
+      ))
   ) {
     throw new AgentError("RECOVERY_REQUIRED", "Session queued outbound record is malformed");
   }

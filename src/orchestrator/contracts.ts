@@ -1,5 +1,8 @@
 import type { CompletionClaim, CompletionVerification, RepositoryCompletionState } from "./completion.js";
-import type { LocalToolName } from "../protocol/types.js";
+import type {
+  BudgetMetric,
+  LocalToolName,
+} from "../protocol/types.js";
 
 export type ToolName = LocalToolName;
 
@@ -92,19 +95,48 @@ export interface ProtocolAdapter {
 }
 
 export type AuthorizationDecision =
-  | { readonly outcome: "allow"; readonly reasonCode: string; readonly explanation: string }
+  | {
+      readonly outcome: "allow";
+      readonly reasonCode: string;
+      readonly explanation: string;
+      readonly plannedMutation?: {
+        readonly changedFiles: number;
+        readonly changedLines: number;
+      };
+      /** Conservative full protocol-boundary reservation for this tool result. */
+      readonly plannedDisclosureBytes?: number;
+      /** Effective ceilings approved only for this exact operation. */
+      readonly oneTimeBudgetLimits?: Readonly<Partial<Record<BudgetMetric, number>>>;
+    }
   | { readonly outcome: "ask"; readonly reasonCode: string; readonly explanation: string; readonly capability: Readonly<Record<string, unknown>> }
-  | { readonly outcome: "deny"; readonly reasonCode: string; readonly explanation: string };
+  | { readonly outcome: "deny"; readonly reasonCode: string; readonly explanation: string }
+  | { readonly outcome: "conflict"; readonly reasonCode: string; readonly explanation: string };
 
 export interface RuntimePolicy {
   summarize(): Readonly<Record<string, unknown>>;
   authorize(call: NormalizedToolCall): AuthorizationDecision | Promise<AuthorizationDecision>;
+  authorizeOnce?(
+    call: NormalizedToolCall,
+    capability: Readonly<Record<string, unknown>>,
+  ): AuthorizationDecision | Promise<AuthorizationDecision>;
   expandSessionGrant(capability: Readonly<Record<string, unknown>>): Promise<boolean>;
 }
 
 export interface ToolExecutor {
-  execute(call: NormalizedToolCall, signal: AbortSignal): Promise<ToolOutcome>;
+  execute(
+    call: NormalizedToolCall,
+    signal: AbortSignal,
+    context?: ToolExecutionContext,
+  ): Promise<ToolOutcome>;
   inspectCompletionState(): Promise<RepositoryCompletionState>;
+}
+
+export interface ToolExecutionContext {
+  /** Exact mutation plan already authorized and reserved by the runtime. */
+  readonly plannedMutation?: {
+    readonly changedFiles: number;
+    readonly changedLines: number;
+  };
 }
 
 export interface DisclosureGuard {

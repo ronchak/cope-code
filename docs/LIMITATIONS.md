@@ -38,6 +38,16 @@ No live tuple is certified by this source tree. Windows x64 remains the primary 
 - V1 supports bounded text files; not binary/media/archive/database/executable/certificate/key content, permission-only changes, links/junctions, devices, or submodules. Repositories containing an index gitlink or any descendant `.git` file/directory are rejected before tools start, and path resolution rechecks this boundary before access.
 - Search is deterministic local text search, not semantic/AST indexing.
 - Bounded `git_diff` supports working-tree, staged, one-checkpoint, and whole-agent-session baselines. It is not arbitrary Git history traversal, and checkpoint/session scopes cover only integrity-verified checkpoint inventory that remains allowed by current read policy.
+- Atomic mutation and automatic rollback support files up to 16 MiB each.
+  Configuration rejects a larger `max_file_bytes` value. A legacy
+  `checkpoint.v1` containing a larger individual before-image remains
+  integrity-verifiable, but automatic rollback fails closed and requires
+  manual recovery; the total `max_checkpoint_bytes` budget may exceed 16 MiB.
+- Atomic mutation and rollback require regular-file hard links in each target
+  directory. The engine authenticates a deterministic reserved probe and tests
+  every participating directory before parking any target; FAT/exFAT and other
+  volumes without same-volume hard-link support fail without changing target
+  bytes or modes.
 - Ignore/generated/vendor/minified/lock/oversized handling is conservative and may hide content needed for a task until policy is changed.
 - Hash-guarded atomic changes prevent stale overwrite, but external editors can still race between observations and cause a conflict/stop.
 - The workspace lock prevents two agent sessions, not all other developer or IDE activity.
@@ -47,10 +57,11 @@ No live tuple is certified by this source tree. Windows x64 remains the primary 
 ## Commands and isolation
 
 - The command catalog blocks arbitrary shell construction, but approved executables and their repository scripts remain trusted computing base.
-- The current `cba/1` catalog declares only `sideEffects: boolean`; it has no versioned bounded write-path/checkpoint contract for intentional command-driven source mutation. Explicitly granted `sideEffects: true` validation may run in `edit`/`auto` and may create ordinary Git-ignored artifacts, but source-mutating commands remain unsupported; source changes must use `apply_patch` until that future contract exists.
+- The current `cba/1` catalog declares only `sideEffects: boolean`; it has no versioned bounded write-path/checkpoint contract for intentional command-driven source mutation. Explicitly granted `sideEffects: true` validation may run in `edit`/`auto` and may create ordinary Git-ignored artifacts, but source-mutating commands remain unsupported; direct source changes use `edit_text` for small literal edits to existing text files or `apply_patch` for creates, deletes, whole-file replacements, and multi-file transactions.
 - Every command is bracketed by nested-Git plus Git-visible/nonignored, keyed policy-hidden protected-path, and Git-control integrity checks. Commands declared side-effect-free additionally inventory ordinary Git-ignored files under explicit entry/byte bounds. Tracked/nonignored, protected, control, or nested-boundary drift—or unverifiable state—becomes recovery-required and cannot count as trusted validation. Ordinary ignored artifacts created by a side-effecting command are excluded from the completion source fingerprint.
 - These checks are detection, not an OS filesystem/network/resource sandbox. Approved executables and transitive scripts are trusted computing base, and external writes cannot be comprehensively prevented or observed. Endpoint containment, egress/resource controls, and command/script review therefore remain live-pilot and release gates; this residual risk does not block the deterministic offline autonomous-loop demonstration.
 - There are timeout, output, environment, working-directory, cancellation, and process-tree controls; there are no kernel-enforced CPU, RAM, disk, handle, or child-count quotas.
+- Source mutation and rollback authenticate deterministic staging/parking/probe leaves, persist exact private-quarantine identities and recovery phases, and preflight hard-link support across the full transaction before capture, but this is not a kernel-enforced filesystem transaction. Portable Node APIs do not provide a cross-platform pathname compare-and-swap, so a hostile same-user process racing inside the private namespace or at the final `rename`/`link` syscall remains outside the supported concurrency boundary. Stop editors/watchers that write the same targets and use endpoint isolation for adversarial writers.
 - Declared network policy is not network sandboxing. A malicious/miscataloged binary may make network calls unless endpoint controls prevent it.
 - Process-tree termination on Windows is best effort through `taskkill.exe`; hostile processes may evade ordinary user-level control.
 - npm scripts can invoke transitive tools, mutate generated files, read environment, or access network. Review them before cataloging.

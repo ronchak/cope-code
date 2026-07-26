@@ -31,13 +31,27 @@ export class BudgetMeter {
     }
   }
 
-  public assertCanConsume(counter: BudgetCounter, amount = 1): void {
+  public assertCanConsume(
+    counter: BudgetCounter,
+    amount = 1,
+    oneTimeLimit?: number,
+  ): void {
     if (!Number.isSafeInteger(amount) || amount < 0) {
       throw new AgentError("INTERNAL_ERROR", `Invalid budget amount for ${counter}`, { amount });
     }
     const limitKey = counterToLimit[counter];
     const current = this.state.budgetUsage[counter];
-    const limit = this.state.budgetLimits[limitKey];
+    const persistedLimit = this.state.budgetLimits[limitKey];
+    if (
+      oneTimeLimit !== undefined &&
+      (!Number.isSafeInteger(oneTimeLimit) || oneTimeLimit < persistedLimit)
+    ) {
+      throw new AgentError("INTERNAL_ERROR", `Invalid one-time budget limit for ${counter}`, {
+        oneTimeLimit,
+        persistedLimit,
+      });
+    }
+    const limit = oneTimeLimit ?? persistedLimit;
     if (current + amount > limit) {
       throw new AgentError("BUDGET_EXCEEDED", `Budget exhausted for ${counter}`, {
         counter,
@@ -48,8 +62,8 @@ export class BudgetMeter {
     }
   }
 
-  public consume(counter: BudgetCounter, amount = 1): void {
-    this.assertCanConsume(counter, amount);
+  public consume(counter: BudgetCounter, amount = 1, oneTimeLimit?: number): void {
+    this.assertCanConsume(counter, amount, oneTimeLimit);
     this.state.budgetUsage = {
       ...this.state.budgetUsage,
       [counter]: this.state.budgetUsage[counter] + amount,

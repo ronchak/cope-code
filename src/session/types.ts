@@ -75,6 +75,11 @@ export interface QueuedOutbound {
   readonly artifactId: string;
   readonly messageHash: string;
   readonly createdAt: string;
+  readonly disclosure?: {
+    readonly kind: "tool_result";
+    readonly disclosedBytes: number;
+    readonly sha256: string;
+  };
 }
 
 export interface MutationRecord {
@@ -137,6 +142,11 @@ export interface SessionState {
   mutationSequence: number;
   pendingOperations: PendingOperation[];
   completedOperationIds: string[];
+  /**
+   * Completed local operations whose results are not yet represented by a
+   * durable queued outbound artifact. Optional for legacy session records.
+   */
+  unreturnedOperationIds?: string[];
   submission?: SubmissionIntent;
   transportConversationId?: string;
   queuedOutbound?: QueuedOutbound;
