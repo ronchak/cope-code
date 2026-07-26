@@ -358,24 +358,7 @@ async function removeStaging(directory) {
     if (!openedRoot.isDirectory() || !sameFileIdentity(root, openedRoot)) {
       throw new Error("Activation residue changed before cleanup");
     }
-    await directoryHandle.chmod(0o700);
-    const entries = await readdir(directory, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isFile() || entry.isSymbolicLink()) continue;
-      const filename = path.join(directory, entry.name);
-      const before = await lstat(filename);
-      if (!before.isFile() || before.isSymbolicLink()) continue;
-      const handle = await open(filename, fsConstants.O_RDONLY | noFollow);
-      try {
-        const opened = await handle.stat();
-        if (!opened.isFile() || !sameFileIdentity(before, opened)) {
-          throw new Error("Activation residue changed before cleanup");
-        }
-        await handle.chmod(0o600);
-      } finally {
-        await handle.close();
-      }
-    }
+    if (process.platform !== "win32") await directoryHandle.chmod(0o700);
   } finally {
     if (directoryHandle !== undefined) await directoryHandle.close();
   }

@@ -229,9 +229,15 @@ function resolveLockDependency(packages, fromPackagePath, dependencyName, declar
   const candidates = options.peer === true
     ? peerResolutionCandidates(fromPackagePath, dependencyName)
     : lockResolutionCandidates(fromPackagePath, dependencyName);
+  let sawRuntimeCandidate = false;
   for (const candidate of candidates) {
     if (!Object.hasOwn(packages, candidate)) continue;
     const resolved = packages[candidate];
+    if (resolved !== null && typeof resolved === "object" && !Array.isArray(resolved) &&
+        resolved.dev === true && options.peer === true) {
+      continue;
+    }
+    sawRuntimeCandidate = true;
     if (resolved === null || typeof resolved !== "object" || Array.isArray(resolved) ||
         typeof resolved.version !== "string" || resolved.version.length === 0 ||
         resolved.dev === true) {
@@ -240,8 +246,7 @@ function resolveLockDependency(packages, fromPackagePath, dependencyName, declar
     validateResolvedDependency(dependencyName, declaredSpec, resolved);
     return candidate;
   }
-  if (options.allowAbsent === true &&
-      candidates.every((candidate) => !Object.hasOwn(packages, candidate))) {
+  if (options.allowAbsent === true && !sawRuntimeCandidate) {
     return undefined;
   }
   const context = fromPackagePath === "" ? dependencyName : `${dependencyName} from ${fromPackagePath}`;

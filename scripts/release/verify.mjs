@@ -306,8 +306,12 @@ function validateSpdx(sbom, manifest, artifact) {
 
   const packageIds = new Set();
   for (const [index, packageEntry] of sbom.packages.entries()) {
+    if (packageEntry?.checksums === undefined) {
+      throw new Error("Every SPDX package requires its exact checksum");
+    }
     const expectedKeys = [
       "SPDXID",
+      "checksums",
       "copyrightText",
       "downloadLocation",
       "filesAnalyzed",
@@ -316,7 +320,6 @@ function validateSpdx(sbom, manifest, artifact) {
       "name",
       "primaryPackagePurpose",
       "versionInfo",
-      ...(packageEntry.checksums === undefined ? [] : ["checksums"]),
     ];
     exactObjectKeys(packageEntry, expectedKeys, "SPDX package");
     if (typeof packageEntry.SPDXID !== "string" || !/^SPDXRef-[A-Za-z0-9.-]+$/u.test(packageEntry.SPDXID) ||
@@ -329,7 +332,7 @@ function validateSpdx(sbom, manifest, artifact) {
       throw new Error("SPDX package contains invalid required fields");
     }
     packageIds.add(packageEntry.SPDXID);
-    if (packageEntry.checksums !== undefined) validateSpdxChecksums(packageEntry.checksums);
+    validateSpdxChecksums(packageEntry.checksums, index === 0 ? "SHA256" : "SHA512");
     if (index === 0) {
       if (packageEntry.SPDXID !== "SPDXRef-Package-Cope" || packageEntry.name !== manifest.packageName ||
           packageEntry.versionInfo !== manifest.version || packageEntry.primaryPackagePurpose !== "APPLICATION" ||
@@ -358,14 +361,14 @@ function validateSpdx(sbom, manifest, artifact) {
   }
 }
 
-function validateSpdxChecksums(checksums) {
+function validateSpdxChecksums(checksums, expectedAlgorithm) {
   if (!Array.isArray(checksums) || checksums.length !== 1) throw new Error("SPDX package checksum list is invalid");
   const checksum = checksums[0];
   exactObjectKeys(checksum, ["algorithm", "checksumValue"], "SPDX checksum");
-  const expectedLength = checksum.algorithm === "SHA256" ? 64 : checksum.algorithm === "SHA512" ? 128 : 0;
-  if (expectedLength === 0 || typeof checksum.checksumValue !== "string" ||
+  const expectedLength = expectedAlgorithm === "SHA256" ? 64 : 128;
+  if (checksum.algorithm !== expectedAlgorithm || typeof checksum.checksumValue !== "string" ||
       !new RegExp(`^[a-f0-9]{${expectedLength}}$`, "u").test(checksum.checksumValue)) {
-    throw new Error("SPDX checksum must use lowercase hexadecimal SHA-256 or SHA-512");
+    throw new Error(`SPDX package checksum must use lowercase hexadecimal ${expectedAlgorithm}`);
   }
 }
 

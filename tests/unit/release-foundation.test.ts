@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
-import { generateKeyPairSync } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign } from "node:crypto";
 import {
   chmod,
   copyFile,
+  link,
   lstat,
   mkdir,
   mkdtemp,
@@ -108,6 +109,23 @@ test("release evidence is canonical, reproducible, SPDX-correct, and explicit ab
     generationArguments(fixture, unsignedStable, "stable"),
     { COPE_RELEASE_SIGNING_KEY_FILE: undefined },
   ), /requires COPE_RELEASE_SIGNING_KEY_FILE/iu);
+
+  for (const checksumCase of ["missing", "wrong-algorithm"] as const) {
+    const candidate = await fixture.candidate(`verified-${checksumCase}-dependency-checksum`, "stable", checksumCase);
+    await resignMutatedSbom(candidate, fixture.privateKeyFile, (document) => {
+      const dependency = document.packages[1]!;
+      if (checksumCase === "missing") {
+        delete dependency.checksums;
+      } else {
+        dependency.checksums = [{ algorithm: "SHA256", checksumValue: "a".repeat(64) }];
+      }
+    });
+    expectFailure(invoke(verifyScript, [
+      candidate,
+      "--trusted-public-key",
+      fixture.publicKeyFile,
+    ]), /checksum|SHA512/iu);
+  }
 
   for (const [name, dependencies] of [
     ["missing-lock-dependency", { example: "2.0.0", "not-in-lock": "1.0.0" }],
@@ -331,6 +349,79 @@ test("release evidence is canonical, reproducible, SPDX-correct, and explicit ab
   optionalPeerArguments[optionalPeerArguments.indexOf("--package") + 1] = optionalPeerPackageFile;
   optionalPeerArguments[optionalPeerArguments.indexOf("--lock") + 1] = optionalPeerLockFile;
   expectSuccess(invoke(generateScript, optionalPeerArguments, { COPE_RELEASE_SIGNING_KEY_FILE: undefined }));
+
+  const devOptionalPeerCandidate = await fixture.emptyCandidate("dev-optional-peer", "optional-peer");
+  const devOptionalPeerPackageJson = npmPackageJson("1.2.3", {
+    peerDependencies: { host: "^1.0.0" },
+    peerDependenciesMeta: { host: { optional: true } },
+  });
+  await writeFile(path.join(devOptionalPeerCandidate, "cope.tgz"), npmArchive([
+    { archivePath: "package/package.json", content: devOptionalPeerPackageJson },
+    { archivePath: "package/dist/src/cli/main.js", content: "cli", mode: 0o755 },
+  ]));
+  const devOptionalPeerPackageFile = path.join(fixture.root, "dev-optional-peer.package.json");
+  const devOptionalPeerLockFile = path.join(fixture.root, "dev-optional-peer.package-lock.json");
+  const devOptionalPeerLock = JSON.parse(await readFile(fixture.lockFile, "utf8")) as {
+    packages: Record<string, {
+      dev?: boolean;
+      integrity?: string;
+      peerDependencies?: Record<string, string>;
+      peerDependenciesMeta?: Record<string, { optional: boolean }>;
+      version?: string;
+    }>;
+  };
+  devOptionalPeerLock.packages[""]!.peerDependencies = { host: "^1.0.0" };
+  devOptionalPeerLock.packages[""]!.peerDependenciesMeta = { host: { optional: true } };
+  devOptionalPeerLock.packages["node_modules/host"] = {
+    version: "1.4.0",
+    dev: true,
+    integrity: `sha512-${peerIntegrity}`,
+  };
+  await writeFile(devOptionalPeerPackageFile, devOptionalPeerPackageJson);
+  await writeFile(devOptionalPeerLockFile, JSON.stringify(devOptionalPeerLock));
+  const devOptionalPeerArguments = generationArguments(fixture, devOptionalPeerCandidate, "preview");
+  devOptionalPeerArguments[devOptionalPeerArguments.indexOf("--package") + 1] = devOptionalPeerPackageFile;
+  devOptionalPeerArguments[devOptionalPeerArguments.indexOf("--lock") + 1] = devOptionalPeerLockFile;
+  expectSuccess(invoke(generateScript, devOptionalPeerArguments, { COPE_RELEASE_SIGNING_KEY_FILE: undefined }));
+  const devOptionalPeerSbom = JSON.parse(
+    await readFile(path.join(devOptionalPeerCandidate, "sbom.spdx.json"), "utf8"),
+  ) as { packages: Array<{ name: string }> };
+  assert.equal(devOptionalPeerSbom.packages.some((entry) => entry.name === "host"), false);
+
+  const peerFallbackCandidate = await fixture.emptyCandidate("peer-dev-near-runtime-ancestor", "peer");
+  const peerFallbackLockFile = path.join(fixture.root, "peer-dev-near-runtime-ancestor.package-lock.json");
+  const peerFallbackLock = JSON.parse(await readFile(fixture.lockFile, "utf8")) as {
+    packages: Record<string, {
+      dependencies?: Record<string, string>;
+      dev?: boolean;
+      integrity?: string;
+      peerDependencies?: Record<string, string>;
+      version?: string;
+    }>;
+  };
+  peerFallbackLock.packages["node_modules/example"]!.dependencies = { child: "^3.0.0" };
+  peerFallbackLock.packages["node_modules/example/node_modules/child"] = {
+    version: "3.1.0",
+    integrity: `sha512-${peerIntegrity}`,
+    peerDependencies: { host: "^1.0.0" },
+  };
+  peerFallbackLock.packages["node_modules/example/node_modules/host"] = {
+    version: "1.4.0",
+    dev: true,
+    integrity: `sha512-${peerIntegrity}`,
+  };
+  peerFallbackLock.packages["node_modules/host"] = {
+    version: "1.5.0",
+    integrity: `sha512-${peerIntegrity}`,
+  };
+  await writeFile(peerFallbackLockFile, JSON.stringify(peerFallbackLock));
+  const peerFallbackArguments = generationArguments(fixture, peerFallbackCandidate, "preview");
+  peerFallbackArguments[peerFallbackArguments.indexOf("--lock") + 1] = peerFallbackLockFile;
+  expectSuccess(invoke(generateScript, peerFallbackArguments, { COPE_RELEASE_SIGNING_KEY_FILE: undefined }));
+  const peerFallbackSbom = JSON.parse(
+    await readFile(path.join(peerFallbackCandidate, "sbom.spdx.json"), "utf8"),
+  ) as { packages: Array<{ name: string; versionInfo: string }> };
+  assert.ok(peerFallbackSbom.packages.some((entry) => entry.name === "host" && entry.versionInfo === "1.5.0"));
 
   for (const [name, declaredSpec, resolvedVersion, resolvedName] of [
     ["exact", "2.0.0", "2.0.0", undefined],
@@ -724,6 +815,7 @@ test("activation is publisher-authenticated, locked, pointer-atomic, and explici
     await symlink(externalDirectory, linkedResidueDirectory);
     await mkdir(childLinkedResidueDirectory);
     await symlink(externalFile, path.join(childLinkedResidueDirectory, "external-link"));
+    await link(externalFile, path.join(childLinkedResidueDirectory, "external-hard-link"));
   }
   expectSuccess(invoke(activateScript, [
     second,
@@ -1039,6 +1131,103 @@ function expectSuccess(result: SpawnSyncReturns<string>): SpawnSyncReturns<strin
 function expectFailure(result: SpawnSyncReturns<string>, pattern: RegExp): void {
   assert.notEqual(result.status, 0, "process unexpectedly succeeded");
   assert.match(`${result.stdout}\n${result.stderr}`, pattern);
+}
+
+interface MutableTestSpdxPackage {
+  checksums?: Array<{ algorithm: string; checksumValue: string }>;
+  readonly [key: string]: unknown;
+}
+
+interface MutableTestSpdx {
+  documentNamespace: string;
+  packages: MutableTestSpdxPackage[];
+  readonly [key: string]: unknown;
+}
+
+async function resignMutatedSbom(
+  candidate: string,
+  privateKeyFile: string,
+  mutate: (document: MutableTestSpdx) => void,
+): Promise<void> {
+  const sbomFile = path.join(candidate, "sbom.spdx.json");
+  const manifestFile = path.join(candidate, "manifest.json");
+  const signatureFile = path.join(candidate, "manifest.sig.json");
+  const channelFile = path.join(candidate, "channel.json");
+  const sbom = JSON.parse(await readFile(sbomFile, "utf8")) as MutableTestSpdx;
+  const manifest = JSON.parse(await readFile(manifestFile, "utf8")) as {
+    builder: unknown;
+    channel: string;
+    sourceCommit: string;
+    sbom: {
+      bytes: number;
+      documentNamespace: string;
+      sha256: string;
+    };
+    readonly [key: string]: unknown;
+  };
+  mutate(sbom);
+  const namespaceIdentity: Record<string, unknown> = { ...sbom };
+  delete namespaceIdentity.documentNamespace;
+  sbom.documentNamespace = `https://github.com/ronchak/cope-code/spdx/${testSha256(Buffer.from(testCanonicalJson({
+    ...namespaceIdentity,
+    buildIdentity: {
+      builder: manifest.builder,
+      channel: manifest.channel,
+      sourceCommit: manifest.sourceCommit,
+    },
+  })))}`;
+  const sbomBytes = Buffer.from(`${testCanonicalJson(sbom)}\n`);
+  await writeFile(sbomFile, sbomBytes);
+  manifest.sbom.bytes = sbomBytes.length;
+  manifest.sbom.sha256 = testSha256(sbomBytes);
+  manifest.sbom.documentNamespace = sbom.documentNamespace;
+  const manifestBytes = Buffer.from(`${testCanonicalJson(manifest)}\n`);
+  await writeFile(manifestFile, manifestBytes);
+
+  const privateKey = createPrivateKey(await readFile(privateKeyFile));
+  const publicKey = createPublicKey(privateKey);
+  const publicKeyDer = publicKey.export({ type: "spki", format: "der" });
+  const keyId = `sha256:${testSha256(publicKeyDer)}`;
+  const manifestSha256 = testSha256(manifestBytes);
+  await writeFile(signatureFile, `${testCanonicalJson({
+    schemaVersion: "cope-release-signature/2",
+    algorithm: "ed25519",
+    keyId,
+    manifestSha256,
+    publicKeySpki: publicKeyDer.toString("base64"),
+    signature: sign(null, manifestBytes, privateKey).toString("base64"),
+  })}\n`);
+
+  const channel = JSON.parse(await readFile(channelFile, "utf8")) as {
+    manifest: { sha256: string };
+    signature: { algorithm: string; keyId: string; status: string };
+    readonly [key: string]: unknown;
+  };
+  channel.manifest.sha256 = manifestSha256;
+  channel.signature = {
+    status: "present-requires-external-trust",
+    algorithm: "ed25519",
+    keyId,
+  };
+  await writeFile(channelFile, `${testCanonicalJson(channel)}\n`);
+}
+
+function testCanonicalJson(value: unknown): string {
+  return JSON.stringify(sortTestJson(value));
+}
+
+function sortTestJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortTestJson);
+  if (value === null || typeof value !== "object") return value;
+  const sorted: Record<string, unknown> = {};
+  for (const key of Object.keys(value).sort()) {
+    sorted[key] = sortTestJson((value as Readonly<Record<string, unknown>>)[key]);
+  }
+  return sorted;
+}
+
+function testSha256(bytes: Buffer): string {
+  return createHash("sha256").update(bytes).digest("hex");
 }
 
 async function manifestDigest(candidate: string): Promise<string> {
