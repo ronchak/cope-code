@@ -5,8 +5,17 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+import { inspectNpmArchive } from "./archive.mjs";
 import { generateRelease } from "./generate.mjs";
-import { isWithin, regularFileStat, safeTopLevelFilename } from "./lib.mjs";
+import {
+  MAX_ARTIFACT_BYTES,
+  isWithin,
+  readRegularFile,
+  regularFileStat,
+  safeTopLevelFilename,
+} from "./lib.mjs";
+
+const utf8 = new TextDecoder("utf-8", { fatal: true });
 
 export async function buildRelease(outputInput, channel, environment = process.env) {
   if (typeof outputInput !== "string" || outputInput.length === 0) throw new Error("An explicit release output directory is required");
@@ -36,6 +45,14 @@ export async function buildRelease(outputInput, channel, environment = process.e
   }
   await regularFileStat(npmCli, 16 * 1024 * 1024);
   requireCleanCheckout(projectRoot);
+  const sourceCommit = git(["rev-parse", "--verify", "HEAD^{commit}"], projectRoot);
+  const trackedPaths = gitNulPaths([
+    "ls-tree",
+    "-r",
+    "--name-only",
+    "-z",
+    sourceCommit,
+  ], projectRoot);
 
   let staging = await mkdtemp(path.join(outputParent, ".cope-release-"));
   try {
@@ -59,8 +76,11 @@ export async function buildRelease(outputInput, channel, environment = process.e
     const artifactName = safeTopLevelFilename(`cope-${packageDocument.version}.tgz`, "release artifact filename");
     const artifactPath = path.join(staging, artifactName);
     await rename(path.join(staging, packedName), artifactPath);
+    validatePackedSourceInventory(
+      await readRegularFile(artifactPath, MAX_ARTIFACT_BYTES),
+      trackedPaths,
+    );
 
-    const sourceCommit = git(["rev-parse", "--verify", "HEAD^{commit}"], projectRoot);
     const commitEpoch = git(["show", "-s", "--format=%ct", sourceCommit], projectRoot);
     if (!/^(?:0|[1-9][0-9]{0,11})$/u.test(commitEpoch)) {
       throw new Error("Git returned an invalid source commit timestamp");
@@ -86,12 +106,39 @@ export async function buildRelease(outputInput, channel, environment = process.e
       node_version: process.versions.node,
       npm_version: npmVersion,
     }, environment);
-    requireCleanCheckout(projectRoot);
+    requireCleanCheckout(projectRoot, sourceCommit);
     await rename(staging, output);
     staging = undefined;
     return { output, channel, sourceCommit };
   } finally {
     if (staging !== undefined) await rm(staging, { recursive: true, force: true });
+  }
+}
+
+export function validatePackedSourceInventory(artifactBytes, trackedPaths) {
+  if (!Array.isArray(trackedPaths) ||
+      trackedPaths.some((entry) => typeof entry !== "string" || entry.length === 0)) {
+    throw new Error("Tracked source inventory is invalid");
+  }
+  const allowed = new Set(trackedPaths);
+  for (const sourcePath of trackedPaths) {
+    if (!sourcePath.startsWith("src/") || !sourcePath.endsWith(".ts") ||
+        sourcePath.endsWith(".d.ts")) {
+      continue;
+    }
+    const outputBase = `dist/${sourcePath.slice(0, -".ts".length)}`;
+    for (const suffix of [".d.ts", ".d.ts.map", ".js", ".js.map"]) {
+      allowed.add(`${outputBase}${suffix}`);
+    }
+  }
+
+  for (const entry of inspectNpmArchive(artifactBytes).entries) {
+    const packedPath = entry.path.slice("package/".length);
+    if (!allowed.has(packedPath)) {
+      throw new Error(
+        `npm artifact contains a file not bound to the source commit or TypeScript build: ${packedPath}`,
+      );
+    }
   }
 }
 
@@ -113,9 +160,24 @@ function git(arguments_, cwd) {
   }).trim();
 }
 
-function requireCleanCheckout(cwd) {
+function gitNulPaths(arguments_, cwd) {
+  const output = execFileSync("git", arguments_, {
+    cwd,
+    encoding: null,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const text = utf8.decode(output);
+  if (text !== "" && !text.endsWith("\0")) throw new Error("Git returned a truncated path inventory");
+  return text.split("\0").filter((entry) => entry !== "");
+}
+
+function requireCleanCheckout(cwd, expectedHead) {
   const status = git(["status", "--porcelain=v1", "--untracked-files=all"], cwd);
   if (status !== "") throw new Error("Release builds require a clean source checkout");
+  if (expectedHead !== undefined &&
+      git(["rev-parse", "--verify", "HEAD^{commit}"], cwd) !== expectedHead) {
+    throw new Error("Release source commit changed during the build");
+  }
 }
 
 function parseArguments(args) {

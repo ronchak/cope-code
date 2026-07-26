@@ -1,9 +1,12 @@
 import type { AuditLog } from "../audit/audit-log.js";
-import type {
-  CompletedReceiveResult,
-  ModelTransport,
-  ReceiveResult,
-  SubmissionReceipt,
+import {
+  MODEL_TRANSPORT_CONTRACT_VERSION,
+  type CompletedReceiveResult,
+  type ModelTransport,
+  type ReceiveRequest,
+  type ReceiveResult,
+  type SubmissionReceipt,
+  type SubmissionRequest,
 } from "../transport/model-transport.js";
 import { newId, sha256, stableJson } from "../shared/crypto.js";
 import { AgentError, errorMessage } from "../shared/errors.js";
@@ -11,10 +14,23 @@ import type { Clock } from "../shared/time.js";
 import { systemClock } from "../shared/time.js";
 import { BudgetMeter } from "../session/budgets.js";
 import type { SessionArtifactStore } from "../session/artifact-store.js";
-import type { CompletionHandoffStore } from "../session/completion-handoff-store.js";
+import type {
+  CompletionHandoffReference,
+  CompletionHandoffStore,
+} from "../session/completion-handoff-store.js";
 import type { OperationJournal, OperationRecord } from "../session/operation-journal.js";
 import type { SessionStore } from "../session/store.js";
-import { transitionSession } from "../session/state-machine.js";
+import {
+  isTerminal,
+  restoreSessionLifecycle,
+  snapshotSessionLifecycle,
+  transitionSession,
+} from "../session/state-machine.js";
+import {
+  cleanupTerminalRecoveryArtifacts,
+  sessionRetainsSourceArtifacts,
+  setTerminalCleanupPolicy,
+} from "../session/terminal-cleanup.js";
 import type { SessionState } from "../session/types.js";
 import { isBatchableToolName, isReadOnlyToolName } from "../protocol/types.js";
 import {
@@ -51,7 +67,6 @@ export interface AgentRuntimeDependencies {
   readonly idFactory?: (prefix: string) => string;
   readonly artifacts?: SessionArtifactStore;
   readonly completionHandoffs?: CompletionHandoffStore;
-  readonly retainSourceArtifactsOnCompletion?: boolean;
   /** Deterministic, source-free operational events for an interactive CLI. */
   readonly onProgress?: (event: RuntimeProgressEvent) => void;
 }
@@ -91,8 +106,7 @@ export class AgentRuntime {
     this.clock = dependencies.clock ?? systemClock;
     const handleCallerAbort = (): void => {
       const reason = interruptionReason(dependencies.signal?.reason, "Caller requested a resumable stop");
-      this.interruption = { status: "paused", reason };
-      this.controller.abort(dependencies.signal?.reason);
+      this.recordInterruption("paused", reason, dependencies.signal?.reason);
       void dependencies.transport.emergencyStop(reason).catch(() => undefined);
     };
     if (dependencies.signal?.aborted === true) handleCallerAbort();
@@ -104,17 +118,28 @@ export class AgentRuntime {
       const startupResult = await this.advanceStartup();
       if (startupResult !== undefined) return startupResult;
       let outbound: string | undefined;
-      let recovered: { readonly turnId: string; readonly response: CompletedReceiveResult } | undefined;
+      let recovered:
+        | {
+            readonly turnId: string;
+            readonly response: CompletedReceiveResult;
+            readonly recoveryReplay: boolean;
+          }
+        | undefined;
       if (this.state.queuedOutbound !== undefined) {
         outbound = await this.readQueuedOutbound();
       } else if (this.state.submission !== undefined && this.state.turnSequence > 0) {
-        const response = await this.recoverExchange();
+        const exchange = await this.recoverExchange();
+        const response = exchange.result;
         if (response.status !== "completed") {
           const terminal = await this.handleTransportResult(response);
           if (terminal) return terminal;
           throw new AgentError("TRANSPORT_INDETERMINATE", `Unhandled recovered transport state ${response.status}`);
         }
-        recovered = { turnId: this.state.submission.turnId, response };
+        recovered = {
+          turnId: this.state.submission.turnId,
+          response,
+          recoveryReplay: exchange.recoveryReplay,
+        };
       } else if (this.state.turnSequence === 0) {
         const bootstrap = this.dependencies.protocol.renderBootstrap({
           sessionId: this.state.sessionId,
@@ -133,27 +158,51 @@ export class AgentRuntime {
       while (!this.controller.signal.aborted) {
         let turnId: string;
         let response: ReceiveResult;
+        let recoveryReplay = false;
         if (recovered !== undefined) {
           turnId = recovered.turnId;
           response = recovered.response;
+          recoveryReplay = recovered.recoveryReplay;
           recovered = undefined;
         } else {
           if (outbound === undefined) {
             throw new AgentError("RECOVERY_REQUIRED", "No queued outbound message is available for the next turn");
           }
           this.meter.assertTime(this.clock.now().getTime());
-          this.meter.consume("turns");
-          turnId = `turn_${String(++this.state.turnSequence).padStart(4, "0")}`;
+          const queuedTurnId = this.state.queuedOutbound?.turnId;
+          const accountedTurnId =
+            this.state.turnSequence === 0
+              ? undefined
+              : `turn_${String(this.state.turnSequence).padStart(4, "0")}`;
+          if (accountedTurnId !== undefined && queuedTurnId === accountedTurnId) {
+            // A crash can land after the queued turn's sequence and budget are
+            // durable but before exchange() replaces the queue with a
+            // submission intent. Reuse that already-accounted turn.
+            turnId = queuedTurnId;
+          } else {
+            const expectedTurnId = nextTurnId(this.state.turnSequence);
+            if (queuedTurnId !== expectedTurnId) {
+              throw new AgentError("RECOVERY_REQUIRED", "Queued outbound turn does not match the session sequence", {
+                queued: queuedTurnId,
+                expected: expectedTurnId,
+              });
+            }
+            this.meter.consume("turns");
+            this.state.turnSequence += 1;
+            turnId = expectedTurnId;
+            await this.persist();
+          }
+          if (this.interruption !== undefined) return await this.finishInterruption();
           if (this.state.queuedOutbound?.turnId !== turnId) {
             throw new AgentError("RECOVERY_REQUIRED", "Queued outbound turn does not match the session sequence", {
               queued: this.state.queuedOutbound?.turnId,
               expected: turnId,
             });
           }
-          await this.persist();
           response = await this.exchange(turnId, outbound);
           outbound = undefined;
         }
+        if (this.interruption !== undefined) return await this.finishInterruption();
         if (response.status !== "completed") {
           const terminal = await this.handleTransportResult(response);
           if (terminal) return terminal;
@@ -169,27 +218,57 @@ export class AgentRuntime {
           status: "received",
           responseBytes: Buffer.byteLength(response.content),
         }, { turnId });
+        if (this.interruption !== undefined) return await this.finishInterruption();
 
         let messages: readonly NormalizedModelMessage[];
         try {
           messages = this.dependencies.protocol.parseModelTurn(response.content, {
             taskId: this.state.taskId,
             turnId,
-            ...(response.responseId.startsWith("recovered_") ? { recoveryReplay: true } : {}),
+            ...(recoveryReplay ? { recoveryReplay: true } : {}),
           }).messages;
           this.state.protocolRepairStreak = 0;
         } catch (error) {
-          this.meter.consume("protocolRepairs");
-          this.state.protocolRepairStreak += 1;
+          const repairable = this.dependencies.protocol.isRepairableParseError(error);
+          const repairAttempt = repairable ? this.state.protocolRepairStreak + 1 : undefined;
+          const repairBudgetAvailable =
+            repairAttempt !== undefined &&
+            repairAttempt <= this.state.budgetLimits.maxProtocolRepairs &&
+            this.meter.remaining("protocolRepairs") > 0;
           await this.dependencies.audit.append({
             type: "protocol.error",
             taskId: this.state.taskId,
             turnId,
-            data: { error: errorMessage(error), repairAttempt: this.state.protocolRepairStreak },
+            data: {
+              error: errorMessage(error),
+              repairable,
+              ...(repairAttempt === undefined
+                ? {}
+                : {
+                    repairAttempt,
+                    repairBudgetAvailable,
+                    repairBudgetUsed: this.state.budgetUsage.protocolRepairs,
+                    repairBudgetLimit: this.state.budgetLimits.maxProtocolRepairs,
+                  }),
+            },
           });
-          if (this.state.protocolRepairStreak > this.state.budgetLimits.maxProtocolRepairs) {
-            throw new AgentError("PROTOCOL_INVALID", "Copilot exceeded the consecutive protocol-repair limit");
+          if (!repairable) {
+            throw new AgentError(
+              "PROTOCOL_INVALID",
+              `Non-repairable protocol violation: ${errorMessage(error)}`,
+              {},
+              { cause: error },
+            );
           }
+          if (!repairBudgetAvailable || repairAttempt === undefined) {
+            throw new AgentError("PROTOCOL_INVALID", "Copilot exhausted the protocol-repair budget", {
+              repairAttempt,
+              used: this.state.budgetUsage.protocolRepairs,
+              limit: this.state.budgetLimits.maxProtocolRepairs,
+            });
+          }
+          this.meter.consume("protocolRepairs");
+          this.state.protocolRepairStreak = repairAttempt;
           outbound = await this.serializeForDisclosure(
             this.dependencies.protocol.renderProtocolError({
               taskId: this.state.taskId,
@@ -206,15 +285,18 @@ export class AgentRuntime {
         }
 
         const action = selectAction(messages);
+        if (this.interruption !== undefined) return await this.finishInterruption();
         const next = await this.handleAction(action, turnId);
         if (next.terminal) {
-          await this.dependencies.artifacts?.remove("response", turnId);
-          await this.cleanupTerminalArtifacts();
+          if (["completed", "rolled_back", "blocked", "aborted", "failed"].includes(this.state.status)) {
+            await this.dependencies.artifacts?.remove("response", turnId);
+          }
           return next.result;
         }
         outbound = next.outbound;
         await this.queueOutbound(outbound, nextTurnId(this.state.turnSequence));
         await this.dependencies.artifacts?.remove("response", turnId);
+        if (this.interruption !== undefined) return await this.finishInterruption();
       }
 
       return await this.finishInterruption();
@@ -225,24 +307,26 @@ export class AgentRuntime {
         (error.code === "TRANSPORT_INDETERMINATE" || error.code === "RECOVERY_REQUIRED") &&
         !["completed", "rolled_back", "blocked", "aborted", "failed", "paused"].includes(this.state.status)
       ) {
-        await this.move("paused", error.message);
-        return this.result(error.message);
+        return await this.pauseWithInterruptionPriority(error.message);
       }
-      return await this.fail(error);
+      const failed = await this.fail(error);
+      return failed;
     } finally {
-      await this.dependencies.transport.close().catch(() => undefined);
+      try {
+        if (isTerminal(this.state.status)) await this.cleanupTerminalArtifacts();
+      } finally {
+        await this.dependencies.transport.close().catch(() => undefined);
+      }
     }
   }
 
   public async emergencyStop(reason: string): Promise<void> {
-    this.interruption = { status: "aborted", reason };
-    this.controller.abort(reason);
+    this.recordInterruption("aborted", reason);
     await this.dependencies.transport.emergencyStop(reason);
   }
 
   public async requestPause(reason: string): Promise<void> {
-    this.interruption = { status: "paused", reason };
-    this.controller.abort(reason);
+    this.recordInterruption("paused", reason);
     await this.dependencies.transport.emergencyStop(reason);
   }
 
@@ -261,11 +345,9 @@ export class AgentRuntime {
     }
     const uncertainMutation = await this.findUncertainMutation();
     if (uncertainMutation !== undefined) {
-      await this.move(
-        "paused",
+      return this.pauseWithInterruptionPriority(
         `Mutation ${uncertainMutation.operationId} may have executed before interruption; rollback or reconcile before resuming`,
       );
-      return this.result(this.state.pauseReason);
     }
     if (this.state.status === "initializing_model" || this.state.status === "recovering") {
       await this.move("awaiting_model");
@@ -278,9 +360,65 @@ export class AgentRuntime {
 
   private async findUncertainMutation(): Promise<SessionState["pendingOperations"][number] | undefined> {
     for (const pending of this.state.pendingOperations) {
-      if (!pending.mutating) continue;
       const record = await this.dependencies.journal.read(pending.operationId);
-      if (record.status === "completed" || record.status === "failed" || record.status === "accepted") continue;
+      if (
+        !pending.mutating &&
+        !record.mutating &&
+        pending.status === "executing" &&
+        record.status === "executing"
+      ) {
+        await this.dependencies.journal.markNotStarted(record, this.now());
+        const specializedCounter = specializedBudgetCounter(pending.tool);
+        if (specializedCounter !== undefined) this.meter.refund(specializedCounter);
+        this.state.pendingOperations = this.state.pendingOperations.map((operation) =>
+          operation.operationId === pending.operationId
+            ? { ...operation, status: "accepted" as const }
+            : operation,
+        );
+        await this.persist();
+        await this.dependencies.audit.append({
+          type: "session.recovered",
+          taskId: this.state.taskId,
+          operationId: pending.operationId,
+          data: {
+            decision: "retry",
+            reasonCode: "READ_ONLY_EXECUTION_INTERRUPTED",
+            journalStatus: record.status,
+            sessionStatus: pending.status,
+          },
+        });
+        continue;
+      }
+      if (pending.status === "accepted" && record.status === "executing") {
+        await this.dependencies.journal.markNotStarted(record, this.now());
+        await this.persist();
+        await this.dependencies.audit.append({
+          type: "session.recovered",
+          taskId: this.state.taskId,
+          operationId: pending.operationId,
+          data: {
+            decision: "retry",
+            reasonCode: "EXECUTION_NOT_DISPATCHED",
+            journalStatus: record.status,
+            sessionStatus: pending.status,
+          },
+        });
+        continue;
+      }
+      if (record.status === "accepted") {
+        if (pending.status === "executing") {
+          const specializedCounter = specializedBudgetCounter(pending.tool);
+          if (specializedCounter !== undefined) this.meter.refund(specializedCounter);
+          this.state.pendingOperations = this.state.pendingOperations.map((operation) =>
+            operation.operationId === pending.operationId
+              ? { ...operation, status: "accepted" as const }
+              : operation,
+          );
+          await this.persist();
+        }
+        continue;
+      }
+      if (!pending.mutating || record.status === "completed" || record.status === "failed") continue;
       const indeterminate = { ...pending, status: "indeterminate" as const };
       this.state.pendingOperations = this.state.pendingOperations.map((operation) =>
         operation.operationId === pending.operationId ? indeterminate : operation,
@@ -322,19 +460,21 @@ export class AgentRuntime {
       data: { submissionId, phase: "prepared", bytes: Buffer.byteLength(content), messageHash: sha256(content) },
     });
 
+    const request: SubmissionRequest = {
+      taskId: this.state.taskId,
+      turnId,
+      submissionId,
+      content,
+      ...(this.state.transportConversationId === undefined
+        ? {}
+        : { expectedConversationId: this.state.transportConversationId }),
+    };
     let receipt = await this.dependencies.transport.submit(
-      {
-        taskId: this.state.taskId,
-        turnId,
-        submissionId,
-        content,
-        ...(this.state.transportConversationId === undefined
-          ? {}
-          : { expectedConversationId: this.state.transportConversationId }),
-      },
+      request,
       { signal: this.controller.signal },
     );
-    receipt = await this.resolveReceipt(receipt, content);
+    this.assertTransportCorrelation(receipt, request, "submission receipt");
+    receipt = await this.resolveReceipt(receipt, request);
     if (receipt.status !== "submitted") {
       throw new AgentError("TRANSPORT_INDETERMINATE", "Submission could not be proven delivered", {
         submissionId,
@@ -342,37 +482,34 @@ export class AgentRuntime {
         diagnosticCode: receipt.diagnosticCode,
       });
     }
-    this.bindConversation(receipt);
     this.state.submission = {
       ...this.state.submission,
       state: "submitted",
       submittedAt: receipt.observedAt,
     };
     await this.persist();
-    return this.receiveAndRecord(
-      receipt,
-      turnId,
-      submissionId,
-    );
+    return this.receiveAndRecord(turnId, submissionId);
   }
 
   private async receiveAndRecord(
-    receipt: SubmissionReceipt,
     turnId: string,
     submissionId: string,
   ): Promise<ReceiveResult> {
+    const request: ReceiveRequest = {
+      taskId: this.state.taskId,
+      turnId,
+      submissionId,
+      ...(this.state.transportConversationId === undefined
+        ? {}
+        : { expectedConversationId: this.state.transportConversationId }),
+    };
     const result = await this.dependencies.transport.receive(
-      {
-        taskId: this.state.taskId,
-        turnId,
-        submissionId,
-        ...(this.state.transportConversationId === undefined
-          ? {}
-          : { expectedConversationId: this.state.transportConversationId }),
-      },
+      request,
       { signal: this.controller.signal },
     );
+    this.assertTransportCorrelation(result, request, "receive result");
     if (result.status === "completed") {
+      this.bindConversation(result);
       await this.dependencies.artifacts?.put("response", turnId, result.content);
       if (this.state.submission?.submissionId === submissionId) {
         this.state.submission = {
@@ -387,7 +524,10 @@ export class AgentRuntime {
     return result;
   }
 
-  private async recoverExchange(): Promise<ReceiveResult> {
+  private async recoverExchange(): Promise<{
+    readonly result: ReceiveResult;
+    readonly recoveryReplay: boolean;
+  }> {
     const submission = this.state.submission;
     if (submission === undefined) {
       throw new AgentError("RECOVERY_REQUIRED", "No submission is available for recovery");
@@ -395,60 +535,76 @@ export class AgentRuntime {
     if (submission.state === "answered") {
       const content = await this.requireArtifacts().get("response", submission.turnId);
       return {
-        contractVersion: "model-transport/v1",
-        taskId: this.state.taskId,
-        turnId: submission.turnId,
-        submissionId: submission.submissionId,
-        ...(this.state.transportConversationId === undefined
-          ? {}
-          : { expectedConversationId: this.state.transportConversationId }),
-        observedAt: submission.answeredAt ?? this.now(),
-        status: "completed",
-        responseId: `recovered_${submission.turnId}`,
-        content,
+        recoveryReplay: true,
+        result: {
+          contractVersion: MODEL_TRANSPORT_CONTRACT_VERSION,
+          taskId: this.state.taskId,
+          turnId: submission.turnId,
+          submissionId: submission.submissionId,
+          ...(this.state.transportConversationId === undefined
+            ? {}
+            : { conversationId: this.state.transportConversationId }),
+          observedAt: submission.answeredAt ?? this.now(),
+          status: "completed",
+          responseId: `recovered_${submission.turnId}`,
+          content,
+        },
       };
     }
 
     const content = await this.requireArtifacts().get("outbox", submission.submissionId);
+    const contentHash = sha256(content);
+    if (contentHash !== submission.messageHash) {
+      throw new AgentError("RECOVERY_REQUIRED", "Recovered outbound message does not match the durable submission intent", {
+        submissionId: submission.submissionId,
+        expectedMessageHash: submission.messageHash,
+        actualMessageHash: contentHash,
+      });
+    }
+    const request: SubmissionRequest = {
+      taskId: this.state.taskId,
+      turnId: submission.turnId,
+      submissionId: submission.submissionId,
+      content,
+      ...(this.state.transportConversationId === undefined
+        ? {}
+        : { expectedConversationId: this.state.transportConversationId }),
+    };
     let receipt = await this.dependencies.transport.resolveSubmission(
       {
-        taskId: this.state.taskId,
-        turnId: submission.turnId,
-        submissionId: submission.submissionId,
-        ...(this.state.transportConversationId === undefined
+        taskId: request.taskId,
+        turnId: request.turnId,
+        submissionId: request.submissionId,
+        ...(request.expectedConversationId === undefined
           ? {}
-          : { expectedConversationId: this.state.transportConversationId }),
+          : { expectedConversationId: request.expectedConversationId }),
       },
       { signal: this.controller.signal },
     );
+    this.assertTransportCorrelation(receipt, request, "submission resolution");
     if (receipt.status === "not-submitted") {
       receipt = await this.dependencies.transport.submit(
-        {
-          taskId: this.state.taskId,
-          turnId: submission.turnId,
-          submissionId: submission.submissionId,
-          content,
-          ...(this.state.transportConversationId === undefined
-            ? {}
-            : { expectedConversationId: this.state.transportConversationId }),
-        },
+        request,
         { signal: this.controller.signal },
       );
+      this.assertTransportCorrelation(receipt, request, "recovery submission receipt");
     }
-    receipt = await this.resolveReceipt(receipt, content);
+    receipt = await this.resolveReceipt(receipt, request);
     if (receipt.status !== "submitted") {
       throw new AgentError("TRANSPORT_INDETERMINATE", "Recovery could not prove submission delivery", {
         status: receipt.status,
       });
     }
-    this.bindConversation(receipt);
     this.state.submission = {
       ...submission,
       state: "submitted",
       submittedAt: receipt.observedAt,
     };
     await this.persist();
-    return this.receiveAndRecord(receipt, submission.turnId, submission.submissionId);
+    return {
+      result: await this.receiveAndRecord(submission.turnId, submission.submissionId),
+      recoveryReplay: false,
+    };
   }
 
   private async queueOutbound(content: string, turnId: string): Promise<void> {
@@ -463,18 +619,18 @@ export class AgentRuntime {
     await this.persist();
   }
 
-  private bindConversation(receipt: SubmissionReceipt): void {
-    if (receipt.conversationId === undefined) return;
+  private bindConversation(value: { readonly conversationId?: string }): void {
+    if (value.conversationId === undefined) return;
     if (
       this.state.transportConversationId !== undefined &&
-      this.state.transportConversationId !== receipt.conversationId
+      this.state.transportConversationId !== value.conversationId
     ) {
       throw new AgentError("TRANSPORT_INDETERMINATE", "Transport conversation changed during the active task", {
         expectedConversationId: this.state.transportConversationId,
-        actualConversationId: receipt.conversationId,
+        actualConversationId: value.conversationId,
       });
     }
-    this.state.transportConversationId = receipt.conversationId;
+    this.state.transportConversationId = value.conversationId;
   }
 
   private async readQueuedOutbound(): Promise<string> {
@@ -495,12 +651,47 @@ export class AgentRuntime {
   }
 
   private async cleanupTerminalArtifacts(): Promise<void> {
-    if (this.dependencies.retainSourceArtifactsOnCompletion !== true) {
-      await this.dependencies.artifacts?.clear();
-    }
+    await cleanupTerminalRecoveryArtifacts({
+      status: this.state.status,
+      retainSourceArtifacts: sessionRetainsSourceArtifacts(this.state),
+      ...(this.dependencies.artifacts === undefined ? {} : { artifacts: this.dependencies.artifacts }),
+      ...(this.dependencies.completionHandoffs === undefined
+        ? {}
+        : { completionHandoffs: this.dependencies.completionHandoffs }),
+    });
   }
 
-  private async resolveReceipt(receipt: SubmissionReceipt, content: string): Promise<SubmissionReceipt> {
+  private async prepareCompletionHandoff(
+    claim: CompletionClaim,
+    verification: CompletionVerification,
+  ): Promise<CompletionHandoffReference | undefined> {
+    if (!verification.accepted) {
+      delete this.state.completionHandoff;
+      return undefined;
+    }
+    const existing = this.state.completionHandoff;
+    const store = this.dependencies.completionHandoffs;
+    if (store === undefined) {
+      if (existing !== undefined) {
+        throw new AgentError(
+          "RECOVERY_REQUIRED",
+          "Completion handoff state exists without its durable store",
+        );
+      }
+      return undefined;
+    }
+    if (existing !== undefined) {
+      await store.assertReusable(existing, claim, verification);
+      return existing;
+    }
+    return store.save(claim, verification, this.now());
+  }
+
+  private async resolveReceipt(
+    receipt: SubmissionReceipt,
+    request: SubmissionRequest,
+  ): Promise<SubmissionReceipt> {
+    this.assertTransportCorrelation(receipt, request, "submission receipt");
     if (receipt.status !== "indeterminate") return receipt;
     if (this.state.submission) {
       this.state.submission = { ...this.state.submission, state: "indeterminate" };
@@ -508,39 +699,89 @@ export class AgentRuntime {
     }
     const resolved = await this.dependencies.transport.resolveSubmission(
       {
-        taskId: receipt.taskId,
-        turnId: receipt.turnId,
-        submissionId: receipt.submissionId,
-        ...(this.state.transportConversationId === undefined
+        taskId: request.taskId,
+        turnId: request.turnId,
+        submissionId: request.submissionId,
+        ...(request.expectedConversationId === undefined
           ? {}
-          : { expectedConversationId: this.state.transportConversationId }),
+          : { expectedConversationId: request.expectedConversationId }),
       },
       { signal: this.controller.signal },
     );
+    this.assertTransportCorrelation(resolved, request, "submission resolution");
     if (resolved.status === "not-submitted") {
-      return this.dependencies.transport.submit(
-        {
-          taskId: receipt.taskId,
-          turnId: receipt.turnId,
-          submissionId: receipt.submissionId,
-          content,
-          ...(this.state.transportConversationId === undefined
-            ? {}
-            : { expectedConversationId: this.state.transportConversationId }),
-        },
+      const retried = await this.dependencies.transport.submit(
+        request,
         { signal: this.controller.signal },
       );
+      this.assertTransportCorrelation(retried, request, "retried submission receipt");
+      return retried;
     }
     return resolved;
+  }
+
+  private assertTransportCorrelation(
+    actual: {
+      readonly contractVersion: string;
+      readonly taskId: string;
+      readonly turnId: string;
+      readonly submissionId: string;
+      readonly conversationId?: string;
+      readonly status: string;
+    },
+    expected: {
+      readonly taskId: string;
+      readonly turnId: string;
+      readonly submissionId: string;
+      readonly expectedConversationId?: string;
+    },
+    kind: string,
+  ): void {
+    const expectedConversationId =
+      expected.expectedConversationId ?? this.state.transportConversationId;
+    const trustedConversationRequired =
+      expectedConversationId !== undefined &&
+      (actual.status === "submitted" || actual.status === "completed");
+    const conversationMismatch =
+      expectedConversationId !== undefined &&
+      (
+        (trustedConversationRequired && actual.conversationId === undefined) ||
+        (actual.conversationId !== undefined && actual.conversationId !== expectedConversationId)
+      );
+    if (
+      actual.contractVersion !== MODEL_TRANSPORT_CONTRACT_VERSION ||
+      actual.taskId !== expected.taskId ||
+      actual.turnId !== expected.turnId ||
+      actual.submissionId !== expected.submissionId ||
+      conversationMismatch
+    ) {
+      throw new AgentError("TRANSPORT_INDETERMINATE", `${kind} correlation mismatch`, {
+        expectedContractVersion: MODEL_TRANSPORT_CONTRACT_VERSION,
+        actualContractVersion: actual.contractVersion,
+        expectedTaskId: expected.taskId,
+        actualTaskId: actual.taskId,
+        expectedTurnId: expected.turnId,
+        actualTurnId: actual.turnId,
+        expectedSubmissionId: expected.submissionId,
+        actualSubmissionId: actual.submissionId,
+        ...(expectedConversationId === undefined
+          ? {}
+          : { expectedConversationId, actualConversationId: actual.conversationId }),
+      });
+    }
   }
 
   private async handleAction(
     action: NormalizedModelMessage,
     turnId: string,
   ): Promise<{ readonly terminal: false; readonly outbound: string } | { readonly terminal: true; readonly result: AgentRunResult }> {
+    if (this.interruption !== undefined) {
+      return { terminal: true, result: await this.finishInterruption() };
+    }
     switch (action.type) {
       case "tool_request": {
         await this.move("executing_tools");
+        this.throwIfInterrupted();
         const outcomes = await this.executeCalls(action.calls, turnId);
         await this.move("returning_results");
         const outbound = await this.serializeForDisclosure(
@@ -560,8 +801,10 @@ export class AgentRuntime {
           () => this.dependencies.user.requestInput({
             question: action.question,
             ...(action.choices === undefined ? {} : { choices: action.choices }),
+            signal: this.controller.signal,
           }),
         );
+        this.throwIfInterrupted();
         const outbound = await this.serializeForDisclosure(
           this.dependencies.protocol.renderUserDecision({
             taskId: this.state.taskId,
@@ -587,12 +830,16 @@ export class AgentRuntime {
             capability: action.capability,
             reason: action.reason,
             ...(action.risk === undefined ? {} : { risk: action.risk }),
+            signal: this.controller.signal,
           }),
         );
+        this.throwIfInterrupted();
         const userDecision = capabilityDecision(decisionRecord);
         let granted = false;
         if (userDecision.decision === "allow_session") {
+          this.throwIfInterrupted();
           granted = await this.dependencies.policy.expandSessionGrant(action.capability);
+          this.throwIfInterrupted();
         }
         // A standalone capability request has no exact operation to which a
         // one-shot token can safely bind. Copilot must request the operation;
@@ -633,19 +880,26 @@ export class AgentRuntime {
           turnId,
           data: { summaryHash: sha256(action.claim.summary), riskCount: action.claim.remainingRisks.length },
         });
+        if (this.interruption !== undefined) {
+          return { terminal: true, result: await this.finishInterruption() };
+        }
         const repository = await this.dependencies.tools.inspectCompletionState();
+        if (this.interruption !== undefined) {
+          return { terminal: true, result: await this.finishInterruption() };
+        }
         const verification = verifyCompletion(
           this.state,
           action.claim,
           repository,
           this.dependencies.completionRequirements,
         );
+        const completionHandoff = await this.prepareCompletionHandoff(action.claim, verification);
         this.lastCompletion = verification;
-        const completionHandoff = verification.accepted
-          ? await this.dependencies.completionHandoffs?.save(action.claim, verification, this.now())
-          : undefined;
         if (completionHandoff !== undefined) {
           this.state.completionHandoff = completionHandoff;
+        }
+        if (this.interruption !== undefined) {
+          return { terminal: true, result: await this.finishInterruption() };
         }
         await this.dependencies.audit.append({
           type: "completion.verified",
@@ -658,6 +912,9 @@ export class AgentRuntime {
             ...(completionHandoff === undefined ? {} : { handoffIntegrity: completionHandoff.integrity }),
           },
         });
+        if (this.interruption !== undefined) {
+          return { terminal: true, result: await this.finishInterruption() };
+        }
         if (verification.accepted) {
           this.finalModelSummary = action.claim.summary;
           this.finalModelReport = action.claim;
@@ -723,7 +980,10 @@ export class AgentRuntime {
     turnId: string,
     requester: () => Promise<Readonly<Record<string, unknown>>>,
   ): Promise<Readonly<Record<string, unknown>>> {
-    const alreadyAccounted = this.state.completedOperationIds.includes(requestId);
+    this.throwIfInterrupted();
+    const alreadyAccounted =
+      this.state.completedOperationIds.includes(requestId) ||
+      this.state.pendingOperations.some((operation) => operation.operationId === requestId);
     const registration = await this.dependencies.journal.register(
       requestId,
       tool,
@@ -741,6 +1001,7 @@ export class AgentRuntime {
           requestId,
         });
       }
+      this.clearPending(requestId);
       if (!this.state.completedOperationIds.includes(requestId)) {
         this.state.completedOperationIds.push(requestId);
       }
@@ -757,7 +1018,13 @@ export class AgentRuntime {
     if (registration.kind === "indeterminate_mutation") {
       throw new AgentError("RECOVERY_REQUIRED", "A user-decision request was classified as a mutation");
     }
+    this.setPending({ operationId: requestId, name: tool }, registration.record, "accepted");
+    await this.persist();
+    this.throwIfInterrupted();
     const executing = await this.dependencies.journal.markExecuting(registration.record, this.now());
+    this.setPending({ operationId: requestId, name: tool }, executing, "executing");
+    await this.persist();
+    this.throwIfInterrupted();
     await this.dependencies.audit.append({
       type: "user.requested",
       taskId: this.state.taskId,
@@ -765,12 +1032,16 @@ export class AgentRuntime {
       operationId: requestId,
       data: { tool, requestHash: registration.record.requestHash },
     });
+    this.throwIfInterrupted();
     const cached = await this.dependencies.artifacts?.getOptional("decision", artifactId);
+    this.throwIfInterrupted();
     const decision = cached === undefined
       ? await requester()
       : parseDecisionArtifact(cached);
+    this.throwIfInterrupted();
     if (cached === undefined) {
       await this.requireArtifacts().put("decision", artifactId, stableJson(decision));
+      this.throwIfInterrupted();
     }
     const decisionHash = sha256(stableJson(decision));
     await this.dependencies.journal.markCompleted(
@@ -779,6 +1050,7 @@ export class AgentRuntime {
       "answered",
       { decisionHash },
     );
+    this.clearPending(requestId);
     if (!this.state.completedOperationIds.includes(requestId)) {
       this.state.completedOperationIds.push(requestId);
     }
@@ -790,6 +1062,7 @@ export class AgentRuntime {
       data: { tool, decisionHash },
     });
     await this.persist();
+    this.throwIfInterrupted();
     return decision;
   }
 
@@ -815,6 +1088,7 @@ export class AgentRuntime {
     }
     const outcomes: ToolOutcome[] = [];
     for (const call of calls) {
+      this.throwIfInterrupted();
       outcomes.push(await this.executeCall(call, turnId));
     }
     return outcomes;
@@ -841,6 +1115,7 @@ export class AgentRuntime {
   }
 
   private async executeCall(call: NormalizedToolCall, turnId: string): Promise<ToolOutcome> {
+    this.throwIfInterrupted();
     const mutating = !isReadOnlyToolName(call.name);
     const operationAlreadyAccounted =
       this.state.completedOperationIds.includes(call.operationId) ||
@@ -881,6 +1156,7 @@ export class AgentRuntime {
     }
     this.setPending(call, registration.record, "accepted");
     await this.persist();
+    this.throwIfInterrupted();
 
     await this.dependencies.audit.append({
       type: "tool.requested",
@@ -889,7 +1165,9 @@ export class AgentRuntime {
       operationId: call.operationId,
       data: { tool: call.name, requestHash: registration.record.requestHash },
     });
+    this.throwIfInterrupted();
     const policy = await this.dependencies.policy.authorize(call);
+    this.throwIfInterrupted();
     await this.dependencies.audit.append({
       type: "policy.decision",
       taskId: this.state.taskId,
@@ -897,9 +1175,11 @@ export class AgentRuntime {
       operationId: call.operationId,
       data: { tool: call.name, ...policy },
     });
+    this.throwIfInterrupted();
     let allowed = policy.outcome === "allow";
     if (policy.outcome === "ask") {
       await this.move("awaiting_user", policy.explanation);
+      this.throwIfInterrupted();
       await this.dependencies.audit.append({
         type: "capability.requested",
         taskId: this.state.taskId,
@@ -907,19 +1187,26 @@ export class AgentRuntime {
         operationId: call.operationId,
         data: { reasonCode: policy.reasonCode, capability: policy.capability },
       });
+      this.throwIfInterrupted();
       const decisionArtifactId = `decision_policy_${call.operationId}`;
       const cachedDecision = await this.dependencies.artifacts?.getOptional("decision", decisionArtifactId);
+      this.throwIfInterrupted();
       const decision = cachedDecision === undefined
         ? await this.dependencies.user.requestCapability({
             capability: policy.capability,
             reason: policy.explanation,
+            signal: this.controller.signal,
           })
         : capabilityDecision(parseDecisionArtifact(cachedDecision));
+      this.throwIfInterrupted();
       if (cachedDecision === undefined) {
         await this.requireArtifacts().put("decision", decisionArtifactId, stableJson(decision));
+        this.throwIfInterrupted();
       }
       if (decision.decision === "allow_session") {
+        this.throwIfInterrupted();
         allowed = await this.dependencies.policy.expandSessionGrant(policy.capability);
+        this.throwIfInterrupted();
       } else {
         allowed = decision.decision === "allow_once";
       }
@@ -930,8 +1217,11 @@ export class AgentRuntime {
         operationId: call.operationId,
         data: { decision: decision.decision, effective: allowed },
       });
+      this.throwIfInterrupted();
       await this.move("executing_tools");
+      this.throwIfInterrupted();
     }
+    this.throwIfInterrupted();
     if (!allowed) {
       const failed = await this.dependencies.journal.markFailed(
         registration.record,
@@ -953,11 +1243,27 @@ export class AgentRuntime {
       };
     }
 
-    if (call.name === "run_command") this.meter.consume("commands");
-    if (call.name === "read_file") this.meter.consume("readFiles");
-    const executing = await this.dependencies.journal.markExecuting(registration.record, this.now());
+    const specializedCounter = specializedBudgetCounter(call.name);
+    if (specializedCounter !== undefined) this.meter.consume(specializedCounter);
+    this.throwIfInterrupted();
+    let executing: OperationRecord;
+    try {
+      executing = await this.dependencies.journal.markExecuting(registration.record, this.now());
+    } catch (error) {
+      if (specializedCounter !== undefined) this.meter.refund(specializedCounter);
+      throw error;
+    }
+    if (this.interruption !== undefined) {
+      await this.restoreUnstartedOperation(call, executing, specializedCounter);
+      this.throwIfInterrupted();
+    }
     this.setPending(call, executing, "executing");
     await this.persist();
+    if (this.interruption !== undefined) {
+      await this.restoreUnstartedOperation(call, executing, specializedCounter);
+      this.throwIfInterrupted();
+    }
+    this.throwIfInterrupted();
     let operationWasCommitted = false;
     try {
       const outcome = await this.dependencies.tools.execute(call, this.controller.signal);
@@ -1039,7 +1345,7 @@ export class AgentRuntime {
   }
 
   private setPending(
-    call: NormalizedToolCall,
+    call: { readonly operationId: string; readonly name: string },
     record: OperationRecord,
     status: "accepted" | "executing" | "indeterminate",
   ): void {
@@ -1058,6 +1364,23 @@ export class AgentRuntime {
     this.state.pendingOperations = this.state.pendingOperations.filter(
       (operation) => operation.operationId !== operationId,
     );
+  }
+
+  private async restoreUnstartedOperation(
+    call: { readonly operationId: string; readonly name: string },
+    executing: OperationRecord,
+    specializedCounter?: "commands" | "readFiles",
+  ): Promise<void> {
+    const accepted = await this.dependencies.journal.markNotStarted(executing, this.now());
+    if (specializedCounter !== undefined) this.meter.refund(specializedCounter);
+    this.setPending(call, accepted, "accepted");
+    await this.persist();
+  }
+
+  private throwIfInterrupted(): void {
+    if (this.interruption !== undefined) {
+      throw new AgentError("INTERNAL_ERROR", "Execution stopped at an interruption boundary");
+    }
   }
 
   private async recordToolEffects(
@@ -1140,14 +1463,16 @@ export class AgentRuntime {
   }
 
   private async handleTransportResult(result: Exclude<ReceiveResult, { status: "completed" }>): Promise<AgentRunResult | undefined> {
+    if (this.interruption !== undefined) return this.finishInterruption();
     if (result.status === "cancelled") return this.abort(result.diagnosticCode);
     if (result.status === "blocked" && !result.retryable) {
       await this.move("blocked", result.reason);
       return this.result(result.reason);
     }
     if (result.status === "blocked" || result.status === "timed-out") {
-      await this.move("paused", result.status === "blocked" ? result.reason : result.diagnosticCode);
-      return this.result(result.status === "blocked" ? result.reason : result.diagnosticCode);
+      return this.pauseWithInterruptionPriority(
+        result.status === "blocked" ? result.reason : result.diagnosticCode,
+      );
     }
     if (result.status === "indeterminate") {
       throw new AgentError("TRANSPORT_INDETERMINATE", result.diagnosticCode);
@@ -1162,6 +1487,21 @@ export class AgentRuntime {
     return this.result(reason);
   }
 
+  private async pauseWithInterruptionPriority(reason: string): Promise<AgentRunResult> {
+    const interruption = this.interruption;
+    if (interruption?.status === "aborted") return this.abort(interruption.reason);
+    const effectiveReason = interruption?.status === "paused" ? interruption.reason : reason;
+    if (["completed", "rolled_back", "blocked", "aborted", "failed"].includes(this.state.status)) {
+      return this.result(effectiveReason);
+    }
+    if (this.state.status !== "paused") await this.move("paused", effectiveReason);
+    const currentInterruption = this.interruption;
+    if (currentInterruption?.status === "aborted") {
+      return this.abort(currentInterruption.reason);
+    }
+    return this.result(currentInterruption?.reason ?? effectiveReason);
+  }
+
   private async finishInterruption(): Promise<AgentRunResult> {
     const interruption = this.interruption ?? {
       status: "aborted" as const,
@@ -1171,18 +1511,38 @@ export class AgentRuntime {
     if (["completed", "rolled_back", "blocked", "aborted", "failed"].includes(this.state.status)) {
       return this.result(interruption.reason);
     }
-    if (this.state.status !== "paused") await this.move("paused", interruption.reason);
-    return this.result(interruption.reason);
+    return this.pauseWithInterruptionPriority(interruption.reason);
+  }
+
+  private recordInterruption(
+    status: "paused" | "aborted",
+    reason: string,
+    signalReason: unknown = reason,
+  ): void {
+    if (this.interruption?.status !== "aborted") {
+      if (this.interruption === undefined || status === "aborted") {
+        this.interruption = { status, reason };
+      }
+    }
+    if (!this.controller.signal.aborted) this.controller.abort(signalReason);
   }
 
   private async fail(error: unknown): Promise<AgentRunResult> {
     const message = errorMessage(error);
     if (!["completed", "rolled_back", "blocked", "aborted", "failed"].includes(this.state.status)) {
+      const prior = snapshotSessionLifecycle(this.state);
+      delete this.state.completionHandoff;
       transitionSession(this.state, "failed", this.now(), {
         reason: message,
         failure: { code: error instanceof AgentError ? error.code : "INTERNAL_ERROR", message },
       });
-      await this.persist();
+      setTerminalCleanupPolicy(this.state);
+      try {
+        await this.persist();
+      } catch (persistError) {
+        restoreSessionLifecycle(this.state, prior);
+        throw persistError;
+      }
       await this.dependencies.audit.append({
         type: "session.ended",
         taskId: this.state.taskId,
@@ -1194,8 +1554,20 @@ export class AgentRuntime {
 
   private async move(status: SessionState["status"], reason?: string): Promise<void> {
     const from = this.state.status;
+    const prior = snapshotSessionLifecycle(this.state);
     transitionSession(this.state, status, this.now(), reason === undefined ? {} : { reason });
-    await this.persist();
+    if (isTerminal(status) && status !== "completed") {
+      delete this.state.completionHandoff;
+    }
+    if (isTerminal(status)) {
+      setTerminalCleanupPolicy(this.state);
+    }
+    try {
+      await this.persist();
+    } catch (error) {
+      restoreSessionLifecycle(this.state, prior);
+      throw error;
+    }
     await this.dependencies.audit.append({
       type: status === "completed" || status === "blocked" || status === "aborted" || status === "failed"
         ? "session.ended"
@@ -1238,13 +1610,16 @@ export class AgentRuntime {
   }
 
   private result(reason?: string): AgentRunResult {
+    const completed = this.state.status === "completed";
     return {
       status: this.state.status,
       sessionId: this.state.sessionId,
       taskId: this.state.taskId,
-      ...(this.lastCompletion === undefined ? {} : { completion: this.lastCompletion }),
-      ...(this.finalModelSummary === undefined ? {} : { modelSummary: this.finalModelSummary }),
-      ...(this.finalModelReport === undefined ? {} : { modelReport: this.finalModelReport }),
+      ...(!completed || this.lastCompletion === undefined
+        ? {}
+        : { completion: this.lastCompletion }),
+      ...(!completed || this.finalModelSummary === undefined ? {} : { modelSummary: this.finalModelSummary }),
+      ...(!completed || this.finalModelReport === undefined ? {} : { modelReport: this.finalModelReport }),
       ...(reason === undefined ? {} : { reason }),
     };
   }
@@ -1256,6 +1631,12 @@ function selectAction(messages: readonly NormalizedModelMessage[]): NormalizedMo
     throw new AgentError("PROTOCOL_INVALID", "A model turn contains more than one dependent action class");
   }
   return actionable[0] ?? messages[0] ?? (() => { throw new AgentError("PROTOCOL_INVALID", "Empty model turn"); })();
+}
+
+function specializedBudgetCounter(tool: string): "commands" | "readFiles" | undefined {
+  if (tool === "run_command") return "commands";
+  if (tool === "read_file") return "readFiles";
+  return undefined;
 }
 
 function outcomeFromRecord(call: NormalizedToolCall, record: OperationRecord): ToolOutcome {

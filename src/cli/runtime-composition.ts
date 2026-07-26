@@ -240,8 +240,6 @@ export async function composeRuntime(options: ComposeRuntimeOptions): Promise<Co
       state.sessionId,
       new SecretScanner(fingerprintKey),
     ),
-    retainSourceArtifactsOnCompletion:
-      configuration.repository.retention.retain_source_artifacts_on_completion,
     ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
   });
   return { runtime, audit, repository, disclosureLedger };

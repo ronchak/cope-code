@@ -687,6 +687,35 @@ test("release generation rejects metadata that its verifier cannot read", async 
   await assert.rejects(lstat(path.join(oversizedSbom, "manifest.json")), { code: "ENOENT" });
 });
 
+test("release packing excludes ignored and untracked payloads from the source identity", async () => {
+  const trackedPaths = [
+    "docs/guide.md",
+    "package.json",
+    "src/cli/main.ts",
+  ];
+  const packageJson = npmPackageJson("1.2.3", { dependencies: {} });
+  const expectedEntries = [
+    { archivePath: "package/package.json", content: packageJson },
+    { archivePath: "package/docs/guide.md", content: "tracked" },
+    { archivePath: "package/dist/src/cli/main.js", content: "built", mode: 0o755 },
+  ];
+  expectSuccess(invokePackInventoryValidator(npmArchive(expectedEntries), trackedPaths));
+
+  for (const archivePath of [
+    "package/docs/secret.log",
+    "package/config/examples/local.env",
+    "package/dist/src/hidden.js",
+  ]) {
+    expectFailure(
+      invokePackInventoryValidator(npmArchive([
+        ...expectedEntries,
+        { archivePath, content: "ignored" },
+      ]), trackedPaths),
+      /not bound to the source commit or TypeScript build/iu,
+    );
+  }
+});
+
 test("release generation rejects traversal, links, and non-regular payload boundaries", async (context) => {
   const fixture = await releaseFixture(context);
   const traversal = await fixture.emptyCandidate("traversal", "bad");
@@ -1226,6 +1255,27 @@ function invokeTestGenerator(
   return spawnSync(process.execPath, ["--input-type=module", "--eval", source], {
     cwd: repositoryRoot,
     env: environment,
+    encoding: "utf8",
+  });
+}
+
+function invokePackInventoryValidator(
+  artifactBytes: Buffer,
+  trackedPaths: string[],
+): SpawnSyncReturns<string> {
+  const moduleUrl = pathToFileURL(buildScript).href;
+  const source = [
+    `import { validatePackedSourceInventory } from ${JSON.stringify(moduleUrl)};`,
+    "try {",
+    `  validatePackedSourceInventory(Buffer.from(${JSON.stringify(artifactBytes.toString("base64"))}, "base64"), ${JSON.stringify(trackedPaths)});`,
+    "} catch (error) {",
+    "  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\\n`);",
+    "  process.exitCode = 1;",
+    "}",
+  ].join("\n");
+  return spawnSync(process.execPath, ["--input-type=module", "--eval", source], {
+    cwd: repositoryRoot,
+    env: process.env,
     encoding: "utf8",
   });
 }

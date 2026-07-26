@@ -1,6 +1,16 @@
 import { AgentError } from "../shared/errors.js";
 import type { SessionState, SessionStatus, TerminalSessionStatus } from "./types.js";
 
+export interface SessionLifecycleSnapshot {
+  readonly status: SessionState["status"];
+  readonly updatedAt: string;
+  readonly pauseReason: SessionState["pauseReason"];
+  readonly failure: SessionState["failure"];
+  readonly completedAt: SessionState["completedAt"];
+  readonly completionHandoff: SessionState["completionHandoff"];
+  readonly terminalCleanup: SessionState["terminalCleanup"];
+}
+
 const terminal = new Set<SessionStatus>(["completed", "rolled_back", "blocked", "aborted", "failed"]);
 
 const transitions: Readonly<Record<SessionStatus, ReadonlySet<SessionStatus>>> = {
@@ -94,6 +104,42 @@ export function isTerminal(status: SessionStatus): status is TerminalSessionStat
   return terminal.has(status);
 }
 
+export function snapshotSessionLifecycle(state: SessionState): SessionLifecycleSnapshot {
+  return {
+    status: state.status,
+    updatedAt: state.updatedAt,
+    pauseReason: state.pauseReason,
+    failure: state.failure,
+    completedAt: state.completedAt,
+    completionHandoff: state.completionHandoff,
+    terminalCleanup: state.terminalCleanup,
+  };
+}
+
+export function restoreSessionLifecycle(
+  state: SessionState,
+  snapshot: SessionLifecycleSnapshot,
+): void {
+  state.status = snapshot.status;
+  state.updatedAt = snapshot.updatedAt;
+  restoreOptional(state, "pauseReason", snapshot.pauseReason);
+  restoreOptional(state, "failure", snapshot.failure);
+  restoreOptional(state, "completedAt", snapshot.completedAt);
+  restoreOptional(state, "completionHandoff", snapshot.completionHandoff);
+  restoreOptional(state, "terminalCleanup", snapshot.terminalCleanup);
+}
+
 export function allowedTransitions(status: SessionStatus): readonly SessionStatus[] {
   return [...transitions[status]];
+}
+
+function restoreOptional<
+  Key extends "pauseReason" | "failure" | "completedAt" | "completionHandoff" | "terminalCleanup",
+>(
+  state: SessionState,
+  key: Key,
+  value: SessionState[Key],
+): void {
+  if (value === undefined) delete state[key];
+  else state[key] = value;
 }

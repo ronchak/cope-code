@@ -68,7 +68,7 @@ No live tuple is certified by this source tree. Windows x64 remains the primary 
 
 - Hash chains are tamper-evident relative to the retained local chain; they are not signatures, trusted timestamps, immutable storage, or proof against a privileged full rewrite.
 - File modes are best-effort across platforms and do not configure Windows ACLs, BitLocker, backup, endpoint DLP, or secure erase.
-- Exact outbox, model response, and user-decision recovery artifacts can exist locally during recovery windows. Decision artifacts may contain free-form sensitive text. Verified completion clears the transient artifact directory unless retention is explicitly enabled; pause/failure/interruption may leave it for recovery.
+- Exact outbox, model response, and user-decision recovery artifacts can exist locally during recovery windows. Decision artifacts may contain free-form sensitive text. Paused and otherwise nonterminal sessions retain them for recovery. Terminal sessions durably record the effective remove/retain decision and retry required cleanup on later loads.
 - Checkpoints, the per-session HMAC fingerprint key, and the redacted completion handoff are separate sensitive records and are not removed by transient-artifact cleanup. The handoff can contain task prose and repository paths even after secret redaction. Once a session has a durable repository baseline, a missing or malformed fingerprint key makes recovery fail closed rather than generating a replacement.
 - Ordinary delete is not assured physical erasure on SSDs.
 - No cloud telemetry is intentionally added, but Copilot interaction itself is a cloud disclosure.

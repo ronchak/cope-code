@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { SecretScanner } from "../../src/security/secrets.js";
 import { BudgetMeter } from "../../src/session/budgets.js";
+import { SessionArtifactStore } from "../../src/session/artifact-store.js";
+import { CompletionHandoffStore } from "../../src/session/completion-handoff-store.js";
 import { SessionStore } from "../../src/session/store.js";
 import { allowedTransitions, isTerminal, transitionSession } from "../../src/session/state-machine.js";
 import {
@@ -71,6 +74,10 @@ test("budget meter performs check-before-consume and never overdraws", () => {
   assert.equal(meter.remaining("turns"), 0);
   assert.throws(() => meter.consume("turns"), /Budget exhausted/);
   assert.equal(state.budgetUsage.turns, 1);
+  meter.refund("turns");
+  assert.equal(meter.remaining("turns"), 1);
+  assert.throws(() => meter.refund("turns"), /Invalid budget refund/u);
+  assert.equal(state.budgetUsage.turns, 0);
 });
 
 test("session store writes atomically and rejects mismatched identity", async () => {
@@ -85,6 +92,256 @@ test("session store writes atomically and rejects mismatched identity", async ()
   parsed.sessionId = "session_tampered";
   await writeFile(filename, `${JSON.stringify(parsed)}\n`, "utf8");
   await assert.rejects(() => store.read(state.sessionId), /does not match/);
+});
+
+test("session store migrates legacy non-completed terminal handoffs on load", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-session-legacy-handoff-"));
+  const store = new SessionStore(root);
+  const state = makeState({
+    status: "rolled_back",
+    completedAt: "2026-01-01T00:00:03.000Z",
+    completionHandoff: {
+      version: "completion-handoff/1",
+      integrity: "e".repeat(64),
+      createdAt: "2026-01-01T00:00:02.000Z",
+      redactionCount: 0,
+    },
+  });
+  await store.create(state);
+  const sessionDirectory = store.sessionDirectory(state.sessionId);
+  const handoffFilename = path.join(sessionDirectory, "handoff", "completion.json");
+  await mkdir(path.dirname(handoffFilename), { recursive: true, mode: 0o700 });
+  await writeFile(handoffFilename, "legacy sensitive report\n", "utf8");
+
+  const migrated = await store.read(state.sessionId);
+  assert.equal(migrated.completionHandoff, undefined);
+  await assert.rejects(() => readFile(handoffFilename, "utf8"), { code: "ENOENT" });
+  const durable = JSON.parse(await readFile(path.join(sessionDirectory, "session.json"), "utf8")) as SessionState;
+  assert.deepEqual(durable.completionHandoff, state.completionHandoff);
+});
+
+test("session store removes an orphaned legacy terminal handoff without a state reference", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-session-orphaned-handoff-"));
+  const store = new SessionStore(root);
+  const state = makeState({
+    status: "failed",
+    completedAt: "2026-01-01T00:00:03.000Z",
+    failure: { code: "INTERNAL_ERROR", message: "legacy failure" },
+  });
+  await store.create(state);
+  const handoffFilename = path.join(store.sessionDirectory(state.sessionId), "handoff", "completion.json");
+  await mkdir(path.dirname(handoffFilename), { recursive: true, mode: 0o700 });
+  await writeFile(handoffFilename, "orphaned legacy report\n", "utf8");
+
+  const migrated = await store.read(state.sessionId);
+  assert.equal(migrated.status, "failed");
+  assert.equal(migrated.completionHandoff, undefined);
+  await assert.rejects(() => readFile(handoffFilename, "utf8"), { code: "ENOENT" });
+});
+
+test("session store clears source artifacts from legacy terminal states by default", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-session-legacy-artifacts-"));
+  const store = new SessionStore(root);
+  const state = makeState({
+    status: "failed",
+    completedAt: "2026-01-01T00:00:03.000Z",
+    failure: { code: "INTERNAL_ERROR", message: "legacy failure" },
+  });
+  await store.create(state);
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(state.sessionId), "artifacts"));
+  await artifacts.put("response", "turn_0001", "legacy source-bearing response");
+
+  const migrated = await store.read(state.sessionId);
+
+  assert.equal(migrated.status, "failed");
+  assert.equal(migrated.sourceArtifactRetention, undefined);
+  assert.equal(migrated.terminalCleanup, undefined);
+  assert.equal(await artifacts.getOptional("response", "turn_0001"), undefined);
+});
+
+test("hosts without directory fsync commit completion handoffs inline with session state", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-session-inline-handoff-"));
+  const sessionStore = new SessionStore(root);
+  const state = makeState();
+  await sessionStore.create(state);
+  const handoffDirectory = path.join(sessionStore.sessionDirectory(state.sessionId), "handoff");
+  const legacyFilename = path.join(handoffDirectory, "completion.json");
+  await mkdir(handoffDirectory, { recursive: true, mode: 0o700 });
+  await writeFile(legacyFilename, "orphaned 0.1.6 report\n", "utf8");
+  const handoffs = new CompletionHandoffStore(
+    handoffDirectory,
+    state.sessionId,
+    new SecretScanner(Buffer.alloc(32, 17)),
+    false,
+  );
+  const reference = await handoffs.save({
+    summary: "Inline Windows completion",
+    acceptanceCriteria: [],
+    validation: [],
+    skippedValidation: [],
+    remainingRisks: [],
+    recommendedFollowUp: [],
+  }, {
+    accepted: true,
+    reasons: [],
+    actual: {
+      changedPaths: [],
+      agentChangedPaths: [],
+      preExistingPaths: [],
+      successfulCommands: [],
+      failedCommands: [],
+      gitStatusSummary: "clean",
+      repositoryFingerprint: "f".repeat(64),
+    },
+  }, "2026-01-01T00:00:02.000Z");
+  assert.ok(reference.inlineRecord);
+  await assert.rejects(() => readFile(legacyFilename, "utf8"), { code: "ENOENT" });
+
+  state.status = "completed";
+  state.completedAt = "2026-01-01T00:00:03.000Z";
+  state.completionHandoff = reference;
+  await sessionStore.write(state);
+  // A power loss may restore the unflushable legacy directory entry. The
+  // completed inline state is a durable cleanup tombstone on every load.
+  await writeFile(legacyFilename, "resurrected 0.1.6 report\n", "utf8");
+  const durable = await sessionStore.read(state.sessionId);
+  assert.deepEqual(durable.completionHandoff, reference);
+  assert.equal((await handoffs.read(durable.completionHandoff)).claim.summary, "Inline Windows completion");
+  await assert.rejects(() => readFile(legacyFilename, "utf8"), { code: "ENOENT" });
+
+  const inlineRecord = reference.inlineRecord;
+  assert.ok(inlineRecord);
+  const tampered: SessionState = {
+    ...state,
+    completionHandoff: {
+      ...reference,
+      inlineRecord: {
+        ...inlineRecord,
+        claim: { ...inlineRecord.claim, summary: "tampered after hashing" },
+      },
+    },
+  };
+  await assert.rejects(() => sessionStore.write(tampered), /reference is malformed/u);
+});
+
+test("file-backed handoff creation flushes its parent before publishing the file", async () => {
+  const operations: string[] = [];
+  const directory = path.join("/state", "sessions", "session_12345678", "handoff");
+  const handoffs = new CompletionHandoffStore(
+    directory,
+    "session_12345678",
+    new SecretScanner(Buffer.alloc(32, 19)),
+    true,
+    {
+      makeDirectory: async (target) => {
+        operations.push(`mkdir:${target}`);
+      },
+      syncDirectory: async (target) => {
+        operations.push(`sync:${target}`);
+      },
+      writeAtomically: async (target) => {
+        operations.push(`write:${target}`);
+      },
+    },
+  );
+
+  await handoffs.save({
+    summary: "File-backed completion",
+    acceptanceCriteria: [],
+    validation: [],
+    skippedValidation: [],
+    remainingRisks: [],
+    recommendedFollowUp: [],
+  }, {
+    accepted: true,
+    reasons: [],
+    actual: {
+      changedPaths: [],
+      agentChangedPaths: [],
+      preExistingPaths: [],
+      successfulCommands: [],
+      failedCommands: [],
+      gitStatusSummary: "clean",
+      repositoryFingerprint: "f".repeat(64),
+    },
+  }, "2026-01-01T00:00:02.000Z");
+
+  assert.deepEqual(operations, [
+    `mkdir:${directory}`,
+    `sync:${path.dirname(directory)}`,
+    `write:${path.join(directory, "completion.json")}`,
+  ]);
+});
+
+test("hosts without directory fsync still unlink legacy handoff files", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-session-inline-legacy-cleanup-"));
+  const handoffDirectory = path.join(root, "handoff");
+  const filename = path.join(handoffDirectory, "completion.json");
+  await mkdir(handoffDirectory, { recursive: true, mode: 0o700 });
+  await writeFile(filename, "legacy report\n", "utf8");
+
+  await CompletionHandoffStore.removeAt(handoffDirectory, false);
+  await assert.rejects(() => readFile(filename, "utf8"), { code: "ENOENT" });
+});
+
+test("legacy handoff migration cannot overwrite a concurrent terminal state write", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-session-handoff-race-"));
+  const store = new SessionStore(root);
+  const state = makeState({
+    status: "blocked",
+    completedAt: "2026-01-01T00:00:03.000Z",
+    pauseReason: "legacy block",
+    completionHandoff: {
+      version: "completion-handoff/1",
+      integrity: "e".repeat(64),
+      createdAt: "2026-01-01T00:00:02.000Z",
+      redactionCount: 0,
+    },
+  });
+  await store.create(state);
+  const handoffFilename = path.join(store.sessionDirectory(state.sessionId), "handoff", "completion.json");
+  await mkdir(path.dirname(handoffFilename), { recursive: true, mode: 0o700 });
+  await writeFile(handoffFilename, "legacy report\n", "utf8");
+
+  const originalRemoveAt = CompletionHandoffStore.removeAt;
+  let releaseRemoval!: () => void;
+  const removalReleased = new Promise<void>((resolve) => {
+    releaseRemoval = resolve;
+  });
+  let removalEnteredResolve!: () => void;
+  const removalEntered = new Promise<void>((resolve) => {
+    removalEnteredResolve = resolve;
+  });
+  CompletionHandoffStore.removeAt = async (directory: string): Promise<void> => {
+    removalEnteredResolve();
+    await removalReleased;
+    await originalRemoveAt(directory);
+  };
+
+  try {
+    const migration = store.read(state.sessionId);
+    await removalEntered;
+    const rolledBack: SessionState = {
+      ...state,
+      status: "rolled_back",
+      updatedAt: "2026-01-01T00:00:04.000Z",
+      completedAt: "2026-01-01T00:00:04.000Z",
+    };
+    delete rolledBack.pauseReason;
+    delete rolledBack.completionHandoff;
+    const concurrentWrite = store.write(rolledBack);
+    await concurrentWrite;
+    releaseRemoval();
+    const migrated = await migration;
+    assert.equal(migrated.status, "rolled_back");
+  } finally {
+    releaseRemoval();
+    CompletionHandoffStore.removeAt = originalRemoveAt;
+  }
+
+  const durable = await store.read(state.sessionId);
+  assert.equal(durable.status, "rolled_back");
+  assert.equal(durable.completionHandoff, undefined);
 });
 
 test("session store rejects unknown fields and partial durable state", async () => {

@@ -108,6 +108,15 @@ export class OperationJournal {
     return this.update(record, "executing", now);
   }
 
+  public async markNotStarted(record: OperationRecord, now: string): Promise<OperationRecord> {
+    if (record.status !== "executing") {
+      throw new AgentError("RECOVERY_REQUIRED", `Cannot restore an unstarted operation from ${record.status}`, {
+        operationId: record.operationId,
+      });
+    }
+    return this.update(record, "accepted", now);
+  }
+
   public async markCompleted(
     record: OperationRecord,
     now: string,
