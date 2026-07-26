@@ -1813,6 +1813,91 @@ test("recovery finishes a refund interrupted after the journal became retry-safe
   assert.equal(localState.pendingOperations.length, 0);
 });
 
+test("read-only recovery retries once without recharging its persisted specialized budget", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-read-recovery-budget-"));
+  const localState = state(root);
+  localState.status = "executing_tools";
+  localState.turnSequence = 1;
+  localState.budgetLimits = { ...localState.budgetLimits, maxReadFiles: 1 };
+  localState.budgetUsage = { ...localState.budgetUsage, operations: 1, readFiles: 1 };
+  localState.submission = {
+    submissionId: "submission_1",
+    turnId: "turn_0001",
+    messageHash: "a".repeat(64),
+    marker: "marker",
+    state: "answered",
+    preparedAt: "2026-01-01T00:00:00.000Z",
+    answeredAt: "2026-01-01T00:00:01.000Z",
+  };
+  const call = {
+    operationId: "op_read_recovery",
+    name: "read_file" as const,
+    arguments: { path: "README.md" },
+  };
+  const journal = new OperationJournal(path.join(root, "operations"), localState.sessionId);
+  const registration = await journal.register(
+    call.operationId,
+    call.name,
+    false,
+    call,
+    "2026-01-01T00:00:00.000Z",
+  );
+  const executing = await journal.markExecuting(registration.record, "2026-01-01T00:00:01.000Z");
+  localState.pendingOperations = [{
+    operationId: call.operationId,
+    tool: call.name,
+    mutating: false,
+    requestHash: executing.requestHash,
+    status: "executing",
+    acceptedAt: executing.acceptedAt,
+  }];
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
+  await artifacts.put("response", "turn_0001", JSON.stringify([{ type: "tool_request", calls: [call] }]));
+  const transport = new QueueTransport([JSON.stringify([{
+    type: "complete_task",
+    operationId: "op_complete_after_read_recovery",
+    claim: {
+      summary: "Recovered the interrupted file read.",
+      acceptanceCriteria: [],
+      validation: [],
+      skippedValidation: [],
+      remainingRisks: [],
+      recommendedFollowUp: [],
+    },
+  }])]);
+  let executions = 0;
+
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+    execute: async (requested) => {
+      executions += 1;
+      return {
+        operationId: requested.operationId,
+        tool: requested.name,
+        status: "success",
+        data: { content: "read once" },
+        safeMetadata: {
+          path: "README.md",
+          sha256: "d".repeat(64),
+          bytes: 9,
+        },
+      };
+    },
+  }).run();
+
+  assert.equal(result.status, "completed", result.reason);
+  assert.equal(executions, 1);
+  assert.equal(localState.budgetUsage.readFiles, 1);
+  assert.equal(localState.pendingOperations.length, 0);
+  assert.equal((await journal.read(call.operationId)).status, "completed");
+});
+
 test("recovery retries a mutation whose journal advanced before accepted session state", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-predispatch-journal-recovery-"));
   const localState = state(root);
