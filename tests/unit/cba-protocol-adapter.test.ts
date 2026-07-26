@@ -3,6 +3,7 @@ import test from "node:test";
 import { CbaProtocolAdapter } from "../../src/orchestrator/cba-protocol-adapter.js";
 import {
   ORCHESTRATOR_TOOL_NAMES,
+  ProtocolParseError,
   TOOL_REGISTRY,
   parseProtocolEnvelope,
   serializeProtocolEnvelope,
@@ -162,4 +163,61 @@ test("CBA adapter enforces prior operation IDs through the protocol parser", () 
     turnId: "turn_0003",
     recoveryReplay: true,
   }));
+});
+
+test("CBA adapter repairs only parser failures explicitly marked repairable", () => {
+  const adapter = new CbaProtocolAdapter({ seenOperationIds: () => new Set(["op_used"]) });
+
+  const capture = (
+    raw: string,
+    expected: { readonly taskId: string; readonly turnId: string },
+  ): ProtocolParseError => {
+    try {
+      adapter.parseModelTurn(raw, expected);
+    } catch (error) {
+      assert.ok(error instanceof ProtocolParseError);
+      return error;
+    }
+    throw new Error("expected parse failure");
+  };
+
+  const malformed = capture("not a protocol envelope", {
+    taskId: "task_12345678",
+    turnId: "turn_0001",
+  });
+  assert.equal(adapter.isRepairableParseError(malformed), true);
+
+  const correlated = serializeProtocolEnvelope({
+    protocol: "cba/1",
+    message_type: "tool_request",
+    message_id: "msg_correlation",
+    task_id: "task_other",
+    turn_id: 9,
+    operations: [{ operation_id: "op_new", tool: "git_status", arguments: {} }],
+  });
+  for (const [error, code] of [
+    [
+      capture(correlated, { taskId: "task_12345678", turnId: "turn_0009" }),
+      "TASK_MISMATCH",
+    ],
+    [
+      capture(correlated, { taskId: "task_other", turnId: "turn_0008" }),
+      "TURN_MISMATCH",
+    ],
+    [
+      capture("x".repeat(1_048_577), { taskId: "task_12345678", turnId: "turn_0001" }),
+      "INPUT_TOO_LARGE",
+    ],
+  ] as const) {
+    assert.equal(error.protocolCode, code);
+    assert.equal(adapter.isRepairableParseError(error), false);
+  }
+
+  const cases = [
+    new ProtocolParseError("DUPLICATE_OPERATION_ID", "duplicate operation", {}, false),
+    new Error("unexpected adapter failure"),
+  ];
+  for (const error of cases) {
+    assert.equal(adapter.isRepairableParseError(error), false);
+  }
 });
