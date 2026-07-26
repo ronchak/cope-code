@@ -704,6 +704,7 @@ export class AgentRuntime {
     switch (action.type) {
       case "tool_request": {
         await this.move("executing_tools");
+        this.throwIfInterrupted();
         const outcomes = await this.executeCalls(action.calls, turnId);
         await this.move("returning_results");
         const outbound = await this.serializeForDisclosure(
@@ -723,8 +724,10 @@ export class AgentRuntime {
           () => this.dependencies.user.requestInput({
             question: action.question,
             ...(action.choices === undefined ? {} : { choices: action.choices }),
+            signal: this.controller.signal,
           }),
         );
+        this.throwIfInterrupted();
         const outbound = await this.serializeForDisclosure(
           this.dependencies.protocol.renderUserDecision({
             taskId: this.state.taskId,
@@ -750,12 +753,16 @@ export class AgentRuntime {
             capability: action.capability,
             reason: action.reason,
             ...(action.risk === undefined ? {} : { risk: action.risk }),
+            signal: this.controller.signal,
           }),
         );
+        this.throwIfInterrupted();
         const userDecision = capabilityDecision(decisionRecord);
         let granted = false;
         if (userDecision.decision === "allow_session") {
+          this.throwIfInterrupted();
           granted = await this.dependencies.policy.expandSessionGrant(action.capability);
+          this.throwIfInterrupted();
         }
         // A standalone capability request has no exact operation to which a
         // one-shot token can safely bind. Copilot must request the operation;
@@ -896,6 +903,7 @@ export class AgentRuntime {
     turnId: string,
     requester: () => Promise<Readonly<Record<string, unknown>>>,
   ): Promise<Readonly<Record<string, unknown>>> {
+    this.throwIfInterrupted();
     const alreadyAccounted = this.state.completedOperationIds.includes(requestId);
     const registration = await this.dependencies.journal.register(
       requestId,
@@ -942,8 +950,10 @@ export class AgentRuntime {
     const decision = cached === undefined
       ? await requester()
       : parseDecisionArtifact(cached);
+    this.throwIfInterrupted();
     if (cached === undefined) {
       await this.requireArtifacts().put("decision", artifactId, stableJson(decision));
+      this.throwIfInterrupted();
     }
     const decisionHash = sha256(stableJson(decision));
     await this.dependencies.journal.markCompleted(
@@ -963,6 +973,7 @@ export class AgentRuntime {
       data: { tool, decisionHash },
     });
     await this.persist();
+    this.throwIfInterrupted();
     return decision;
   }
 
@@ -988,6 +999,7 @@ export class AgentRuntime {
     }
     const outcomes: ToolOutcome[] = [];
     for (const call of calls) {
+      this.throwIfInterrupted();
       outcomes.push(await this.executeCall(call, turnId));
     }
     return outcomes;
@@ -1014,6 +1026,7 @@ export class AgentRuntime {
   }
 
   private async executeCall(call: NormalizedToolCall, turnId: string): Promise<ToolOutcome> {
+    this.throwIfInterrupted();
     const mutating = !isReadOnlyToolName(call.name);
     const operationAlreadyAccounted =
       this.state.completedOperationIds.includes(call.operationId) ||
@@ -1054,6 +1067,7 @@ export class AgentRuntime {
     }
     this.setPending(call, registration.record, "accepted");
     await this.persist();
+    this.throwIfInterrupted();
 
     await this.dependencies.audit.append({
       type: "tool.requested",
@@ -1062,7 +1076,9 @@ export class AgentRuntime {
       operationId: call.operationId,
       data: { tool: call.name, requestHash: registration.record.requestHash },
     });
+    this.throwIfInterrupted();
     const policy = await this.dependencies.policy.authorize(call);
+    this.throwIfInterrupted();
     await this.dependencies.audit.append({
       type: "policy.decision",
       taskId: this.state.taskId,
@@ -1070,9 +1086,11 @@ export class AgentRuntime {
       operationId: call.operationId,
       data: { tool: call.name, ...policy },
     });
+    this.throwIfInterrupted();
     let allowed = policy.outcome === "allow";
     if (policy.outcome === "ask") {
       await this.move("awaiting_user", policy.explanation);
+      this.throwIfInterrupted();
       await this.dependencies.audit.append({
         type: "capability.requested",
         taskId: this.state.taskId,
@@ -1080,19 +1098,26 @@ export class AgentRuntime {
         operationId: call.operationId,
         data: { reasonCode: policy.reasonCode, capability: policy.capability },
       });
+      this.throwIfInterrupted();
       const decisionArtifactId = `decision_policy_${call.operationId}`;
       const cachedDecision = await this.dependencies.artifacts?.getOptional("decision", decisionArtifactId);
+      this.throwIfInterrupted();
       const decision = cachedDecision === undefined
         ? await this.dependencies.user.requestCapability({
             capability: policy.capability,
             reason: policy.explanation,
+            signal: this.controller.signal,
           })
         : capabilityDecision(parseDecisionArtifact(cachedDecision));
+      this.throwIfInterrupted();
       if (cachedDecision === undefined) {
         await this.requireArtifacts().put("decision", decisionArtifactId, stableJson(decision));
+        this.throwIfInterrupted();
       }
       if (decision.decision === "allow_session") {
+        this.throwIfInterrupted();
         allowed = await this.dependencies.policy.expandSessionGrant(policy.capability);
+        this.throwIfInterrupted();
       } else {
         allowed = decision.decision === "allow_once";
       }
@@ -1103,8 +1128,11 @@ export class AgentRuntime {
         operationId: call.operationId,
         data: { decision: decision.decision, effective: allowed },
       });
+      this.throwIfInterrupted();
       await this.move("executing_tools");
+      this.throwIfInterrupted();
     }
+    this.throwIfInterrupted();
     if (!allowed) {
       const failed = await this.dependencies.journal.markFailed(
         registration.record,
@@ -1128,9 +1156,19 @@ export class AgentRuntime {
 
     if (call.name === "run_command") this.meter.consume("commands");
     if (call.name === "read_file") this.meter.consume("readFiles");
+    this.throwIfInterrupted();
     const executing = await this.dependencies.journal.markExecuting(registration.record, this.now());
+    if (this.interruption !== undefined) {
+      await this.restoreUnstartedOperation(call, executing);
+      this.throwIfInterrupted();
+    }
     this.setPending(call, executing, "executing");
     await this.persist();
+    if (this.interruption !== undefined) {
+      await this.restoreUnstartedOperation(call, executing);
+      this.throwIfInterrupted();
+    }
+    this.throwIfInterrupted();
     let operationWasCommitted = false;
     try {
       const outcome = await this.dependencies.tools.execute(call, this.controller.signal);
@@ -1231,6 +1269,21 @@ export class AgentRuntime {
     this.state.pendingOperations = this.state.pendingOperations.filter(
       (operation) => operation.operationId !== operationId,
     );
+  }
+
+  private async restoreUnstartedOperation(
+    call: NormalizedToolCall,
+    executing: OperationRecord,
+  ): Promise<void> {
+    const accepted = await this.dependencies.journal.markNotStarted(executing, this.now());
+    this.setPending(call, accepted, "accepted");
+    await this.persist();
+  }
+
+  private throwIfInterrupted(): void {
+    if (this.interruption !== undefined) {
+      throw new AgentError("INTERNAL_ERROR", "Execution stopped at an interruption boundary");
+    }
   }
 
   private async recordToolEffects(

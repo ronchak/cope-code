@@ -115,10 +115,12 @@ export interface UserInteraction {
   requestInput(request: {
     readonly question: string;
     readonly choices?: readonly string[];
+    readonly signal: AbortSignal;
   }): Promise<Readonly<Record<string, unknown>>>;
   requestCapability(request: {
     readonly capability: Readonly<Record<string, unknown>>;
     readonly reason: string;
     readonly risk?: string;
+    readonly signal: AbortSignal;
   }): Promise<{ readonly decision: "deny" | "allow_once" | "allow_session"; readonly note?: string }>;
 }

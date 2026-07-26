@@ -19,7 +19,9 @@ import type {
   NormalizedModelMessage,
   ParsedModelTurn,
   ProtocolAdapter,
+  RuntimePolicy,
   ToolExecutor,
+  UserInteraction,
 } from "../../src/orchestrator/contracts.js";
 import { OperationJournal } from "../../src/session/operation-journal.js";
 import { SessionArtifactStore } from "../../src/session/artifact-store.js";
@@ -378,6 +380,34 @@ class PauseWriteGateStore extends SessionStore {
   }
 }
 
+class ToolExecutionWriteGateStore extends SessionStore {
+  private executingWriteSeen = false;
+  private markExecutingWriteStarted!: () => void;
+  private finishExecutingWrite!: () => void;
+  public readonly executingWriteStarted = new Promise<void>((resolve) => {
+    this.markExecutingWriteStarted = resolve;
+  });
+  private readonly executingWriteReleased = new Promise<void>((resolve) => {
+    this.finishExecutingWrite = resolve;
+  });
+
+  public releaseExecutingWrite(): void {
+    this.finishExecutingWrite();
+  }
+
+  public override async write(session: SessionState): Promise<void> {
+    if (
+      !this.executingWriteSeen &&
+      session.pendingOperations.some((operation) => operation.status === "executing")
+    ) {
+      this.executingWriteSeen = true;
+      this.markExecutingWriteStarted();
+      await this.executingWriteReleased;
+    }
+    await super.write(session);
+  }
+}
+
 class RecoveryProbeTransport extends QueueTransport {
   public resolveCalls = 0;
 
@@ -442,6 +472,8 @@ function runtimeForTest(input: {
   readonly execute?: ToolExecutor["execute"];
   readonly inspectCompletionState?: ToolExecutor["inspectCompletionState"];
   readonly disclosure?: DisclosureGuard;
+  readonly policy?: RuntimePolicy;
+  readonly user?: UserInteraction;
   readonly idFactory?: (prefix: string) => string;
   readonly retainSourceArtifactsOnCompletion?: boolean;
 }): AgentRuntime {
@@ -451,7 +483,7 @@ function runtimeForTest(input: {
     journal: new OperationJournal(path.join(input.root, "operations"), input.state.sessionId),
     audit: new AuditLog(path.join(input.root, "audit.jsonl"), input.state.sessionId),
     protocol: input.protocol ?? protocol,
-    policy: {
+    policy: input.policy ?? {
       summarize: () => ({}),
       authorize: () => ({ outcome: "allow", reasonCode: "OK", explanation: "ok" }),
       expandSessionGrant: async () => false,
@@ -471,7 +503,7 @@ function runtimeForTest(input: {
     },
     transport: input.transport,
     disclosure: input.disclosure ?? { inspectAndSerialize: async (message) => message },
-    user: {
+    user: input.user ?? {
       requestInput: async () => ({}),
       requestCapability: async () => ({ decision: "deny" }),
     },
@@ -1455,6 +1487,163 @@ test("abort cannot be downgraded by a racing pause request", async () => {
   assert.equal(result.reason, "operator kill switch");
   assert.equal(await artifacts.getOptional("outbox", "submission_1"), undefined);
   assert.equal(await artifacts.getOptional("decision", "sentinel"), undefined);
+});
+
+test("abort during policy authorization cannot start a repository mutation", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-abort-policy-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  let markAuthorizationStarted!: () => void;
+  let releaseAuthorization!: () => void;
+  const authorizationStarted = new Promise<void>((resolve) => { markAuthorizationStarted = resolve; });
+  const authorizationReleased = new Promise<void>((resolve) => { releaseAuthorization = resolve; });
+  let expansions = 0;
+  let executions = 0;
+  const runtime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport: new QueueTransport([JSON.stringify([{
+      type: "tool_request",
+      calls: [{ operationId: "op_abort_policy", name: "apply_patch", arguments: { changes: [] } }],
+    }])]),
+    policy: {
+      summarize: () => ({}),
+      authorize: async () => {
+        markAuthorizationStarted();
+        await authorizationReleased;
+        return {
+          outcome: "ask",
+          reasonCode: "ASK_WRITE",
+          explanation: "Approve repository mutation",
+          capability: { kind: "path", access: "write", paths: ["src/new.ts"] },
+        };
+      },
+      expandSessionGrant: async () => { expansions += 1; return true; },
+    },
+    execute: async (call) => {
+      executions += 1;
+      return {
+        operationId: call.operationId,
+        tool: call.name,
+        status: "success",
+        data: {},
+        safeMetadata: {},
+      };
+    },
+  });
+
+  const run = runtime.run();
+  await authorizationStarted;
+  await runtime.emergencyStop("abort while policy is pending");
+  releaseAuthorization();
+  const result = await run;
+  assert.equal(result.status, "aborted");
+  assert.equal(result.reason, "abort while policy is pending");
+  assert.equal(expansions, 0);
+  assert.equal(executions, 0);
+  const journal = new OperationJournal(path.join(root, "operations"), localState.sessionId);
+  assert.equal((await journal.read("op_abort_policy")).status, "accepted");
+});
+
+test("abort cancels a standalone capability prompt before grant expansion", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-abort-capability-prompt-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  let markPromptStarted!: () => void;
+  const promptStarted = new Promise<void>((resolve) => { markPromptStarted = resolve; });
+  let promptSignal: AbortSignal | undefined;
+  let expansions = 0;
+  let executions = 0;
+  const runtime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport: new QueueTransport([JSON.stringify([{
+      type: "request_capability",
+      requestId: "cap_abort_prompt",
+      capability: { kind: "path", access: "write", paths: ["src/new.ts"] },
+      reason: "Need repository write access",
+    }])]),
+    policy: {
+      summarize: () => ({}),
+      authorize: () => ({ outcome: "allow", reasonCode: "OK", explanation: "ok" }),
+      expandSessionGrant: async () => { expansions += 1; return true; },
+    },
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async (request) => {
+        promptSignal = request.signal;
+        markPromptStarted();
+        return new Promise((_, reject) => {
+          const rejectForAbort = (): void => reject(new Error("capability prompt aborted"));
+          if (request.signal.aborted) rejectForAbort();
+          else request.signal.addEventListener("abort", rejectForAbort, { once: true });
+        });
+      },
+    },
+    execute: async (call) => {
+      executions += 1;
+      return {
+        operationId: call.operationId,
+        tool: call.name,
+        status: "success",
+        data: {},
+        safeMetadata: {},
+      };
+    },
+  });
+
+  const run = runtime.run();
+  await promptStarted;
+  await runtime.emergencyStop("abort capability prompt");
+  const result = await run;
+  assert.equal(result.status, "aborted");
+  assert.equal(result.reason, "abort capability prompt");
+  assert.equal(promptSignal?.aborted, true);
+  assert.equal(expansions, 0);
+  assert.equal(executions, 0);
+});
+
+test("abort during pre-execution persistence restores a retry-safe journal without invoking the tool", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-abort-execution-persist-"));
+  const localState = state(root);
+  const store = new ToolExecutionWriteGateStore(path.join(root, "state"));
+  await store.create(localState);
+  let executions = 0;
+  const runtime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport: new QueueTransport([JSON.stringify([{
+      type: "tool_request",
+      calls: [{ operationId: "op_abort_persist", name: "apply_patch", arguments: { changes: [] } }],
+    }])]),
+    execute: async (call) => {
+      executions += 1;
+      return {
+        operationId: call.operationId,
+        tool: call.name,
+        status: "success",
+        data: {},
+        safeMetadata: {},
+      };
+    },
+  });
+
+  const run = runtime.run();
+  await store.executingWriteStarted;
+  await runtime.emergencyStop("abort during pre-execution persistence");
+  store.releaseExecutingWrite();
+  const result = await run;
+  assert.equal(result.status, "aborted");
+  assert.equal(result.reason, "abort during pre-execution persistence");
+  assert.equal(executions, 0);
+  const journal = new OperationJournal(path.join(root, "operations"), localState.sessionId);
+  assert.equal((await journal.read("op_abort_persist")).status, "accepted");
+  assert.equal(localState.pendingOperations[0]?.status, "accepted");
 });
 
 test("abort clears a completed response received during transport shutdown", async () => {
