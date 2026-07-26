@@ -56,6 +56,19 @@ export class BudgetMeter {
     } satisfies BudgetUsage;
   }
 
+  public refund(counter: BudgetCounter, amount = 1): void {
+    if (!Number.isSafeInteger(amount) || amount < 0 || this.state.budgetUsage[counter] < amount) {
+      throw new AgentError("INTERNAL_ERROR", `Invalid budget refund for ${counter}`, {
+        amount,
+        current: this.state.budgetUsage[counter],
+      });
+    }
+    this.state.budgetUsage = {
+      ...this.state.budgetUsage,
+      [counter]: this.state.budgetUsage[counter] - amount,
+    } satisfies BudgetUsage;
+  }
+
   public remaining(counter: BudgetCounter): number {
     const limitKey = counterToLimit[counter];
     return this.state.budgetLimits[limitKey] - this.state.budgetUsage[counter];

@@ -55,6 +55,7 @@ import {
 import { SessionStore, type WorkspaceLock } from "../session/store.js";
 import {
   cleanupTerminalRecoveryArtifacts,
+  sessionRetainsSourceArtifacts,
   setTerminalCleanupPolicy,
 } from "../session/terminal-cleanup.js";
 import {
@@ -319,6 +320,10 @@ async function runNewSession(
         repository: configuration.hashes.repository,
         grant: grantHash,
       },
+      sourceArtifactRetention:
+        configuration.repository.retention.retain_source_artifacts_on_completion
+          ? "retain"
+          : "remove",
       budgetLimits: sessionBudgetLimits(engine.getEffectiveBudgetLimits()),
       budgetUsage: zeroBudgetUsage(),
       turnSequence: 0,
@@ -388,8 +393,6 @@ async function runNewSession(
         store,
         sessionAudit,
         "Initial session grant was declined",
-        undefined,
-        configuration.repository.retention.retain_source_artifacts_on_completion,
       );
       output(command.json, io, sessionResult(newState, "Initial session grant was declined"));
       return 2;
@@ -457,7 +460,6 @@ async function runNewSession(
           audit,
           errorMessage(error),
           error,
-          configuration.repository.retention.retain_source_artifacts_on_completion,
         );
       }
     }
@@ -548,6 +550,7 @@ async function resumeSession(
     }
     assertConfigurationUnchanged(state, manifest, configuration);
     assertGrantMatchesState(grant, state);
+    await pinLegacySessionRetention(state, configuration, store);
     const audit = new AuditLog(path.join(sessionDirectory, "audit.jsonl"), state.sessionId);
     const user = terminalUser(command.json, io);
     await audit.initialize();
@@ -563,8 +566,6 @@ async function resumeSession(
           store,
           audit,
           "Initial session grant was declined",
-          undefined,
-          configuration.repository.retention.retain_source_artifacts_on_completion,
         );
         output(command.json, io, sessionResult(state, "Initial session grant was declined"));
         return 2;
@@ -639,7 +640,6 @@ async function resumeSession(
           audit,
           errorMessage(error),
           error,
-          configuration.repository.retention.retain_source_artifacts_on_completion,
         );
       }
     }
@@ -726,28 +726,12 @@ async function controlSession(
       throw new AgentError("RECOVERY_REQUIRED", `Session state '${state.status}' is not actively running and cannot be paused`);
     }
     const audit = new AuditLog(path.join(store.sessionDirectory(state.sessionId), "audit.jsonl"), state.sessionId);
-    let retainSourceArtifacts = false;
-    try {
-      const configuration = await loadRuntimeConfiguration({
-        repositoryRoot: state.repositoryRoot,
-        stateHome,
-        requireBrowser: false,
-        host,
-      });
-      retainSourceArtifacts =
-        configuration.repository.retention.retain_source_artifacts_on_completion;
-    } catch {
-      // Abort must remain configuration-independent. When retention cannot be
-      // proven, default to removing source-bearing recovery data.
-    }
     await moveState(
       state,
       action === "pause" ? "paused" : "aborted",
       store,
       audit,
       reason,
-      undefined,
-      retainSourceArtifacts,
     );
     output(command.json, io, sessionResult(state, reason));
     return 0;
@@ -815,8 +799,6 @@ async function rollbackSession(
         store,
         audit,
         "Completion invalidated by explicit checkpoint rollback",
-        undefined,
-        configuration.repository.retention.retain_source_artifacts_on_completion,
       );
     }
     output(command.json, io, {
@@ -1103,6 +1085,20 @@ function assertGrantMatchesState(grant: SessionGrant, state: SessionState): void
   }
 }
 
+async function pinLegacySessionRetention(
+  state: SessionState,
+  configuration: LoadedRuntimeConfiguration,
+  store: SessionStore,
+): Promise<void> {
+  if (state.sourceArtifactRetention !== undefined) return;
+  state.sourceArtifactRetention =
+    configuration.repository.retention.retain_source_artifacts_on_completion
+      ? "retain"
+      : "remove";
+  state.updatedAt = new Date().toISOString();
+  await store.write(state);
+}
+
 async function moveState(
   state: SessionState,
   next: SessionStatus,
@@ -1110,10 +1106,10 @@ async function moveState(
   audit: AuditLog,
   reason?: string,
   failure?: unknown,
-  retainSourceArtifacts = false,
 ): Promise<void> {
   const from = state.status;
   const prior = snapshotSessionLifecycle(state);
+  const retainSourceArtifacts = sessionRetainsSourceArtifacts(state);
   const now = new Date().toISOString();
   transitionSession(state, next, now, {
     ...(reason === undefined ? {} : { reason }),
@@ -1127,7 +1123,7 @@ async function moveState(
       : {}),
   });
   if (isTerminal(next) && next !== "completed") delete state.completionHandoff;
-  if (isTerminal(next)) setTerminalCleanupPolicy(state, retainSourceArtifacts);
+  if (isTerminal(next)) setTerminalCleanupPolicy(state);
   try {
     await store.write(state);
   } catch (error) {

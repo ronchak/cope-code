@@ -125,6 +125,12 @@ export interface SessionState {
     readonly repository: string;
     grant: string;
   };
+  /**
+   * Session-effective retention policy pinned when the original repository
+   * policy is accepted. Legacy 0.1.6 sessions may omit it until safely resumed
+   * under their original policy hashes.
+   */
+  sourceArtifactRetention?: "remove" | "retain";
   budgetLimits: BudgetLimits;
   budgetUsage: BudgetUsage;
   turnSequence: number;

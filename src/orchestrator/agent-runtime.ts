@@ -28,6 +28,7 @@ import {
 } from "../session/state-machine.js";
 import {
   cleanupTerminalRecoveryArtifacts,
+  sessionRetainsSourceArtifacts,
   setTerminalCleanupPolicy,
 } from "../session/terminal-cleanup.js";
 import type { SessionState } from "../session/types.js";
@@ -66,7 +67,6 @@ export interface AgentRuntimeDependencies {
   readonly idFactory?: (prefix: string) => string;
   readonly artifacts?: SessionArtifactStore;
   readonly completionHandoffs?: CompletionHandoffStore;
-  readonly retainSourceArtifactsOnCompletion?: boolean;
   /** Deterministic, source-free operational events for an interactive CLI. */
   readonly onProgress?: (event: RuntimeProgressEvent) => void;
 }
@@ -339,9 +339,21 @@ export class AgentRuntime {
 
   private async findUncertainMutation(): Promise<SessionState["pendingOperations"][number] | undefined> {
     for (const pending of this.state.pendingOperations) {
-      if (!pending.mutating) continue;
       const record = await this.dependencies.journal.read(pending.operationId);
-      if (record.status === "completed" || record.status === "failed" || record.status === "accepted") continue;
+      if (record.status === "accepted") {
+        if (pending.status === "executing") {
+          const specializedCounter = specializedBudgetCounter(pending.tool);
+          if (specializedCounter !== undefined) this.meter.refund(specializedCounter);
+          this.state.pendingOperations = this.state.pendingOperations.map((operation) =>
+            operation.operationId === pending.operationId
+              ? { ...operation, status: "accepted" as const }
+              : operation,
+          );
+          await this.persist();
+        }
+        continue;
+      }
+      if (!pending.mutating || record.status === "completed" || record.status === "failed") continue;
       const indeterminate = { ...pending, status: "indeterminate" as const };
       this.state.pendingOperations = this.state.pendingOperations.map((operation) =>
         operation.operationId === pending.operationId ? indeterminate : operation,
@@ -576,7 +588,7 @@ export class AgentRuntime {
   private async cleanupTerminalArtifacts(): Promise<void> {
     await cleanupTerminalRecoveryArtifacts({
       status: this.state.status,
-      retainSourceArtifacts: this.dependencies.retainSourceArtifactsOnCompletion === true,
+      retainSourceArtifacts: sessionRetainsSourceArtifacts(this.state),
       ...(this.dependencies.artifacts === undefined ? {} : { artifacts: this.dependencies.artifacts }),
       ...(this.dependencies.completionHandoffs === undefined
         ? {}
@@ -904,7 +916,9 @@ export class AgentRuntime {
     requester: () => Promise<Readonly<Record<string, unknown>>>,
   ): Promise<Readonly<Record<string, unknown>>> {
     this.throwIfInterrupted();
-    const alreadyAccounted = this.state.completedOperationIds.includes(requestId);
+    const alreadyAccounted =
+      this.state.completedOperationIds.includes(requestId) ||
+      this.state.pendingOperations.some((operation) => operation.operationId === requestId);
     const registration = await this.dependencies.journal.register(
       requestId,
       tool,
@@ -922,6 +936,7 @@ export class AgentRuntime {
           requestId,
         });
       }
+      this.clearPending(requestId);
       if (!this.state.completedOperationIds.includes(requestId)) {
         this.state.completedOperationIds.push(requestId);
       }
@@ -938,7 +953,13 @@ export class AgentRuntime {
     if (registration.kind === "indeterminate_mutation") {
       throw new AgentError("RECOVERY_REQUIRED", "A user-decision request was classified as a mutation");
     }
+    this.setPending({ operationId: requestId, name: tool }, registration.record, "accepted");
+    await this.persist();
+    this.throwIfInterrupted();
     const executing = await this.dependencies.journal.markExecuting(registration.record, this.now());
+    this.setPending({ operationId: requestId, name: tool }, executing, "executing");
+    await this.persist();
+    this.throwIfInterrupted();
     await this.dependencies.audit.append({
       type: "user.requested",
       taskId: this.state.taskId,
@@ -946,7 +967,9 @@ export class AgentRuntime {
       operationId: requestId,
       data: { tool, requestHash: registration.record.requestHash },
     });
+    this.throwIfInterrupted();
     const cached = await this.dependencies.artifacts?.getOptional("decision", artifactId);
+    this.throwIfInterrupted();
     const decision = cached === undefined
       ? await requester()
       : parseDecisionArtifact(cached);
@@ -962,6 +985,7 @@ export class AgentRuntime {
       "answered",
       { decisionHash },
     );
+    this.clearPending(requestId);
     if (!this.state.completedOperationIds.includes(requestId)) {
       this.state.completedOperationIds.push(requestId);
     }
@@ -1154,18 +1178,24 @@ export class AgentRuntime {
       };
     }
 
-    if (call.name === "run_command") this.meter.consume("commands");
-    if (call.name === "read_file") this.meter.consume("readFiles");
+    const specializedCounter = specializedBudgetCounter(call.name);
+    if (specializedCounter !== undefined) this.meter.consume(specializedCounter);
     this.throwIfInterrupted();
-    const executing = await this.dependencies.journal.markExecuting(registration.record, this.now());
+    let executing: OperationRecord;
+    try {
+      executing = await this.dependencies.journal.markExecuting(registration.record, this.now());
+    } catch (error) {
+      if (specializedCounter !== undefined) this.meter.refund(specializedCounter);
+      throw error;
+    }
     if (this.interruption !== undefined) {
-      await this.restoreUnstartedOperation(call, executing);
+      await this.restoreUnstartedOperation(call, executing, specializedCounter);
       this.throwIfInterrupted();
     }
     this.setPending(call, executing, "executing");
     await this.persist();
     if (this.interruption !== undefined) {
-      await this.restoreUnstartedOperation(call, executing);
+      await this.restoreUnstartedOperation(call, executing, specializedCounter);
       this.throwIfInterrupted();
     }
     this.throwIfInterrupted();
@@ -1250,7 +1280,7 @@ export class AgentRuntime {
   }
 
   private setPending(
-    call: NormalizedToolCall,
+    call: { readonly operationId: string; readonly name: string },
     record: OperationRecord,
     status: "accepted" | "executing" | "indeterminate",
   ): void {
@@ -1272,10 +1302,12 @@ export class AgentRuntime {
   }
 
   private async restoreUnstartedOperation(
-    call: NormalizedToolCall,
+    call: { readonly operationId: string; readonly name: string },
     executing: OperationRecord,
+    specializedCounter?: "commands" | "readFiles",
   ): Promise<void> {
     const accepted = await this.dependencies.journal.markNotStarted(executing, this.now());
+    if (specializedCounter !== undefined) this.meter.refund(specializedCounter);
     this.setPending(call, accepted, "accepted");
     await this.persist();
   }
@@ -1439,10 +1471,7 @@ export class AgentRuntime {
         reason: message,
         failure: { code: error instanceof AgentError ? error.code : "INTERNAL_ERROR", message },
       });
-      setTerminalCleanupPolicy(
-        this.state,
-        this.dependencies.retainSourceArtifactsOnCompletion === true,
-      );
+      setTerminalCleanupPolicy(this.state);
       try {
         await this.persist();
       } catch (persistError) {
@@ -1466,10 +1495,7 @@ export class AgentRuntime {
       delete this.state.completionHandoff;
     }
     if (isTerminal(status)) {
-      setTerminalCleanupPolicy(
-        this.state,
-        this.dependencies.retainSourceArtifactsOnCompletion === true,
-      );
+      setTerminalCleanupPolicy(this.state);
     }
     try {
       await this.persist();
@@ -1540,6 +1566,12 @@ function selectAction(messages: readonly NormalizedModelMessage[]): NormalizedMo
     throw new AgentError("PROTOCOL_INVALID", "A model turn contains more than one dependent action class");
   }
   return actionable[0] ?? messages[0] ?? (() => { throw new AgentError("PROTOCOL_INVALID", "Empty model turn"); })();
+}
+
+function specializedBudgetCounter(tool: string): "commands" | "readFiles" | undefined {
+  if (tool === "run_command") return "commands";
+  if (tool === "read_file") return "readFiles";
+  return undefined;
 }
 
 function outcomeFromRecord(call: NormalizedToolCall, record: OperationRecord): ToolOutcome {

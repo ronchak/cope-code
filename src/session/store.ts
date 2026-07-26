@@ -39,6 +39,7 @@ const SESSION_KEYS = [
   "pauseReason",
   "failure",
   "policyHashes",
+  "sourceArtifactRetention",
   "budgetLimits",
   "budgetUsage",
   "turnSequence",
@@ -359,6 +360,8 @@ function assertValidSessionState(value: Partial<SessionState>): asserts value is
     !isIsoTimestamp(value.createdAt) ||
     !isIsoTimestamp(value.updatedAt) ||
     !isIsoTimestamp(value.startedAt) ||
+    (value.sourceArtifactRetention !== undefined &&
+      !["remove", "retain"].includes(value.sourceArtifactRetention)) ||
     !isExactIntegerRecord(value.budgetLimits, [
       "maxTurns",
       "maxOperations",

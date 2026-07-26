@@ -73,6 +73,10 @@ test("budget meter performs check-before-consume and never overdraws", () => {
   assert.equal(meter.remaining("turns"), 0);
   assert.throws(() => meter.consume("turns"), /Budget exhausted/);
   assert.equal(state.budgetUsage.turns, 1);
+  meter.refund("turns");
+  assert.equal(meter.remaining("turns"), 1);
+  assert.throws(() => meter.refund("turns"), /Invalid budget refund/u);
+  assert.equal(state.budgetUsage.turns, 0);
 });
 
 test("session store writes atomically and rejects mismatched identity", async () => {

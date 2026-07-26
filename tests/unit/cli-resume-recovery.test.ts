@@ -12,6 +12,7 @@ import {
 } from "../../src/cli/session-files.js";
 import { createDefaultSessionGrant } from "../../src/policy/index.js";
 import { SecretScanner } from "../../src/security/secrets.js";
+import { SessionArtifactStore } from "../../src/session/artifact-store.js";
 import { CompletionHandoffStore } from "../../src/session/completion-handoff-store.js";
 import { SessionStore } from "../../src/session/store.js";
 import {
@@ -205,6 +206,41 @@ test("resume reports missing pinned browser configuration without exposing raw E
   });
   assert.equal(exitCode, 0);
   assert.equal((await store.read(state.sessionId)).status, "aborted");
+});
+
+test("standalone abort preserves the session-pinned retention decision without current configuration", async (context) => {
+  const stateHome = await mkdtemp(path.join(tmpdir(), "cope-abort-pinned-retention-"));
+  context.after(async () => rm(stateHome, { recursive: true, force: true }));
+  const now = "2026-07-24T12:00:00.000Z";
+  const state = sessionState("session_pinned_retention", "paused", now);
+  state.pauseReason = "awaiting operator decision";
+  state.sourceArtifactRetention = "retain";
+  const store = new SessionStore(stateHome);
+  await store.create(state);
+  const artifacts = new SessionArtifactStore(
+    path.join(store.sessionDirectory(state.sessionId), "artifacts"),
+  );
+  await artifacts.put("decision", "retained", "session-approved retained evidence");
+
+  const exitCode = await executeCommand({
+    command: "abort",
+    sessionId: state.sessionId,
+    reason: "Discard interrupted session",
+    stateHome,
+    json: false,
+  }, {
+    stdout: { write: () => undefined },
+    stderr: { write: () => undefined },
+  }, {
+    host: createStandardUserHost(),
+  });
+
+  assert.equal(exitCode, 0);
+  const aborted = await store.read(state.sessionId);
+  assert.equal(aborted.status, "aborted");
+  assert.equal(aborted.sourceArtifactRetention, "retain");
+  assert.deepEqual(aborted.terminalCleanup, { sourceArtifacts: "retain" });
+  assert.equal(await artifacts.get("decision", "retained"), "session-approved retained evidence");
 });
 
 test("resume rejects a runtime-pinned pre-grant session before configuration loading", async (context) => {

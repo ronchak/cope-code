@@ -1,7 +1,28 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { cleanupTerminalRecoveryArtifacts } from "../../src/session/terminal-cleanup.js";
+import {
+  cleanupTerminalRecoveryArtifacts,
+  sessionRetainsSourceArtifacts,
+  setTerminalCleanupPolicy,
+} from "../../src/session/terminal-cleanup.js";
+import type { SessionState } from "../../src/session/types.js";
+
+test("session-pinned retention overrides a prior terminal marker", () => {
+  const state = {
+    sourceArtifactRetention: "remove",
+    terminalCleanup: { sourceArtifacts: "retain" },
+  } as SessionState;
+  assert.equal(sessionRetainsSourceArtifacts(state), false);
+  setTerminalCleanupPolicy(state);
+  assert.deepEqual(state.terminalCleanup, { sourceArtifacts: "remove" });
+
+  delete state.sourceArtifactRetention;
+  state.terminalCleanup = { sourceArtifacts: "retain" };
+  assert.equal(sessionRetainsSourceArtifacts(state), true);
+  setTerminalCleanupPolicy(state);
+  assert.deepEqual(state.terminalCleanup, { sourceArtifacts: "retain" });
+});
 
 test("terminal cleanup attempts handoff removal when artifact clearing fails", async () => {
   let handoffRemovalCalls = 0;

@@ -15,11 +15,21 @@ export interface TerminalCleanupDependencies {
  */
 export function setTerminalCleanupPolicy(
   state: SessionState,
-  retainSourceArtifacts: boolean,
 ): void {
   state.terminalCleanup = {
-    sourceArtifacts: retainSourceArtifacts ? "retain" : "remove",
+    sourceArtifacts:
+      state.sourceArtifactRetention ??
+      state.terminalCleanup?.sourceArtifacts ??
+      "remove",
   };
+}
+
+export function sessionRetainsSourceArtifacts(state: SessionState): boolean {
+  return (
+    state.sourceArtifactRetention ??
+    state.terminalCleanup?.sourceArtifacts ??
+    "remove"
+  ) === "retain";
 }
 
 /**

@@ -475,7 +475,6 @@ function runtimeForTest(input: {
   readonly policy?: RuntimePolicy;
   readonly user?: UserInteraction;
   readonly idFactory?: (prefix: string) => string;
-  readonly retainSourceArtifactsOnCompletion?: boolean;
 }): AgentRuntime {
   return new AgentRuntime({
     state: input.state,
@@ -516,9 +515,6 @@ function runtimeForTest(input: {
     idFactory: input.idFactory ?? (() => "submission_1"),
     ...(input.artifacts === undefined ? {} : { artifacts: input.artifacts }),
     ...(input.completionHandoffs === undefined ? {} : { completionHandoffs: input.completionHandoffs }),
-    ...(input.retainSourceArtifactsOnCompletion === undefined
-      ? {}
-      : { retainSourceArtifactsOnCompletion: input.retainSourceArtifactsOnCompletion }),
   });
 }
 
@@ -1646,6 +1642,258 @@ test("abort during pre-execution persistence restores a retry-safe journal witho
   assert.equal(localState.pendingOperations[0]?.status, "accepted");
 });
 
+test("paused pre-execution command resumes once without double charging its limit", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-pause-command-budget-"));
+  const localState = state(root);
+  localState.budgetLimits = { ...localState.budgetLimits, maxCommands: 1 };
+  const store = new ToolExecutionWriteGateStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{
+        operationId: "op_pause_command",
+        name: "run_command",
+        arguments: { command_id: "validate" },
+      }],
+    }]),
+    JSON.stringify([{
+      type: "complete_task",
+      operationId: "op_complete_after_command",
+      claim: {
+        summary: "Command resumed exactly once.",
+        acceptanceCriteria: [],
+        validation: [{
+          commandId: "validate",
+          status: "passed",
+          summary: "Validation passed after the resumed command.",
+        }],
+        skippedValidation: [],
+        remainingRisks: [],
+        recommendedFollowUp: [],
+      },
+    }]),
+  ]);
+  let executions = 0;
+  const execute: ToolExecutor["execute"] = async (call) => {
+    executions += 1;
+    return {
+      operationId: call.operationId,
+      tool: call.name,
+      status: "success",
+      data: {},
+      safeMetadata: {
+        commandId: "validate",
+        outcome: "success",
+        exitCode: 0,
+        outputBytes: 0,
+        repositoryFingerprint: "d".repeat(64),
+      },
+    };
+  };
+  const firstRuntime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+    execute,
+  });
+
+  const firstRun = firstRuntime.run();
+  await store.executingWriteStarted;
+  await firstRuntime.requestPause("pause during pre-execution command persistence");
+  store.releaseExecutingWrite();
+  const paused = await firstRun;
+  assert.equal(paused.status, "paused");
+  assert.equal(executions, 0);
+  assert.equal(localState.budgetUsage.commands, 0);
+  assert.equal(localState.pendingOperations[0]?.status, "accepted");
+
+  const completed = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+    execute,
+  }).run();
+  assert.equal(completed.status, "completed", completed.reason);
+  assert.equal(executions, 1);
+  assert.equal(localState.budgetUsage.commands, 1);
+});
+
+test("recovery finishes a refund interrupted after the journal became retry-safe", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-command-refund-recovery-"));
+  const localState = state(root);
+  localState.status = "executing_tools";
+  localState.turnSequence = 1;
+  localState.budgetLimits = { ...localState.budgetLimits, maxCommands: 1 };
+  localState.budgetUsage = { ...localState.budgetUsage, operations: 1, commands: 1 };
+  localState.submission = {
+    submissionId: "submission_1",
+    turnId: "turn_0001",
+    messageHash: "a".repeat(64),
+    marker: "marker",
+    state: "answered",
+    preparedAt: "2026-01-01T00:00:00.000Z",
+    answeredAt: "2026-01-01T00:00:01.000Z",
+  };
+  const call = {
+    operationId: "op_refund_recovery",
+    name: "run_command" as const,
+    arguments: { command_id: "validate" },
+  };
+  const journal = new OperationJournal(path.join(root, "operations"), localState.sessionId);
+  const registration = await journal.register(
+    call.operationId,
+    call.name,
+    true,
+    call,
+    "2026-01-01T00:00:00.000Z",
+  );
+  localState.pendingOperations = [{
+    operationId: call.operationId,
+    tool: call.name,
+    mutating: true,
+    requestHash: registration.record.requestHash,
+    status: "executing",
+    acceptedAt: registration.record.acceptedAt,
+  }];
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
+  await artifacts.put("response", "turn_0001", JSON.stringify([{ type: "tool_request", calls: [call] }]));
+  const transport = new QueueTransport([JSON.stringify([{
+    type: "complete_task",
+    operationId: "op_complete_after_refund",
+    claim: {
+      summary: "Recovered the interrupted refund.",
+      acceptanceCriteria: [],
+      validation: [{
+        commandId: "validate",
+        status: "passed",
+        summary: "Validation passed once.",
+      }],
+      skippedValidation: [],
+      remainingRisks: [],
+      recommendedFollowUp: [],
+    },
+  }])]);
+  let executions = 0;
+
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+    execute: async (requested) => {
+      executions += 1;
+      return {
+        operationId: requested.operationId,
+        tool: requested.name,
+        status: "success",
+        data: {},
+        safeMetadata: {
+          commandId: "validate",
+          outcome: "success",
+          exitCode: 0,
+          outputBytes: 0,
+          repositoryFingerprint: "d".repeat(64),
+        },
+      };
+    },
+  }).run();
+
+  assert.equal(result.status, "completed", result.reason);
+  assert.equal(executions, 1);
+  assert.equal(localState.budgetUsage.commands, 1);
+  assert.equal(localState.pendingOperations.length, 0);
+});
+
+test("cancelled user prompt resumes once without double charging its operation limit", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-pause-user-budget-"));
+  const localState = state(root);
+  localState.budgetLimits = { ...localState.budgetLimits, maxOperations: 1 };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "request_user_input",
+      requestId: "request_pause_budget",
+      question: "Continue after pause?",
+    }]),
+    JSON.stringify([{
+      type: "complete_task",
+      operationId: "op_complete_after_prompt",
+      claim: {
+        summary: "User prompt resumed exactly once.",
+        acceptanceCriteria: [],
+        validation: [],
+        skippedValidation: [],
+        remainingRisks: [],
+        recommendedFollowUp: [],
+      },
+    }]),
+  ]);
+  let markPromptStarted!: () => void;
+  const promptStarted = new Promise<void>((resolve) => { markPromptStarted = resolve; });
+  let startedPrompts = 0;
+  let completedPrompts = 0;
+  const firstRuntime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+    user: {
+      requestInput: async (request) => {
+        startedPrompts += 1;
+        markPromptStarted();
+        return new Promise((_, reject) => {
+          const rejectForPause = (): void => reject(new Error("user prompt paused"));
+          if (request.signal.aborted) rejectForPause();
+          else request.signal.addEventListener("abort", rejectForPause, { once: true });
+        });
+      },
+      requestCapability: async () => ({ decision: "deny" }),
+    },
+  });
+
+  const firstRun = firstRuntime.run();
+  await promptStarted;
+  await firstRuntime.requestPause("pause outstanding user prompt");
+  const paused = await firstRun;
+  assert.equal(paused.status, "paused");
+  assert.equal(localState.budgetUsage.operations, 1);
+  assert.equal(localState.pendingOperations[0]?.operationId, "request_pause_budget");
+
+  const completed = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+    user: {
+      requestInput: async () => {
+        startedPrompts += 1;
+        completedPrompts += 1;
+        return { answer: "yes" };
+      },
+      requestCapability: async () => ({ decision: "deny" }),
+    },
+  }).run();
+  assert.equal(completed.status, "completed", completed.reason);
+  assert.equal(startedPrompts, 2);
+  assert.equal(completedPrompts, 1);
+  assert.equal(localState.budgetUsage.operations, 1);
+  assert.equal(localState.pendingOperations.length, 0);
+  assert.deepEqual(localState.completedOperationIds, ["request_pause_budget"]);
+});
+
 test("abort clears a completed response received during transport shutdown", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-abort-completed-race-"));
   const localState = state(root);
@@ -1729,6 +1977,7 @@ test("failed terminal artifact cleanup is retried from durable state on a later 
 test("terminal cleanup preserves source artifacts when retention is enabled", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-terminal-retention-enabled-"));
   const localState = state(root);
+  localState.sourceArtifactRetention = "retain";
   const store = new SessionStore(path.join(root, "state"));
   await store.create(localState);
   const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
@@ -1739,7 +1988,6 @@ test("terminal cleanup preserves source artifacts when retention is enabled", as
     store,
     transport: new TerminalBlockedTransport([]),
     artifacts,
-    retainSourceArtifactsOnCompletion: true,
   });
 
   const result = await runtime.run();
