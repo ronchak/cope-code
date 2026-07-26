@@ -47,6 +47,10 @@ export async function sha256File(filename, maximumBytes = MAX_ARTIFACT_BYTES) {
 }
 
 export async function readRegularFile(filename, maximumBytes = MAX_METADATA_BYTES) {
+  return (await readRegularFileSnapshot(filename, maximumBytes)).bytes;
+}
+
+export async function readRegularFileSnapshot(filename, maximumBytes = MAX_METADATA_BYTES) {
   const before = await lstat(filename, { bigint: true });
   validateRegularStat(before, filename, maximumBytes);
   const noFollow = fsConstants.O_NOFOLLOW ?? 0;
@@ -62,9 +66,17 @@ export async function readRegularFile(filename, maximumBytes = MAX_METADATA_BYTE
         !sameFileSnapshot(before, afterPath)) {
       throw new Error(`File changed while it was being read: ${filename}`);
     }
-    return bytes;
+    return { bytes, snapshot: before };
   } finally {
     await handle.close();
+  }
+}
+
+export async function assertRegularFileSnapshot(filename, snapshot, maximumBytes = MAX_METADATA_BYTES) {
+  const current = await lstat(filename, { bigint: true });
+  validateRegularStat(current, filename, maximumBytes);
+  if (!sameFileSnapshot(snapshot, current)) {
+    throw new Error(`File changed after it was read: ${filename}`);
   }
 }
 

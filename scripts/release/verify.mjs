@@ -13,9 +13,11 @@ import {
   canonicalJson,
   canonicalJsonLine,
   exactObjectKeys,
+  assertRegularFileSnapshot,
   isWithin,
   parseCanonicalSemver,
   readRegularFile,
+  readRegularFileSnapshot,
   safeTopLevelFilename,
   sha256Bytes,
   validPackedCliMode,
@@ -25,7 +27,7 @@ import {
 const NPM_PACKAGE_NAME = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/u;
 const utf8 = new TextDecoder("utf-8", { fatal: true });
 
-export async function verifyRelease(rootInput, options = {}) {
+export async function verifyRelease(rootInput, options = {}, capabilities = {}) {
   if (typeof rootInput !== "string" || rootInput.length === 0) throw new Error("A release directory is required");
   const requestedRoot = path.resolve(rootInput);
   const rootStat = await lstat(requestedRoot, { bigint: true });
@@ -38,16 +40,26 @@ export async function verifyRelease(rootInput, options = {}) {
     throw new Error("Release directory must contain only its expected regular files");
   }
   const actualNames = new Set(actualEntries.map((entry) => entry.name));
+  const fileSnapshots = new Map();
+  const readBundleFile = async (name, maximumBytes) => {
+    if (fileSnapshots.has(name)) throw new Error(`Release file was read more than once: ${name}`);
+    const result = await readRegularFileSnapshot(path.join(root, name), maximumBytes);
+    fileSnapshots.set(name, { snapshot: result.snapshot, maximumBytes });
+    return result.bytes;
+  };
+  const readBundleJson = async (name, label, maximumBytes = MAX_METADATA_BYTES) => (
+    parseCanonicalJsonBytes(await readBundleFile(name, maximumBytes), label)
+  );
 
-  const { bytes: manifestBytes, value: manifest } = await readCanonicalJsonFile(
-    path.join(root, "manifest.json"),
+  const { bytes: manifestBytes, value: manifest } = await readBundleJson(
+    "manifest.json",
     "release manifest",
   );
   validateManifest(manifest);
 
   const artifactDescriptor = manifest.artifacts[0];
   const artifactName = safeTopLevelFilename(artifactDescriptor.path, "manifest artifact path");
-  const artifactBytes = await readRegularFile(path.join(root, artifactName), MAX_ARTIFACT_BYTES);
+  const artifactBytes = await readBundleFile(artifactName, MAX_ARTIFACT_BYTES);
   if (artifactBytes.length !== artifactDescriptor.bytes || sha256Bytes(artifactBytes) !== artifactDescriptor.sha256) {
     throw new Error("Release artifact size or digest does not match the manifest");
   }
@@ -57,8 +69,8 @@ export async function verifyRelease(rootInput, options = {}) {
     throw new Error("Release archive contents do not match the signed manifest inventory");
   }
 
-  const { bytes: sbomBytes, value: sbom } = await readCanonicalJsonFile(
-    path.join(root, manifest.sbom.path),
+  const { bytes: sbomBytes, value: sbom } = await readBundleJson(
+    manifest.sbom.path,
     "SPDX SBOM",
   );
   if (sbomBytes.length !== manifest.sbom.bytes || sha256Bytes(sbomBytes) !== manifest.sbom.sha256) {
@@ -70,7 +82,7 @@ export async function verifyRelease(rootInput, options = {}) {
   let signaturePresent = actualNames.has("manifest.sig.json");
   let publisherAuthenticated = false;
   if (signaturePresent) {
-    signature = (await readCanonicalJsonFile(path.join(root, "manifest.sig.json"), "release signature")).value;
+    signature = (await readBundleJson("manifest.sig.json", "release signature")).value;
     let externalPublicKey;
     if (options.trustedPublicKeyFile !== undefined) {
       const trustPath = path.resolve(options.trustedPublicKeyFile);
@@ -103,7 +115,7 @@ export async function verifyRelease(rootInput, options = {}) {
     throw new Error("Publisher authentication requires a valid signature and an external trust root");
   }
 
-  const { value: channel } = await readCanonicalJsonFile(path.join(root, "channel.json"), "release channel");
+  const { value: channel } = await readBundleJson("channel.json", "release channel");
   const expectedChannel = expectedChannelDocument(manifest, manifestBytes, signature);
   if (canonicalJson(channel) !== canonicalJson(expectedChannel)) {
     throw new Error("Release channel metadata does not exactly match the manifest and signature evidence");
@@ -119,14 +131,29 @@ export async function verifyRelease(rootInput, options = {}) {
   if (actualNames.size !== expectedNames.size || [...actualNames].some((name) => !expectedNames.has(name))) {
     throw new Error("Release directory contains unexpected or missing entries");
   }
+  if (fileSnapshots.size !== expectedNames.size ||
+      [...expectedNames].some((name) => !fileSnapshots.has(name))) {
+    throw new Error("Release directory verification did not snapshot every expected file");
+  }
+  if (capabilities.beforeFinalSnapshotCheck !== undefined) {
+    if (typeof capabilities.beforeFinalSnapshotCheck !== "function") {
+      throw new Error("Invalid verification test capability");
+    }
+    await capabilities.beforeFinalSnapshotCheck();
+  }
   const finalEntries = await readdir(root, { withFileTypes: true });
-  const finalRootStat = await lstat(root, { bigint: true });
   const finalNames = finalEntries.map((entry) => entry.name).sort();
   const initialNames = [...actualNames].sort();
   if (finalEntries.some((entry) => !entry.isFile() || entry.isSymbolicLink()) ||
       finalNames.length !== initialNames.length ||
-      finalNames.some((name, index) => name !== initialNames[index]) ||
-      rootStat.dev !== finalRootStat.dev || rootStat.ino !== finalRootStat.ino) {
+      finalNames.some((name, index) => name !== initialNames[index])) {
+    throw new Error("Release directory changed while it was being verified");
+  }
+  for (const [name, { snapshot, maximumBytes }] of fileSnapshots) {
+    await assertRegularFileSnapshot(path.join(root, name), snapshot, maximumBytes);
+  }
+  const finalRootStat = await lstat(root, { bigint: true });
+  if (rootStat.dev !== finalRootStat.dev || rootStat.ino !== finalRootStat.ino) {
     throw new Error("Release directory changed while it was being verified");
   }
 
@@ -146,6 +173,10 @@ export async function verifyRelease(rootInput, options = {}) {
 
 export async function readCanonicalJsonFile(filename, label, maximumBytes = MAX_METADATA_BYTES) {
   const bytes = await readRegularFile(filename, maximumBytes);
+  return parseCanonicalJsonBytes(bytes, label);
+}
+
+function parseCanonicalJsonBytes(bytes, label) {
   let text;
   let value;
   try {

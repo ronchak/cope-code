@@ -34,7 +34,9 @@ Verification rejects links, non-regular archive entries,
 absolute or traversal paths, duplicate and case-colliding paths, Windows-reserved
 or otherwise non-portable names, concatenated gzip members, unexpected top-level
 files, non-portable archive owners/modes/timestamps, non-canonical metadata, and
-digest or inventory drift. The manifest also binds the name, version, executable
+digest or inventory drift. It records and rechecks the identity and metadata
+snapshot of every top-level bundle file so replacement during a verification pass
+fails closed. The manifest also binds the name, version, executable
 mapping, and runtime dependency declarations from the packed
 `package/package.json`, and requires the mapped CLI target to be present with an
 executable archive mode on POSIX builders. npm's Windows packer records the

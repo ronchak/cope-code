@@ -49,6 +49,16 @@ test("release evidence is canonical, reproducible, SPDX-correct, and explicit ab
     channel: "stable",
     artifact: "cope.tgz",
   });
+  const replacementRace = await fixture.candidate("replacement-race", "stable", "replacement");
+  expectFailure(
+    invokeTestVerifierWithReplacement(
+      replacementRace,
+      fixture.publicKeyFile,
+      "manifest.json",
+      path.join(fixture.root, "replacement-manifest.json"),
+    ),
+    /File changed after it was read/iu,
+  );
 
   const sbom = JSON.parse(await readFile(path.join(first, "sbom.spdx.json"), "utf8")) as {
     packages: Array<{
@@ -1289,6 +1299,36 @@ function invokeTestGenerator(
   return spawnSync(process.execPath, ["--input-type=module", "--eval", source], {
     cwd: repositoryRoot,
     env: environment,
+    encoding: "utf8",
+  });
+}
+
+function invokeTestVerifierWithReplacement(
+  root: string,
+  publicKeyFile: string,
+  targetName: string,
+  replacementPath: string,
+): SpawnSyncReturns<string> {
+  const moduleUrl = pathToFileURL(verifyScript).href;
+  const target = path.join(root, targetName);
+  const source = [
+    'import { readFile, rename, writeFile } from "node:fs/promises";',
+    `import { verifyRelease } from ${JSON.stringify(moduleUrl)};`,
+    `const target = ${JSON.stringify(target)};`,
+    `const replacement = ${JSON.stringify(replacementPath)};`,
+    "await writeFile(replacement, await readFile(target));",
+    "try {",
+    `  await verifyRelease(${JSON.stringify(root)}, { trustedPublicKeyFile: ${JSON.stringify(publicKeyFile)} }, {`,
+    "    beforeFinalSnapshotCheck: async () => rename(replacement, target),",
+    "  });",
+    "} catch (error) {",
+    "  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\\n`);",
+    "  process.exitCode = 1;",
+    "}",
+  ].join("\n");
+  return spawnSync(process.execPath, ["--input-type=module", "--eval", source], {
+    cwd: repositoryRoot,
+    env: process.env,
     encoding: "utf8",
   });
 }
