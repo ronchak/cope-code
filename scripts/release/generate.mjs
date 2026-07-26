@@ -85,6 +85,16 @@ export async function generateRelease(options, environment = process.env, capabi
   const runtimePackagePaths = collectRuntimePackagePaths(lockDocument.packages, runtimeDeclarations);
 
   const artifactBytes = await readRegularFile(artifactInput, 128 * 1024 * 1024);
+  if (capabilities.expectedArtifact !== undefined) {
+    const expectedArtifact = capabilities.expectedArtifact;
+    if (expectedArtifact === null || typeof expectedArtifact !== "object" ||
+        !Number.isSafeInteger(expectedArtifact.bytes) || expectedArtifact.bytes < 0 ||
+        !/^[a-f0-9]{64}$/u.test(expectedArtifact.sha256) ||
+        artifactBytes.length !== expectedArtifact.bytes ||
+        sha256Bytes(artifactBytes) !== expectedArtifact.sha256) {
+      throw new Error("Release artifact changed after its source/build inventory was validated");
+    }
+  }
   const archiveInspection = inspectNpmArchive(artifactBytes);
   const expectedPackageIdentity = {
     name: packageDocument.name,

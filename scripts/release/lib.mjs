@@ -55,11 +55,10 @@ export async function readRegularFile(filename, maximumBytes = MAX_METADATA_BYTE
     const opened = await handle.stat({ bigint: true });
     validateRegularStat(opened, filename, maximumBytes);
     if (!sameFileSnapshot(before, opened)) throw new Error(`File changed before it was read: ${filename}`);
-    const bytes = await handle.readFile();
+    const bytes = await readBoundedFileHandle(handle, opened.size, filename);
     const afterOpen = await handle.stat({ bigint: true });
     const afterPath = await lstat(filename, { bigint: true });
-    if (BigInt(bytes.length) !== opened.size ||
-        !sameFileSnapshot(opened, afterOpen) ||
+    if (!sameFileSnapshot(opened, afterOpen) ||
         !sameFileSnapshot(before, afterPath)) {
       throw new Error(`File changed while it was being read: ${filename}`);
     }
@@ -67,6 +66,32 @@ export async function readRegularFile(filename, maximumBytes = MAX_METADATA_BYTE
   } finally {
     await handle.close();
   }
+}
+
+export async function readBoundedFileHandle(handle, expectedSize, filename = "open file") {
+  if (typeof expectedSize !== "bigint" || expectedSize < 0n ||
+      expectedSize > BigInt(MAX_ARTIFACT_BYTES)) {
+    throw new Error(`Invalid file snapshot size: ${filename}`);
+  }
+  const expectedBytes = Number(expectedSize);
+  const buffer = Buffer.allocUnsafe(expectedBytes + 1);
+  let total = 0;
+  while (total < buffer.length) {
+    const { bytesRead } = await handle.read(
+      buffer,
+      total,
+      buffer.length - total,
+      total,
+    );
+    if (!Number.isSafeInteger(bytesRead) || bytesRead < 0 ||
+        bytesRead > buffer.length - total) {
+      throw new Error(`Invalid bounded read result: ${filename}`);
+    }
+    if (bytesRead === 0) break;
+    total += bytesRead;
+  }
+  if (total !== expectedBytes) throw new Error(`File changed while it was being read: ${filename}`);
+  return buffer.subarray(0, total);
 }
 
 export async function regularFileStat(filename, maximumBytes = MAX_ARTIFACT_BYTES) {

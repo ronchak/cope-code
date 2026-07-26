@@ -3,6 +3,17 @@
 Cope can produce deterministic, inspectable npm release evidence from a clean Git
 checkout. This is a foundation for a future release service; it is not the release
 service itself and is not wired into the current installers or `cope update`.
+The builder copies the exact commit's regular Git blobs into a private temporary
+directory, installs the locked development toolchain with lifecycle scripts
+disabled, and builds there. It rejects source links and submodules, verifies that
+the build did not change tracked bytes, snapshots the exact expected TypeScript
+outputs, rejects other build-created files outside `node_modules`, and requires
+every file in the packed artifact to match the bytes, digest, and portable mode
+of either its Git blob or that isolated-build snapshot.
+The exact validated artifact digest is then required by evidence generation.
+This isolates packaging from ignored or untracked checkout content and detects
+post-build file changes; it is not a hermetic compiler or dependency provenance
+attestation.
 
 Run an unsigned preview build through npm and place the output outside the
 checkout:

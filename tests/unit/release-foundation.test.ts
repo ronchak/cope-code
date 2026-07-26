@@ -687,19 +687,28 @@ test("release generation rejects metadata that its verifier cannot read", async 
   await assert.rejects(lstat(path.join(oversizedSbom, "manifest.json")), { code: "ENOENT" });
 });
 
-test("release packing excludes ignored and untracked payloads from the source identity", async () => {
-  const trackedPaths = [
-    "docs/guide.md",
-    "package.json",
-    "src/cli/main.ts",
-  ];
+test("release packing binds every payload byte to Git or the isolated build", async () => {
   const packageJson = npmPackageJson("1.2.3", { dependencies: {} });
   const expectedEntries = [
     { archivePath: "package/package.json", content: packageJson },
     { archivePath: "package/docs/guide.md", content: "tracked" },
     { archivePath: "package/dist/src/cli/main.js", content: "built", mode: 0o755 },
   ];
-  expectSuccess(invokePackInventoryValidator(npmArchive(expectedEntries), trackedPaths));
+  const expectedDescriptors = expectedEntries.map((entry) => {
+    const bytes = Buffer.from(entry.content);
+    return {
+      path: entry.archivePath.slice("package/".length),
+      bytes: bytes.length,
+      sha256: testSha256(bytes),
+      mode: entry.mode ?? 0o644,
+    };
+  });
+  const requiredGeneratedPaths = ["dist/src/cli/main.js"];
+  expectSuccess(invokePackInventoryValidator(
+    npmArchive(expectedEntries),
+    expectedDescriptors,
+    requiredGeneratedPaths,
+  ));
 
   for (const archivePath of [
     "package/docs/secret.log",
@@ -710,10 +719,35 @@ test("release packing excludes ignored and untracked payloads from the source id
       invokePackInventoryValidator(npmArchive([
         ...expectedEntries,
         { archivePath, content: "ignored" },
-      ]), trackedPaths),
-      /not bound to the source commit or TypeScript build/iu,
+      ]), expectedDescriptors, requiredGeneratedPaths),
+      /not bound to the source commit or isolated build/iu,
     );
   }
+
+  const poisonCases: Array<[string, string]> = [
+    ["package/docs/guide.md", "poison!"],
+    ["package/dist/src/cli/main.js", "evil!"],
+  ];
+  for (const [archivePath, poisoned] of poisonCases) {
+    expectFailure(
+      invokePackInventoryValidator(
+        npmArchive(expectedEntries.map((entry) => (
+          entry.archivePath === archivePath ? { ...entry, content: poisoned } : entry
+        ))),
+        expectedDescriptors,
+        requiredGeneratedPaths,
+      ),
+      /differs from its bound source\/build bytes/iu,
+    );
+  }
+});
+
+test("release file reads stop one byte past the opened snapshot", () => {
+  expectSuccess(invokeBoundedFileReader(3, 3));
+  expectFailure(
+    invokeBoundedFileReader(3, 1024 * 1024),
+    /File changed while it was being read/iu,
+  );
 });
 
 test("release generation rejects traversal, links, and non-regular payload boundaries", async (context) => {
@@ -1261,13 +1295,48 @@ function invokeTestGenerator(
 
 function invokePackInventoryValidator(
   artifactBytes: Buffer,
-  trackedPaths: string[],
+  expectedDescriptors: Array<{
+    path: string;
+    bytes: number;
+    sha256: string;
+    mode: number;
+  }>,
+  requiredGeneratedPaths: string[],
 ): SpawnSyncReturns<string> {
   const moduleUrl = pathToFileURL(buildScript).href;
   const source = [
     `import { validatePackedSourceInventory } from ${JSON.stringify(moduleUrl)};`,
     "try {",
-    `  validatePackedSourceInventory(Buffer.from(${JSON.stringify(artifactBytes.toString("base64"))}, "base64"), ${JSON.stringify(trackedPaths)});`,
+    `  validatePackedSourceInventory(Buffer.from(${JSON.stringify(artifactBytes.toString("base64"))}, "base64"), ${JSON.stringify(expectedDescriptors)}, ${JSON.stringify(requiredGeneratedPaths)});`,
+    "} catch (error) {",
+    "  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\\n`);",
+    "  process.exitCode = 1;",
+    "}",
+  ].join("\n");
+  return spawnSync(process.execPath, ["--input-type=module", "--eval", source], {
+    cwd: repositoryRoot,
+    env: process.env,
+    encoding: "utf8",
+  });
+}
+
+function invokeBoundedFileReader(
+  snapshotBytes: number,
+  availableBytes: number,
+): SpawnSyncReturns<string> {
+  const moduleUrl = pathToFileURL(path.join(repositoryRoot, "scripts", "release", "lib.mjs")).href;
+  const source = [
+    `import { readBoundedFileHandle } from ${JSON.stringify(moduleUrl)};`,
+    `const payload = Buffer.alloc(${JSON.stringify(availableBytes)}, 0x61);`,
+    "const handle = {",
+    "  async read(target, offset, length, position) {",
+    "    const count = Math.max(0, Math.min(length, payload.length - position));",
+    "    if (count > 0) payload.copy(target, offset, position, position + count);",
+    "    return { bytesRead: count, buffer: target };",
+    "  },",
+    "};",
+    "try {",
+    `  await readBoundedFileHandle(handle, BigInt(${JSON.stringify(snapshotBytes)}), "growth-race fixture");`,
     "} catch (error) {",
     "  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\\n`);",
     "  process.exitCode = 1;",
