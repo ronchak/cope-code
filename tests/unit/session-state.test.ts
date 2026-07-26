@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { SecretScanner } from "../../src/security/secrets.js";
 import { BudgetMeter } from "../../src/session/budgets.js";
+import { SessionArtifactStore } from "../../src/session/artifact-store.js";
 import { CompletionHandoffStore } from "../../src/session/completion-handoff-store.js";
 import { SessionStore } from "../../src/session/store.js";
 import { allowedTransitions, isTerminal, transitionSession } from "../../src/session/state-machine.js";
@@ -136,6 +137,26 @@ test("session store removes an orphaned legacy terminal handoff without a state 
   assert.equal(migrated.status, "failed");
   assert.equal(migrated.completionHandoff, undefined);
   await assert.rejects(() => readFile(handoffFilename, "utf8"), { code: "ENOENT" });
+});
+
+test("session store clears source artifacts from legacy terminal states by default", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-session-legacy-artifacts-"));
+  const store = new SessionStore(root);
+  const state = makeState({
+    status: "failed",
+    completedAt: "2026-01-01T00:00:03.000Z",
+    failure: { code: "INTERNAL_ERROR", message: "legacy failure" },
+  });
+  await store.create(state);
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(state.sessionId), "artifacts"));
+  await artifacts.put("response", "turn_0001", "legacy source-bearing response");
+
+  const migrated = await store.read(state.sessionId);
+
+  assert.equal(migrated.status, "failed");
+  assert.equal(migrated.sourceArtifactRetention, undefined);
+  assert.equal(migrated.terminalCleanup, undefined);
+  assert.equal(await artifacts.getOptional("response", "turn_0001"), undefined);
 });
 
 test("hosts without directory fsync commit completion handoffs inline with session state", async () => {

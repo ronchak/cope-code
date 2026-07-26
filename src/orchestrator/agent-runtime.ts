@@ -169,15 +169,36 @@ export class AgentRuntime {
             throw new AgentError("RECOVERY_REQUIRED", "No queued outbound message is available for the next turn");
           }
           this.meter.assertTime(this.clock.now().getTime());
-          this.meter.consume("turns");
-          turnId = `turn_${String(++this.state.turnSequence).padStart(4, "0")}`;
+          const queuedTurnId = this.state.queuedOutbound?.turnId;
+          const accountedTurnId =
+            this.state.turnSequence === 0
+              ? undefined
+              : `turn_${String(this.state.turnSequence).padStart(4, "0")}`;
+          if (accountedTurnId !== undefined && queuedTurnId === accountedTurnId) {
+            // A crash can land after the queued turn's sequence and budget are
+            // durable but before exchange() replaces the queue with a
+            // submission intent. Reuse that already-accounted turn.
+            turnId = queuedTurnId;
+          } else {
+            const expectedTurnId = nextTurnId(this.state.turnSequence);
+            if (queuedTurnId !== expectedTurnId) {
+              throw new AgentError("RECOVERY_REQUIRED", "Queued outbound turn does not match the session sequence", {
+                queued: queuedTurnId,
+                expected: expectedTurnId,
+              });
+            }
+            this.meter.consume("turns");
+            this.state.turnSequence += 1;
+            turnId = expectedTurnId;
+            await this.persist();
+          }
+          if (this.interruption !== undefined) return await this.finishInterruption();
           if (this.state.queuedOutbound?.turnId !== turnId) {
             throw new AgentError("RECOVERY_REQUIRED", "Queued outbound turn does not match the session sequence", {
               queued: this.state.queuedOutbound?.turnId,
               expected: turnId,
             });
           }
-          await this.persist();
           response = await this.exchange(turnId, outbound);
           outbound = undefined;
         }

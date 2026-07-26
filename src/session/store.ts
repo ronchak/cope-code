@@ -12,6 +12,7 @@ import {
   CompletionHandoffStore,
   isCompletionHandoffReference,
 } from "./completion-handoff-store.js";
+import { sessionRetainsSourceArtifacts } from "./terminal-cleanup.js";
 import { CURRENT_HOST_PLATFORM } from "../platform/index.js";
 
 const MAX_SESSION_BYTES = 4 * 1024 * 1024;
@@ -95,7 +96,7 @@ export class SessionStore {
   public async read(sessionId: string): Promise<SessionState> {
     const parsed = await this.readValidated(sessionId);
     if (!isTerminal(parsed.status)) return parsed;
-    const removeSourceArtifacts = parsed.terminalCleanup?.sourceArtifacts === "remove";
+    const removeSourceArtifacts = !sessionRetainsSourceArtifacts(parsed);
     const removeSeparateHandoff =
       parsed.status !== "completed" || parsed.completionHandoff?.inlineRecord !== undefined;
     if (!removeSourceArtifacts && !removeSeparateHandoff) return parsed;

@@ -408,6 +408,37 @@ class ToolExecutionWriteGateStore extends SessionStore {
   }
 }
 
+class TurnAccountingWriteGateStore extends SessionStore {
+  private turnWriteSeen = false;
+  private markTurnWriteStarted!: () => void;
+  private finishTurnWrite!: () => void;
+  public readonly turnWriteStarted = new Promise<void>((resolve) => {
+    this.markTurnWriteStarted = resolve;
+  });
+  private readonly turnWriteReleased = new Promise<void>((resolve) => {
+    this.finishTurnWrite = resolve;
+  });
+
+  public releaseTurnWrite(): void {
+    this.finishTurnWrite();
+  }
+
+  public override async write(session: SessionState): Promise<void> {
+    if (
+      !this.turnWriteSeen &&
+      session.submission === undefined &&
+      session.queuedOutbound?.turnId === "turn_0001" &&
+      session.turnSequence === 1 &&
+      session.budgetUsage.turns === 1
+    ) {
+      this.turnWriteSeen = true;
+      this.markTurnWriteStarted();
+      await this.turnWriteReleased;
+    }
+    await super.write(session);
+  }
+}
+
 class RecoveryProbeTransport extends QueueTransport {
   public resolveCalls = 0;
 
@@ -1194,6 +1225,103 @@ test("pause after a nonterminal action durably queues its outbound without repla
   assert.equal(executions, 1, "the completed action must not replay on resume");
   assert.equal(toolResultSerializations, 1, "the queued outbound must not be serialized or charged again");
   assert.equal(localState.budgetUsage.disclosedBytes, disclosedBytesAtPause);
+});
+
+test("recovery submits an already-accounted queued turn once at a limit of one", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-queued-turn-recovery-"));
+  const localState = state(root);
+  localState.status = "awaiting_model";
+  localState.turnSequence = 1;
+  localState.budgetLimits = { ...localState.budgetLimits, maxTurns: 1 };
+  localState.budgetUsage = { ...localState.budgetUsage, turns: 1 };
+  localState.queuedOutbound = {
+    turnId: "turn_0001",
+    artifactId: "queued_turn_0001",
+    messageHash: sha256("bootstrap"),
+    createdAt: "2026-01-01T00:00:00.000Z",
+  };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
+  await artifacts.put("outbox", "queued_turn_0001", "bootstrap");
+  const transport = new QueueTransport([JSON.stringify([{
+    type: "complete_task",
+    operationId: "op_complete_queued_turn_recovery",
+    claim: {
+      summary: "Recovered the already-accounted queued turn.",
+      acceptanceCriteria: [],
+      validation: [],
+      skippedValidation: [],
+      remainingRisks: [],
+      recommendedFollowUp: [],
+    },
+  }])]);
+
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+  }).run();
+
+  assert.equal(result.status, "completed", result.reason);
+  assert.deepEqual(transport.submittedContents, ["bootstrap"]);
+  assert.equal(localState.turnSequence, 1);
+  assert.equal(localState.budgetUsage.turns, 1);
+  assert.equal(localState.queuedOutbound, undefined);
+});
+
+test("pause during turn-accounting persistence cannot dispatch the queued turn", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-pause-turn-accounting-"));
+  const localState = state(root);
+  localState.budgetLimits = { ...localState.budgetLimits, maxTurns: 1 };
+  const store = new TurnAccountingWriteGateStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
+  const transport = new QueueTransport([JSON.stringify([{
+    type: "complete_task",
+    operationId: "op_complete_after_turn_pause",
+    claim: {
+      summary: "Resumed the queued turn after a pause.",
+      acceptanceCriteria: [],
+      validation: [],
+      skippedValidation: [],
+      remainingRisks: [],
+      recommendedFollowUp: [],
+    },
+  }])]);
+  const runtime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+  });
+
+  const run = runtime.run();
+  await store.turnWriteStarted;
+  await runtime.requestPause("pause during turn accounting");
+  store.releaseTurnWrite();
+  const paused = await run;
+
+  assert.equal(paused.status, "paused");
+  assert.deepEqual(transport.submittedContents, []);
+  assert.equal(localState.queuedOutbound?.turnId, "turn_0001");
+  assert.equal(localState.turnSequence, 1);
+  assert.equal(localState.budgetUsage.turns, 1);
+
+  const resumed = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+  }).run();
+  assert.equal(resumed.status, "completed", resumed.reason);
+  assert.deepEqual(transport.submittedContents, ["bootstrap"]);
+  assert.equal(localState.turnSequence, 1);
+  assert.equal(localState.budgetUsage.turns, 1);
 });
 
 test("interruption during completed-state persistence still clears terminal artifacts", async () => {
