@@ -10,6 +10,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  reliability:
+    name: deterministic-reliability
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      COPE_RELIABILITY_SEED: "1129271365"
+      COPE_RELIABILITY_ITERATIONS: "24"
+      COPE_RELIABILITY_ARTIFACT_DIR: reliability-artifacts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Reliability and current recovery tests with explicit coverage floors
+        run: mkdir -p reliability-artifacts && npm run test:coverage
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reliability-${{ github.run_id }}-${{ github.run_attempt }}
+          path: reliability-artifacts/*.json
+          if-no-files-found: ignore
+          retention-days: 7
+
   offline:
     name: offline-${{ matrix.tuple }}
     timeout-minutes: 20
