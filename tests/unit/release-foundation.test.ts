@@ -590,6 +590,103 @@ test("release evidence is canonical, reproducible, SPDX-correct, and explicit ab
   expectFailure(invoke(buildScript, [repositoryRoot, "preview"]), /outside the source checkout/iu);
 });
 
+test("release generation and verification require canonical full SemVer", async (context) => {
+  const fixture = await releaseFixture(context);
+  const valid = await fixture.candidate("valid-preview-version", "preview", "valid", false);
+  const manifestFile = path.join(valid, "manifest.json");
+  const originalManifest = JSON.parse(await readFile(manifestFile, "utf8")) as Record<string, unknown>;
+
+  for (const [index, invalidVersion] of ["1.2.3-01", "1.2.3-a..b", "1.2.3+a..b"].entries()) {
+    await writeFile(manifestFile, `${testCanonicalJson({
+      ...originalManifest,
+      version: invalidVersion,
+    })}\n`);
+    expectFailure(invoke(verifyScript, [valid]), /manifest identity or source metadata is invalid/iu);
+
+    const candidate = await fixture.emptyCandidate(
+      `invalid-version-${index}`,
+      "invalid",
+      invalidVersion,
+    );
+    const packageDocument = npmPackageJson(invalidVersion, { dependencies: {} });
+    await writeFile(path.join(candidate, "cope.tgz"), npmArchive([
+      { archivePath: "package/package.json", content: packageDocument },
+      { archivePath: "package/dist/src/cli/main.js", content: "cli", mode: 0o755 },
+    ]));
+    await writeFile(fixture.packageFile, packageDocument);
+    await writeFile(fixture.lockFile, JSON.stringify({
+      name: "@local/copilot-browser-agent",
+      version: invalidVersion,
+      packages: {
+        "": {
+          name: "@local/copilot-browser-agent",
+          version: invalidVersion,
+          dependencies: {},
+        },
+      },
+    }));
+    expectFailure(
+      invoke(generateScript, generationArguments(fixture, candidate, "preview")),
+      /does not identify a valid Cope release/iu,
+    );
+  }
+});
+
+test("release generation rejects metadata that its verifier cannot read", async (context) => {
+  const fixture = await releaseFixture(context);
+  const oversizedManifest = await fixture.emptyCandidate("oversized-manifest", "large");
+  const longEntries = Array.from({ length: 9998 }, (_, index) => ({
+    archivePath: `package/${String(index).padStart(4, "0")}-${"x".repeat(87)}`,
+    content: "x".repeat(1000),
+  }));
+  await writeFile(path.join(oversizedManifest, "cope.tgz"), npmArchive([
+    { archivePath: "package/package.json", content: npmPackageJson("1.2.3") },
+    { archivePath: "package/dist/src/cli/main.js", content: "cli", mode: 0o755 },
+    ...longEntries,
+  ]));
+  expectFailure(
+    invoke(generateScript, generationArguments(fixture, oversizedManifest, "preview")),
+    /Generated release manifest exceeds the 2097152-byte metadata limit/iu,
+  );
+  await assert.rejects(lstat(path.join(oversizedManifest, "sbom.spdx.json")), { code: "ENOENT" });
+  await assert.rejects(lstat(path.join(oversizedManifest, "manifest.json")), { code: "ENOENT" });
+
+  const oversizedSbom = await fixture.emptyCandidate("oversized-sbom", "large");
+  const dependencyCount = 6000;
+  const integrity = `sha512-${Buffer.alloc(64, 0x6d).toString("base64")}`;
+  const packageDocument = npmPackageJson("1.2.3", { dependencies: { p0: "1.0.0" } });
+  const packages: Record<string, unknown> = {
+    "": {
+      name: "@local/copilot-browser-agent",
+      version: "1.2.3",
+      dependencies: { p0: "1.0.0" },
+    },
+  };
+  for (let index = 0; index < dependencyCount; index += 1) {
+    packages[`node_modules/p${index}`] = {
+      version: "1.0.0",
+      integrity,
+      ...(index + 1 === dependencyCount ? {} : { dependencies: { [`p${index + 1}`]: "1.0.0" } }),
+    };
+  }
+  await writeFile(path.join(oversizedSbom, "cope.tgz"), npmArchive([
+    { archivePath: "package/package.json", content: packageDocument },
+    { archivePath: "package/dist/src/cli/main.js", content: "cli", mode: 0o755 },
+  ]));
+  await writeFile(fixture.packageFile, packageDocument);
+  await writeFile(fixture.lockFile, JSON.stringify({
+    name: "@local/copilot-browser-agent",
+    version: "1.2.3",
+    packages,
+  }));
+  expectFailure(
+    invoke(generateScript, generationArguments(fixture, oversizedSbom, "preview")),
+    /Generated SPDX SBOM exceeds the 2097152-byte metadata limit/iu,
+  );
+  await assert.rejects(lstat(path.join(oversizedSbom, "sbom.spdx.json")), { code: "ENOENT" });
+  await assert.rejects(lstat(path.join(oversizedSbom, "manifest.json")), { code: "ENOENT" });
+});
+
 test("release generation rejects traversal, links, and non-regular payload boundaries", async (context) => {
   const fixture = await releaseFixture(context);
   const traversal = await fixture.emptyCandidate("traversal", "bad");

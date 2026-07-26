@@ -11,9 +11,11 @@ import { inspectNpmArchive } from "./archive.mjs";
 import {
   CHANNEL_VERSION,
   MANIFEST_VERSION,
+  MAX_METADATA_BYTES,
   canonicalJson,
   canonicalJsonLine,
   compareText,
+  parseCanonicalSemver,
   readRegularFile,
   safeTopLevelFilename,
   sha256Bytes,
@@ -21,7 +23,6 @@ import {
   validPackedCliMode,
 } from "./lib.mjs";
 
-const SEMVER = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u;
 const TOOL_VERSION = "cope-release-generator/2";
 
 export async function generateRelease(options, environment = process.env, capabilities = {}) {
@@ -48,12 +49,13 @@ export async function generateRelease(options, environment = process.env, capabi
 
   const packageDocument = JSON.parse(await readRegularFile(packageFile));
   const lockDocument = JSON.parse(await readRegularFile(lockFile));
+  const packageVersion = parseCanonicalSemver(packageDocument?.version);
   if (packageDocument?.name !== "@local/copilot-browser-agent" ||
-      typeof packageDocument.version !== "string" || !SEMVER.test(packageDocument.version)) {
+      packageVersion === undefined) {
     throw new Error("package.json does not identify a valid Cope release");
   }
   if (channelName === "stable" &&
-      !/^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/u.test(packageDocument.version)) {
+      (packageVersion.prerelease.length !== 0 || packageVersion.build.length !== 0)) {
     throw new Error("Stable evidence requires a release version without prerelease or build metadata");
   }
   if (lockDocument?.name !== packageDocument.name || lockDocument?.version !== packageDocument.version ||
@@ -136,7 +138,7 @@ export async function generateRelease(options, environment = process.env, capabi
     sourceCommit,
   });
   const sbomBytes = Buffer.from(canonicalJsonLine(sbom));
-  await exclusiveWrite(path.join(output, "sbom.spdx.json"), sbomBytes);
+  requireMetadataSize(sbomBytes, "Generated SPDX SBOM");
 
   const manifest = {
     schemaVersion: MANIFEST_VERSION,
@@ -157,6 +159,8 @@ export async function generateRelease(options, environment = process.env, capabi
     },
   };
   const manifestBytes = Buffer.from(canonicalJsonLine(manifest));
+  requireMetadataSize(manifestBytes, "Generated release manifest");
+  await exclusiveWrite(path.join(output, "sbom.spdx.json"), sbomBytes);
   await exclusiveWrite(path.join(output, "manifest.json"), manifestBytes);
 
   let signature;
@@ -174,6 +178,12 @@ export async function generateRelease(options, environment = process.env, capabi
     publisherAuthenticated: false,
     manifestSha256: sha256Bytes(manifestBytes),
   };
+}
+
+function requireMetadataSize(bytes, label) {
+  if (bytes.length > MAX_METADATA_BYTES) {
+    throw new Error(`${label} exceeds the ${MAX_METADATA_BYTES}-byte metadata limit`);
+  }
 }
 
 function collectRuntimePackagePaths(packages, rootDeclarations) {

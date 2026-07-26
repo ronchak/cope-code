@@ -9,6 +9,8 @@ import { constants as fsConstants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import path from "node:path";
 
+import semver from "semver";
+
 export const MANIFEST_VERSION = "cope-release-manifest/2";
 export const CHANNEL_VERSION = "cope-release-channel/2";
 export const SIGNATURE_VERSION = "cope-release-signature/2";
@@ -23,6 +25,16 @@ export function canonicalJson(value) {
 
 export function canonicalJsonLine(value) {
   return `${canonicalJson(value)}\n`;
+}
+
+export function parseCanonicalSemver(value) {
+  if (typeof value !== "string") return undefined;
+  const parsed = semver.parse(value);
+  if (parsed === null) return undefined;
+  const prerelease = parsed.prerelease.length === 0 ? "" : `-${parsed.prerelease.join(".")}`;
+  const build = parsed.build.length === 0 ? "" : `+${parsed.build.join(".")}`;
+  const canonical = `${parsed.major}.${parsed.minor}.${parsed.patch}${prerelease}${build}`;
+  return canonical === value ? parsed : undefined;
 }
 
 export function sha256Bytes(bytes) {

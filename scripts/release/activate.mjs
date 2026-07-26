@@ -14,6 +14,7 @@ import {
   compareText,
   exactObjectKeys,
   isWithin,
+  parseCanonicalSemver,
   safeTopLevelFilename,
 } from "./lib.mjs";
 import { readCanonicalJsonFile, verifyRelease } from "./verify.mjs";
@@ -410,7 +411,7 @@ function compareReleaseVersions(left, right) {
 }
 
 function parseReleaseVersion(value) {
-  if (typeof value !== "string") return undefined;
+  if (parseCanonicalSemver(value) === undefined) return undefined;
   const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/u.exec(value);
   if (match === null) return undefined;
   const prerelease = match[4] === undefined ? [] : match[4].split(".");

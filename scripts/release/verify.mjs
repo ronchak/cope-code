@@ -14,6 +14,7 @@ import {
   canonicalJsonLine,
   exactObjectKeys,
   isWithin,
+  parseCanonicalSemver,
   readRegularFile,
   safeTopLevelFilename,
   sha256Bytes,
@@ -21,7 +22,6 @@ import {
   verifyManifestSignature,
 } from "./lib.mjs";
 
-const SEMVER = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u;
 const NPM_PACKAGE_NAME = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/u;
 const utf8 = new TextDecoder("utf-8", { fatal: true });
 
@@ -171,11 +171,13 @@ function validateManifest(manifest) {
     "sourceCommit",
     "version",
   ], "Release manifest");
+  const releaseVersion = parseCanonicalSemver(manifest.version);
   if (manifest.schemaVersion !== MANIFEST_VERSION || manifest.product !== "cope" ||
       manifest.packageName !== "@local/copilot-browser-agent" ||
-      typeof manifest.version !== "string" || !SEMVER.test(manifest.version) ||
+      releaseVersion === undefined ||
       (manifest.channel !== "preview" && manifest.channel !== "stable") ||
-      (manifest.channel === "stable" && !/^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/u.test(manifest.version)) ||
+      (manifest.channel === "stable" &&
+        (releaseVersion?.prerelease.length !== 0 || releaseVersion?.build.length !== 0)) ||
       typeof manifest.createdAt !== "string" ||
       !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/u.test(manifest.createdAt) ||
       new Date(manifest.createdAt).toISOString().replace(".000Z", "Z") !== manifest.createdAt ||
