@@ -83,13 +83,25 @@ async function writeDiagnostic(
     scenario: name,
     baseSeed,
     scenarioSeed,
-    errorName: error instanceof Error ? error.name : "UnknownError",
+    errorName: safeErrorName(error),
     errorFingerprint: sha256(error instanceof Error ? error.message : String(error)),
   };
   await writeFile(path.join(directory, `${safeName}-${baseSeed}.json`), `${stableJson(body)}\n`, {
     encoding: "utf8",
     mode: 0o600,
   });
+}
+
+function safeErrorName(error: unknown): string {
+  if (error instanceof AggregateError) return "AggregateError";
+  if (error instanceof TypeError) return "TypeError";
+  if (error instanceof RangeError) return "RangeError";
+  if (error instanceof SyntaxError) return "SyntaxError";
+  if (error instanceof ReferenceError) return "ReferenceError";
+  if (error instanceof URIError) return "URIError";
+  if (error instanceof EvalError) return "EvalError";
+  if (error instanceof Error) return "Error";
+  return "UnknownError";
 }
 
 function parseBoundedInteger(raw: string | undefined, fallback: number, minimum: number, maximum: number): number {

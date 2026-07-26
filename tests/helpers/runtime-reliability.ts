@@ -1,4 +1,4 @@
-import { access, mkdir, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { AuditLog } from "../../src/audit/audit-log.js";
@@ -112,6 +112,7 @@ export class PersistentTransport implements ModelTransport {
     const filename = this.submissionPath(request.submissionId);
     await mkdir(path.dirname(filename), { recursive: true, mode: 0o700 });
     await writeFile(filename, `${request.submissionId}\n`, { flag: "wx", mode: 0o600, flush: true });
+    await recordTransportCall(this.root, "submit", request.submissionId);
     this.submitCount += 1;
     this.afterSubmit?.();
     return receipt(request, "submitted");
@@ -123,6 +124,7 @@ export class PersistentTransport implements ModelTransport {
   }
 
   public async receive(request: ReceiveRequest) {
+    await recordTransportCall(this.root, "receive", request.submissionId);
     this.receiveCount += 1;
     return {
       contractVersion: MODEL_TRANSPORT_CONTRACT_VERSION,
@@ -231,6 +233,25 @@ export function createReliabilityRuntime(input: {
 
 export function crashNow(): never {
   process.exit(CRASH_EXIT_CODE);
+}
+
+export async function readTransportCallIds(root: string, operation: "submit" | "receive"): Promise<string[]> {
+  try {
+    return (await readdir(path.join(root, "transport-calls", operation))).toSorted();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+async function recordTransportCall(root: string, operation: "submit" | "receive", submissionId: string): Promise<void> {
+  const directory = path.join(root, "transport-calls", operation);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await writeFile(path.join(directory, `${submissionId}.txt`), `${submissionId}\n`, {
+    flag: "wx",
+    mode: 0o600,
+    flush: true,
+  });
 }
 
 async function exists(filename: string): Promise<boolean> {

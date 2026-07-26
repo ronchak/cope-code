@@ -28,6 +28,7 @@ import {
   PersistentTransport,
   SESSION_ID,
   createReliabilityRuntime,
+  readTransportCallIds,
 } from "../helpers/runtime-reliability.js";
 
 const runtimeCrashChild = fileURLToPath(new URL("../fixtures/reliability-runtime-crash.js", import.meta.url));
@@ -101,6 +102,11 @@ test("hard-exit runtime matrix reconstructs real durable commits without duplica
           noReplayBoundaries.has(boundaryName) ? 0 : 1,
           `${boundaryName} mutation execution count`,
         );
+        const expectedTurns = pauseBoundaries.has(boundaryName) ? 1 : 2;
+        const submittedIds = await readTransportCallIds(root, "submit");
+        const receivedIds = await readTransportCallIds(root, "receive");
+        assert.equal(submittedIds.length, expectedTurns, `${boundaryName} durable submission count`);
+        assert.deepEqual(receivedIds, submittedIds, `${boundaryName} durable receive calls`);
       } finally {
         await rm(root, { recursive: true, force: true });
       }
@@ -270,6 +276,27 @@ test("failure diagnostic records a base seed that reproduces the exact derived t
       seed: diagnostic.scenarioSeed,
       trace: expectedTrace,
     });
+
+    process.env.COPE_RELIABILITY_ARTIFACT_DIR = directory;
+    try {
+      await assert.rejects(
+        () => reliabilityScenario("diagnostic privacy", 1234, async () => {
+          const error = new Error("private message");
+          error.name = "source-bearing-private-name";
+          throw error;
+        }),
+        /private message/u,
+      );
+    } finally {
+      if (prior === undefined) delete process.env.COPE_RELIABILITY_ARTIFACT_DIR;
+      else process.env.COPE_RELIABILITY_ARTIFACT_DIR = prior;
+    }
+    const privateDiagnosticText = await readFile(
+      path.join(directory, "diagnostic_privacy-1234.json"),
+      "utf8",
+    );
+    assert.equal(privateDiagnosticText.includes("source-bearing-private-name"), false);
+    assert.equal((JSON.parse(privateDiagnosticText) as Record<string, unknown>).errorName, "Error");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
