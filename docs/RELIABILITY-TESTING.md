@@ -4,7 +4,7 @@ Cope's reliability harness exercises selected high-risk local runtime, transport
 
 ## Commands
 
-- `npm run test:reliability` runs 24 seeded iterations for each critical-boundary scenario.
+- `npm run test:reliability` runs one deterministic pass over each hard-exit boundary plus 24 seeded iterations for each bounded fuzz/soak scenario.
 - `npm run test:reliability:soak` runs 200 iterations for local or scheduled soak evidence.
 - `npm run test:coverage` runs the reliability suite plus current 0.1.6 session/setup recovery tests with explicit production-file denominators and minimum line, branch, and function floors.
 
