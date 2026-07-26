@@ -1813,6 +1813,97 @@ test("recovery finishes a refund interrupted after the journal became retry-safe
   assert.equal(localState.pendingOperations.length, 0);
 });
 
+test("recovery retries a mutation whose journal advanced before accepted session state", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-predispatch-journal-recovery-"));
+  const localState = state(root);
+  localState.status = "executing_tools";
+  localState.turnSequence = 1;
+  localState.budgetLimits = { ...localState.budgetLimits, maxCommands: 1 };
+  localState.budgetUsage = { ...localState.budgetUsage, operations: 1, commands: 0 };
+  localState.submission = {
+    submissionId: "submission_1",
+    turnId: "turn_0001",
+    messageHash: "a".repeat(64),
+    marker: "marker",
+    state: "answered",
+    preparedAt: "2026-01-01T00:00:00.000Z",
+    answeredAt: "2026-01-01T00:00:01.000Z",
+  };
+  const call = {
+    operationId: "op_predispatch_recovery",
+    name: "run_command" as const,
+    arguments: { command_id: "validate" },
+  };
+  const journal = new OperationJournal(path.join(root, "operations"), localState.sessionId);
+  const registration = await journal.register(
+    call.operationId,
+    call.name,
+    true,
+    call,
+    "2026-01-01T00:00:00.000Z",
+  );
+  await journal.markExecuting(registration.record, "2026-01-01T00:00:01.000Z");
+  localState.pendingOperations = [{
+    operationId: call.operationId,
+    tool: call.name,
+    mutating: true,
+    requestHash: registration.record.requestHash,
+    status: "accepted",
+    acceptedAt: registration.record.acceptedAt,
+  }];
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
+  await artifacts.put("response", "turn_0001", JSON.stringify([{ type: "tool_request", calls: [call] }]));
+  const transport = new QueueTransport([JSON.stringify([{
+    type: "complete_task",
+    operationId: "op_complete_after_predispatch",
+    claim: {
+      summary: "Recovered the pre-dispatch journal window.",
+      acceptanceCriteria: [],
+      validation: [{
+        commandId: "validate",
+        status: "passed",
+        summary: "Validation passed once.",
+      }],
+      skippedValidation: [],
+      remainingRisks: [],
+      recommendedFollowUp: [],
+    },
+  }])]);
+  let executions = 0;
+
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+    execute: async (requested) => {
+      executions += 1;
+      return {
+        operationId: requested.operationId,
+        tool: requested.name,
+        status: "success",
+        data: {},
+        safeMetadata: {
+          commandId: "validate",
+          outcome: "success",
+          exitCode: 0,
+          outputBytes: 0,
+          repositoryFingerprint: "d".repeat(64),
+        },
+      };
+    },
+  }).run();
+
+  assert.equal(result.status, "completed", result.reason);
+  assert.equal(executions, 1);
+  assert.equal(localState.budgetUsage.commands, 1);
+  assert.equal(localState.pendingOperations.length, 0);
+  assert.equal((await journal.read(call.operationId)).status, "completed");
+});
+
 test("cancelled user prompt resumes once without double charging its operation limit", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-pause-user-budget-"));
   const localState = state(root);

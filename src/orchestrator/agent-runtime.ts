@@ -340,6 +340,22 @@ export class AgentRuntime {
   private async findUncertainMutation(): Promise<SessionState["pendingOperations"][number] | undefined> {
     for (const pending of this.state.pendingOperations) {
       const record = await this.dependencies.journal.read(pending.operationId);
+      if (pending.status === "accepted" && record.status === "executing") {
+        await this.dependencies.journal.markNotStarted(record, this.now());
+        await this.persist();
+        await this.dependencies.audit.append({
+          type: "session.recovered",
+          taskId: this.state.taskId,
+          operationId: pending.operationId,
+          data: {
+            decision: "retry",
+            reasonCode: "EXECUTION_NOT_DISPATCHED",
+            journalStatus: record.status,
+            sessionStatus: pending.status,
+          },
+        });
+        continue;
+      }
       if (record.status === "accepted") {
         if (pending.status === "executing") {
           const specializedCounter = specializedBudgetCounter(pending.tool);
