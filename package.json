@@ -30,6 +30,10 @@
     "test:e2e": "npm run build && node --test --test-concurrency=1 dist/tests/e2e/**/*.test.js",
     "test:chromium-safety": "npm run build && node scripts/run-tests-without-skips.mjs --manifest tests/chromium-safety-manifest.json",
     "verify:release-version": "node scripts/verify-release-version.mjs",
+    "release:build": "node scripts/release/build.mjs",
+    "release:verify": "node scripts/release/verify.mjs",
+    "release:compare": "node scripts/release/compare.mjs",
+    "release:ci": "node scripts/release/ci.mjs",
     "check": "npm run verify:release-version && npm run build && npm test",
     "start": "node dist/src/cli/main.js",
     "dev": "npm run build --silent && node dist/src/cli/main.js",
@@ -44,6 +48,8 @@
   "devDependencies": {
     "@types/node": "24.13.3",
     "es-module-lexer": "2.2.0",
+    "npm-package-arg": "13.0.2",
+    "semver": "7.8.5",
     "typescript": "7.0.2"
   }
 }
