@@ -24,6 +24,7 @@ import {
 import { runHostEligibilityPreflight, runMachinePreflight } from "../preflight/machine.js";
 import {
   CheckpointStore,
+  DEFAULT_MAX_CHECKPOINT_FILES,
   GitInspector,
   RepositoryBoundary,
   type RepositoryContext,
@@ -770,7 +771,10 @@ async function rollbackSession(
     );
     const checkpoints = await CheckpointStore.create(boundary, path.join(sessionDirectory, "checkpoints"), {
       maxCheckpointBytes: configuration.repository.limits.max_checkpoint_bytes,
-      maxFiles: state.budgetLimits.maxChangedFiles,
+      // Recovery must use the same structural bound as execution (see
+      // runtime-composition). The persisted session budget must not gate
+      // rollback: approved one-time expansions can legitimately exceed it.
+      maxFiles: DEFAULT_MAX_CHECKPOINT_FILES,
     });
     const recoveredAssociation = checkpointId === undefined;
     if (checkpointId === undefined) {

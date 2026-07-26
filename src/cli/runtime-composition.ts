@@ -16,6 +16,7 @@ import {
   type SessionGrant,
 } from "../policy/index.js";
 import {
+  DEFAULT_MAX_CHECKPOINT_FILES,
   DEFAULT_REPOSITORY_EXCLUSIONS,
   RepositoryContext,
 } from "../repository/index.js";
@@ -119,6 +120,10 @@ export async function composeRuntime(options: ComposeRuntimeOptions): Promise<Co
     },
     checkpoints: {
       maxCheckpointBytes: configuration.repository.limits.max_checkpoint_bytes,
+      // Structural entry bound shared with recovery (see commands.ts);
+      // approved one-time file-budget expansions must never make an
+      // execution-created checkpoint unloadable at rollback.
+      maxFiles: DEFAULT_MAX_CHECKPOINT_FILES,
     },
     patchBudgets: {
       maxFiles: state.budgetLimits.maxChangedFiles,

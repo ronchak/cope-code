@@ -200,6 +200,14 @@ export interface RollbackOptions {
   readonly force?: boolean;
 }
 
+/**
+ * Structural bound on checkpoint entries shared by execution and recovery.
+ * Session budget limits (including approved one-time expansions) gate new
+ * mutations, but recovery must accept every checkpoint execution could
+ * create; never substitute a persisted budget limit for this bound.
+ */
+export const DEFAULT_MAX_CHECKPOINT_FILES = 200;
+
 export interface CheckpointStoreOptions {
   readonly maxCheckpointBytes?: number;
   readonly maxFiles?: number;
@@ -232,7 +240,7 @@ export class CheckpointStore {
     options: CheckpointStoreOptions,
   ) {
     this.maxCheckpointBytes = options.maxCheckpointBytes ?? 16 * 1024 * 1024;
-    this.maxFiles = options.maxFiles ?? 200;
+    this.maxFiles = options.maxFiles ?? DEFAULT_MAX_CHECKPOINT_FILES;
     this.hooks = options.hooks ?? {};
   }
 
