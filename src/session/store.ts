@@ -6,8 +6,13 @@ import { newId, stableJson } from "../shared/crypto.js";
 import { isOperationId } from "../shared/operation-id.js";
 import { currentHost, workspaceKey } from "./paths.js";
 import { SESSION_SCHEMA_VERSION, type SessionState } from "./types.js";
-import { allowedTransitions } from "./state-machine.js";
-import { COMPLETION_HANDOFF_VERSION } from "./completion-handoff-store.js";
+import { allowedTransitions, isTerminal } from "./state-machine.js";
+import { SessionArtifactStore } from "./artifact-store.js";
+import {
+  CompletionHandoffStore,
+  isCompletionHandoffReference,
+} from "./completion-handoff-store.js";
+import { sessionRetainsSourceArtifacts } from "./terminal-cleanup.js";
 import { CURRENT_HOST_PLATFORM } from "../platform/index.js";
 
 const MAX_SESSION_BYTES = 4 * 1024 * 1024;
@@ -35,12 +40,14 @@ const SESSION_KEYS = [
   "pauseReason",
   "failure",
   "policyHashes",
+  "sourceArtifactRetention",
   "budgetLimits",
   "budgetUsage",
   "turnSequence",
   "mutationSequence",
   "pendingOperations",
   "completedOperationIds",
+  "unreturnedOperationIds",
   "submission",
   "transportConversationId",
   "queuedOutbound",
@@ -49,6 +56,7 @@ const SESSION_KEYS = [
   "lastCheckpointId",
   "lastModelSummaryHash",
   "completionHandoff",
+  "terminalCleanup",
   "protocolRepairStreak",
 ] as const;
 
@@ -83,6 +91,53 @@ export class SessionStore {
     assertValidSessionState(state);
     const directory = this.sessionDirectory(state.sessionId);
     await mkdir(directory, { recursive: true, mode: 0o700 });
+    await this.writeValidated(state);
+  }
+
+  public async read(sessionId: string): Promise<SessionState> {
+    const parsed = await this.readValidated(sessionId);
+    if (!isTerminal(parsed.status)) return parsed;
+    const removeSourceArtifacts = !sessionRetainsSourceArtifacts(parsed);
+    const removeSeparateHandoff =
+      parsed.status !== "completed" || parsed.completionHandoff?.inlineRecord !== undefined;
+    if (!removeSourceArtifacts && !removeSeparateHandoff) return parsed;
+
+    try {
+      // Legacy rollback paths could leave a completion report attached to a
+      // later non-completed terminal state. A completed inline handoff can
+      // likewise coexist with an orphaned file from an interrupted 0.1.6
+      // completion. Removing the separate report is sufficient to retire the
+      // sensitive artifact and deliberately avoids rewriting a possibly newer
+      // state snapshot.
+      const sessionDirectory = this.sessionDirectory(sessionId);
+      const cleanup: Promise<void>[] = [];
+      if (removeSourceArtifacts) {
+        cleanup.push(new SessionArtifactStore(path.join(sessionDirectory, "artifacts")).clear());
+      }
+      if (removeSeparateHandoff) {
+        cleanup.push(CompletionHandoffStore.removeAt(path.join(sessionDirectory, "handoff")));
+      }
+      // Start independent cleanup operations before awaiting so one transient
+      // failure cannot suppress another. The durable terminal policy retries
+      // the entire idempotent set on the next load.
+      await Promise.all(cleanup);
+      const current = await this.readValidated(sessionId);
+      // Suppress the obsolete reference in memory. A later legitimate state
+      // transition persists the already-established terminal invariant.
+      if (isTerminal(current.status) && current.status !== "completed") delete current.completionHandoff;
+      return current;
+    } catch (error) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Cannot finish terminal recovery artifact cleanup",
+        { sessionId, status: parsed.status },
+        { cause: error },
+      );
+    }
+  }
+
+  private async writeValidated(state: SessionState): Promise<void> {
+    const directory = this.sessionDirectory(state.sessionId);
     const destination = path.join(directory, "session.json");
     const temporary = path.join(directory, `session.${newId("write")}.tmp`);
     const serialized = `${stableJson(state)}\n`;
@@ -100,7 +155,7 @@ export class SessionStore {
     await syncDirectory(directory);
   }
 
-  public async read(sessionId: string): Promise<SessionState> {
+  private async readValidated(sessionId: string): Promise<SessionState> {
     const filename = path.join(this.sessionDirectory(sessionId), "session.json");
     let raw: string;
     try {
@@ -307,6 +362,8 @@ function assertValidSessionState(value: Partial<SessionState>): asserts value is
     !isIsoTimestamp(value.createdAt) ||
     !isIsoTimestamp(value.updatedAt) ||
     !isIsoTimestamp(value.startedAt) ||
+    (value.sourceArtifactRetention !== undefined &&
+      !["remove", "retain"].includes(value.sourceArtifactRetention)) ||
     !isExactIntegerRecord(value.budgetLimits, [
       "maxTurns",
       "maxOperations",
@@ -336,6 +393,9 @@ function assertValidSessionState(value: Partial<SessionState>): asserts value is
     (value.mutationSequence ?? -1) < 0 ||
     !Array.isArray(value.pendingOperations) || value.pendingOperations.length > 100_000 ||
     !Array.isArray(value.completedOperationIds) || value.completedOperationIds.length > 100_000 ||
+    (value.unreturnedOperationIds !== undefined &&
+      (!Array.isArray(value.unreturnedOperationIds) ||
+        value.unreturnedOperationIds.length > 100_000)) ||
     !Array.isArray(value.mutations) || value.mutations.length > 100_000 ||
     !Array.isArray(value.validations) || value.validations.length > 100_000 ||
     !Number.isSafeInteger(value.protocolRepairStreak) ||
@@ -348,6 +408,12 @@ function assertValidSessionState(value: Partial<SessionState>): asserts value is
     !value.pendingOperations.every(isPendingOperation) ||
     !value.completedOperationIds.every(isOperationId) ||
     new Set(value.completedOperationIds).size !== value.completedOperationIds.length ||
+    (value.unreturnedOperationIds !== undefined &&
+      (!value.unreturnedOperationIds.every(isOperationId) ||
+        new Set(value.unreturnedOperationIds).size !== value.unreturnedOperationIds.length ||
+        value.unreturnedOperationIds.some(
+          (operationId) => !value.completedOperationIds?.includes(operationId),
+        ))) ||
     !value.mutations.every(isMutationRecord) ||
     !value.validations.every(isValidationRecord)
   ) {
@@ -355,18 +421,23 @@ function assertValidSessionState(value: Partial<SessionState>): asserts value is
   }
   if (
     value.completionHandoff !== undefined &&
-    (!hasExactKeys(value.completionHandoff, ["version", "integrity", "createdAt", "redactionCount"]) ||
-      value.completionHandoff.version !== COMPLETION_HANDOFF_VERSION ||
-      !/^[a-f0-9]{64}$/u.test(value.completionHandoff.integrity) ||
-      !isIsoTimestamp(value.completionHandoff.createdAt) ||
-      !Number.isSafeInteger(value.completionHandoff.redactionCount) ||
-      value.completionHandoff.redactionCount < 0)
+    !isCompletionHandoffReference(value.completionHandoff, value.sessionId)
   ) {
     throw new AgentError("RECOVERY_REQUIRED", "Session completion-handoff reference is malformed");
+  }
+  if (
+    value.terminalCleanup !== undefined &&
+    (!hasExactKeys(value.terminalCleanup, ["sourceArtifacts"]) ||
+      !["remove", "retain"].includes(value.terminalCleanup.sourceArtifacts))
+  ) {
+    throw new AgentError("RECOVERY_REQUIRED", "Session terminal-cleanup policy is malformed");
   }
   // This also guarantees that a status is a recognized key in the transition table.
   const status = value.status;
   allowedTransitions(status);
+  if (value.terminalCleanup !== undefined && !isTerminal(status)) {
+    throw new AgentError("RECOVERY_REQUIRED", "A nonterminal session cannot have a terminal-cleanup policy");
+  }
   const operationIds = value.pendingOperations.map((operation) => operation.operationId);
   if (new Set(operationIds).size !== operationIds.length) {
     throw new AgentError("RECOVERY_REQUIRED", "Session contains duplicate pending operation identifiers");
@@ -396,11 +467,28 @@ function assertValidSessionState(value: Partial<SessionState>): asserts value is
   }
   if (
     value.queuedOutbound !== undefined &&
-    (!hasExactKeys(value.queuedOutbound, ["turnId", "artifactId", "messageHash", "createdAt"]) ||
+    (!hasExactKeys(
+      value.queuedOutbound,
+      ["turnId", "artifactId", "messageHash", "createdAt", "disclosure"],
+      true,
+    ) ||
       typeof value.queuedOutbound.turnId !== "string" ||
       typeof value.queuedOutbound.artifactId !== "string" ||
       !/^[a-f0-9]{64}$/u.test(value.queuedOutbound.messageHash) ||
-      !isIsoTimestamp(value.queuedOutbound.createdAt))
+      !isIsoTimestamp(value.queuedOutbound.createdAt) ||
+      (
+        value.queuedOutbound.disclosure !== undefined &&
+        (
+          !hasExactKeys(
+            value.queuedOutbound.disclosure,
+            ["kind", "disclosedBytes", "sha256"],
+          ) ||
+          value.queuedOutbound.disclosure.kind !== "tool_result" ||
+          !Number.isSafeInteger(value.queuedOutbound.disclosure.disclosedBytes) ||
+          value.queuedOutbound.disclosure.disclosedBytes < 0 ||
+          !HASH_PATTERN.test(value.queuedOutbound.disclosure.sha256)
+        )
+      ))
   ) {
     throw new AgentError("RECOVERY_REQUIRED", "Session queued outbound record is malformed");
   }

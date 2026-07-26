@@ -570,12 +570,22 @@ test("pinned leaf operations preserve concurrent replacements at validation boun
   await writeFile(source, "original\n");
   const directoryIdentity = await pinnedIdentityAt(temporary);
   const sourceIdentity = await pinnedIdentityAt(source);
+  const quarantineIdentity = runPinnedMutation(temporary, directoryIdentity, {
+    kind: "create_quarantine",
+    name: ".test-private",
+  });
+  assert.ok(isPinnedIdentity(quarantineIdentity));
+  const quarantine = {
+    name: ".test-private",
+    identity: quarantineIdentity,
+  };
 
   assert.throws(
     () => runPinnedMutation(temporary, directoryIdentity, {
       kind: "remove",
       name: path.basename(source),
       identity: sourceIdentity,
+      quarantine,
       testReplaceAfterValidation: {
         parked: path.basename(parked),
         bytes: Buffer.from("concurrent\n").toString("base64"),
@@ -587,14 +597,45 @@ test("pinned leaf operations preserve concurrent replacements at validation boun
   assert.equal(await readFile(source, "utf8"), "concurrent\n");
   assert.equal(await readFile(parked, "utf8"), "original\n");
   const concurrentMode = (await stat(source)).mode & 0o777;
+  const concurrentIdentity = await pinnedIdentityAt(source);
+
+  const lateSource = path.join(temporary, "late-source.txt");
+  const lateParked = path.join(temporary, "late-parked.txt");
+  await writeFile(lateSource, "late original\n");
+  const lateIdentity = await pinnedIdentityAt(lateSource);
+  const lateMode = (await stat(lateSource)).mode & 0o777;
+  assert.throws(
+    () => runPinnedMutation(temporary, directoryIdentity, {
+      kind: "remove",
+      name: path.basename(lateSource),
+      identity: lateIdentity,
+      expectedSha256: sha256("late original\n"),
+      expectedMode: lateMode,
+      quarantine,
+      testReplaceBeforeRemoval: {
+        parked: path.basename(lateParked),
+        bytes: Buffer.from("late concurrent\n").toString("base64"),
+        mode: 0o600,
+      },
+    }),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  assert.equal(await readFile(lateSource, "utf8"), "late concurrent\n");
+  assert.equal(await readFile(lateParked, "utf8"), "late original\n");
+  assert.deepEqual(
+    await readdir(path.join(temporary, quarantine.name)),
+    [],
+  );
 
   assert.throws(
     () => runPinnedMutation(temporary, directoryIdentity, {
       kind: "capture",
       source: path.basename(source),
       destination: path.basename(destination),
+      sourceIdentity: concurrentIdentity,
       expectedSha256: sha256("concurrent\n"),
       expectedMode: concurrentMode,
+      quarantine,
       testCreateDestinationAfterValidation: Buffer.from("destination race\n").toString("base64"),
     }),
     (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
@@ -608,14 +649,184 @@ test("pinned leaf operations preserve concurrent replacements at validation boun
       kind: "capture",
       source: path.basename(source),
       destination: path.basename(destination),
+      sourceIdentity: concurrentIdentity,
       expectedSha256: sha256("concurrent\n"),
       expectedMode: concurrentMode,
+      quarantine,
       testWriteAfterCaptureValidation: Buffer.from("tail race\n").toString("base64"),
     }),
     (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
   );
   assert.equal(await readFile(source, "utf8"), "tail race\n");
   assert.equal(await readFile(destination, "utf8"), "tail race\n");
+
+  const identitySource = path.join(temporary, "identity-source.txt");
+  const identityParked = path.join(temporary, "identity-parked.txt");
+  const identityDestination = path.join(temporary, "identity-destination.txt");
+  await writeFile(identitySource, "same bytes\n", { mode: 0o600 });
+  const exactIdentity = await pinnedIdentityAt(identitySource);
+  const exactMode = (await stat(identitySource)).mode & 0o777;
+  assert.throws(
+    () => runPinnedMutation(temporary, directoryIdentity, {
+      kind: "capture",
+      source: path.basename(identitySource),
+      destination: path.basename(identityDestination),
+      sourceIdentity: exactIdentity,
+      expectedSha256: sha256("same bytes\n"),
+      expectedMode: exactMode,
+      quarantine,
+      testReplaceSourceAfterValidation: {
+        parked: path.basename(identityParked),
+        bytes: Buffer.from("same bytes\n").toString("base64"),
+        mode: 0o600,
+      },
+    }),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  assert.equal(await readFile(identitySource, "utf8"), "same bytes\n");
+  assert.equal(await readFile(identityParked, "utf8"), "same bytes\n");
+  await assert.rejects(readFile(identityDestination));
+
+  const captureRaceSource = path.join(temporary, "capture-race-source.txt");
+  const captureRaceParked = path.join(temporary, "capture-race-parked.txt");
+  const captureRaceDestination = path.join(temporary, "capture-race-destination.txt");
+  await writeFile(captureRaceSource, "capture original\n", { mode: 0o600 });
+  const captureRaceIdentity = await pinnedIdentityAt(captureRaceSource);
+  const captureRaceMode = (await stat(captureRaceSource)).mode & 0o777;
+  assert.throws(
+    () => runPinnedMutation(temporary, directoryIdentity, {
+      kind: "capture",
+      source: path.basename(captureRaceSource),
+      destination: path.basename(captureRaceDestination),
+      sourceIdentity: captureRaceIdentity,
+      expectedSha256: sha256("capture original\n"),
+      expectedMode: captureRaceMode,
+      quarantine,
+      testReplaceBeforeRemoval: {
+        parked: path.basename(captureRaceParked),
+        bytes: Buffer.from("capture replacement\n").toString("base64"),
+        mode: 0o600,
+      },
+    }),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  assert.equal(await readFile(captureRaceSource, "utf8"), "capture replacement\n");
+  assert.equal(await readFile(captureRaceParked, "utf8"), "capture original\n");
+  assert.equal(await readFile(captureRaceDestination, "utf8"), "capture original\n");
+  assert.deepEqual(await readdir(path.join(temporary, quarantine.name)), []);
+
+  const linkCrashSource = path.join(temporary, "link-crash-source.txt");
+  const linkCrashDestination = path.join(temporary, "link-crash-destination.txt");
+  await writeFile(linkCrashSource, "link crash\n", { mode: 0o600 });
+  const linkCrashIdentity = await pinnedIdentityAt(linkCrashSource);
+  const linkCrashMode = (await stat(linkCrashSource)).mode & 0o777;
+  assert.throws(
+    () => runPinnedMutation(temporary, directoryIdentity, {
+      kind: "capture",
+      source: path.basename(linkCrashSource),
+      destination: path.basename(linkCrashDestination),
+      sourceIdentity: linkCrashIdentity,
+      expectedSha256: sha256("link crash\n"),
+      expectedMode: linkCrashMode,
+      quarantine,
+      testFailAfterLink: true,
+    }),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  assert.equal((await stat(linkCrashSource)).nlink, 2);
+  assert.equal(await readFile(linkCrashDestination, "utf8"), "link crash\n");
+  runPinnedMutation(temporary, directoryIdentity, {
+    kind: "remove",
+    name: path.basename(linkCrashSource),
+    identity: linkCrashIdentity,
+    expectedSha256: sha256("link crash\n"),
+    expectedMode: linkCrashMode,
+    quarantine,
+  });
+  await assert.rejects(readFile(linkCrashSource));
+  assert.equal(await readFile(linkCrashDestination, "utf8"), "link crash\n");
+
+  const crashSource = path.join(temporary, "crash-source.txt");
+  const crashDestination = path.join(temporary, "crash-destination.txt");
+  await writeFile(crashSource, "crash exact\n", { mode: 0o600 });
+  const crashIdentity = await pinnedIdentityAt(crashSource);
+  const crashMode = (await stat(crashSource)).mode & 0o777;
+  assert.throws(
+    () => runPinnedMutation(temporary, directoryIdentity, {
+      kind: "capture",
+      source: path.basename(crashSource),
+      destination: path.basename(crashDestination),
+      sourceIdentity: crashIdentity,
+      expectedSha256: sha256("crash exact\n"),
+      expectedMode: crashMode,
+      quarantine,
+      testFailAfterQuarantineMove: true,
+    }),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  await assert.rejects(readFile(crashSource));
+  assert.equal(await readFile(crashDestination, "utf8"), "crash exact\n");
+  assert.equal((await readdir(path.join(temporary, quarantine.name))).length, 1);
+  runPinnedMutation(temporary, directoryIdentity, {
+    kind: "reconcile_quarantine",
+    name: path.basename(crashSource),
+    identity: crashIdentity,
+    expectedSha256: sha256("crash exact\n"),
+    expectedMode: crashMode,
+    quarantine,
+  });
+  assert.deepEqual(await readdir(path.join(temporary, quarantine.name)), []);
+
+  assert.throws(
+    () => runPinnedMutation(temporary, directoryIdentity, {
+      kind: "remove",
+      name: path.basename(crashDestination),
+      identity: crashIdentity,
+      expectedSha256: sha256("crash exact\n"),
+      expectedMode: crashMode,
+      quarantine,
+      testFailAfterQuarantineMove: true,
+    }),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  runPinnedMutation(temporary, directoryIdentity, {
+    kind: "reconcile_quarantine",
+    name: path.basename(crashDestination),
+    identity: crashIdentity,
+    expectedSha256: sha256("crash exact\n"),
+    expectedMode: crashMode,
+    quarantine,
+  });
+  await assert.rejects(readFile(crashDestination));
+
+  const unexpectedQuarantineLeaf = path.join(temporary, quarantine.name, "unexpected");
+  await writeFile(unexpectedQuarantineLeaf, "preserve\n");
+  assert.throws(
+    () => runPinnedMutation(temporary, directoryIdentity, {
+      kind: "remove_quarantine",
+      quarantine,
+    }),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  assert.equal(await readFile(unexpectedQuarantineLeaf, "utf8"), "preserve\n");
+  await unlink(unexpectedQuarantineLeaf);
+
+  const parkedQuarantine = path.join(temporary, ".test-private-parked");
+  await rename(path.join(temporary, quarantine.name), parkedQuarantine);
+  await mkdir(path.join(temporary, quarantine.name), { mode: 0o700 });
+  assert.throws(
+    () => runPinnedMutation(temporary, directoryIdentity, {
+      kind: "verify_quarantine",
+      quarantine,
+    }),
+    (error: unknown) => error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+  );
+  await rm(path.join(temporary, quarantine.name), { recursive: true });
+  await rename(parkedQuarantine, path.join(temporary, quarantine.name));
+  runPinnedMutation(temporary, directoryIdentity, {
+    kind: "remove_quarantine",
+    quarantine,
+  });
 });
 
 test("pinned workers execute the payload captured before helper-path replacement", async (context) => {
@@ -849,20 +1060,23 @@ test("rollback authenticates and cleans an interrupted forward delete probe", as
   const targetIdentity = await pinnedIdentityAt(target);
   const directory = await pinnedIdentityAt(root);
   const targetMode = (await stat(target)).mode & 0o777;
+  const artifactPaths = checkpointMutationArtifactPaths(
+    target,
+    "delete.txt",
+    checkpoint.id,
+  );
+  await mkdir(artifactPaths.quarantinePath, { mode: 0o700 });
   await checkpoints.recordMutationArtifacts(checkpoint.id, [{
     path: "delete.txt",
     directory,
+    quarantine: await pinnedIdentityAt(artifactPaths.quarantinePath),
     probe: {
       ...targetIdentity,
       sha256: sha256(before),
       mode: targetMode,
     },
   }]);
-  const probe = checkpointMutationArtifactPaths(
-    target,
-    "delete.txt",
-    checkpoint.id,
-  ).probePath;
+  const probe = artifactPaths.probePath;
   await link(target, probe);
 
   assert.equal((await stat(target)).nlink, 2);
@@ -897,6 +1111,10 @@ test("rollback resumes an exact created-target probe and rejects a different-ino
       "created.txt",
       checkpoint.id,
     ).probePath}.rollback`;
+    const rollbackQuarantine = `${
+      checkpointMutationArtifactPaths(target, "created.txt", checkpoint.id).quarantinePath
+    }.rollback`;
+    await mkdir(rollbackQuarantine, { mode: 0o700 });
     if (exactProbe) {
       await link(target, rollbackProbe);
     } else {
@@ -924,6 +1142,7 @@ test("rollback resumes an exact created-target probe and rejects a different-ino
         temporary: null,
         backup: null,
         installed: null,
+        quarantine: await pinnedIdentityAt(rollbackQuarantine),
       }],
     };
     const { integrity: _integrity, ...body } = manifest;
@@ -1304,11 +1523,13 @@ test("checkpoint rollback removes identity-bound artifacts left by an interrupte
   await writeFile(target, "partially updated\n");
   await writeFile(artifacts.temporaryPath, "staged\n");
   await writeFile(artifacts.backupPath, "original\n");
+  await mkdir(artifacts.quarantinePath, { mode: 0o700 });
   const temporaryState = await stat(artifacts.temporaryPath);
   const backupState = await stat(artifacts.backupPath);
   await checkpoints.recordMutationArtifacts(checkpoint.id, [{
     path: "file.txt",
     directory: await pinnedIdentityAt(root),
+    quarantine: await pinnedIdentityAt(artifacts.quarantinePath),
     temporary: {
       ...await pinnedIdentityAt(artifacts.temporaryPath),
       sha256: sha256("staged\n"), mode: temporaryState.mode & 0o777,
@@ -1840,6 +2061,133 @@ test("persisted rollback resumes after process loss at each target phase", async
         [],
       );
     });
+  }
+});
+
+test("rollback resumes write-ahead captures across link boundaries", async (context) => {
+  async function storedState(filename: string, content: string) {
+    const state = await stat(filename, { bigint: true });
+    return {
+      ...pinnedIdentityFromBigInts(state.dev, state.ino),
+      sha256: sha256(content),
+      mode: Number(state.mode & 0o777n),
+    };
+  }
+
+  for (const phase of ["applying", "reverting"] as const) {
+    for (const capturePoint of ["before-link", "after-link"] as const) {
+      await context.test(`${phase}/${capturePoint}`, async () => {
+        const temporary = await mkdtemp(
+          path.join(
+            os.tmpdir(),
+            `cba-rollback-capture-${phase}-${capturePoint}-`,
+          ),
+        );
+        context.after(async () => rm(temporary, { recursive: true, force: true }));
+        const root = path.join(temporary, "repo");
+        const checkpointRoot = path.join(temporary, "checkpoints");
+        await mkdir(root);
+        const target = path.join(root, "file.txt");
+        await writeFile(target, "before\n");
+        const boundary = await RepositoryBoundary.create(root);
+        const checkpoints = await CheckpointStore.create(boundary, checkpointRoot);
+        const engine = new PatchEngine(boundary, checkpoints, new ProtectedPathPolicy());
+        const result = await engine.editText({
+          path: "file.txt",
+          base_sha256: sha256("before\n"),
+          old_text: "before",
+          new_text: "after",
+          expected_occurrences: 1,
+        });
+        const artifacts = checkpointMutationArtifactPaths(
+          target,
+          "file.txt",
+          result.checkpointId,
+        );
+        const rollbackTemporary = `${artifacts.temporaryPath}.rollback`;
+        const rollbackBackup = `${artifacts.backupPath}.rollback`;
+        const rollbackQuarantine = `${artifacts.quarantinePath}.rollback`;
+        await mkdir(rollbackQuarantine, { mode: 0o700 });
+
+        let current;
+        let staged;
+        let backup;
+        let installed = null;
+        if (phase === "applying") {
+          await writeFile(rollbackTemporary, "before\n");
+          current = await storedState(target, "after\n");
+          staged = await storedState(rollbackTemporary, "before\n");
+          if (capturePoint === "after-link") {
+            await link(target, rollbackBackup);
+            backup = await storedState(rollbackBackup, "after\n");
+          } else {
+            backup = current;
+          }
+        } else {
+          await rename(target, rollbackBackup);
+          await writeFile(target, "before\n");
+          current = await storedState(rollbackBackup, "after\n");
+          backup = current;
+          installed = await storedState(target, "before\n");
+          if (capturePoint === "after-link") {
+            await link(target, rollbackTemporary);
+            staged = await storedState(rollbackTemporary, "before\n");
+          } else {
+            staged = installed;
+          }
+        }
+        assert.equal(
+          (await stat(target)).nlink,
+          capturePoint === "after-link" ? 2 : 1,
+        );
+
+        const manifestPath = path.join(
+          checkpointRoot,
+          result.checkpointId,
+          "manifest.json",
+        );
+        const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+          integrity: string;
+          rollback?: unknown;
+          [key: string]: unknown;
+        };
+        manifest.rollback = {
+          startedAt: "2026-07-25T00:00:00.000Z",
+          forced: false,
+          phase,
+          entries: [{
+            path: "file.txt",
+            directory: await pinnedIdentityAt(root),
+            current,
+            temporary: staged,
+            backup,
+            installed,
+            quarantine: await pinnedIdentityAt(rollbackQuarantine),
+          }],
+        };
+        const { integrity: _integrity, ...body } = manifest;
+        await writeFile(
+          manifestPath,
+          `${stableJson({ ...body, integrity: sha256(stableJson(body)) })}\n`,
+        );
+
+        if (phase === "applying") {
+          await checkpoints.rollback(result.checkpointId);
+          assert.equal(await readFile(target, "utf8"), "before\n");
+        } else {
+          await assert.rejects(
+            checkpoints.rollback(result.checkpointId),
+            (error: unknown) =>
+              error instanceof AgentError && error.code === "RECOVERY_REQUIRED",
+          );
+          assert.equal(await readFile(target, "utf8"), "after\n");
+        }
+        assert.deepEqual(
+          (await readdir(root)).filter((name) => name.startsWith(".cba-")),
+          [],
+        );
+      });
+    }
   }
 });
 

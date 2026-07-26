@@ -34,13 +34,14 @@ export class TerminalUserInteraction implements UserInteraction {
   public async requestInput(request: {
     readonly question: string;
     readonly choices?: readonly string[];
+    readonly signal: AbortSignal;
   }): Promise<Readonly<Record<string, unknown>>> {
     section("Copilot has a question", this.output);
     this.output.write(`${request.question}\n`);
     if (request.choices && request.choices.length > 0) {
       request.choices.forEach((choice, index) => this.output.write(`  ${cyan(String(index + 1))}  ${choice}\n`));
     }
-    const answer = await this.readLine(`${cyan(">")} `);
+    const answer = await this.readLine(`${cyan(">")} `, request.signal);
     return { answer };
   }
 
@@ -48,6 +49,7 @@ export class TerminalUserInteraction implements UserInteraction {
     readonly capability: Readonly<Record<string, unknown>>;
     readonly reason: string;
     readonly risk?: string;
+    readonly signal: AbortSignal;
   }): Promise<{ readonly decision: "deny" | "allow_once" | "allow_session"; readonly note?: string }> {
     section("Permission needed", this.output);
     this.output.write(`${request.reason}\n`);
@@ -56,7 +58,7 @@ export class TerminalUserInteraction implements UserInteraction {
     this.output.write(`\n  ${bold("1")}  Allow once\n`);
     this.output.write(`  ${bold("2")}  Allow for this session\n`);
     this.output.write(`  ${bold("3")}  Deny ${dim("(default)")}\n`);
-    const answer = (await this.readLine(`${cyan("?")} Choose [1/2/3]: `)).trim().toLowerCase();
+    const answer = (await this.readLine(`${cyan("?")} Choose [1/2/3]: `, request.signal)).trim().toLowerCase();
     if (answer === "1" || answer === "once" || answer === "y" || answer === "yes") {
       return { decision: "allow_once" };
     }
@@ -155,13 +157,13 @@ export class TerminalUserInteraction implements UserInteraction {
     return answer === "y" || answer === "yes";
   }
 
-  private async readLine(prompt: string): Promise<string> {
+  private async readLine(prompt: string, signal?: AbortSignal): Promise<string> {
     if (!stdin.isTTY || !stdout.isTTY) {
       throw new Error("Interactive input is required but no terminal is attached");
     }
     const readline = createInterface({ input: stdin, output: stdout });
     try {
-      return await readline.question(prompt);
+      return await readline.question(prompt, signal === undefined ? {} : { signal });
     } finally {
       readline.close();
     }

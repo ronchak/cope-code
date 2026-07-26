@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 
 import { AgentError } from "../shared/errors.js";
 import { MAX_MUTATION_FILE_BYTES } from "../shared/mutation-limits.js";
+import { CURRENT_HOST_PLATFORM } from "../platform/index.js";
 
 export interface PinnedIdentity {
   readonly device: string;
@@ -16,6 +17,11 @@ export interface PinnedFileState extends PinnedIdentity {
   readonly bytes?: string;
 }
 
+export interface PinnedQuarantine {
+  readonly name: string;
+  readonly identity: PinnedIdentity;
+}
+
 export const MAX_PINNED_FILE_BYTES = MAX_MUTATION_FILE_BYTES;
 const MAX_PINNED_MESSAGE_BYTES = 32 * 1024 * 1024;
 const DECIMAL_IDENTITY = /^(?:0|[1-9]\d*)$/u;
@@ -26,10 +32,24 @@ type PinnedOperation =
       readonly kind: "capture";
       readonly source: string;
       readonly destination: string;
+      readonly sourceIdentity: PinnedIdentity;
       readonly expectedSha256: string;
       readonly expectedMode: number;
+      readonly quarantine: PinnedQuarantine;
       readonly testCreateDestinationAfterValidation?: string;
+      readonly testReplaceSourceAfterValidation?: {
+        readonly parked: string;
+        readonly bytes: string;
+        readonly mode: number;
+      };
+      readonly testReplaceBeforeRemoval?: {
+        readonly parked: string;
+        readonly bytes: string;
+        readonly mode: number;
+      };
       readonly testWriteAfterCaptureValidation?: string;
+      readonly testFailAfterLink?: boolean;
+      readonly testFailAfterQuarantineMove?: boolean;
     }
   | {
       readonly kind: "install";
@@ -48,6 +68,7 @@ type PinnedOperation =
       readonly sourceIdentity: PinnedIdentity;
       readonly sourceSha256: string;
       readonly sourceMode: number;
+      readonly quarantine: PinnedQuarantine;
       readonly failBeforeLink?: boolean;
     }
   | {
@@ -63,11 +84,38 @@ type PinnedOperation =
       readonly identity: PinnedIdentity | null;
       readonly expectedSha256?: string;
       readonly expectedMode?: number;
+      readonly quarantine: PinnedQuarantine;
       readonly testReplaceAfterValidation?: {
         readonly parked: string;
         readonly bytes: string;
         readonly mode: number;
       };
+      readonly testReplaceBeforeRemoval?: {
+        readonly parked: string;
+        readonly bytes: string;
+        readonly mode: number;
+      };
+      readonly testFailAfterQuarantineMove?: boolean;
+    }
+  | {
+      readonly kind: "create_quarantine";
+      readonly name: string;
+    }
+  | {
+      readonly kind: "reconcile_quarantine";
+      readonly name: string;
+      readonly identity: PinnedIdentity;
+      readonly expectedSha256?: string;
+      readonly expectedMode?: number;
+      readonly quarantine: PinnedQuarantine;
+    }
+  | {
+      readonly kind: "remove_quarantine";
+      readonly quarantine: PinnedQuarantine;
+    }
+  | {
+      readonly kind: "verify_quarantine";
+      readonly quarantine: PinnedQuarantine;
     }
   | {
       readonly kind: "restore";
@@ -97,7 +145,11 @@ export function runPinnedMutation(
     ["--input-type=module", "--eval", WORKER_SOURCE],
     {
       cwd: directory,
-      input: JSON.stringify({ directory: directoryIdentity, operation }),
+      input: JSON.stringify({
+        directory: directoryIdentity,
+        supportsPosixModes: CURRENT_HOST_PLATFORM.supportsPosixModes,
+        operation,
+      }),
       encoding: "utf8",
       env: workerEnvironment(),
       maxBuffer: MAX_PINNED_MESSAGE_BYTES,

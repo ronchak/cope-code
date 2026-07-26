@@ -8,7 +8,13 @@ import {
   type SessionCapabilityExpansion,
   type SessionGrant,
 } from "../policy/index.js";
-import { BUDGET_METRICS, isToolName, TOOL_NAMES, toolRequiresContext } from "../protocol/index.js";
+import {
+  BUDGET_METRICS,
+  isToolName,
+  TOOL_NAMES,
+  toolRequiresContext,
+  type BudgetMetric,
+} from "../protocol/index.js";
 import type { RepositoryBoundary } from "../repository/boundary.js";
 import { countChangedLines, planExactTextEdit } from "../repository/exact-text-edit.js";
 import type { RepositoryReadOperation } from "../repository/repository-tools.js";
@@ -20,6 +26,20 @@ import type {
   NormalizedToolCall,
   RuntimePolicy,
 } from "./contracts.js";
+import {
+  GIT_STATUS_RESULT_BYTES,
+  LIST_FILES_RESULT_BYTES,
+  plannedToolResultDisclosureBytes,
+} from "./disclosure-budget.js";
+
+const OPERATION_SCOPED_BUDGET_METRICS = new Set<BudgetMetric>([
+  "read_files",
+  "changed_files",
+  "changed_lines",
+  "disclosed_bytes",
+  "commands",
+  "command_output_bytes",
+]);
 
 export interface LayeredRuntimePolicyOptions {
   readonly engine: PolicyEngine;
@@ -77,6 +97,20 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
     call: NormalizedToolCall,
     capability: Readonly<Record<string, unknown>>,
   ): Promise<AuthorizationDecision> {
+    const expansions = parseExpansions(capability, this.options.commandCatalog);
+    const unsupportedBudget = expansions.find(
+      (expansion) =>
+        expansion.kind === "budget" &&
+        !OPERATION_SCOPED_BUDGET_METRICS.has(expansion.metric),
+    );
+    if (unsupportedBudget?.kind === "budget") {
+      return {
+        outcome: "deny",
+        reasonCode: "CAPABILITY_EXPANSION_DENIED",
+        explanation:
+          `The ${unsupportedBudget.metric} budget cannot be expanded for one operation; session approval is required.`,
+      };
+    }
     const engine = this.expandedEngine(capability);
     if (engine === undefined) {
       return {
@@ -85,7 +119,22 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
         explanation: "The approved one-time capability could not be applied.",
       };
     }
-    return this.authorizeAgainst(engine, call);
+    const decision = await this.authorizeAgainst(engine, call);
+    if (decision.outcome !== "allow") return decision;
+    const oneTimeBudgetLimits = Object.fromEntries(
+      expansions
+        .filter((expansion) => expansion.kind === "budget")
+        .flatMap((expansion) => {
+          const limit = engine.getEffectiveBudgetLimits()[expansion.metric];
+          return limit === undefined ? [] : [[expansion.metric, limit] as const];
+        }),
+    );
+    return {
+      ...decision,
+      ...(Object.keys(oneTimeBudgetLimits).length === 0
+        ? {}
+        : { oneTimeBudgetLimits }),
+    };
   }
 
   private async authorizeAgainst(
@@ -197,23 +246,21 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
       const byteCount = positiveInteger(call.arguments.max_bytes) ?? this.options.defaultReadBytes ?? 128 * 1024;
       disclosure = disclosureFact(this.classification, byteCount, 1);
       usage.read_files += 1;
-      usage.disclosed_bytes += byteCount;
     } else if (call.name === "search_text") {
       const byteCount = this.options.defaultSearchBytes ?? 128 * 1024;
       disclosure = disclosureFact(this.classification, byteCount, 1);
-      usage.disclosed_bytes += byteCount;
     } else if (call.name === "list_files") {
       const fileCount = positiveInteger(call.arguments.max_results) ?? 500;
-      const byteCount = Math.min(fileCount * 256, 128 * 1024);
-      disclosure = disclosureFact(this.classification, byteCount, fileCount);
-      usage.disclosed_bytes += byteCount;
+      disclosure = disclosureFact(
+        this.classification,
+        LIST_FILES_RESULT_BYTES,
+        fileCount,
+      );
     } else if (call.name === "git_diff") {
       const byteCount = positiveInteger(call.arguments.max_bytes) ?? this.options.defaultDiffBytes ?? 256 * 1024;
       disclosure = disclosureFact(this.classification, byteCount, 1);
-      usage.disclosed_bytes += byteCount;
     } else if (call.name === "git_status") {
-      disclosure = disclosureFact(this.classification, 64 * 1024, 1);
-      usage.disclosed_bytes += 64 * 1024;
+      disclosure = disclosureFact(this.classification, GIT_STATUS_RESULT_BYTES, 1);
     } else if (call.name === "run_command") {
       const commandId = requiredString(call.arguments.command_id, "command_id");
       const requestedTimeout = positiveInteger(call.arguments.timeout_ms);
@@ -233,7 +280,6 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
       disclosure = disclosureFact(this.classification, resolved.maxOutputBytes, 1);
       usage.commands += 1;
       usage.command_output_bytes += resolved.maxOutputBytes;
-      usage.disclosed_bytes += resolved.maxOutputBytes;
     } else if (call.name === "apply_patch") {
       const changes = patchChanges(call.arguments.changes);
       const changedLines = exactPatchLines ? await this.countExactChangedLines(changes) : 0;
@@ -262,6 +308,19 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
       usage.changed_lines += changedLines;
     }
 
+    const pathBytes = paths.reduce(
+      (total, entry) => total + Buffer.byteLength(entry.path),
+      0,
+    );
+    const plannedDisclosureBytes = plannedToolResultDisclosureBytes(
+      disclosure?.byte_count ?? 0,
+      pathBytes,
+    );
+    if (!Number.isSafeInteger(usage.disclosed_bytes + plannedDisclosureBytes)) {
+      throw new AgentError("BUDGET_EXCEEDED", "Projected disclosure usage is too large");
+    }
+    usage.disclosed_bytes += plannedDisclosureBytes;
+
     return {
       tool: call.name,
       ...(paths.length === 0 ? {} : { paths }),
@@ -269,6 +328,7 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
       ...(disclosure === undefined ? {} : { disclosure }),
       ...(network === undefined ? {} : { network }),
       ...(change === undefined ? {} : { change }),
+      planned_disclosure_bytes: plannedDisclosureBytes,
       projected_usage: usage,
     };
   }
@@ -375,6 +435,9 @@ function decisionFor(
       outcome: "allow",
       reasonCode: "ALLOWED",
       explanation: "Operation is inside the effective grant.",
+      ...(operation.planned_disclosure_bytes === undefined
+        ? {}
+        : { plannedDisclosureBytes: operation.planned_disclosure_bytes }),
       ...(operation.change === undefined
         ? {}
         : {

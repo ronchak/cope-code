@@ -29,3 +29,26 @@ test("audit verification detects tampering and partial records", async () => {
   await writeFile(filename, raw.trimEnd(), "utf8");
   await assert.rejects(() => AuditLog.verify(filename, "session_12345678"), /partial/);
 });
+
+test("audit idempotency survives process reconstruction", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-audit-once-"));
+  const filename = path.join(root, "audit.jsonl");
+  const event = {
+    type: "disclosure.recorded" as const,
+    taskId: "task_1",
+    turnId: "turn_0002",
+    data: { kind: "tool_result", disclosedBytes: 12, sha256: "a".repeat(64) },
+  };
+  await new AuditLog(filename, "session_12345678").appendOnce(
+    event,
+    "disclosure:task_1:turn_0002",
+  );
+  await new AuditLog(filename, "session_12345678").appendOnce(
+    event,
+    "disclosure:task_1:turn_0002",
+  );
+
+  const events = await AuditLog.verify(filename, "session_12345678");
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.data.idempotencyKey, "disclosure:task_1:turn_0002");
+});

@@ -119,7 +119,6 @@ export async function composeRuntime(options: ComposeRuntimeOptions): Promise<Co
     },
     checkpoints: {
       maxCheckpointBytes: configuration.repository.limits.max_checkpoint_bytes,
-      maxFiles: state.budgetLimits.maxChangedFiles,
     },
     patchBudgets: {
       maxFiles: state.budgetLimits.maxChangedFiles,
@@ -242,8 +241,6 @@ export async function composeRuntime(options: ComposeRuntimeOptions): Promise<Co
       state.sessionId,
       new SecretScanner(fingerprintKey),
     ),
-    retainSourceArtifactsOnCompletion:
-      configuration.repository.retention.retain_source_artifacts_on_completion,
     ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
   });
   return { runtime, audit, repository, disclosureLedger };

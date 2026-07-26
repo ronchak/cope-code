@@ -22,6 +22,7 @@ import {
   runPinnedMutation,
   type PinnedFileState,
   type PinnedIdentity,
+  type PinnedQuarantine,
 } from "./pinned-mutation-fs.js";
 
 export type PatchChange =
@@ -57,6 +58,11 @@ export interface PatchBudgets {
   readonly maxChangedLines?: number;
   readonly allowCreate?: boolean;
   readonly allowDelete?: boolean;
+}
+
+export interface MutationBudgetReservation {
+  readonly maxFiles: number;
+  readonly maxChangedLines: number;
 }
 
 export interface PatchEngineHooks {
@@ -112,7 +118,9 @@ interface MutationPlan {
   temporaryPath: string | null;
   backupPath: string | null;
   probePath: string | null;
+  quarantinePath: string | null;
   probeIdentity: PinnedIdentity | null;
+  quarantineIdentity: PinnedIdentity | null;
   temporaryIdentity: PinnedIdentity | null;
   backupIdentity: PinnedIdentity | null;
   finalIdentity: PinnedIdentity | null;
@@ -120,6 +128,7 @@ interface MutationPlan {
   temporaryCreated: boolean;
   backupCreated: boolean;
   backupDeleted: boolean;
+  quarantineCreated: boolean;
   finalInstallAttempted: boolean;
   finalInstalled: boolean;
 }
@@ -164,7 +173,10 @@ export class PatchEngine {
    * Builds a targeted update from an exact, hash-guarded before-image, then
    * delegates commit/checkpoint/rollback/post-state verification to applyPatch.
    */
-  public async editText(request: EditTextRequest): Promise<ApplyPatchResult> {
+  public async editText(
+    request: EditTextRequest,
+    reservation?: MutationBudgetReservation,
+  ): Promise<ApplyPatchResult> {
     const normalizedPath = normalizeRepositoryPath(request.path);
     assertSupportedMutationPath(normalizedPath);
     this.protectedPaths.assertAllowed(normalizedPath, "update");
@@ -202,25 +214,34 @@ export class PatchEngine {
       },
       Math.min(this.maxFileBytes, this.maxTotalBytes),
     );
-    return this.applyPatch({
-      changes: [{
-        kind: "update",
-        path: normalizedPath,
-        base_sha256: snapshot.state.sha256,
-        content: edit.content,
-      }],
-      ...(request.operationId === undefined ? {} : { operationId: request.operationId }),
-    });
+    return this.applyPatch(
+      {
+        changes: [{
+          kind: "update",
+          path: normalizedPath,
+          base_sha256: snapshot.state.sha256,
+          content: edit.content,
+        }],
+        ...(request.operationId === undefined ? {} : { operationId: request.operationId }),
+      },
+      reservation,
+    );
   }
 
-  public async applyPatch(request: ApplyPatchRequest): Promise<ApplyPatchResult> {
+  public async applyPatch(
+    request: ApplyPatchRequest,
+    reservation?: MutationBudgetReservation,
+  ): Promise<ApplyPatchResult> {
+    const maxFiles = reservation?.maxFiles ?? this.maxFiles;
+    const maxChangedLines = reservation?.maxChangedLines ?? this.maxChangedLines;
+    assertMutationBudgetReservation(maxFiles, maxChangedLines);
     if (!Array.isArray(request.changes) || request.changes.length === 0) {
       throw new AgentError("PROTOCOL_INVALID", "Patch transaction must contain at least one change");
     }
-    if (request.changes.length > this.maxFiles) {
+    if (request.changes.length > maxFiles) {
       throw new AgentError("BUDGET_EXCEEDED", "Patch exceeds the changed-file budget", {
         fileCount: request.changes.length,
-        maxFiles: this.maxFiles,
+        maxFiles,
       });
     }
 
@@ -332,7 +353,9 @@ export class PatchEngine {
         temporaryPath: null,
         backupPath: null,
         probePath: null,
+        quarantinePath: null,
         probeIdentity: null,
+        quarantineIdentity: null,
         temporaryIdentity: null,
         backupIdentity: null,
         finalIdentity: null,
@@ -340,17 +363,18 @@ export class PatchEngine {
         temporaryCreated: false,
         backupCreated: false,
         backupDeleted: false,
+        quarantineCreated: false,
         finalInstallAttempted: false,
         finalInstalled: false,
       });
     }
 
-    if (totalBytes > this.maxTotalBytes || changedLines > this.maxChangedLines) {
+    if (totalBytes > this.maxTotalBytes || changedLines > maxChangedLines) {
       throw new AgentError("BUDGET_EXCEEDED", "Patch exceeds the configured change budget", {
         totalBytes,
         maxTotalBytes: this.maxTotalBytes,
         changedLines,
-        maxChangedLines: this.maxChangedLines,
+        maxChangedLines,
       });
     }
 
@@ -370,8 +394,10 @@ export class PatchEngine {
       plan.temporaryPath = plan.newBytes === null ? null : artifacts.temporaryPath;
       plan.backupPath = plan.oldBytes === null ? null : artifacts.backupPath;
       plan.probePath = artifacts.probePath;
+      plan.quarantinePath = artifacts.quarantinePath;
     }
     await this.recordMutationArtifacts(checkpoint.id, plans);
+    let checkpointSealed = false;
     try {
       await this.commit(checkpoint.id, plans);
 
@@ -439,6 +465,10 @@ export class PatchEngine {
           mode: plan.newBytes === null ? null : plan.finalMode,
         })),
       );
+      checkpointSealed = true;
+      for (const plan of plans) {
+        removeMutationQuarantine(plan);
+      }
 
       return {
         checkpointId: checkpoint.id,
@@ -448,6 +478,14 @@ export class PatchEngine {
         warnings: [],
       };
     } catch (error) {
+      if (checkpointSealed) {
+        throw new AgentError(
+          "RECOVERY_REQUIRED",
+          "Patch was sealed but private artifact cleanup is incomplete",
+          { checkpointId: checkpoint.id },
+          { cause: error },
+        );
+      }
       try {
         await this.restorePlans(plans);
       } catch (restoreError) {
@@ -463,6 +501,25 @@ export class PatchEngine {
   }
 
   private async commit(checkpointId: string, plans: readonly MutationPlan[]): Promise<void> {
+    for (const plan of plans) {
+      if (plan.quarantinePath === null) {
+        throw new AgentError("INTERNAL_ERROR", "Mutation quarantine path is missing");
+      }
+      await assertMutationDirectoriesStable(plan);
+      const parent = mutationParentIdentity(plan);
+      const created = runPinnedMutation(parent.absolutePath, parent, {
+        kind: "create_quarantine",
+        name: path.basename(plan.quarantinePath),
+      });
+      if (!isPinnedIdentity(created)) {
+        throw new AgentError("RECOVERY_REQUIRED", "Pinned quarantine evidence is invalid");
+      }
+      plan.quarantineIdentity = fileIdentity(created);
+      plan.quarantineCreated = true;
+      // The exact directory identity is durable before any target or artifact
+      // can be moved into this private namespace.
+      await this.recordMutationArtifacts(checkpointId, plans);
+    }
     for (const plan of plans) {
       if (plan.newBytes !== null && plan.temporaryPath !== null) {
         await assertMutationDirectoriesStable(plan);
@@ -528,9 +585,9 @@ export class PatchEngine {
             path: plan.path,
           });
         }
-        // rename preserves the inode. Bind the anticipated backup identity in
-        // the checkpoint before the consequential target→backup move so a
-        // process death on either side can be reconciled exactly.
+        // Bind the anticipated backup identity before the no-overwrite hard
+        // link and private-quarantine removal so every interruption boundary
+        // can be reconciled exactly.
         plan.backupIdentity = fileIdentity(recaptured);
         await this.recordMutationArtifacts(checkpointId, plans);
         try {
@@ -541,13 +598,23 @@ export class PatchEngine {
               kind: "capture",
               source: path.basename(plan.absolutePath),
               destination: path.basename(plan.backupPath),
+              sourceIdentity: plan.backupIdentity,
               expectedSha256: plan.expectedSha256,
               expectedMode: plan.oldMode ?? 0o600,
+              quarantine: mutationQuarantine(plan),
             },
           ));
           plan.backupIdentity = fileIdentity(captured);
           plan.backupCreated = true;
         } catch (error) {
+          reconcileQuarantinedRemoval(
+            parent,
+            path.basename(plan.absolutePath),
+            plan.backupIdentity,
+            plan.expectedSha256,
+            plan.oldMode ?? 0o600,
+            mutationQuarantine(plan),
+          );
           const captured = tryReadExact(
             parent,
             path.basename(plan.backupPath),
@@ -639,6 +706,7 @@ export class PatchEngine {
           plan.temporaryIdentity,
           sha256(plan.newBytes),
           plan.finalMode,
+          mutationQuarantine(plan),
         );
         plan.temporaryCreated = false;
         await this.hooks.afterTemporaryCleanup?.(plan.path);
@@ -672,6 +740,7 @@ export class PatchEngine {
           plan.backupIdentity,
           plan.expectedSha256,
           plan.oldMode ?? 0o600,
+          mutationQuarantine(plan),
         );
         plan.backupCreated = false;
         plan.backupDeleted = true;
@@ -731,11 +800,20 @@ export class PatchEngine {
           sourceIdentity,
           sourceSha256: source.sha256,
           sourceMode: source.mode,
+          quarantine: mutationQuarantine(plan),
           ...(this.hooks.failHardLinkProbe?.(plan.path) === true
             ? { failBeforeLink: true }
             : {}),
         });
       } catch (error) {
+        reconcileQuarantinedRemoval(
+          parent,
+          path.basename(plan.probePath),
+          sourceIdentity,
+          source.sha256,
+          source.mode,
+          mutationQuarantine(plan),
+        );
         const probe = tryReadExact(
           parent,
           path.basename(plan.probePath),
@@ -750,6 +828,7 @@ export class PatchEngine {
             sourceIdentity,
             source.sha256,
             source.mode,
+            mutationQuarantine(plan),
           );
         }
         if (
@@ -794,10 +873,12 @@ export class PatchEngine {
             plan.temporaryIdentity,
             plan.newBytes === null ? undefined : sha256(plan.newBytes),
             plan.finalMode,
+            mutationQuarantine(plan),
           );
           plan.temporaryCreated = false;
         }
         if (!plan.finalInstalled && !plan.backupCreated && !plan.backupDeleted) {
+          removeMutationQuarantine(plan);
           continue;
         }
         if (
@@ -840,8 +921,10 @@ export class PatchEngine {
               kind: "capture",
               source: path.basename(plan.absolutePath),
               destination: path.basename(plan.temporaryPath),
+              sourceIdentity: plan.finalIdentity,
               expectedSha256: sha256(plan.newBytes),
               expectedMode: plan.finalMode,
+              quarantine: mutationQuarantine(plan),
             },
           ));
           plan.temporaryIdentity = fileIdentity(parked);
@@ -882,6 +965,7 @@ export class PatchEngine {
             plan.backupIdentity,
             sourceSha256,
             plan.oldMode,
+            mutationQuarantine(plan),
           );
           plan.backupCreated = false;
         } else if (plan.oldBytes !== null && (plan.finalInstalled || plan.backupDeleted)) {
@@ -907,10 +991,12 @@ export class PatchEngine {
             plan.temporaryIdentity,
             plan.newBytes === null ? undefined : sha256(plan.newBytes),
             plan.finalMode,
+            mutationQuarantine(plan),
           );
           plan.temporaryCreated = false;
         }
         plan.finalInstalled = false;
+        removeMutationQuarantine(plan);
       } catch (error) {
         restorationErrors.push(`${plan.path}: ${String(error)}`);
       }
@@ -952,6 +1038,9 @@ export class PatchEngine {
                 },
               }),
           ...(plan.finalInstallAttempted ? { installAttempted: true } : {}),
+          ...(plan.quarantineIdentity === null
+            ? {}
+            : { quarantine: plan.quarantineIdentity }),
           ...((plan.newBytes ?? plan.oldBytes) === null
             ? {}
             : {
@@ -1132,6 +1221,7 @@ function removeArtifactOrConfirmAbsent(
   identity: PinnedIdentity,
   expectedSha256: string | undefined,
   expectedMode: number,
+  quarantine: PinnedQuarantine,
 ): void {
   try {
     runPinnedMutation(parent.absolutePath, parent, {
@@ -1140,9 +1230,18 @@ function removeArtifactOrConfirmAbsent(
       identity,
       ...(expectedSha256 === undefined ? {} : { expectedSha256 }),
       expectedMode,
+      quarantine,
     });
   } catch (error) {
     try {
+      reconcileQuarantinedRemoval(
+        parent,
+        name,
+        identity,
+        expectedSha256,
+        expectedMode,
+        quarantine,
+      );
       runPinnedMutation(parent.absolutePath, parent, {
         kind: "verify_absent",
         name,
@@ -1151,6 +1250,46 @@ function removeArtifactOrConfirmAbsent(
       throw error;
     }
   }
+}
+
+function reconcileQuarantinedRemoval(
+  parent: MutationDirectoryIdentity,
+  name: string,
+  identity: PinnedIdentity,
+  expectedSha256: string | undefined,
+  expectedMode: number,
+  quarantine: PinnedQuarantine,
+): void {
+  runPinnedMutation(parent.absolutePath, parent, {
+    kind: "reconcile_quarantine",
+    name,
+    identity,
+    ...(expectedSha256 === undefined ? {} : { expectedSha256 }),
+    expectedMode,
+    quarantine,
+  });
+}
+
+function mutationQuarantine(plan: MutationPlan): PinnedQuarantine {
+  if (plan.quarantinePath === null || plan.quarantineIdentity === null) {
+    throw new AgentError("RECOVERY_REQUIRED", "Mutation quarantine evidence is unavailable", {
+      path: plan.path,
+    });
+  }
+  return {
+    name: path.basename(plan.quarantinePath),
+    identity: plan.quarantineIdentity,
+  };
+}
+
+function removeMutationQuarantine(plan: MutationPlan): void {
+  if (!plan.quarantineCreated) return;
+  const parent = mutationParentIdentity(plan);
+  runPinnedMutation(parent.absolutePath, parent, {
+    kind: "remove_quarantine",
+    quarantine: mutationQuarantine(plan),
+  });
+  plan.quarantineCreated = false;
 }
 
 async function assertMutationDirectoriesStable(plan: MutationPlan): Promise<void> {
@@ -1175,5 +1314,22 @@ async function assertMutationDirectoriesStable(plan: MutationPlan): Promise<void
         { cause: error },
       );
     }
+  }
+}
+
+function assertMutationBudgetReservation(
+  maxFiles: number,
+  maxChangedLines: number,
+): void {
+  if (
+    !Number.isSafeInteger(maxFiles) ||
+    maxFiles < 1 ||
+    !Number.isSafeInteger(maxChangedLines) ||
+    maxChangedLines < 0
+  ) {
+    throw new AgentError("INTERNAL_ERROR", "Mutation budget reservation is invalid", {
+      maxFiles,
+      maxChangedLines,
+    });
   }
 }

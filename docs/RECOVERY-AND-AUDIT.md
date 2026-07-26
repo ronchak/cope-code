@@ -20,14 +20,14 @@ The Windows default state root is `%LOCALAPPDATA%\CopilotBrowserAgent`. The expe
 | `artifacts/response` | exact received model response needed for parse recovery | source/model/task-bearing |
 | `artifacts/decision` | exact user input or capability decision needed for replay | may contain free-form source/task-sensitive text |
 | `fingerprint.key` | per-session 256-bit HMAC key for stable secret fingerprints | secret local key; never prompt/export content |
-| completion handoff | bounded redacted model claim plus verifier facts | durable task prose and repository paths; not source-free |
+| completion handoff | bounded redacted model claim plus verifier facts; separately flushed where supported and otherwise inline with session state | durable task prose and repository paths; not source-free |
 | checkpoints | prior bytes/modes for paths in a mutation | source-bearing |
 | `review-package.json` | optional source-free derived counts/hashes/budgets/findings | sensitive metadata; digest is not a signature |
 | `control/request.json` | one versioned local pause or abort request for an active owner | operational metadata |
 
 Exact filenames beyond the public CLI contract are implementation details; use CLI status/verify/rollback rather than editing records. State and recovery roots must remain outside repositories.
 
-Every row requires an explicit handling decision; “no raw file bodies” does not mean public. Verified completion clears the transient `artifacts` directory—including outbox, response, and decision files—unless `retain_source_artifacts_on_completion` is true. Pause, failure, interruption, and some recovery states can retain those files. Checkpoints, `fingerprint.key`, completion handoff, ledgers, audit, and review exports are outside that cleanup switch and remain subject to their own approved retention/deletion procedures. Each product-specific dedicated browser profile is credential-equivalent and requires the strongest handling.
+Every row requires an explicit handling decision; “no raw file bodies” does not mean public. Paused and otherwise nonterminal sessions retain transient `artifacts` for recovery. The effective remove/retain choice is pinned in session state when the original repository policy is accepted; later abort, rollback, and runtime terminalization do not reinterpret mutable repository configuration. A terminal commit records that pinned decision, and when removal is required every later terminal load retries cleanup after transient failure or directory-entry resurrection. Legacy 0.1.6 sessions safely pin the choice when resumed under their unchanged policy hashes; an unpinned legacy session that cannot prove its original policy defaults to removal. Checkpoints, `fingerprint.key`, completion handoff, ledgers, audit, and review exports are outside that cleanup switch and remain subject to their own approved retention/deletion procedures. Each product-specific dedicated browser profile is credential-equivalent and requires the strongest handling.
 
 ## Commit points
 

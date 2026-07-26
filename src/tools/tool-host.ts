@@ -2,7 +2,11 @@ import { AgentError, errorMessage } from "../shared/errors.js";
 import { sha256, stableJson } from "../shared/crypto.js";
 import { isOperationId } from "../shared/operation-id.js";
 import type { GitInspector, GitStatusResult } from "../repository/git.js";
-import type { ApplyPatchResult, PatchEngine } from "../repository/patch-engine.js";
+import type {
+  ApplyPatchResult,
+  MutationBudgetReservation,
+  PatchEngine,
+} from "../repository/patch-engine.js";
 import type { RepositoryTools } from "../repository/repository-tools.js";
 import type { RepositoryContext } from "../repository/context.js";
 import type {
@@ -12,6 +16,10 @@ import type {
 import type { ContentProcessor } from "../repository/types.js";
 import type { ProcessRunner } from "./process-runner.js";
 import { isLocalToolName, type LocalToolName } from "../protocol/types.js";
+import {
+  GIT_STATUS_RESULT_BYTES,
+  LIST_FILES_RESULT_BYTES,
+} from "../orchestrator/disclosure-budget.js";
 
 export type ToolHostToolName = LocalToolName;
 
@@ -19,6 +27,13 @@ export interface ToolHostCall {
   readonly operationId: string;
   readonly name: ToolHostToolName;
   readonly arguments: Readonly<Record<string, unknown>>;
+}
+
+export interface ToolHostExecutionContext {
+  readonly plannedMutation?: {
+    readonly changedFiles: number;
+    readonly changedLines: number;
+  };
 }
 
 export type ToolAuthorizationDecision =
@@ -125,13 +140,25 @@ export class ToolHost {
   }
 
   /** Implements the orchestrator's ToolExecutor contract structurally. */
-  public async execute(call: ToolHostCall, signal: AbortSignal): Promise<ToolHostOutcome> {
-    return this.dispatch(call, signal);
+  public async execute(
+    call: ToolHostCall,
+    signal: AbortSignal,
+    context?: ToolHostExecutionContext,
+  ): Promise<ToolHostOutcome> {
+    return this.dispatch(call, signal, context);
   }
 
-  public async dispatch(call: ToolHostCall, signal?: AbortSignal): Promise<ToolHostOutcome> {
+  public async dispatch(
+    call: ToolHostCall,
+    signal?: AbortSignal,
+    context?: ToolHostExecutionContext,
+  ): Promise<ToolHostOutcome> {
     validateCall(call);
-    const fingerprint = sha256(stableJson({ name: call.name, arguments: call.arguments }));
+    const fingerprint = sha256(stableJson({
+      name: call.name,
+      arguments: call.arguments,
+      ...(context === undefined ? {} : { context }),
+    }));
     const existing = this.operations.get(call.operationId);
     if (existing !== undefined) {
       if (existing.fingerprint !== fingerprint) {
@@ -145,7 +172,7 @@ export class ToolHost {
       return existing.outcome;
     }
 
-    const outcome = this.authorizeAndExecute(call, signal);
+    const outcome = this.authorizeAndExecute(call, signal, context);
     this.operations.set(call.operationId, { fingerprint, outcome });
     return outcome;
   }
@@ -197,6 +224,7 @@ export class ToolHost {
   private async authorizeAndExecute(
     call: ToolHostCall,
     signal: AbortSignal | undefined,
+    context: ToolHostExecutionContext | undefined,
   ): Promise<ToolHostOutcome> {
     try {
       const decision = await this.dependencies.policy.authorize(call);
@@ -217,7 +245,7 @@ export class ToolHost {
           },
         };
       }
-      return await this.executeAuthorized(call, signal);
+      return await this.executeAuthorized(call, signal, context);
     } catch (error) {
       return failureOutcome(call, error);
     }
@@ -226,6 +254,7 @@ export class ToolHost {
   private async executeAuthorized(
     call: ToolHostCall,
     signal: AbortSignal | undefined,
+    context: ToolHostExecutionContext | undefined,
   ): Promise<ToolHostOutcome> {
     switch (call.name) {
       case "list_files": {
@@ -235,9 +264,10 @@ export class ToolHost {
           ...optionalNumberAs(args, "max_depth", "maxDepth"),
           ...optionalNumberAs(args, "max_results", "maxResults"),
         });
-        return successOutcome(call, asRecord(result), {
-          entryCount: result.entries.length,
-          truncated: result.truncated,
+        const bounded = boundEntryResult(result, LIST_FILES_RESULT_BYTES);
+        return successOutcome(call, asRecord(bounded), {
+          entryCount: bounded.entries.length,
+          truncated: bounded.truncated,
         });
       }
       case "search_text": {
@@ -294,11 +324,13 @@ export class ToolHost {
           ...safeFiltered,
           entries: filtered.entries.map(({ stateSha256: _stateSha256, ...entry }) => entry),
         };
-        return successOutcome(call, asRecord(disclosed), {
+        const bounded = boundEntryResult(disclosed, GIT_STATUS_RESULT_BYTES);
+        return successOutcome(call, asRecord(bounded), {
           fingerprint: result.snapshotSha256,
           changedFileCount: filtered.entries.length,
           excludedCount: result.excludedCount,
           hasConflicts: result.hasConflicts,
+          truncated: bounded.truncated,
         });
       }
       case "git_diff": {
@@ -354,24 +386,30 @@ export class ToolHost {
         if (!Array.isArray(args.changes)) {
           throw new AgentError("PROTOCOL_INVALID", "apply_patch changes must be an array");
         }
-        const result = await this.patchEngine.applyPatch({
-          changes: args.changes as never,
-          operationId: call.operationId,
-        });
+        const result = await this.patchEngine.applyPatch(
+          {
+            changes: args.changes as never,
+            operationId: call.operationId,
+          },
+          mutationReservation(context),
+        );
         return this.mutationOutcome(call, result);
       }
       case "edit_text": {
         const args = checkedObject(call.arguments, [
           "path", "base_sha256", "old_text", "new_text", "expected_occurrences",
         ]);
-        const result = await this.patchEngine.editText({
-          path: requiredString(args, "path"),
-          base_sha256: requiredString(args, "base_sha256"),
-          old_text: requiredString(args, "old_text"),
-          new_text: requiredString(args, "new_text"),
-          expected_occurrences: requiredNumber(args, "expected_occurrences"),
-          operationId: call.operationId,
-        });
+        const result = await this.patchEngine.editText(
+          {
+            path: requiredString(args, "path"),
+            base_sha256: requiredString(args, "base_sha256"),
+            old_text: requiredString(args, "old_text"),
+            new_text: requiredString(args, "new_text"),
+            expected_occurrences: requiredNumber(args, "expected_occurrences"),
+            operationId: call.operationId,
+          },
+          mutationReservation(context),
+        );
         return this.mutationOutcome(call, result);
       }
       case "run_command": {
@@ -690,6 +728,17 @@ function successOutcome(
   return { operationId: call.operationId, tool: call.name, status: "success", data, safeMetadata };
 }
 
+function mutationReservation(
+  context: ToolHostExecutionContext | undefined,
+): MutationBudgetReservation | undefined {
+  const planned = context?.plannedMutation;
+  if (planned === undefined) return undefined;
+  return {
+    maxFiles: planned.changedFiles,
+    maxChangedLines: planned.changedLines,
+  };
+}
+
 function failureOutcome(call: ToolHostCall, error: unknown): ToolHostOutcome {
   const code = error instanceof AgentError ? error.code : "INTERNAL_ERROR";
   const status =
@@ -712,6 +761,48 @@ function failureOutcome(call: ToolHostCall, error: unknown): ToolHostOutcome {
     data: { code, message: errorMessage(error), details },
     safeMetadata: { errorCode: code },
   };
+}
+
+function boundEntryResult<
+  Result extends {
+    readonly entries: readonly unknown[];
+    readonly truncated?: boolean;
+  },
+>(
+  result: Result,
+  maxBytes: number,
+): Result & { readonly truncated: boolean } {
+  const withEntries = (count: number, truncated: boolean) => ({
+    ...result,
+    entries: result.entries.slice(0, count),
+    truncated,
+  });
+  const full = withEntries(
+    result.entries.length,
+    result.truncated === true,
+  );
+  if (Buffer.byteLength(stableJson(full)) <= maxBytes) {
+    return full;
+  }
+  const empty = withEntries(0, true);
+  if (Buffer.byteLength(stableJson(empty)) > maxBytes) {
+    throw new AgentError(
+      "BUDGET_EXCEEDED",
+      "Tool-result metadata exceeds its disclosure limit",
+      { maxBytes },
+    );
+  }
+  let low = 0;
+  let high = result.entries.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(stableJson(withEntries(middle, true))) <= maxBytes) {
+      low = middle;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return withEntries(low, true);
 }
 
 function asRecord(value: unknown): Readonly<Record<string, unknown>> {

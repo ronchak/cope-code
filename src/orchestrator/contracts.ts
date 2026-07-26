@@ -1,5 +1,8 @@
 import type { CompletionClaim, CompletionVerification, RepositoryCompletionState } from "./completion.js";
-import type { LocalToolName } from "../protocol/types.js";
+import type {
+  BudgetMetric,
+  LocalToolName,
+} from "../protocol/types.js";
 
 export type ToolName = LocalToolName;
 
@@ -62,6 +65,8 @@ export interface ProtocolAdapter {
     /** True only while replaying an integrity-checked cached response after interruption. */
     readonly recoveryReplay?: boolean;
   }): ParsedModelTurn;
+  /** Classifies parser failures before the runtime decides whether a repair turn is safe. */
+  isRepairableParseError(error: unknown): boolean;
   renderToolOutcomes(input: {
     readonly taskId: string;
     readonly priorTurnId: string;
@@ -98,6 +103,10 @@ export type AuthorizationDecision =
         readonly changedFiles: number;
         readonly changedLines: number;
       };
+      /** Conservative full protocol-boundary reservation for this tool result. */
+      readonly plannedDisclosureBytes?: number;
+      /** Effective ceilings approved only for this exact operation. */
+      readonly oneTimeBudgetLimits?: Readonly<Partial<Record<BudgetMetric, number>>>;
     }
   | { readonly outcome: "ask"; readonly reasonCode: string; readonly explanation: string; readonly capability: Readonly<Record<string, unknown>> }
   | { readonly outcome: "deny"; readonly reasonCode: string; readonly explanation: string }
@@ -114,8 +123,20 @@ export interface RuntimePolicy {
 }
 
 export interface ToolExecutor {
-  execute(call: NormalizedToolCall, signal: AbortSignal): Promise<ToolOutcome>;
+  execute(
+    call: NormalizedToolCall,
+    signal: AbortSignal,
+    context?: ToolExecutionContext,
+  ): Promise<ToolOutcome>;
   inspectCompletionState(): Promise<RepositoryCompletionState>;
+}
+
+export interface ToolExecutionContext {
+  /** Exact mutation plan already authorized and reserved by the runtime. */
+  readonly plannedMutation?: {
+    readonly changedFiles: number;
+    readonly changedLines: number;
+  };
 }
 
 export interface DisclosureGuard {
@@ -126,10 +147,12 @@ export interface UserInteraction {
   requestInput(request: {
     readonly question: string;
     readonly choices?: readonly string[];
+    readonly signal: AbortSignal;
   }): Promise<Readonly<Record<string, unknown>>>;
   requestCapability(request: {
     readonly capability: Readonly<Record<string, unknown>>;
     readonly reason: string;
     readonly risk?: string;
+    readonly signal: AbortSignal;
   }): Promise<{ readonly decision: "deny" | "allow_once" | "allow_session"; readonly note?: string }>;
 }

@@ -26,6 +26,7 @@ import {
   runPinnedMutation,
   type PinnedFileState,
   type PinnedIdentity,
+  type PinnedQuarantine,
 } from "./pinned-mutation-fs.js";
 
 export const CHECKPOINT_VERSION = "checkpoint.v1" as const;
@@ -69,6 +70,8 @@ interface CheckpointMutationArtifact {
   readonly temporary: StoredArtifactEvidence | null;
   readonly backup: StoredArtifactEvidence | null;
   readonly probe?: StoredArtifactEvidence | null;
+  /** Exact private directory used to make destructive cleanup crash-recoverable. */
+  readonly quarantine?: StoredDirectoryIdentity | null;
   /** Written before attempting the no-overwrite final link. */
   readonly installAttempted?: true;
 }
@@ -99,6 +102,7 @@ interface CheckpointRollbackEntry {
   readonly temporary: StoredArtifactIdentity | null;
   readonly backup: StoredArtifactIdentity | null;
   readonly installed: StoredArtifactIdentity | null;
+  readonly quarantine?: StoredDirectoryIdentity | null;
   /** Written before attempting the no-overwrite rollback link. */
   readonly installAttempted?: true;
   /** Written before attempting to reinstall the pre-rollback object. */
@@ -136,6 +140,10 @@ export interface MutationArtifactIdentity {
     readonly sha256: string;
     readonly mode: number;
   };
+  readonly quarantine?: {
+    readonly device: string;
+    readonly inode: string;
+  };
   readonly installAttempted?: true;
 }
 
@@ -148,6 +156,7 @@ interface RollbackSnapshot {
   temporary: PinnedFileState | null;
   backup: PinnedFileState | null;
   installed: PinnedFileState | null;
+  quarantine: PinnedIdentity | null;
   installAttempted: boolean;
   revertInstallAttempted: boolean;
   targetMutated: boolean;
@@ -405,6 +414,7 @@ export class CheckpointStore {
         (artifact.temporary !== undefined && !validMutationFileIdentity(artifact.temporary)) ||
         (artifact.backup !== undefined && !validMutationFileIdentity(artifact.backup)) ||
         (artifact.probe !== undefined && !validMutationFileIdentity(artifact.probe)) ||
+        (artifact.quarantine !== undefined && !validArtifactIdentity(artifact.quarantine)) ||
         (artifact.installAttempted !== undefined && artifact.installAttempted !== true)
       ) {
         throw new AgentError("PROTOCOL_INVALID", "Mutation artifact identity is invalid", {
@@ -419,6 +429,10 @@ export class CheckpointStore {
           artifact.temporary === undefined ? null : storeArtifactIdentity(artifact.temporary),
         backup: artifact.backup === undefined ? null : storeArtifactIdentity(artifact.backup),
         probe: artifact.probe === undefined ? null : storeArtifactIdentity(artifact.probe),
+        quarantine:
+          artifact.quarantine === undefined
+            ? null
+            : storeDirectoryIdentity(artifact.quarantine),
         ...(artifact.installAttempted === true ? { installAttempted: true } : {}),
       });
     }
@@ -453,6 +467,8 @@ export class CheckpointStore {
             !artifactEvidenceCanAdvance(prior.temporary, next.temporary)) ||
           (prior.backup !== null && !artifactEvidenceCanAdvance(prior.backup, next.backup)) ||
           (prior.probe != null && !artifactEvidenceCanAdvance(prior.probe, next.probe ?? null)) ||
+          (prior.quarantine != null &&
+            stableJson(prior.quarantine) !== stableJson(next.quarantine)) ||
           (prior.installAttempted === true && next.installAttempted !== true)
         ) {
           throw new AgentError("RECOVERY_REQUIRED", "Mutation artifact identity was already bound", {
@@ -975,6 +991,17 @@ export class CheckpointStore {
     );
     const snapshots: RollbackSnapshot[] = [];
     for (const entry of manifest.entries) {
+      const persistedMutationArtifact = recordedArtifacts.get(
+        this.boundary.pathKey(entry.path),
+      );
+      if (persistedMutationArtifact !== undefined) {
+        reconcileMutationQuarantineState(
+          this.boundary.root,
+          entry.path,
+          manifest.id,
+          persistedMutationArtifact,
+        );
+      }
       if (entry.existed && entry.sizeBytes > MAX_PINNED_FILE_BYTES) {
         throw new AgentError(
           "RECOVERY_REQUIRED",
@@ -991,7 +1018,7 @@ export class CheckpointStore {
       try {
         target = await this.boundary.resolve(entry.path, { allowMissingLeaf: true });
       } catch (error) {
-        const recorded = recordedArtifacts.get(this.boundary.pathKey(entry.path));
+        const recorded = persistedMutationArtifact;
         if (
           !(error instanceof AgentError) ||
           error.code !== "UNSUPPORTED_FILE" ||
@@ -1016,7 +1043,7 @@ export class CheckpointStore {
         };
       }
       const artifact =
-        recordedArtifacts.get(this.boundary.pathKey(entry.path)) ??
+        persistedMutationArtifact ??
         await this.legacyRecoveryArtifact(entry.path, target.absolutePath);
       const current = target.exists
         ? pinnedFileState(runPinnedMutation(
@@ -1069,6 +1096,7 @@ export class CheckpointStore {
         rollbackArtifacts.temporaryPath,
         rollbackArtifacts.backupPath,
         rollbackArtifacts.probePath,
+        rollbackArtifacts.quarantinePath,
       ]) {
         runPinnedMutation(
           path.dirname(target.absolutePath),
@@ -1085,6 +1113,7 @@ export class CheckpointStore {
         temporary: null,
         backup: null,
         installed: null,
+        quarantine: null,
         installAttempted: false,
         revertInstallAttempted: false,
         targetMutated: false,
@@ -1134,6 +1163,29 @@ export class CheckpointStore {
         manifest.id,
       );
       const directory = storedDirectoryIdentity(artifact);
+      if (snapshot.quarantine === null) {
+        const created = runPinnedMutation(
+          path.dirname(snapshot.absoluteTarget),
+          directory,
+          {
+            kind: "create_quarantine",
+            name: path.basename(paths.quarantinePath),
+          },
+        );
+        if (!isPinnedIdentity(created)) {
+          throw new AgentError("RECOVERY_REQUIRED", "Rollback quarantine evidence is invalid", {
+            checkpointId: manifest.id,
+            path: entry.path,
+          });
+        }
+        snapshot.quarantine = fileIdentity(created);
+        await this.persistRollbackState(manifest, snapshots, "applying");
+      } else {
+        runPinnedMutation(path.dirname(snapshot.absoluteTarget), directory, {
+          kind: "verify_quarantine",
+          quarantine: snapshotQuarantine(snapshot),
+        });
+      }
       if (entry.existed && snapshot.temporary === null) {
         if (entry.blob === null || entry.mode === null || entry.sha256 === null) {
           throw new AgentError("CHECKPOINT_CORRUPT", "Verified checkpoint entry became invalid");
@@ -1177,11 +1229,19 @@ export class CheckpointStore {
           sourceIdentity: fileIdentity(source),
           sourceSha256: source.sha256,
           sourceMode: source.mode,
+          quarantine: snapshotQuarantine(snapshot),
           ...(this.hooks.failRollbackHardLinkProbe?.(snapshot.entry.path) === true
             ? { failBeforeLink: true }
             : {}),
         });
       } catch (error) {
+        reconcilePinnedRemoval(
+          path.dirname(snapshot.absoluteTarget),
+          directory,
+          path.basename(paths.probePath),
+          source,
+          snapshotQuarantine(snapshot),
+        );
         const probe = tryReadPinnedExact(
           path.dirname(snapshot.absoluteTarget),
           directory,
@@ -1196,6 +1256,7 @@ export class CheckpointStore {
             directory,
             path.basename(paths.probePath),
             probe,
+            snapshotQuarantine(snapshot),
           );
         }
         if (
@@ -1235,12 +1296,18 @@ export class CheckpointStore {
       );
       const directory = storedDirectoryIdentity(artifact);
       if (current !== null && snapshot.backup === null) {
+        // Persist the exact anticipated capture inode before the hard link.
+        // A restarted process can distinguish "not started" from either side
+        // of the link-plus-quarantine sequence without guessing by content.
+        snapshot.backup = current;
+        await this.persistRollbackState(manifest, snapshots, "applying");
         snapshot.backup = captureOrReconcile(
           path.dirname(snapshot.absoluteTarget),
           directory,
           path.basename(snapshot.absoluteTarget),
           path.basename(paths.backupPath),
           current,
+          snapshotQuarantine(snapshot),
         );
         snapshot.targetMutated = true;
         await this.persistRollbackState(manifest, snapshots, "applying");
@@ -1305,16 +1372,21 @@ export class CheckpointStore {
             directory,
             path.basename(paths.temporaryPath),
             snapshot.temporary,
+            snapshotQuarantine(snapshot),
           );
           snapshot.temporary = null;
           await this.persistRollbackState(manifest, snapshots, "reverting");
         }
+        const anticipatedCapture = snapshot.installed;
+        snapshot.temporary = anticipatedCapture;
+        await this.persistRollbackState(manifest, snapshots, "reverting");
         snapshot.temporary = captureOrReconcile(
           path.dirname(snapshot.absoluteTarget),
           directory,
           path.basename(snapshot.absoluteTarget),
           path.basename(paths.temporaryPath),
-          snapshot.installed,
+          anticipatedCapture,
+          snapshotQuarantine(snapshot),
         );
         snapshot.installed = null;
         await this.persistRollbackState(manifest, snapshots, "reverting");
@@ -1376,6 +1448,10 @@ export class CheckpointStore {
         temporary: snapshot.temporary === null ? null : storePinnedState(snapshot.temporary),
         backup: snapshot.backup === null ? null : storePinnedState(snapshot.backup),
         installed: snapshot.installed === null ? null : storePinnedState(snapshot.installed),
+        quarantine:
+          snapshot.quarantine === null
+            ? null
+            : storeDirectoryIdentity(snapshot.quarantine),
         ...(snapshot.installAttempted ? { installAttempted: true } : {}),
         ...(snapshot.revertInstallAttempted ? { revertInstallAttempted: true } : {}),
       })),
@@ -1438,15 +1514,88 @@ export class CheckpointStore {
           manifest.mutationArtifacts?.find(
             (candidate) => this.boundary.pathKey(candidate.path) === this.boundary.pathKey(entry.path),
           )?.probe ?? null,
+        quarantine:
+          manifest.mutationArtifacts?.find(
+            (candidate) => this.boundary.pathKey(candidate.path) === this.boundary.pathKey(entry.path),
+          )?.quarantine ?? null,
       };
       const parent = path.dirname(absoluteTarget);
       const directory = storedDirectoryIdentity(artifact);
       const paths = checkpointRollbackArtifactPaths(absoluteTarget, entry.path, manifest.id);
-      const targetState = await readAnyPinned(parent, directory, path.basename(absoluteTarget));
+      let quarantine =
+        recorded.quarantine === undefined || recorded.quarantine === null
+          ? null
+          : {
+              device: recorded.quarantine.device,
+              inode: recorded.quarantine.inode,
+            };
+      if (quarantine !== null) {
+        const pinned = rollbackQuarantine(paths, quarantine);
+        const quarantinePresent = pinnedQuarantinePresent(parent, directory, pinned);
+        if (
+          !quarantinePresent &&
+          rollback.phase !== "restored" &&
+          rollback.phase !== "reverted"
+        ) {
+          throw new AgentError(
+            "RECOVERY_REQUIRED",
+            "Persisted rollback quarantine is missing before rollback completion",
+            { checkpointId: manifest.id, path: entry.path },
+          );
+        }
+        if (!quarantinePresent) quarantine = null;
+      }
+      if (quarantine !== null) {
+        const pinned = rollbackQuarantine(paths, quarantine);
+        const targetRemoval =
+          rollback.phase === "applying"
+            ? recorded.current
+            : rollback.phase === "reverting" || rollback.phase === "reverted"
+              ? recorded.installed
+              : null;
+        reconcilePersistedRemoval(
+          parent,
+          directory,
+          path.basename(absoluteTarget),
+          targetRemoval,
+          pinned,
+        );
+        reconcilePersistedRemoval(
+          parent,
+          directory,
+          path.basename(paths.temporaryPath),
+          recorded.temporary,
+          pinned,
+        );
+        reconcilePersistedRemoval(
+          parent,
+          directory,
+          path.basename(paths.backupPath),
+          recorded.backup,
+          pinned,
+        );
+        reconcilePersistedRemoval(
+          parent,
+          directory,
+          path.basename(paths.probePath),
+          recorded.temporary ?? recorded.current,
+          pinned,
+        );
+      } else {
+        runPinnedMutation(parent, directory, {
+          kind: "verify_absent",
+          name: path.basename(paths.quarantinePath),
+        });
+      }
+      let targetState = await readAnyPinned(parent, directory, path.basename(absoluteTarget));
       const targetIsRecordedTemporary =
         recorded.temporary !== null &&
         targetState !== null &&
         matchesStoredState(targetState, recorded.temporary);
+      const targetIsRecordedCurrent =
+        recorded.current !== null &&
+        targetState !== null &&
+        matchesStoredState(targetState, recorded.current);
       const temporary = await readRollbackArtifact(
         parent,
         directory,
@@ -1465,8 +1614,57 @@ export class CheckpointStore {
         path.basename(paths.backupPath),
         recorded.backup,
         recorded.current,
-        rollback.phase === "restored" || rollback.phase === "reverted",
+        rollback.phase === "restored" ||
+          rollback.phase === "reverted" ||
+          (rollback.phase === "applying" && targetIsRecordedCurrent),
       );
+      if (
+        rollback.phase === "applying" &&
+        recorded.current !== null &&
+        backup !== null &&
+        targetState !== null &&
+        matchesStoredState(backup, recorded.current) &&
+        matchesStoredState(targetState, recorded.current) &&
+        samePinnedIdentity(backup, targetState)
+      ) {
+        removePinnedArtifactOrConfirmAbsent(
+          parent,
+          directory,
+          path.basename(absoluteTarget),
+          targetState,
+          rollbackQuarantine(paths, quarantine),
+        );
+        targetState = requireAbsentAfterInterruptedCapture(
+          parent,
+          directory,
+          path.basename(absoluteTarget),
+          manifest.id,
+          entry.path,
+        );
+      } else if (
+        rollback.phase === "reverting" &&
+        recorded.installed !== null &&
+        temporary !== null &&
+        targetState !== null &&
+        matchesStoredState(temporary, recorded.installed) &&
+        matchesStoredState(targetState, recorded.installed) &&
+        samePinnedIdentity(temporary, targetState)
+      ) {
+        removePinnedArtifactOrConfirmAbsent(
+          parent,
+          directory,
+          path.basename(absoluteTarget),
+          targetState,
+          rollbackQuarantine(paths, quarantine),
+        );
+        targetState = requireAbsentAfterInterruptedCapture(
+          parent,
+          directory,
+          path.basename(absoluteTarget),
+          manifest.id,
+          entry.path,
+        );
+      }
       let current: PinnedFileState | null = null;
       if (recorded.current !== null) {
         if (backup !== null && matchesStoredState(backup, recorded.current)) {
@@ -1505,6 +1703,7 @@ export class CheckpointStore {
           directory,
           path.basename(paths.probePath),
           probe,
+          rollbackQuarantine(paths, quarantine),
         );
       }
       let installed: PinnedFileState | null = null;
@@ -1602,6 +1801,7 @@ export class CheckpointStore {
         temporary,
         backup,
         installed,
+        quarantine,
         installAttempted: recorded.installAttempted === true && installed === null,
         revertInstallAttempted:
           recorded.revertInstallAttempted === true && !targetAlreadyReverted,
@@ -1656,6 +1856,7 @@ export function checkpointMutationArtifactPaths(
   readonly temporaryPath: string;
   readonly backupPath: string;
   readonly probePath: string;
+  readonly quarantinePath: string;
 } {
   const key = sha256(relativePath).slice(0, 20);
   const prefix = path.join(path.dirname(absoluteTarget), `.cba-${checkpointId}-${key}`);
@@ -1663,6 +1864,7 @@ export function checkpointMutationArtifactPaths(
     temporaryPath: `${prefix}.new`,
     backupPath: `${prefix}.old`,
     probePath: `${prefix}.link-probe`,
+    quarantinePath: `${prefix}.private`,
   };
 }
 
@@ -1674,12 +1876,14 @@ function checkpointRollbackArtifactPaths(
   readonly temporaryPath: string;
   readonly backupPath: string;
   readonly probePath: string;
+  readonly quarantinePath: string;
 } {
   const artifacts = checkpointMutationArtifactPaths(absoluteTarget, relativePath, checkpointId);
   return {
     temporaryPath: `${artifacts.temporaryPath}.rollback`,
     backupPath: `${artifacts.backupPath}.rollback`,
     probePath: `${artifacts.probePath}.rollback`,
+    quarantinePath: `${artifacts.quarantinePath}.rollback`,
   };
 }
 
@@ -1855,14 +2059,17 @@ function captureOrReconcile(
   source: string,
   destination: string,
   expected: PinnedFileState,
+  quarantine: PinnedQuarantine,
 ): PinnedFileState {
   try {
     const captured = pinnedFileState(runPinnedMutation(parent, directory, {
       kind: "capture",
       source,
       destination,
+      sourceIdentity: fileIdentity(expected),
       expectedSha256: expected.sha256,
       expectedMode: expected.mode,
+      quarantine,
     }));
     return requirePinnedExact(
       captured,
@@ -1871,6 +2078,13 @@ function captureOrReconcile(
       expected.mode,
     );
   } catch (error) {
+    reconcilePinnedRemoval(
+      parent,
+      directory,
+      source,
+      expected,
+      quarantine,
+    );
     const captured = tryReadPinnedExact(
       parent,
       directory,
@@ -2125,6 +2339,7 @@ function removePinnedArtifactOrConfirmAbsent(
   directory: PinnedIdentity,
   name: string,
   expected: PinnedFileState,
+  quarantine: PinnedQuarantine,
 ): void {
   try {
     runPinnedMutation(parent, directory, {
@@ -2133,14 +2348,174 @@ function removePinnedArtifactOrConfirmAbsent(
       identity: fileIdentity(expected),
       expectedSha256: expected.sha256,
       expectedMode: expected.mode,
+      quarantine,
     });
   } catch (error) {
     try {
+      reconcilePinnedRemoval(parent, directory, name, expected, quarantine);
       runPinnedMutation(parent, directory, { kind: "verify_absent", name });
     } catch {
       throw error;
     }
   }
+}
+
+function reconcilePinnedRemoval(
+  parent: string,
+  directory: PinnedIdentity,
+  name: string,
+  expected: PinnedFileState,
+  quarantine: PinnedQuarantine,
+): void {
+  runPinnedMutation(parent, directory, {
+    kind: "reconcile_quarantine",
+    name,
+    identity: fileIdentity(expected),
+    expectedSha256: expected.sha256,
+    expectedMode: expected.mode,
+    quarantine,
+  });
+}
+
+function requireAbsentAfterInterruptedCapture(
+  parent: string,
+  directory: PinnedIdentity,
+  name: string,
+  checkpointId: string,
+  repositoryPath: string,
+): null {
+  if (readAnyPinned(parent, directory, name) !== null) {
+    throw new AgentError(
+      "RECOVERY_REQUIRED",
+      "Concurrent replacement appeared while completing an interrupted capture",
+      { checkpointId, path: repositoryPath },
+    );
+  }
+  return null;
+}
+
+function pinnedQuarantinePresent(
+  parent: string,
+  directory: PinnedIdentity,
+  quarantine: PinnedQuarantine,
+): boolean {
+  try {
+    runPinnedMutation(parent, directory, {
+      kind: "verify_quarantine",
+      quarantine,
+    });
+    return true;
+  } catch (error) {
+    try {
+      runPinnedMutation(parent, directory, {
+        kind: "verify_absent",
+        name: quarantine.name,
+      });
+      return false;
+    } catch {
+      throw error;
+    }
+  }
+}
+
+function reconcilePersistedRemoval(
+  parent: string,
+  directory: PinnedIdentity,
+  name: string,
+  expected: StoredArtifactIdentity | null,
+  quarantine: PinnedQuarantine,
+): void {
+  if (expected === null) return;
+  runPinnedMutation(parent, directory, {
+    kind: "reconcile_quarantine",
+    name,
+    identity: {
+      device: expected.device,
+      inode: expected.inode,
+    },
+    expectedSha256: expected.sha256,
+    expectedMode: expected.mode,
+    quarantine,
+  });
+}
+
+function reconcileMutationQuarantineState(
+  repositoryRoot: string,
+  relativePath: string,
+  checkpointId: string,
+  artifact: CheckpointMutationArtifact,
+): void {
+  const absoluteTarget = path.resolve(repositoryRoot, relativePath);
+  const parent = path.dirname(absoluteTarget);
+  const directory = storedDirectoryIdentity(artifact);
+  const paths = checkpointMutationArtifactPaths(absoluteTarget, relativePath, checkpointId);
+  if (artifact.quarantine == null) {
+    runPinnedMutation(parent, directory, {
+      kind: "verify_absent",
+      name: path.basename(paths.quarantinePath),
+    });
+    return;
+  }
+  const quarantine: PinnedQuarantine = {
+    name: path.basename(paths.quarantinePath),
+    identity: {
+      device: artifact.quarantine.device,
+      inode: artifact.quarantine.inode,
+    },
+  };
+  if (!pinnedQuarantinePresent(parent, directory, quarantine)) return;
+  reconcilePersistedRemoval(
+    parent,
+    directory,
+    path.basename(absoluteTarget),
+    isStoredArtifactIdentity(artifact.backup) ? artifact.backup : null,
+    quarantine,
+  );
+  reconcilePersistedRemoval(
+    parent,
+    directory,
+    path.basename(paths.temporaryPath),
+    isStoredArtifactIdentity(artifact.temporary) ? artifact.temporary : null,
+    quarantine,
+  );
+  reconcilePersistedRemoval(
+    parent,
+    directory,
+    path.basename(paths.backupPath),
+    isStoredArtifactIdentity(artifact.backup) ? artifact.backup : null,
+    quarantine,
+  );
+  reconcilePersistedRemoval(
+    parent,
+    directory,
+    path.basename(paths.probePath),
+    isStoredArtifactIdentity(artifact.probe ?? null)
+      ? artifact.probe as StoredArtifactIdentity
+      : null,
+    quarantine,
+  );
+}
+
+function rollbackQuarantine(
+  paths: { readonly quarantinePath: string },
+  identity: PinnedIdentity | null,
+): PinnedQuarantine {
+  if (identity === null) {
+    throw new AgentError("RECOVERY_REQUIRED", "Rollback quarantine evidence is unavailable");
+  }
+  return {
+    name: path.basename(paths.quarantinePath),
+    identity,
+  };
+}
+
+function snapshotQuarantine(snapshot: RollbackSnapshot): PinnedQuarantine {
+  const paths = checkpointRollbackArtifactPaths(
+    snapshot.absoluteTarget,
+    snapshot.entry.path,
+    snapshot.checkpointId,
+  );
+  return rollbackQuarantine(paths, snapshot.quarantine);
 }
 
 async function cleanupRollbackArtifacts(
@@ -2177,6 +2552,7 @@ async function cleanupRollbackArtifacts(
         directory,
         path.basename(artifacts.probePath),
         probe,
+        snapshotQuarantine(snapshot),
       );
     }
     if (snapshot.temporary !== null) {
@@ -2185,6 +2561,7 @@ async function cleanupRollbackArtifacts(
         directory,
         path.basename(artifacts.temporaryPath),
         snapshot.temporary,
+        snapshotQuarantine(snapshot),
       );
       snapshot.temporary = null;
     }
@@ -2194,8 +2571,21 @@ async function cleanupRollbackArtifacts(
         directory,
         path.basename(artifacts.backupPath),
         snapshot.backup,
+        snapshotQuarantine(snapshot),
       );
       snapshot.backup = null;
+    }
+    if (snapshot.quarantine !== null) {
+      runPinnedMutation(path.dirname(snapshot.absoluteTarget), directory, {
+        kind: "remove_quarantine",
+        quarantine: snapshotQuarantine(snapshot),
+      });
+      snapshot.quarantine = null;
+    } else {
+      runPinnedMutation(path.dirname(snapshot.absoluteTarget), directory, {
+        kind: "verify_absent",
+        name: path.basename(artifacts.quarantinePath),
+      });
     }
   }
 }
@@ -2212,6 +2602,7 @@ async function cleanupMutationArtifacts(
       artifacts.temporaryPath,
       artifacts.backupPath,
       artifacts.probePath,
+      artifacts.quarantinePath,
     ]) {
       try {
         await access(artifact, constants.F_OK);
@@ -2227,24 +2618,96 @@ async function cleanupMutationArtifacts(
     return;
   }
   const directory = storedDirectoryIdentity(expectedIdentity);
+  const persistedQuarantine =
+    expectedIdentity.quarantine == null
+      ? null
+      : {
+          name: path.basename(artifacts.quarantinePath),
+          identity: {
+            device: expectedIdentity.quarantine.device,
+            inode: expectedIdentity.quarantine.inode,
+          },
+        };
+  const quarantine =
+    persistedQuarantine !== null &&
+    pinnedQuarantinePresent(
+      path.dirname(absoluteTarget),
+      directory,
+      persistedQuarantine,
+    )
+      ? persistedQuarantine
+      : null;
+  if (persistedQuarantine === null) {
+    runPinnedMutation(path.dirname(absoluteTarget), directory, {
+      kind: "verify_absent",
+      name: path.basename(artifacts.quarantinePath),
+    });
+  }
+  if (quarantine !== null) {
+    reconcilePersistedRemoval(
+      path.dirname(absoluteTarget),
+      directory,
+      path.basename(absoluteTarget),
+      isStoredArtifactIdentity(expectedIdentity.backup)
+        ? expectedIdentity.backup
+        : null,
+      quarantine,
+    );
+    reconcilePersistedRemoval(
+      path.dirname(absoluteTarget),
+      directory,
+      path.basename(artifacts.temporaryPath),
+      isStoredArtifactIdentity(expectedIdentity.temporary)
+        ? expectedIdentity.temporary
+        : null,
+      quarantine,
+    );
+    reconcilePersistedRemoval(
+      path.dirname(absoluteTarget),
+      directory,
+      path.basename(artifacts.backupPath),
+      isStoredArtifactIdentity(expectedIdentity.backup)
+        ? expectedIdentity.backup
+        : null,
+      quarantine,
+    );
+    reconcilePersistedRemoval(
+      path.dirname(absoluteTarget),
+      directory,
+      path.basename(artifacts.probePath),
+      isStoredArtifactIdentity(expectedIdentity.probe ?? null)
+        ? expectedIdentity.probe as StoredArtifactIdentity
+        : null,
+      quarantine,
+    );
+  }
   cleanupRecordedArtifact(
     path.dirname(absoluteTarget),
     directory,
     path.basename(artifacts.temporaryPath),
     expectedIdentity.temporary,
+    quarantine,
   );
   cleanupRecordedArtifact(
     path.dirname(absoluteTarget),
     directory,
     path.basename(artifacts.backupPath),
     expectedIdentity.backup,
+    quarantine,
   );
   cleanupRecordedArtifact(
     path.dirname(absoluteTarget),
     directory,
     path.basename(artifacts.probePath),
     expectedIdentity.probe ?? null,
+    quarantine,
   );
+  if (quarantine !== null) {
+    runPinnedMutation(path.dirname(absoluteTarget), directory, {
+      kind: "remove_quarantine",
+      quarantine,
+    });
+  }
 }
 
 function cleanupRecordedArtifact(
@@ -2252,6 +2715,7 @@ function cleanupRecordedArtifact(
   directory: PinnedIdentity,
   name: string,
   expected: StoredArtifactEvidence | null,
+  quarantine: PinnedQuarantine | null,
 ): void {
   if (expected === null) {
     runPinnedMutation(parent, directory, { kind: "verify_absent", name });
@@ -2268,7 +2732,14 @@ function cleanupRecordedArtifact(
       artifact: name,
     });
   }
-  removePinnedArtifactOrConfirmAbsent(parent, directory, name, current);
+  if (quarantine === null) {
+    throw new AgentError(
+      "RECOVERY_REQUIRED",
+      "Recorded artifact cannot be removed without persisted quarantine evidence",
+      { artifact: name },
+    );
+  }
+  removePinnedArtifactOrConfirmAbsent(parent, directory, name, current, quarantine);
 }
 
 function pinnedFileState(
@@ -2376,6 +2847,9 @@ function isManifest(value: unknown): value is CheckpointManifest {
             ((artifact as CheckpointMutationArtifact).probe === undefined ||
               (artifact as CheckpointMutationArtifact).probe === null ||
               isStoredArtifactEvidence((artifact as CheckpointMutationArtifact).probe)) &&
+            ((artifact as CheckpointMutationArtifact).quarantine === undefined ||
+              (artifact as CheckpointMutationArtifact).quarantine === null ||
+              isStoredDirectoryIdentity((artifact as CheckpointMutationArtifact).quarantine)) &&
             ((artifact as CheckpointMutationArtifact).installAttempted === undefined ||
               (artifact as CheckpointMutationArtifact).installAttempted === true),
         ))) &&
@@ -2404,6 +2878,9 @@ function isManifest(value: unknown): value is CheckpointManifest {
               isStoredArtifactIdentity((entry as CheckpointRollbackEntry).backup)) &&
             ((entry as CheckpointRollbackEntry).installed === null ||
               isStoredArtifactIdentity((entry as CheckpointRollbackEntry).installed)) &&
+            ((entry as CheckpointRollbackEntry).quarantine === undefined ||
+              (entry as CheckpointRollbackEntry).quarantine === null ||
+              isStoredDirectoryIdentity((entry as CheckpointRollbackEntry).quarantine)) &&
             ((entry as CheckpointRollbackEntry).installAttempted === undefined ||
               (entry as CheckpointRollbackEntry).installAttempted === true) &&
             ((entry as CheckpointRollbackEntry).revertInstallAttempted === undefined ||

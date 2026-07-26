@@ -8,13 +8,17 @@ import {
   DEFAULT_REPOSITORY_POLICY,
   PolicyEngine,
   createDefaultSessionGrant,
+  type BudgetUsage as PolicyBudgetUsage,
   zeroPolicyBudgetUsage,
 } from "../../src/policy/index.js";
 import { LayeredRuntimePolicy } from "../../src/orchestrator/runtime-policy.js";
 import { RepositoryBoundary } from "../../src/repository/boundary.js";
 import { CommandCatalog } from "../../src/tools/command-catalog.js";
 import { sha256 } from "../../src/shared/crypto.js";
-import type { ToolName } from "../../src/protocol/index.js";
+import type {
+  BudgetMetric,
+  ToolName,
+} from "../../src/protocol/index.js";
 
 async function harness(
   mode: "inspect" | "edit" | "auto" = "auto",
@@ -22,6 +26,8 @@ async function harness(
     readonly tools?: readonly ToolName[];
     readonly maxMutationFileBytes?: number;
     readonly maxPatchBytes?: number;
+    readonly budgets?: Readonly<Partial<Record<BudgetMetric, number>>>;
+    readonly currentUsage?: PolicyBudgetUsage;
   } = {},
 ) {
   const root = await mkdtemp(path.join(tmpdir(), "cba-policy-adapter-"));
@@ -46,6 +52,7 @@ async function harness(
     mode,
     writable_paths: ["src/**"],
     command_ids: ["test"],
+    ...(options.budgets === undefined ? {} : { budgets: options.budgets }),
     ...(options.tools === undefined ? {} : { tools: options.tools }),
   });
   const policy = new LayeredRuntimePolicy({
@@ -56,7 +63,7 @@ async function harness(
     }),
     boundary,
     commandCatalog: catalog,
-    currentUsage: zeroPolicyBudgetUsage,
+    currentUsage: () => options.currentUsage ?? zeroPolicyBudgetUsage(),
     ...(options.maxMutationFileBytes === undefined
       ? {}
       : { maxMutationFileBytes: options.maxMutationFileBytes }),
@@ -228,4 +235,87 @@ test("one-time capability authorization re-evaluates the exact edit without pers
   if (initial.outcome !== "ask") throw new Error("expected capability request");
   assert.equal((await policy.authorizeOnce(call, initial.capability)).outcome, "allow");
   assert.equal((await policy.authorize(call)).outcome, "ask");
+});
+
+test("one-time budget authorization returns the exact scoped runtime ceiling", async () => {
+  const { policy } = await harness("auto", {
+    budgets: { changed_lines: 0 },
+  });
+  const call = {
+    operationId: "op_edit_budget_once",
+    name: "edit_text" as const,
+    arguments: {
+      path: "src/a.txt",
+      base_sha256: sha256("old\nvalue\n"),
+      old_text: "old",
+      new_text: "new",
+      expected_occurrences: 1,
+    },
+  };
+  const initial = await policy.authorize(call);
+  if (initial.outcome !== "ask") throw new Error("expected budget capability request");
+  assert.deepEqual(initial.capability.expansion, {
+    kind: "budget",
+    metric: "changed_lines",
+    requested_limit: 2,
+  });
+  const approved = await policy.authorizeOnce(call, initial.capability);
+  assert.equal(approved.outcome, "allow");
+  assert.deepEqual(
+    approved.outcome === "allow" ? approved.oneTimeBudgetLimits : undefined,
+    { changed_lines: 2 },
+  );
+  assert.equal((await policy.authorize(call)).outcome, "ask");
+});
+
+test("disclosure budget approval reserves the complete protocol boundary", async () => {
+  const { policy } = await harness("auto", {
+    budgets: { disclosed_bytes: 0 },
+  });
+  const call = {
+    operationId: "op_read_disclosure_once",
+    name: "read_file" as const,
+    arguments: { path: "src/a.txt", max_bytes: 1 },
+  };
+  const initial = await policy.authorize(call);
+  if (initial.outcome !== "ask") throw new Error("expected disclosure budget request");
+  const expansion = initial.capability.expansion as {
+    readonly kind: string;
+    readonly metric: string;
+    readonly requested_limit: number;
+  };
+  assert.equal(expansion.kind, "budget");
+  assert.equal(expansion.metric, "disclosed_bytes");
+  assert.equal(expansion.requested_limit > 1, true);
+
+  const approved = await policy.authorizeOnce(call, initial.capability);
+  if (approved.outcome !== "allow") throw new Error("expected one-time approval");
+  assert.equal(approved.plannedDisclosureBytes, expansion.requested_limit);
+  assert.deepEqual(approved.oneTimeBudgetLimits, {
+    disclosed_bytes: expansion.requested_limit,
+  });
+});
+
+test("one-time authorization rejects budgets not consumed by the exact operation", async () => {
+  const { policy } = await harness();
+  const call = {
+    operationId: "op_status_unsupported_budget",
+    name: "git_status" as const,
+    arguments: {},
+  };
+  for (const metric of ["elapsed_ms", "turns", "operations", "protocol_repairs"] as const) {
+    const decision = await policy.authorizeOnce(call, {
+      expansion: {
+        kind: "budget",
+        metric,
+        requested_limit: 999,
+      },
+    });
+    assert.equal(decision.outcome, "deny", metric);
+    assert.equal(
+      decision.outcome === "deny" ? decision.reasonCode : undefined,
+      "CAPABILITY_EXPANSION_DENIED",
+      metric,
+    );
+  }
 });

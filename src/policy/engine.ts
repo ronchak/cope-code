@@ -244,6 +244,12 @@ export class PolicyEngine {
       if (!Number.isSafeInteger(value) || value < 0) invalid("budget", `Projected ${metric} usage must be a non-negative safe integer.`);
     }
     if (
+      operation.planned_disclosure_bytes !== undefined &&
+      !isNonNegativeInteger(operation.planned_disclosure_bytes)
+    ) {
+      invalid("budget", "Planned disclosure bytes must be a non-negative safe integer.");
+    }
+    if (
       operation.command !== undefined &&
       (!Number.isSafeInteger(operation.command.timeout_ms) || operation.command.timeout_ms < 1)
     ) {
