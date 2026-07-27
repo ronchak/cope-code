@@ -1475,6 +1475,15 @@ test("budget recovery prompt failure pauses instead of escaping the runtime", as
       note:
         "Automatic budget-recovery approval was unavailable; no " +
         "capability was granted.",
+      _cope_recovery: {
+        version: 1,
+        kind: "automatic_budget_recovery_default_deny",
+        capability: {
+          kind: "budget",
+          metric: "operations",
+          requested_limit: 1,
+        },
+      },
     }),
   );
 
@@ -1593,6 +1602,142 @@ test("tool-result budget recovery prompt failure pauses and resumes without pend
   assert.equal(resumed.status, "completed", resumed.reason);
   assert.deepEqual(durableState.pendingOperations, []);
 });
+
+for (const journalStatus of [
+  "executing_without_artifact",
+  "executing",
+  "completed",
+] as const) {
+  test(`startup reconciles an abandoned recovery decision from ${journalStatus} journal state`, async () => {
+    const root = await mkdtemp(
+      path.join(tmpdir(), `cba-runtime-budget-reconcile-${journalStatus}-`),
+    );
+    const localState = state(root);
+    localState.status = "paused";
+    localState.pauseReason = "Budget recovery was interrupted";
+    localState.turnSequence = 1;
+    localState.budgetUsage = {
+      ...localState.budgetUsage,
+      turns: 1,
+    };
+    const recoveryRequestId =
+      "_cope_internal_budget_recovery_operations_4_turn_0001";
+    const request = {
+      type: "budget_recovery",
+      capability: {
+        kind: "budget",
+        metric: "operations",
+        requested_limit: 4,
+      },
+      reason: "test recovery",
+    };
+    const journal = new OperationJournal(
+      path.join(root, "operations"),
+      localState.sessionId,
+    );
+    const registration = await journal.register(
+      recoveryRequestId,
+      "request_capability",
+      false,
+      request,
+      "2026-01-01T00:00:00.000Z",
+    );
+    assert.equal(registration.kind, "new");
+    if (registration.kind !== "new") return;
+    const executing = await journal.markExecuting(
+      registration.record,
+      "2026-01-01T00:00:01.000Z",
+    );
+    const abandonedDecision = {
+      decision: "deny",
+      note:
+        "Automatic budget-recovery approval was unavailable; no " +
+        "capability was granted.",
+      _cope_recovery: {
+        version: 1,
+        kind: "automatic_budget_recovery_default_deny",
+        capability: request.capability,
+      },
+    };
+    const decisionHash = sha256(stableJson(abandonedDecision));
+    if (journalStatus === "completed") {
+      await journal.markCompleted(
+        executing,
+        "2026-01-01T00:00:02.000Z",
+        "unavailable",
+        { decisionHash, abandoned: true },
+      );
+    }
+    localState.pendingOperations = [{
+      operationId: recoveryRequestId,
+      tool: "request_capability",
+      mutating: false,
+      requestHash: executing.requestHash,
+      status: "executing",
+      acceptedAt: executing.acceptedAt,
+    }];
+    localState.queuedOutbound = {
+      turnId: "turn_0001",
+      artifactId: "queued_turn_0001",
+      messageHash: sha256("budget notice"),
+      createdAt: "2026-01-01T00:00:03.000Z",
+    };
+    const store = new SessionStore(path.join(root, "state"));
+    await store.create(localState);
+    const artifacts = new SessionArtifactStore(
+      path.join(store.sessionDirectory(localState.sessionId), "artifacts"),
+    );
+    if (journalStatus !== "executing_without_artifact") {
+      await artifacts.put(
+        "decision",
+        `decision_${recoveryRequestId}`,
+        stableJson(abandonedDecision),
+      );
+    }
+    await artifacts.put("outbox", "queued_turn_0001", "budget notice");
+    let prompts = 0;
+    const transport = new QueueTransport([
+      JSON.stringify([{
+        type: "complete_task",
+        operationId: `op_complete_reconciled_${journalStatus}`,
+        claim: {
+          summary: "Recovered an interrupted automatic budget decision.",
+          acceptanceCriteria: [],
+          validation: [],
+          skippedValidation: [],
+          remainingRisks: [],
+          recommendedFollowUp: [],
+        },
+      }]),
+    ]);
+
+    const result = await runtimeForTest({
+      root,
+      state: localState,
+      store,
+      artifacts,
+      transport,
+      user: {
+        requestInput: async () => ({}),
+        requestCapability: async () => {
+          prompts += 1;
+          return { decision: "deny" };
+        },
+      },
+    }).run();
+
+    assert.equal(result.status, "completed", result.reason);
+    assert.equal(prompts, 0);
+    assert.deepEqual(localState.pendingOperations, []);
+    assert.equal(
+      localState.completedOperationIds.includes(recoveryRequestId),
+      true,
+    );
+    const reconciled = await journal.read(recoveryRequestId);
+    assert.equal(reconciled.status, "completed");
+    assert.equal(reconciled.safeResult?.decisionHash, decisionHash);
+  });
+}
 
 test("abandoned recovery decision replays safely when emergency notice queueing fails", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-budget-abandoned-replay-"));

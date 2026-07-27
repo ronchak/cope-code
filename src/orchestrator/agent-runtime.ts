@@ -471,6 +471,10 @@ export class AgentRuntime {
   private async findUncertainMutation(): Promise<SessionState["pendingOperations"][number] | undefined> {
     for (const pending of this.state.pendingOperations) {
       const record = await this.dependencies.journal.read(pending.operationId);
+      if (isBudgetRecoveryOperation(pending.operationId, pending.tool)) {
+        await this.reconcileBudgetRecoveryDecision(pending, record);
+        continue;
+      }
       if (
         !pending.mutating &&
         !record.mutating &&
@@ -543,6 +547,106 @@ export class AgentRuntime {
       return indeterminate;
     }
     return undefined;
+  }
+
+  private async reconcileBudgetRecoveryDecision(
+    pending: SessionState["pendingOperations"][number],
+    initialRecord: OperationRecord,
+  ): Promise<void> {
+    const recovery = budgetRecoveryFromRequestId(pending.operationId);
+    if (recovery === undefined) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "An internal budget-recovery operation has an invalid identifier",
+        { operationId: pending.operationId },
+      );
+    }
+    const artifactId = `decision_${pending.operationId}`;
+    let raw = await this.dependencies.artifacts?.getOptional(
+      "decision",
+      artifactId,
+    );
+    let record = initialRecord;
+    if (
+      raw === undefined &&
+      (record.status === "accepted" || record.status === "executing")
+    ) {
+      const abandoned = automaticBudgetRecoveryDeny(recovery.capability);
+      raw = stableJson(abandoned);
+      await this.requireArtifacts().put("decision", artifactId, raw);
+    }
+    if (raw === undefined) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "A completed budget-recovery decision lacks its recovery artifact",
+        { operationId: pending.operationId },
+      );
+    }
+    const decisionRecord = parseDecisionArtifact(raw);
+    const decision = capabilityDecision(decisionRecord);
+    const decisionHash = sha256(stableJson(decisionRecord));
+    const abandoned = isAutomaticBudgetRecoveryDeny(decisionRecord);
+    if (record.status === "accepted") {
+      record = await this.dependencies.journal.markExecuting(
+        record,
+        this.now(),
+      );
+    }
+    if (record.status === "executing") {
+      record = await this.dependencies.journal.markCompleted(
+        record,
+        this.now(),
+        abandoned ? "unavailable" : "answered",
+        {
+          decisionHash,
+          ...(abandoned ? { abandoned: true } : {}),
+          reconciled: true,
+        },
+      );
+    } else if (
+      (record.status === "completed" || record.status === "failed") &&
+      record.safeResult?.decisionHash !== decisionHash
+    ) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Budget-recovery decision does not match its durable journal record",
+        { operationId: pending.operationId },
+      );
+    } else if (
+      record.status !== "completed" &&
+      record.status !== "failed"
+    ) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        `Cannot reconcile budget recovery from ${record.status}`,
+        { operationId: pending.operationId },
+      );
+    }
+
+    this.clearPending(pending.operationId);
+    if (!this.state.completedOperationIds.includes(pending.operationId)) {
+      this.state.completedOperationIds.push(pending.operationId);
+    }
+    let effective = false;
+    if (!abandoned && decision.decision === "allow_session") {
+      effective = await this.dependencies.policy.expandSessionGrant(
+        recovery.capability,
+      );
+    }
+    await this.dependencies.audit.append({
+      type: "session.recovered",
+      taskId: this.state.taskId,
+      operationId: pending.operationId,
+      data: {
+        decision: abandoned ? "abandon" : "reconcile_decision",
+        reasonCode: abandoned
+          ? "USER_INTERACTION_FAILED"
+          : "BUDGET_RECOVERY_DECISION_RECONCILED",
+        decisionHash,
+        effective,
+      },
+    });
+    await this.persist();
   }
 
   private async exchange(turnId: string, content: string): Promise<ReceiveResult> {
@@ -1236,6 +1340,7 @@ export class AgentRuntime {
       readonly chargeOperation?: boolean;
       readonly abandonOnRequesterError?: boolean;
       readonly abandonOnInterruption?: boolean;
+      readonly recoveryCapability?: BudgetRecoveryCapability["capability"];
     } = {},
   ): Promise<Readonly<Record<string, unknown>>> {
     this.throwIfInterrupted();
@@ -1322,12 +1427,9 @@ export class AgentRuntime {
             options.abandonOnInterruption === true
           )
         ) {
-          const abandonedDecision = {
-            decision: "deny",
-            note:
-              "Automatic budget-recovery approval was unavailable; no " +
-              "capability was granted.",
-          } as const;
+          const abandonedDecision = automaticBudgetRecoveryDeny(
+            options.recoveryCapability,
+          );
           const abandonedDecisionHash =
             sha256(stableJson(abandonedDecision));
           await this.requireArtifacts().put(
@@ -1569,6 +1671,7 @@ export class AgentRuntime {
         chargeOperation: false,
         abandonOnRequesterError: true,
         abandonOnInterruption,
+        recoveryCapability: recovery.capability,
       },
     );
     const decision = capabilityDecision(decisionRecord);
@@ -2824,6 +2927,83 @@ interface BudgetRecoveryCapability {
     metric: BudgetMetric;
     requested_limit: number;
   }>;
+}
+
+const AUTOMATIC_BUDGET_RECOVERY_DENY_KIND =
+  "automatic_budget_recovery_default_deny" as const;
+
+function automaticBudgetRecoveryDeny(
+  capability: BudgetRecoveryCapability["capability"] | undefined,
+): Readonly<Record<string, unknown>> {
+  return {
+    decision: "deny",
+    note:
+      "Automatic budget-recovery approval was unavailable; no capability " +
+      "was granted.",
+    _cope_recovery: {
+      version: 1,
+      kind: AUTOMATIC_BUDGET_RECOVERY_DENY_KIND,
+      ...(capability === undefined ? {} : { capability }),
+    },
+  };
+}
+
+function isAutomaticBudgetRecoveryDeny(
+  value: Readonly<Record<string, unknown>>,
+): boolean {
+  const metadata = value._cope_recovery;
+  return (
+    value.decision === "deny" &&
+    metadata !== null &&
+    typeof metadata === "object" &&
+    !Array.isArray(metadata) &&
+    (metadata as Readonly<Record<string, unknown>>).version === 1 &&
+    (metadata as Readonly<Record<string, unknown>>).kind ===
+      AUTOMATIC_BUDGET_RECOVERY_DENY_KIND
+  );
+}
+
+function isBudgetRecoveryOperation(
+  operationId: string,
+  tool: string,
+): boolean {
+  return (
+    tool === "request_capability" &&
+    operationId.startsWith(
+      `${INTERNAL_OPERATION_ID_PREFIX}budget_recovery_`,
+    )
+  );
+}
+
+function budgetRecoveryFromRequestId(
+  operationId: string,
+): BudgetRecoveryCapability | undefined {
+  const prefix = `${INTERNAL_OPERATION_ID_PREFIX}budget_recovery_`;
+  if (!operationId.startsWith(prefix)) return undefined;
+  const suffix = operationId.slice(prefix.length);
+  const metrics = Object.values(POLICY_METRIC_BY_RUNTIME_COUNTER)
+    .filter((metric): metric is BudgetMetric => metric !== undefined)
+    .sort((left, right) => right.length - left.length);
+  for (const metric of metrics) {
+    const metricPrefix = `${metric}_`;
+    if (!suffix.startsWith(metricPrefix)) continue;
+    const requestedText = suffix.slice(metricPrefix.length).match(/^\d+/u)?.[0];
+    if (requestedText === undefined) return undefined;
+    const requestedLimit = Number(requestedText);
+    if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1) {
+      return undefined;
+    }
+    return {
+      metric,
+      requestedLimit,
+      capability: {
+        kind: "budget",
+        metric,
+        requested_limit: requestedLimit,
+      },
+    };
+  }
+  return undefined;
 }
 
 const POLICY_METRIC_BY_RUNTIME_COUNTER: Readonly<

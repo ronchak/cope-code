@@ -27,6 +27,9 @@ derive from or are checked against that value.
   control-plane paths complete the synthetic request with an integrity-bound
   default-deny decision, clear it from pending work, and pause for interactive
   resume instead of failing or poisoning later completion.
+- Startup reconciles the exact artifact/journal/session-state interruption
+  windows around that default deny, including a missing first artifact write
+  and a completed journal whose pending session state had not yet persisted.
 - Default organization and repository budgets provide four-times working
   headroom only for elapsed time, turns, operations, and disclosed bytes.
   Read-file, mutation, command, command-output, and protocol-repair ceilings
