@@ -23,6 +23,10 @@ derive from or are checked against that value.
   decision is journaled and integrity-bound before the expanded grant is
   persisted. The prompt targets the effective higher-layer ceiling, avoiding a
   new approval request on every subsequent turn or operation.
+- If the recovery approval prompt is unavailable, both data-plane and
+  control-plane paths complete the synthetic request with an integrity-bound
+  default-deny decision, clear it from pending work, and pause for interactive
+  resume instead of failing or poisoning later completion.
 - Default organization and repository budgets provide four-times working
   headroom only for elapsed time, turns, operations, and disclosed bytes.
   Read-file, mutation, command, command-output, and protocol-repair ceilings

@@ -181,7 +181,17 @@ turn. A per-operation reservation
 mismatch cannot be repaired by a cumulative raise and instead returns a
 narrower-request hint. The approval passes through the normal decision journal and integrity
 artifact before the grant changes, closing the crash window between consent
-and persistence. If a hard organization or repository ceiling prevents
+and persistence. If the automatic recovery prompt itself cannot run (for
+example, no interactive terminal is attached), Cope durably abandons that
+synthetic request with an integrity-bound default-deny decision, clears it from
+pending work, preserves the already queued budget notice, and pauses for an
+interactive resume. The default-deny artifact makes the same-turn replay safe
+if interruption occurs before the notice replaces the source response. A
+caller interruption retains a still-available source response so the decision
+can be retried after resume; when a degraded result has already replaced that
+response, the same default-deny cleanup prevents an orphaned request. Both
+data-plane and control-plane recovery entry points share this exception
+boundary. If a hard organization or repository ceiling prevents
 expansion, Cope does not display an ineffective approval prompt. It pauses with
 `BUDGET_EXPANSION_UNAVAILABLE`, naming the blocking layer and ceiling and
 explaining that the policy-pinned session cannot continue. The operator must

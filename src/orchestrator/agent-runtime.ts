@@ -384,10 +384,13 @@ export class AgentRuntime {
             // exceeded its per-operation reservation cannot be repaired by a
             // cumulative raise, so budgetRecoveryCapability deliberately
             // declines it and the model receives the narrower-request hint.
-            const recovery = await this.tryRaiseBudgetAndContinue(
+            const attempt = await this.attemptBudgetRecovery(
               budgetError,
               this.disclosureBudgetPauseReason,
+              true,
             );
+            if (attempt.result !== undefined) return attempt.result;
+            const recovery = attempt.recovery;
             if (recovery.raised) {
               this.disclosureBudgetPauseReason = undefined;
               this.disclosureBudgetPauseError = undefined;
@@ -1229,7 +1232,11 @@ export class AgentRuntime {
     request: unknown,
     turnId: string,
     requester: () => Promise<Readonly<Record<string, unknown>>>,
-    options: { readonly chargeOperation?: boolean } = {},
+    options: {
+      readonly chargeOperation?: boolean;
+      readonly abandonOnRequesterError?: boolean;
+      readonly abandonOnInterruption?: boolean;
+    } = {},
   ): Promise<Readonly<Record<string, unknown>>> {
     this.throwIfInterrupted();
     const alreadyAccounted =
@@ -1258,13 +1265,28 @@ export class AgentRuntime {
       if (!this.state.completedOperationIds.includes(requestId)) {
         this.state.completedOperationIds.push(requestId);
       }
-      await this.dependencies.audit.append({
-        type: "user.decision_replayed",
-        taskId: this.state.taskId,
-        turnId,
-        operationId: requestId,
-        data: { tool, decisionHash },
-      });
+      if (registration.record.safeResult?.abandoned === true) {
+        await this.dependencies.audit.append({
+          type: "session.recovered",
+          taskId: this.state.taskId,
+          turnId,
+          operationId: requestId,
+          data: {
+            decision: "replay_abandoned",
+            reasonCode: "USER_INTERACTION_FAILED",
+            tool,
+            decisionHash,
+          },
+        });
+      } else {
+        await this.dependencies.audit.append({
+          type: "user.decision_replayed",
+          taskId: this.state.taskId,
+          turnId,
+          operationId: requestId,
+          data: { tool, decisionHash },
+        });
+      }
       await this.persist();
       return decision;
     }
@@ -1288,9 +1310,67 @@ export class AgentRuntime {
     this.throwIfInterrupted();
     const cached = await this.dependencies.artifacts?.getOptional("decision", artifactId);
     this.throwIfInterrupted();
-    const decision = cached === undefined
-      ? await requester()
-      : parseDecisionArtifact(cached);
+    let decision: Readonly<Record<string, unknown>>;
+    if (cached === undefined) {
+      try {
+        decision = await requester();
+      } catch (error) {
+        if (
+          options.abandonOnRequesterError === true &&
+          (
+            this.interruption === undefined ||
+            options.abandonOnInterruption === true
+          )
+        ) {
+          const abandonedDecision = {
+            decision: "deny",
+            note:
+              "Automatic budget-recovery approval was unavailable; no " +
+              "capability was granted.",
+          } as const;
+          const abandonedDecisionHash =
+            sha256(stableJson(abandonedDecision));
+          await this.requireArtifacts().put(
+            "decision",
+            artifactId,
+            stableJson(abandonedDecision),
+          );
+          await this.dependencies.journal.markCompleted(
+            executing,
+            this.now(),
+            "unavailable",
+            {
+              decisionHash: abandonedDecisionHash,
+              abandoned: true,
+              errorCode:
+                error instanceof AgentError
+                  ? error.code
+                  : "INTERNAL_ERROR",
+            },
+          );
+          this.clearPending(requestId);
+          if (!this.state.completedOperationIds.includes(requestId)) {
+            this.state.completedOperationIds.push(requestId);
+          }
+          await this.dependencies.audit.append({
+            type: "session.recovered",
+            taskId: this.state.taskId,
+            turnId,
+            operationId: requestId,
+            data: {
+              decision: "abandon",
+              reasonCode: "USER_INTERACTION_FAILED",
+              tool,
+              decisionHash: abandonedDecisionHash,
+            },
+          });
+          await this.persist();
+        }
+        throw error;
+      }
+    } else {
+      decision = parseDecisionArtifact(cached);
+    }
     this.throwIfInterrupted();
     if (cached === undefined) {
       await this.requireArtifacts().put("decision", artifactId, stableJson(decision));
@@ -1351,20 +1431,9 @@ export class AgentRuntime {
     error: AgentError,
   ): Promise<AgentRunResult | undefined> {
     const reason = disclosureBudgetReason(error);
-    let recovery: { readonly raised: boolean; readonly reason: string };
-    try {
-      recovery = await this.tryRaiseBudgetAndContinue(error, reason);
-    } catch (recoveryError) {
-      if (this.interruption !== undefined) {
-        return this.finishInterruption();
-      }
-      await this.queueEmergencyBudgetNotice(error).catch(() => false);
-      return this.pauseForBudget(
-        `${reason} Automatic raise-and-continue could not obtain an operator ` +
-        `decision (${errorMessage(recoveryError)}). Resume this session in an ` +
-        "interactive terminal to retry the recovery decision.",
-      );
-    }
+    const attempt = await this.attemptBudgetRecovery(error, reason, false);
+    if (attempt.result !== undefined) return attempt.result;
+    const recovery = attempt.recovery;
     if (recovery.raised) {
       this.disclosureBudgetPauseReason = undefined;
       this.disclosureBudgetPauseError = undefined;
@@ -1377,9 +1446,51 @@ export class AgentRuntime {
     return this.pauseForBudget(recovery.reason);
   }
 
+  private async attemptBudgetRecovery(
+    error: AgentError,
+    reason: string,
+    abandonOnInterruption: boolean,
+  ): Promise<
+    | {
+        readonly recovery: {
+          readonly raised: boolean;
+          readonly reason: string;
+        };
+        readonly result?: never;
+      }
+    | {
+        readonly recovery?: never;
+        readonly result: AgentRunResult;
+      }
+  > {
+    try {
+      return {
+        recovery: await this.tryRaiseBudgetAndContinue(
+          error,
+          reason,
+          abandonOnInterruption,
+        ),
+      };
+    } catch (recoveryError) {
+      if (this.interruption !== undefined) {
+        return { result: await this.finishInterruption() };
+      }
+      return {
+        recovery: {
+          raised: false,
+          reason:
+            `${reason} Automatic raise-and-continue could not obtain an ` +
+            `operator decision (${errorMessage(recoveryError)}). Resume this ` +
+            "session in an interactive terminal to retry the recovery decision.",
+        },
+      };
+    }
+  }
+
   private async tryRaiseBudgetAndContinue(
     error: AgentError,
     reason: string,
+    abandonOnInterruption: boolean,
   ): Promise<{ readonly raised: boolean; readonly reason: string }> {
     let recovery = budgetRecoveryCapability(error);
     if (
@@ -1454,7 +1565,11 @@ export class AgentRuntime {
           "Only an allow-for-session decision can resume this interrupted work.",
         signal: this.controller.signal,
       }),
-      { chargeOperation: false },
+      {
+        chargeOperation: false,
+        abandonOnRequesterError: true,
+        abandonOnInterruption,
+      },
     );
     const decision = capabilityDecision(decisionRecord);
     let effective = false;
