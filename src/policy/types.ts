@@ -215,6 +215,7 @@ export interface PolicyCheck {
   readonly message: string;
   readonly capability_key?: string;
   readonly resource?: string;
+  readonly details?: Readonly<Record<string, unknown>>;
 }
 
 export interface EffectivePolicy {

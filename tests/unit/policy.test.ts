@@ -1,13 +1,17 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import test from "node:test";
 
 import { TOOL_NAMES, TOOL_REGISTRY } from "../../src/protocol/index.js";
 import {
   DEFAULT_ORGANIZATION_POLICY,
+  DEFAULT_HIGHER_LAYER_BUDGETS,
   DEFAULT_POLICY_BUDGETS,
   DEFAULT_REPOSITORY_POLICY,
   PolicyEngine,
   createDefaultSessionGrant,
+  matchPolicyPattern,
   validatePolicyDocument,
   validateSessionGrant,
   zeroPolicyBudgetUsage,
@@ -46,6 +50,68 @@ test("default policy documents and generated session grant validate", () => {
   assert.equal(validateSessionGrant(session()).valid, true);
 });
 
+test("default session budgets retain bounded approval headroom across shipped policies", () => {
+  const defaultSession = session();
+  assert.deepEqual(
+    defaultSession.capabilities.budgets,
+    DEFAULT_POLICY_BUDGETS,
+  );
+  assert.deepEqual(
+    DEFAULT_ORGANIZATION_POLICY.capabilities.budgets,
+    DEFAULT_HIGHER_LAYER_BUDGETS,
+  );
+  assert.deepEqual(
+    DEFAULT_REPOSITORY_POLICY.capabilities.budgets,
+    DEFAULT_HIGHER_LAYER_BUDGETS,
+  );
+  for (const metric of Object.keys(DEFAULT_POLICY_BUDGETS) as Array<
+    keyof typeof DEFAULT_POLICY_BUDGETS
+  >) {
+    assert.equal(
+      DEFAULT_HIGHER_LAYER_BUDGETS[metric],
+      DEFAULT_POLICY_BUDGETS[metric] * 4,
+      metric,
+    );
+  }
+
+  const organizationExample = JSON.parse(
+    readFileSync(
+      path.resolve("config/examples/organization-policy.json"),
+      "utf8",
+    ),
+  ) as { capabilities: { budgets: unknown } };
+  const repositoryExample = JSON.parse(
+    readFileSync(path.resolve("config/examples/repository.node.json"), "utf8"),
+  ) as { policy: { capabilities: { budgets: unknown } } };
+  assert.deepEqual(
+    organizationExample.capabilities.budgets,
+    DEFAULT_HIGHER_LAYER_BUDGETS,
+  );
+  assert.deepEqual(
+    repositoryExample.policy.capabilities.budgets,
+    DEFAULT_HIGHER_LAYER_BUDGETS,
+  );
+
+  const evaluator = engine(defaultSession);
+  const recoveryLimit = DEFAULT_POLICY_BUDGETS.disclosed_bytes + 1;
+  const recovery = evaluator.expandSessionGrantWithUsage(
+    {
+      kind: "budget",
+      metric: "disclosed_bytes",
+      requested_limit: recoveryLimit,
+    },
+    {
+      ...zeroPolicyBudgetUsage(),
+      disclosed_bytes: DEFAULT_POLICY_BUDGETS.disclosed_bytes,
+    },
+  );
+  assert.equal(recovery.decision, "allow");
+  assert.equal(
+    recovery.grant.capabilities.budgets?.disclosed_bytes,
+    recoveryLimit,
+  );
+});
+
 test("schema and semantic validation reject unknown fields, overlapping rules, and traversal patterns", () => {
   assert.equal(validatePolicyDocument({ ...DEFAULT_ORGANIZATION_POLICY, surprise: true }).valid, false);
   const overlap: PolicyDocument = {
@@ -80,6 +146,36 @@ test("most restrictive organization, repository, and session decision wins", () 
   );
   assert.equal(result.decision, "deny");
   assert.ok(result.reasons.some((reason) => reason.layer === "repository" && reason.reason_code === "PATH_NOT_GRANTED"));
+});
+
+test("repository-wide patterns include root consistently and preserve deny precedence", () => {
+  for (const pattern of ["**", "./**", "**/*"]) {
+    assert.equal(matchPolicyPattern(".", pattern), true, pattern);
+  }
+  assert.equal(matchPolicyPattern("", "**"), true);
+  assert.equal(matchPolicyPattern(".", "src/**"), false);
+
+  const repository: PolicyDocument = {
+    ...DEFAULT_REPOSITORY_POLICY,
+    capabilities: {
+      ...DEFAULT_REPOSITORY_POLICY.capabilities,
+      paths: { read: { deny: ["**/*"], unmatched: "allow" } },
+    },
+  };
+  const rootRead = engine(
+    session(),
+    DEFAULT_ORGANIZATION_POLICY,
+    repository,
+  ).evaluate(
+    operation({
+      tool: "list_files",
+      paths: [{ path: ".", access: "read" }],
+    }),
+  );
+  assert.equal(rootRead.decision, "deny");
+  assert.ok(
+    rootRead.reasons.some((reason) => reason.reason_code === "PATH_NOT_GRANTED"),
+  );
 });
 
 test("session scope produces ask once while protected and escaping paths are hard denials", () => {
@@ -185,7 +281,7 @@ test("classification, secret, disclosure, change, and cumulative budgets are enf
 
   const usage = { ...zeroPolicyBudgetUsage(), changed_lines: DEFAULT_POLICY_BUDGETS.changed_lines + 1 };
   const overBudget = evaluator.evaluate(operation({ projected_usage: usage }));
-  assert.equal(overBudget.decision, "deny");
+  assert.equal(overBudget.decision, "ask");
   assert.ok(overBudget.reasons.some((reason) => reason.reason_code === "BUDGET_EXCEEDED"));
 });
 
@@ -241,9 +337,24 @@ test("session budget may grow only up to the strict higher-layer limit", () => {
     assert.equal(nonExpansion.grant, lowSession);
     assert.match(
       nonExpansion.reasons.map((reason) => reason.message).join(" "),
-      /must increase the current session limit 5/u,
+      /must be at least 6.*current effective limit is 5/u,
     );
   }
+
+  const usageBound = evaluator.expandSessionGrantWithUsage(
+    { kind: "budget", metric: "turns", requested_limit: 7 },
+    { ...zeroPolicyBudgetUsage(), turns: 7 },
+  );
+  assert.equal(usageBound.decision, "deny");
+  assert.match(
+    usageBound.reasons.map((reason) => reason.message).join(" "),
+    /must be at least 8.*current usage is 7/u,
+  );
+  const aboveUsage = evaluator.expandSessionGrantWithUsage(
+    { kind: "budget", metric: "turns", requested_limit: 8 },
+    { ...zeroPolicyBudgetUsage(), turns: 7 },
+  );
+  assert.equal(aboveUsage.decision, "allow");
 });
 
 test("invalid or incomplete deterministic facts fail closed instead of bypassing policy", () => {

@@ -31,9 +31,14 @@ export function isSafePolicyPattern(pattern: string): boolean {
 }
 
 export function matchPolicyPattern(value: string, pattern: string, caseSensitive = false): boolean {
-  const normalizedValue = value.replaceAll("\\", "/");
-  const normalizedPattern = pattern.replaceAll("\\", "/");
-  if (normalizedValue === "." && normalizedPattern === "**") return true;
+  const normalizedValue = normalizeMatchValue(value);
+  const normalizedPattern = normalizeMatchPattern(pattern);
+  if (
+    normalizedValue === "." &&
+    (normalizedPattern === "**" || normalizedPattern === "**/*")
+  ) {
+    return true;
+  }
   if (normalizedPattern.endsWith("/**") && normalizedValue === normalizedPattern.slice(0, -3)) return true;
   return minimatch(normalizedValue, normalizedPattern, {
     dot: true,
@@ -42,6 +47,15 @@ export function matchPolicyPattern(value: string, pattern: string, caseSensitive
     nocomment: true,
     windowsPathsNoEscape: true,
   });
+}
+
+function normalizeMatchValue(value: string): string {
+  const normalized = value.replaceAll("\\", "/").replace(/^\.\/+/u, "");
+  return normalized.length === 0 ? "." : normalized;
+}
+
+function normalizeMatchPattern(pattern: string): string {
+  return pattern.replaceAll("\\", "/").replace(/^\.\/+/u, "");
 }
 
 export function matchAnyPolicyPattern(value: string, patterns: readonly string[] | undefined): boolean {

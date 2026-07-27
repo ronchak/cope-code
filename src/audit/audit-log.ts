@@ -2,7 +2,7 @@ import { mkdir, open, readFile } from "node:fs/promises";
 import path from "node:path";
 import { sha256, stableJson } from "../shared/crypto.js";
 import { AgentError, errorMessage } from "../shared/errors.js";
-import { isOperationId } from "../shared/operation-id.js";
+import { isJournalOperationId } from "../shared/operation-id.js";
 import type { Clock } from "../shared/time.js";
 import { systemClock } from "../shared/time.js";
 import { AUDIT_EVENT_TYPES, AUDIT_SCHEMA_VERSION, type AuditEvent, type AuditEventInput } from "./types.js";
@@ -44,8 +44,14 @@ export class AuditLog {
 
   public async append(input: AuditEventInput): Promise<AuditEvent> {
     await this.initialize();
-    if (input.operationId !== undefined && !isOperationId(input.operationId)) {
-      throw new AgentError("PROTOCOL_INVALID", "Audit operation identifier does not satisfy the cba/1 contract");
+    if (
+      input.operationId !== undefined &&
+      !isJournalOperationId(input.operationId)
+    ) {
+      throw new AgentError(
+        "PROTOCOL_INVALID",
+        "Audit operation identifier is outside the accepted model and local journal namespaces",
+      );
     }
     const base = {
       schemaVersion: AUDIT_SCHEMA_VERSION,
@@ -121,7 +127,8 @@ function verifyAuditText(
       !(AUDIT_EVENT_TYPES as readonly string[]).includes(parsed.type) ||
       typeof parsed.taskId !== "string" ||
       typeof parsed.timestamp !== "string" ||
-      (parsed.operationId !== undefined && !isOperationId(parsed.operationId)) ||
+      (parsed.operationId !== undefined &&
+        !isJournalOperationId(parsed.operationId)) ||
       (parsed.turnId !== undefined && typeof parsed.turnId !== "string") ||
       parsed.data === null ||
       typeof parsed.data !== "object" ||

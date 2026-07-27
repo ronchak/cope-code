@@ -84,6 +84,14 @@ Policy can constrain command `ids`, `categories`, `risks`, `side_effects`, and `
 
 Classification is an onboarding assertion, not automatic data-loss-prevention certification. The repository data owner must choose it and decide whether Copilot Chat is an approved destination.
 
+`list_files` is a bounded, read-only operation with explicit truncation. Its
+omitted default and any larger requested `max_results` are deterministically
+clamped downward to the most restrictive effective file ceiling before both
+authorization and execution. The result includes `applied_max_results`; it
+never treats a request as authority to exceed policy. Other operations that
+cannot safely express truncation continue to deny oversized requests with
+structured limit and retry details.
+
 ### Network
 
 `network.access` and optional host rules evaluate catalog metadata. A command marked `networkRequired: true` must name its target hosts and obtain all applicable policy permission.
@@ -112,10 +120,34 @@ Supported metrics are:
 | `protocol_repairs` | malformed-model-response repairs |
 
 `budget_exceeded` is `ask` or `deny`. A permitted session expansion remains bounded by organization and repository maximums.
-Budget expansion is strictly monotonic: the requested limit must be greater than
-the current session limit. Equal or lower values are rejected and never persisted,
-so an approval cannot accidentally strand a live session below usage already
-consumed.
+Budget expansion is strictly monotonic against live state: the requested limit
+must be greater than both the effective current limit and current usage. Equal,
+lower, or already-consumed values are rejected and never persisted. Denials
+report `current_limit`, `current_usage`, and `minimum_acceptable`.
+
+The shipped defaults distinguish the initial session working grant from its
+higher-layer approval ceiling. Sessions start with the conservative
+`DEFAULT_POLICY_BUDGETS`; organization and repository defaults derive a
+four-times-larger ceiling from that same metric table. Cope therefore cannot
+raise a budget silently, but an explicit raise-and-continue approval has real,
+bounded headroom under the default configuration.
+
+The runtime reserves 64 KiB of the cumulative disclosure limit for its
+source-free control plane, including an 8 KiB emergency slice that ordinary
+decisions and repairs cannot consume. Data-bearing tool results cannot consume
+the 64 KiB window. If any ordinary outbound message reaches its applicable
+ceiling, Cope emits a byte-capped `cba/1` notice from the emergency slice and
+pauses rather than failing.
+
+For turn, operation, elapsed-time, and other recoverable session-budget
+exhaustion, Cope first offers a local raise-and-continue approval when the
+higher policy layers leave headroom. Only `allow_session` is effective, and
+the requested floor is derived from live usage. The exact operator decision is
+journaled, hashed, and stored as a recovery artifact before an expanded grant
+is persisted. Higher-layer ceilings remain non-overridable. Resume keeps the
+same journal, checkpoints,
+completed-operation evidence, and queued outbound, so work is neither
+discarded nor replayed.
 
 ## `cba-repository-config/1`
 

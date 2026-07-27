@@ -18,6 +18,8 @@ import {
 import { SessionStore } from "../../src/session/store.js";
 
 const NOW = "2026-07-17T12:00:00.000Z";
+const INTERNAL_RECOVERY_OPERATION_ID =
+  "_cope_internal_budget_recovery_disclosed_bytes_turn_0002";
 
 async function createSessionFixture(): Promise<{
   readonly root: string;
@@ -57,7 +59,7 @@ async function createSessionFixture(): Promise<{
     turnSequence: 2,
     mutationSequence: 0,
     pendingOperations: [],
-    completedOperationIds: ["op_read_01"],
+    completedOperationIds: ["op_read_01", INTERNAL_RECOVERY_OPERATION_ID],
     mutations: [],
     validations: [],
     protocolRepairStreak: 0,
@@ -72,6 +74,12 @@ async function createSessionFixture(): Promise<{
     type: "session.created",
     taskId: state.taskId,
     data: { privatePath: "AUDIT-PRIVATE-PATH.ts", modelContent: "MODEL-CONTENT-SECRET" },
+  });
+  await audit.append({
+    type: "user.decided",
+    taskId: state.taskId,
+    operationId: INTERNAL_RECOVERY_OPERATION_ID,
+    data: { kind: "capability", decision: "allow_session" },
   });
   const disclosures = new DisclosureLedger(state.sessionId, {
     outputFile: path.join(sessionDirectory, "disclosures.jsonl"),

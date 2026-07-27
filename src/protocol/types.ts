@@ -4,6 +4,8 @@ export type ProtocolVersion = typeof PROTOCOL_VERSION;
 
 /** Safe bounded result count used when list_files.max_results is omitted. */
 export const DEFAULT_LIST_FILES_MAX_RESULTS = 20;
+/** Deterministic repository-adapter ceiling before stricter policy limits. */
+export const MAX_LIST_FILES_RESULTS = 500;
 
 export type ToolExecutionSurface = "local" | "orchestrator";
 export type ToolContextRequirement = "path" | "command" | "network" | "change";

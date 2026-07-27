@@ -35,10 +35,12 @@ test("list_files defaults to a small result window without lowering its explicit
 
   const defaultListing = await tools.listFiles({ maxDepth: 0 });
   assert.equal(defaultListing.entries.length, 20);
+  assert.equal(defaultListing.appliedMaxResults, 20);
   assert.equal(defaultListing.truncated, true);
 
   const explicitListing = await tools.listFiles({ maxDepth: 0, maxResults: 25 });
   assert.equal(explicitListing.entries.length, 25);
+  assert.equal(explicitListing.appliedMaxResults, 25);
 });
 
 test("bounded repository tools honor ignores, file limits, ranges, state hashes, and literal search", async (context) => {

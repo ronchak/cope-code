@@ -11,7 +11,13 @@ import {
   type BudgetUsage as PolicyBudgetUsage,
   zeroPolicyBudgetUsage,
 } from "../../src/policy/index.js";
-import { LayeredRuntimePolicy } from "../../src/orchestrator/runtime-policy.js";
+import {
+  LayeredRuntimePolicy,
+  listFilesRuntimeBounds,
+} from "../../src/orchestrator/runtime-policy.js";
+import {
+  CONTROL_PLANE_RESERVE_BYTES,
+} from "../../src/orchestrator/disclosure-budget.js";
 import { RepositoryBoundary } from "../../src/repository/boundary.js";
 import { CommandCatalog } from "../../src/tools/command-catalog.js";
 import { sha256 } from "../../src/shared/crypto.js";
@@ -27,6 +33,7 @@ async function harness(
     readonly maxMutationFileBytes?: number;
     readonly maxPatchBytes?: number;
     readonly maxDisclosureFiles?: number;
+    readonly maxDisclosureBytes?: number;
     readonly budgets?: Readonly<Partial<Record<BudgetMetric, number>>>;
     readonly currentUsage?: PolicyBudgetUsage;
   } = {},
@@ -56,7 +63,9 @@ async function harness(
     ...(options.budgets === undefined ? {} : { budgets: options.budgets }),
     ...(options.tools === undefined ? {} : { tools: options.tools }),
   });
-  const organization = options.maxDisclosureFiles === undefined
+  const organization =
+    options.maxDisclosureFiles === undefined &&
+    options.maxDisclosureBytes === undefined
     ? DEFAULT_ORGANIZATION_POLICY
     : {
         ...DEFAULT_ORGANIZATION_POLICY,
@@ -64,7 +73,12 @@ async function harness(
           ...DEFAULT_ORGANIZATION_POLICY.capabilities,
           disclosure: {
             ...DEFAULT_ORGANIZATION_POLICY.capabilities.disclosure,
-            max_files_per_operation: options.maxDisclosureFiles,
+            ...(options.maxDisclosureFiles === undefined
+              ? {}
+              : { max_files_per_operation: options.maxDisclosureFiles }),
+            ...(options.maxDisclosureBytes === undefined
+              ? {}
+              : { max_bytes_per_operation: options.maxDisclosureBytes }),
           },
         },
       };
@@ -120,33 +134,98 @@ test("session grant expansion cannot override higher-layer network denial", asyn
   assert.equal(await policy.expandSessionGrant({ kind: "network" }), false);
 });
 
-test("default list_files request is bounded and oversized denials name the exact file limit", async () => {
-  const { policy } = await harness("auto", { maxDisclosureFiles: 20 });
-  const defaultDecision = await policy.authorize({
-    operationId: "op_list_default",
+test("list_files defaults and explicit requests clamp to the effective policy ceiling", async () => {
+  for (const ceiling of [5, 10, 20, 100]) {
+    const { policy } = await harness("auto", {
+      maxDisclosureFiles: ceiling,
+    });
+    const expectedDefault = Math.min(20, ceiling);
+    const defaultDecision = await policy.authorize({
+      operationId: `op_list_default_${ceiling}`,
+      name: "list_files",
+      arguments: { path: "." },
+    });
+    assert.equal(defaultDecision.outcome, "allow");
+    assert.deepEqual(
+      defaultDecision.outcome === "allow"
+        ? defaultDecision.effectiveArguments
+        : undefined,
+      { path: ".", max_results: expectedDefault },
+    );
+
+    const oversized = await policy.authorize({
+      operationId: `op_list_oversized_${ceiling}`,
+      name: "list_files",
+      arguments: { path: ".", max_results: 200 },
+    });
+    assert.equal(oversized.outcome, "allow");
+    assert.deepEqual(
+      oversized.outcome === "allow"
+        ? oversized.effectiveArguments
+        : undefined,
+      { path: ".", max_results: ceiling },
+    );
+  }
+
+  const { policy: incidentPolicy } = await harness("auto", {
+    maxDisclosureFiles: 20,
+    maxDisclosureBytes: 262_144,
+  });
+  const incidentDecision = await incidentPolicy.authorize({
+    operationId: "op_incident_list_root",
     name: "list_files",
     arguments: { path: "." },
   });
-  assert.equal(defaultDecision.outcome, "allow");
+  assert.equal(incidentDecision.outcome, "allow");
+  assert.deepEqual(
+    incidentDecision.outcome === "allow"
+      ? incidentDecision.effectiveArguments
+      : undefined,
+    { path: ".", max_results: 20 },
+  );
 
-  const oversized = await policy.authorize({
-    operationId: "op_list_oversized",
-    name: "list_files",
-    arguments: { path: ".", max_results: 200 },
+  const { policy } = await harness("auto", { maxDisclosureFiles: 20 });
+  const summary = policy.summarize();
+  assert.deepEqual(summary.operation_limits, {
+    list_files: {
+      default_max_results: 20,
+      maximum_results: 20,
+      policy_max_files_per_operation: 20,
+      policy_max_bytes_per_operation: 1_000_000,
+    },
   });
-  assert.equal(oversized.outcome, "deny");
-  assert.equal(oversized.reasonCode, "DISCLOSURE_OPERATION_LIMIT_EXCEEDED");
-  assert.match(
-    oversized.explanation,
-    /organization per-operation disclosure file limit 20 would be exceeded by 200 files/u,
+  assert.deepEqual(
+    listFilesRuntimeBounds(new PolicyEngine({
+      organization: DEFAULT_ORGANIZATION_POLICY,
+      repository: DEFAULT_REPOSITORY_POLICY,
+      session: createDefaultSessionGrant({
+        grant_id: "grant_bounds",
+        task_id: "task_bounds",
+        repository_root: ".",
+        mode: "auto",
+      }),
+    })),
+    { defaultResults: 20, maxResults: 50 },
   );
 
-  const notes = policy.summarize().notes;
-  assert.ok(Array.isArray(notes));
-  assert.match(
-    notes.filter((note): note is string => typeof note === "string").join(" "),
-    /20 files.*hard ceilings are separate from cumulative task budgets/u,
-  );
+  const { policy: disabledPolicy } = await harness("auto", {
+    maxDisclosureFiles: 0,
+  });
+  const disabledDecision = await disabledPolicy.authorize({
+    operationId: "op_list_disabled",
+    name: "list_files",
+    arguments: { path: "." },
+  });
+  assert.equal(disabledDecision.outcome, "deny");
+  assert.deepEqual(disabledPolicy.summarize().operation_limits, {
+    list_files: {
+      default_max_results: 0,
+      maximum_results: 0,
+      listing_disabled_by_policy: true,
+      policy_max_files_per_operation: 0,
+      policy_max_bytes_per_operation: 1_000_000,
+    },
+  });
 });
 
 test("standalone budget capability cannot shrink an active disclosure budget", async () => {
@@ -168,6 +247,34 @@ test("standalone budget capability cannot shrink an active disclosure budget", a
   assert.equal(
     policy.sessionGrant.capabilities.budgets?.disclosed_bytes,
     2_000_000,
+  );
+  assert.deepEqual(
+    policy.assessSessionGrantExpansion({
+      kind: "budget",
+      metric: "disclosed_bytes",
+      requested_limit: 2_000,
+    }),
+    {
+      outcome: "no_op",
+      reasonCode: "CAPABILITY_REQUEST_NO_OP",
+      explanation:
+        "Budget expansion 'budget:disclosed_bytes' must be at least 2000001; " +
+        "current effective limit is 2000000, current usage is 50000, and 2000 was requested.",
+      details: {
+        metric: "disclosed_bytes",
+        requested_limit: 2_000,
+        current_limit: 2_000_000,
+        current_usage: 50_000,
+        minimum_acceptable: 2_000_001,
+      },
+    },
+  );
+  assert.equal(
+    policy.assessSessionGrantExpansion({
+      kind: "disclosure",
+      classifications: ["internal"],
+    }).outcome,
+    "no_op",
   );
 });
 
@@ -354,7 +461,10 @@ test("disclosure budget approval reserves the complete protocol boundary", async
 
   const approved = await policy.authorizeOnce(call, initial.capability);
   if (approved.outcome !== "allow") throw new Error("expected one-time approval");
-  assert.equal(approved.plannedDisclosureBytes, expansion.requested_limit);
+  assert.equal(
+    (approved.plannedDisclosureBytes ?? 0) + CONTROL_PLANE_RESERVE_BYTES,
+    expansion.requested_limit,
+  );
   assert.deepEqual(approved.oneTimeBudgetLimits, {
     disclosed_bytes: expansion.requested_limit,
   });

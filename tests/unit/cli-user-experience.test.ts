@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { CLI_VERSION, executeCommand } from "../../src/cli/commands.js";
+import { renderHumanResult } from "../../src/cli/friendly-output.js";
 import { configuredBrowserLabel, interactiveSetupCommand } from "../../src/cli/interactive.js";
 import { chatFooter, renderUserMessage, setupHero, startupPanel } from "../../src/cli/presentation.js";
 import { chatPromptStartRow, inputViewport } from "../../src/cli/prompts.js";
@@ -86,6 +87,18 @@ test("normal help stays compact while advanced operations remain discoverable", 
   assert.equal(await executeCommand({ command: "help", advanced: true, json: false }, { stdout: advanced, stderr: advanced }), 0);
   assert.match(advanced.value, /verify-audit <session-id>/u);
   assert.match(advanced.value, /Compatibility alias: copilot-agent/u);
+});
+
+test("paused budget exhaustion surfaces its diagnostic and remediation", () => {
+  const rendered = stripAnsi(renderHumanResult({
+    status: "paused",
+    sessionId: "session_budget_pause",
+    reason:
+      "BUDGET_EXCEEDED: disclosedBytes (1984220 / 2000000). Raise the applicable limit to at least 2100000 and resume this session.",
+  }));
+  assert.match(rendered, /Task paused/u);
+  assert.match(rendered, /BUDGET_EXCEEDED: disclosedBytes/u);
+  assert.match(rendered, /resume this session/u);
 });
 
 test("demo mode previews the terminal interface without live setup", async () => {

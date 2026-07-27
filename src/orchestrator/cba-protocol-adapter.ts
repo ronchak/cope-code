@@ -68,6 +68,9 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
         command_ids: strings(summary.command_ids),
         disclosure_classifications: strings(summary.disclosure_classifications),
         network: decision(summary.network),
+        ...(isRecord(summary.operation_limits)
+          ? { operation_limits: summary.operation_limits }
+          : {}),
         notes: strings(summary.notes),
       },
       budgets: budgetSummary(input.budgetSummary),
@@ -116,6 +119,9 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
             decision: outcome.data.decision === "ask" ? "ask" : "deny",
             reason_code: String(outcome.data.code ?? "POLICY_DENIED"),
             message: String(outcome.data.message ?? "The operation is outside the effective grant."),
+            ...(isRecord(outcome.data.details)
+              ? { details: outcome.data.details }
+              : {}),
           })),
         ),
       ), input.taskId, input.priorTurnId);
@@ -344,6 +350,10 @@ function mode(value: unknown): "inspect" | "edit" | "auto" {
 
 function decision(value: unknown): "allow" | "ask" | "deny" {
   return value === "allow" || value === "ask" ? value : "deny";
+}
+
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function budgetSummary(value: Readonly<Record<string, unknown>>) {

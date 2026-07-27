@@ -1,9 +1,11 @@
 import { BUDGET_METRICS, isToolName, toolRequiresContext, type BudgetMetric, type ToolName } from "../protocol/types.js";
 import { assertValidPolicyDocument, assertValidSessionGrant } from "./schemas.js";
+import { DEFAULT_POLICY_BUDGETS } from "./defaults.js";
 import { matchPolicyPattern, normalizeRepositoryPath } from "./patterns.js";
 import {
   POLICY_DECISION_WEIGHT,
   type BudgetLimits,
+  type BudgetUsage,
   type EffectivePolicy,
   type PathAccess,
   type PolicyCapabilities,
@@ -37,6 +39,7 @@ interface CheckInput {
   readonly denyMessage: string;
   readonly capabilityKey?: string;
   readonly resource?: string;
+  readonly details?: Readonly<Record<string, unknown>>;
 }
 
 export class PolicyEngine {
@@ -130,7 +133,30 @@ export class PolicyEngine {
    * approval so it does not prompt repeatedly during this session.
    */
   public expandSessionGrant(expansion: SessionCapabilityExpansion, grantedAt = new Date().toISOString()): SessionExpansionResult {
-    return expandGrant(this.organization, this.repository, this.session, expansion, grantedAt, this.repositoryPathKey);
+    return expandGrant(
+      this.organization,
+      this.repository,
+      this.session,
+      expansion,
+      grantedAt,
+      this.repositoryPathKey,
+    );
+  }
+
+  public expandSessionGrantWithUsage(
+    expansion: SessionCapabilityExpansion,
+    currentUsage: BudgetUsage,
+    grantedAt = new Date().toISOString(),
+  ): SessionExpansionResult {
+    return expandGrant(
+      this.organization,
+      this.repository,
+      this.session,
+      expansion,
+      grantedAt,
+      this.repositoryPathKey,
+      currentUsage,
+    );
   }
 
   private layers(): readonly LayerView[] {
@@ -533,6 +559,21 @@ export class PolicyEngine {
               `${layer.layer} per-operation disclosure ${violation.label} limit ${violation.limit} ` +
               `would be exceeded by ${violation.requested} ${violation.unit}; retry with a smaller bounded operation.`,
             capabilityKey: "budget:disclosed_bytes",
+            details: {
+              dimension: violation.label === "file" ? "files" : "bytes",
+              limit: violation.limit,
+              requested: violation.requested,
+              ...(violation.label === "file" &&
+              operation.tool === "list_files" &&
+              violation.limit > 0
+                ? { retry_with: { max_results: violation.limit } }
+                : violation.label === "byte" &&
+                    (operation.tool === "read_file" ||
+                      operation.tool === "git_diff") &&
+                    violation.limit > 0
+                  ? { retry_with: { max_bytes: violation.limit } }
+                  : {}),
+            },
           }),
         );
       }
@@ -655,6 +696,12 @@ export class PolicyEngine {
             denyMessage: `${layer.layer} ${metric} budget ${limit} would be exceeded by projected usage ${operation.projected_usage[metric]}.`,
             capabilityKey: `budget:${metric}`,
             resource: metric,
+            details: {
+              metric,
+              limit,
+              requested: operation.projected_usage[metric],
+              minimum_acceptable: operation.projected_usage[metric],
+            },
           }),
         );
       }
@@ -671,6 +718,7 @@ export class PolicyEngine {
         message: `Session approval '${input.capabilityKey}' satisfies this policy escalation.`,
         capabilityKey: input.capabilityKey,
         ...(input.resource === undefined ? {} : { resource: input.resource }),
+        ...(input.details === undefined ? {} : { details: input.details }),
       });
     }
     return optionalCheckFields({
@@ -687,6 +735,7 @@ export class PolicyEngine {
             : input.denyMessage,
       ...(input.capabilityKey === undefined ? {} : { capabilityKey: input.capabilityKey }),
       ...(input.resource === undefined ? {} : { resource: input.resource }),
+      ...(input.details === undefined ? {} : { details: input.details }),
     });
   }
 
@@ -742,6 +791,7 @@ function optionalCheckFields(input: {
   readonly message: string;
   readonly capabilityKey?: string;
   readonly resource?: string;
+  readonly details?: Readonly<Record<string, unknown>>;
 }): PolicyCheck {
   return {
     layer: input.layer,
@@ -751,6 +801,7 @@ function optionalCheckFields(input: {
     message: input.message,
     ...(input.capabilityKey === undefined ? {} : { capability_key: input.capabilityKey }),
     ...(input.resource === undefined ? {} : { resource: input.resource }),
+    ...(input.details === undefined ? {} : { details: input.details }),
   };
 }
 
@@ -761,6 +812,7 @@ function expandGrant(
   expansion: SessionCapabilityExpansion,
   grantedAt: string,
   pathKey: (value: string) => string,
+  currentUsage?: BudgetUsage,
 ): SessionExpansionResult {
   const capabilityKey = expansionKey(expansion, pathKey);
   const reasons: PolicyCheck[] = [];
@@ -789,20 +841,27 @@ function expandGrant(
   }
 
   if (expansion.kind === "budget") {
-    const currentLimit = session.capabilities.budgets?.[expansion.metric];
-    if (
-      currentLimit === undefined ||
-      expansion.requested_limit <= currentLimit
-    ) {
+    const configuredLimits = [
+      organization.capabilities.budgets?.[expansion.metric],
+      repository.capabilities.budgets?.[expansion.metric],
+      session.capabilities.budgets?.[expansion.metric],
+    ].filter((limit): limit is number => limit !== undefined);
+    const currentLimit =
+      configuredLimits.length === 0
+        ? DEFAULT_POLICY_BUDGETS[expansion.metric]
+        : Math.min(...configuredLimits);
+    const usage = currentUsage?.[expansion.metric] ?? 0;
+    const minimumAcceptable = Math.max(currentLimit, usage) + 1;
+    if (expansion.requested_limit < minimumAcceptable) {
       reasons.push({
         layer: "session",
         dimension: "budget",
         decision: "deny",
         reason_code: "CAPABILITY_EXPANSION_DENIED",
         message:
-          currentLimit === undefined
-            ? `Budget expansion '${capabilityKey}' cannot establish a new restrictive session limit.`
-            : `Budget expansion '${capabilityKey}' must increase the current session limit ${currentLimit}; requested ${expansion.requested_limit}.`,
+          `Budget expansion '${capabilityKey}' must be at least ${minimumAcceptable}; ` +
+          `current effective limit is ${currentLimit}, current usage is ${usage}, ` +
+          `and ${expansion.requested_limit} was requested.`,
         capability_key: capabilityKey,
         resource: expansion.metric,
       });

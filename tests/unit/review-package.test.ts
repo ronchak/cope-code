@@ -23,6 +23,10 @@ import {
 
 const NOW = "2026-07-17T12:00:00.000Z";
 const clock = { now: () => new Date(NOW) };
+const INTERNAL_RECOVERY_OPERATION_ID =
+  "_cope_internal_budget_recovery_disclosed_bytes_turn_0003";
+const INTERNAL_PENDING_RECOVERY_OPERATION_ID =
+  "_cope_internal_budget_recovery_operations_turn_0004";
 
 function makeState(overrides: Partial<SessionState> = {}): SessionState {
   return {
@@ -109,6 +113,14 @@ async function makeVerifiedEvidence(state: SessionState): Promise<{
     operationId: "op-edit",
     data: { path: "AUDIT-SECRET-PATH.ts" },
   });
+  if (state.completedOperationIds.includes(INTERNAL_RECOVERY_OPERATION_ID)) {
+    await audit.append({
+      type: "user.decided",
+      taskId: state.taskId,
+      operationId: INTERNAL_RECOVERY_OPERATION_ID,
+      data: { kind: "capability", decision: "allow_once" },
+    });
+  }
   const auditEvents = await AuditLog.verify(auditFile, state.sessionId);
 
   const disclosure = new DisclosureLedger(state.sessionId, { clock });
@@ -201,6 +213,33 @@ test("review package is deterministic, integrity protected, and contains only sa
   };
   tampered.body.counts.mutations += 1;
   assert.equal(verifyReviewPackage(tampered), false);
+});
+
+test("review package accepts local recovery IDs in journal and audit metadata", async () => {
+  const state = makeState({
+    completedOperationIds: [
+      "op-edit",
+      "op-test",
+      INTERNAL_RECOVERY_OPERATION_ID,
+    ],
+    unreturnedOperationIds: [INTERNAL_RECOVERY_OPERATION_ID],
+    pendingOperations: [
+      {
+        operationId: INTERNAL_PENDING_RECOVERY_OPERATION_ID,
+        tool: "request_capability",
+        mutating: false,
+        requestHash: "d".repeat(64),
+        status: "accepted",
+        acceptedAt: NOW,
+      },
+    ],
+  });
+  const evidence = await makeVerifiedEvidence(state);
+
+  assert.equal(
+    verifyReviewPackage(createReviewPackage({ state, ...evidence })),
+    true,
+  );
 });
 
 test("review package rejects audit and disclosure evidence that was altered after verification", async () => {

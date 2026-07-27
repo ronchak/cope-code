@@ -166,4 +166,17 @@ Bootstrap messages place the task and operating envelope in distinct authoritati
 
 `cba/1` meanings are immutable. Compatible implementation hardening can occur without changing the wire version. Adding fields, changing tool semantics, relaxing an invariant, or reinterpreting a status requires a new protocol version and compatibility fixtures. The UI adapter has its own independent `copilot-ui/v1[:certification]` version because DOM evolution must not force repository-tool changes.
 
+`max_results` is an upper bound, not a minimum-result guarantee. Applying a
+stricter effective policy ceiling and returning fewer entries with
+`truncated`/`applied_max_results` metadata preserves the existing bounded
+`list_files` meaning. Likewise, additive effective-limit facts in the
+bootstrap's authoritative operating envelope describe the already-enforced
+local policy; they do not add a model action or weaken a schema invariant.
+
+Durable local control-plane decisions use an `_cope_internal_` journal
+identifier namespace. Its leading underscore is intentionally outside the
+cba/1 model operation-ID grammar, so no formerly valid wire identifier is
+reserved or reinterpreted. This prevents untrusted requests—including
+case-folded names on Windows—from colliding with journaled recovery authority.
+
 Browser product selection is deliberately outside this wire contract. Edge and Chrome use the same bootstrap, envelopes, tool meanings, submission correlation, response capture, classifier, and agent loop. Browser product, executable identity, dedicated profile, and browser/UI contract are local configuration/runtime concerns. The persisted runtime-manifest value `edge` remains a compatibility discriminator for the live visible-browser transport, including Chrome-backed sessions; it is not a product claim and is not emitted to the model or users. Adding Chrome therefore does not change `cba/1` semantics.

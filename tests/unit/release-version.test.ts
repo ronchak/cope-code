@@ -37,6 +37,70 @@ test("release verifier rejects package-lock drift", async (context) => {
   );
 });
 
+test("release verifier rejects README version and release-link drift", async (context) => {
+  const temporary = await mkdtemp(path.join(tmpdir(), "cope-release-readme-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  await copyReleaseSurfaces(temporary);
+
+  const readme = path.join(temporary, "README.md");
+  const contents = await readFile(readme, "utf8");
+  await writeFile(
+    readme,
+    contents
+      .replace(
+        /The current package version is \*\*[^*]+\*\*\./u,
+        "The current package version is **9.9.9**.",
+      )
+      .replace(
+        /\[Cope [^\]]+ release notes\]\(docs\/RELEASE-NOTES-[^)]+\.md\)/u,
+        "[Cope 9.9.9 release notes](docs/RELEASE-NOTES-9.9.9.md)",
+      ),
+    "utf8",
+  );
+
+  await assert.rejects(
+    execFileAsync(process.execPath, [verifier], { cwd: temporary }),
+    (error: unknown) => {
+      const output = processError(error);
+      return output.includes(
+        "README.md current package version must match package.json",
+      ) &&
+        output.includes(
+          "README.md release-notes link must match package.json",
+        );
+    },
+  );
+});
+
+test("release verifier rejects a mismatched derived release-note heading", async (context) => {
+  const temporary = await mkdtemp(path.join(tmpdir(), "cope-release-note-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  await copyReleaseSurfaces(temporary);
+  const packageJson = JSON.parse(
+    await readFile(path.join(temporary, "package.json"), "utf8"),
+  ) as { version: string };
+  const releaseNotes = path.join(
+    temporary,
+    `docs/RELEASE-NOTES-${packageJson.version}.md`,
+  );
+  await writeFile(
+    releaseNotes,
+    (await readFile(releaseNotes, "utf8")).replace(
+      /^# Cope .+$/mu,
+      "# Cope 9.9.9",
+    ),
+    "utf8",
+  );
+
+  await assert.rejects(
+    execFileAsync(process.execPath, [verifier], { cwd: temporary }),
+    (error: unknown) =>
+      processError(error).includes(
+        `docs/RELEASE-NOTES-${packageJson.version}.md heading must match package.json`,
+      ),
+  );
+});
+
 test("release verifier rejects a manually duplicated active version", async (context) => {
   const temporary = await mkdtemp(path.join(tmpdir(), "cope-release-literal-"));
   context.after(async () => rm(temporary, { recursive: true, force: true }));
@@ -71,9 +135,14 @@ test("Windows installer binds packed and installed versions to package.json", as
 });
 
 async function copyReleaseSurfaces(target: string): Promise<void> {
+  const packageJson = JSON.parse(
+    await readFile(path.resolve("package.json"), "utf8"),
+  ) as { version: string };
   for (const filename of [
     "package.json",
     "package-lock.json",
+    "README.md",
+    `docs/RELEASE-NOTES-${packageJson.version}.md`,
     "src/cli/commands.ts",
     "scripts/install-windows.ps1",
     "scripts/install-macos.sh",

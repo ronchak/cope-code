@@ -59,6 +59,21 @@ export const DEFAULT_POLICY_BUDGETS: Readonly<Record<BudgetMetric, number>> = {
   protocol_repairs: 4,
 };
 
+/**
+ * Organization and repository defaults are approval ceilings, while
+ * DEFAULT_POLICY_BUDGETS is the smaller per-session working grant. Keeping the
+ * ceiling derived from the working grant guarantees bounded raise-and-continue
+ * headroom without duplicating metric values.
+ */
+export const DEFAULT_BUDGET_APPROVAL_MULTIPLIER = 4;
+export const DEFAULT_HIGHER_LAYER_BUDGETS: Readonly<Record<BudgetMetric, number>> =
+  Object.fromEntries(
+    Object.entries(DEFAULT_POLICY_BUDGETS).map(([metric, limit]) => [
+      metric,
+      limit * DEFAULT_BUDGET_APPROVAL_MULTIPLIER,
+    ]),
+  ) as unknown as Readonly<Record<BudgetMetric, number>>;
+
 export const DEFAULT_ORGANIZATION_POLICY: PolicyDocument = {
   schema_version: POLICY_SCHEMA_VERSION,
   policy_id: "default-organization",
@@ -94,7 +109,7 @@ export const DEFAULT_ORGANIZATION_POLICY: PolicyDocument = {
       max_changed_lines_per_operation: 2_000,
       on_limit_exceeded: "deny",
     },
-    budgets: DEFAULT_POLICY_BUDGETS,
+    budgets: DEFAULT_HIGHER_LAYER_BUDGETS,
     budget_exceeded: "deny",
   },
 };
@@ -118,7 +133,7 @@ export const DEFAULT_REPOSITORY_POLICY: PolicyDocument = {
       local_commits: "deny",
       on_limit_exceeded: "ask",
     },
-    budgets: DEFAULT_POLICY_BUDGETS,
+    budgets: DEFAULT_HIGHER_LAYER_BUDGETS,
     budget_exceeded: "deny",
   },
 };

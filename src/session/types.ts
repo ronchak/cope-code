@@ -76,7 +76,7 @@ export interface QueuedOutbound {
   readonly messageHash: string;
   readonly createdAt: string;
   readonly disclosure?: {
-    readonly kind: "tool_result";
+    readonly kind: "tool_result" | "decision";
     readonly disclosedBytes: number;
     readonly sha256: string;
   };

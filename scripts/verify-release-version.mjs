@@ -37,6 +37,29 @@ export async function verifyReleaseVersion(root) {
   if (packageLock?.packages?.[""]?.version !== packageVersion) {
     errors.push('package-lock.json packages[""] version must match package.json');
   }
+  if (typeof packageVersion === "string" && SEMVER.test(packageVersion)) {
+    const readme = await readText(root, "README.md", errors);
+    if (
+      readme !== undefined &&
+      !readme.includes(`The current package version is **${packageVersion}**.`)
+    ) {
+      errors.push("README.md current package version must match package.json");
+    }
+    const releaseNotesName = `docs/RELEASE-NOTES-${packageVersion}.md`;
+    const releaseNotes = await readText(root, releaseNotesName, errors);
+    if (
+      releaseNotes !== undefined &&
+      !releaseNotes.startsWith(`# Cope ${packageVersion}\n`)
+    ) {
+      errors.push(`${releaseNotesName} heading must match package.json`);
+    }
+    if (
+      readme !== undefined &&
+      !readme.includes(`[Cope ${packageVersion} release notes](${releaseNotesName})`)
+    ) {
+      errors.push("README.md release-notes link must match package.json");
+    }
+  }
 
   for (const [filename, allowedNonReleaseVersions] of ACTIVE_RELEASE_SURFACES) {
     let content;
@@ -73,6 +96,15 @@ async function readJson(root, filename, errors) {
     return JSON.parse(await readFile(path.join(root, filename), "utf8"));
   } catch (error) {
     errors.push(`${filename} is not valid readable JSON: ${errorMessage(error)}`);
+    return undefined;
+  }
+}
+
+async function readText(root, filename, errors) {
+  try {
+    return await readFile(path.join(root, filename), "utf8");
+  } catch (error) {
+    errors.push(`${filename} could not be read: ${errorMessage(error)}`);
     return undefined;
   }
 }

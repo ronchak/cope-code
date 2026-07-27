@@ -25,6 +25,9 @@ export class BudgetMeter {
     }
     if (elapsed > this.state.budgetLimits.maxElapsedMs) {
       throw new AgentError("BUDGET_EXCEEDED", "Elapsed-time budget exhausted", {
+        counter: "elapsedMs",
+        current: elapsed,
+        requested: 1,
         elapsed,
         limit: this.state.budgetLimits.maxElapsedMs,
       });

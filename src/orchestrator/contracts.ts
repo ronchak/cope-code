@@ -107,9 +107,26 @@ export type AuthorizationDecision =
       readonly plannedDisclosureBytes?: number;
       /** Effective ceilings approved only for this exact operation. */
       readonly oneTimeBudgetLimits?: Readonly<Partial<Record<BudgetMetric, number>>>;
+      /**
+       * Deterministically policy-bounded arguments to execute in place of the
+       * original request. The operation identity and journaled request remain
+       * the model's exact request.
+       */
+      readonly effectiveArguments?: Readonly<Record<string, unknown>>;
     }
-  | { readonly outcome: "ask"; readonly reasonCode: string; readonly explanation: string; readonly capability: Readonly<Record<string, unknown>> }
-  | { readonly outcome: "deny"; readonly reasonCode: string; readonly explanation: string }
+  | {
+      readonly outcome: "ask";
+      readonly reasonCode: string;
+      readonly explanation: string;
+      readonly capability: Readonly<Record<string, unknown>>;
+      readonly details?: Readonly<Record<string, unknown>>;
+    }
+  | {
+      readonly outcome: "deny";
+      readonly reasonCode: string;
+      readonly explanation: string;
+      readonly details?: Readonly<Record<string, unknown>>;
+    }
   | { readonly outcome: "conflict"; readonly reasonCode: string; readonly explanation: string };
 
 export interface RuntimePolicy {
@@ -120,6 +137,14 @@ export interface RuntimePolicy {
     capability: Readonly<Record<string, unknown>>,
   ): AuthorizationDecision | Promise<AuthorizationDecision>;
   expandSessionGrant(capability: Readonly<Record<string, unknown>>): Promise<boolean>;
+  assessSessionGrantExpansion?(
+    capability: Readonly<Record<string, unknown>>,
+  ): Readonly<{
+    outcome: "change" | "no_op" | "deny";
+    reasonCode: string;
+    explanation: string;
+    details?: Readonly<Record<string, unknown>>;
+  }>;
 }
 
 export interface ToolExecutor {

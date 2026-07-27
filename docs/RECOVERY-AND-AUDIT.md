@@ -165,6 +165,22 @@ Session status alone is not proof that browser work can resume. Cope derives a s
 - `reconcile_required` means runtime evidence is unreadable or mutation evidence makes automatic discard unsafe.
 - `terminal` means no recovery action is needed.
 
+Disclosure-budget exhaustion is a nonterminal recovery condition. A
+data-bearing result that would cross the reserved data ceiling is replaced by
+a compact source-free notice, durably queued, and the session moves to
+`paused`. The pause does not apply terminal cleanup. On resume, the queued
+notice is submitted once before Copilot continues; already-completed tools and
+mutations are recovered from their journal/checkpoint evidence and are not
+replayed. Ordinary decisions and repairs cannot consume the final 8 KiB
+emergency slice, and the runtime mechanically caps the recovery envelope to
+that slice. Where higher policy layers permit it, Cope can ask the operator
+for a monotonic session-budget raise and continue directly from the durable
+turn. The approval passes through the normal decision journal and integrity
+artifact before the grant changes, closing the crash window between consent
+and persistence. If a hard organization or repository ceiling prevents expansion, Cope
+still pauses with a terminal-visible `BUDGET_EXCEEDED` diagnostic rather than
+transitioning the session to `failed`.
+
 `created` and `preflight` are not resume-supported states. Recovery offers a clean abort for those incomplete startup states unless mutation evidence requires reconciliation. New session publication persists `grant_pending` before the runtime manifest becomes readable, so a crash cannot create a runtime-pinned pre-grant session that is incorrectly advertised as resumable.
 
 Setup performs this scan under the configuration lock before browser discovery, prompts, or launch, then repeats it while holding the lock immediately before committing setup. If live session publication currently owns that lock, early setup deflects as concurrent configuration use instead of inspecting and misclassifying partial startup evidence. A new live session acquires the same lock before it publishes `session.json` and holds it until the pinned runtime manifest and grant-pending state are durable. Setup and session startup therefore have one ordering boundary: setup commits before any session state is exposed, or a complete recoverable session exists before setup can proceed. `cope sessions --all`, `cope resume`, and `cope doctor` use the same assessment—including local signed-executable verification—so their guidance cannot disagree. Recovery classification remains independent of current Copilot-page identity heuristics: the dedicated browser profile is the durable authentication boundary, while page readiness is verified when live work begins.

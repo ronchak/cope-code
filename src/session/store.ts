@@ -3,7 +3,10 @@ import { access, mkdir, open, readFile, rename, unlink } from "node:fs/promises"
 import path from "node:path";
 import { AgentError, errorMessage } from "../shared/errors.js";
 import { newId, stableJson } from "../shared/crypto.js";
-import { isOperationId } from "../shared/operation-id.js";
+import {
+  isJournalOperationId,
+  isOperationId,
+} from "../shared/operation-id.js";
 import { currentHost, workspaceKey } from "./paths.js";
 import { SESSION_SCHEMA_VERSION, type SessionState } from "./types.js";
 import { allowedTransitions, isTerminal } from "./state-machine.js";
@@ -406,10 +409,10 @@ function assertValidSessionState(value: Partial<SessionState>): asserts value is
   if (
     !isHashRecord(value.policyHashes) ||
     !value.pendingOperations.every(isPendingOperation) ||
-    !value.completedOperationIds.every(isOperationId) ||
+    !value.completedOperationIds.every(isJournalOperationId) ||
     new Set(value.completedOperationIds).size !== value.completedOperationIds.length ||
     (value.unreturnedOperationIds !== undefined &&
-      (!value.unreturnedOperationIds.every(isOperationId) ||
+      (!value.unreturnedOperationIds.every(isJournalOperationId) ||
         new Set(value.unreturnedOperationIds).size !== value.unreturnedOperationIds.length ||
         value.unreturnedOperationIds.some(
           (operationId) => !value.completedOperationIds?.includes(operationId),
@@ -483,7 +486,9 @@ function assertValidSessionState(value: Partial<SessionState>): asserts value is
             value.queuedOutbound.disclosure,
             ["kind", "disclosedBytes", "sha256"],
           ) ||
-          value.queuedOutbound.disclosure.kind !== "tool_result" ||
+          !["tool_result", "decision"].includes(
+            value.queuedOutbound.disclosure.kind,
+          ) ||
           !Number.isSafeInteger(value.queuedOutbound.disclosure.disclosedBytes) ||
           value.queuedOutbound.disclosure.disclosedBytes < 0 ||
           !HASH_PATTERN.test(value.queuedOutbound.disclosure.sha256)
@@ -565,7 +570,7 @@ function isPendingOperation(value: unknown): value is SessionState["pendingOpera
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const item = value as Partial<SessionState["pendingOperations"][number]>;
   return hasExactKeys(item, ["operationId", "tool", "mutating", "requestHash", "status", "acceptedAt"]) &&
-    isOperationId(item.operationId) && typeof item.tool === "string" && item.tool.length <= 128 && typeof item.mutating === "boolean" &&
+    isJournalOperationId(item.operationId) && typeof item.tool === "string" && item.tool.length <= 128 && typeof item.mutating === "boolean" &&
     typeof item.requestHash === "string" && /^[a-f0-9]{64}$/u.test(item.requestHash) &&
     (item.status === "accepted" || item.status === "executing" || item.status === "indeterminate") &&
     isIsoTimestamp(item.acceptedAt);

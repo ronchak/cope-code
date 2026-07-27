@@ -2,7 +2,10 @@ import { opendir, stat } from "node:fs/promises";
 
 import { minimatch } from "minimatch";
 
-import { DEFAULT_LIST_FILES_MAX_RESULTS } from "../protocol/types.js";
+import {
+  DEFAULT_LIST_FILES_MAX_RESULTS,
+  MAX_LIST_FILES_RESULTS,
+} from "../protocol/types.js";
 import { AgentError } from "../shared/errors.js";
 import type { RepositoryBoundary } from "./boundary.js";
 import { RepositoryIgnore } from "./ignore.js";
@@ -78,7 +81,7 @@ export class RepositoryTools {
     this.contentProcessor = options.contentProcessor;
     this.isPathReadable = options.isPathReadable ?? (() => true);
     this.maxListDepth = options.maxListDepth ?? 6;
-    this.maxListResults = options.maxListResults ?? 500;
+    this.maxListResults = options.maxListResults ?? MAX_LIST_FILES_RESULTS;
     this.defaultListResults = Math.min(
       options.defaultListResults ?? DEFAULT_LIST_FILES_MAX_RESULTS,
       this.maxListResults,
@@ -209,6 +212,7 @@ export class RepositoryTools {
       contractVersion: REPOSITORY_CONTRACT_VERSION,
       root: start.relativePath,
       entries,
+      appliedMaxResults: maxResults,
       truncated,
       excludedCount,
     };

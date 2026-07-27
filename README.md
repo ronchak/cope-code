@@ -6,9 +6,9 @@ The deterministic harness remains responsible for repository boundaries, permiss
 
 ## Current release
 
-The current package version is **0.1.6**. See the
-[Cope 0.1.6 release notes](docs/RELEASE-NOTES-0.1.6.md) for the complete
-interrupted-session recovery and setup/startup concurrency fixes.
+The current package version is **0.1.7**. See the
+[Cope 0.1.7 release notes](docs/RELEASE-NOTES-0.1.7.md) for the complete
+disclosure-budget recovery and bounded repository-inspection fixes.
 
 ## Install on Windows
 
@@ -188,6 +188,7 @@ Architecture and controls remain documented under `docs`:
 - `docs/WINDOWS-TARGET.md`
 - `docs/MACOS-TARGET.md`
 - `docs/LIVE-PILOT-ACCEPTANCE.md`
+- `docs/RELEASE-NOTES-0.1.7.md`
 - `docs/RELEASE-NOTES-0.1.6.md`
 
 ## Uninstall

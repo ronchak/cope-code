@@ -10,6 +10,7 @@ import {
 } from "../transport/model-transport.js";
 import { newId, sha256, stableJson } from "../shared/crypto.js";
 import { AgentError, errorMessage } from "../shared/errors.js";
+import { INTERNAL_OPERATION_ID_PREFIX } from "../shared/operation-id.js";
 import type { Clock } from "../shared/time.js";
 import { systemClock } from "../shared/time.js";
 import { BudgetMeter } from "../session/budgets.js";
@@ -59,6 +60,8 @@ import type {
   UserInteraction,
 } from "./contracts.js";
 import {
+  CONTROL_PLANE_RESERVE_BYTES,
+  EMERGENCY_NOTICE_RESERVE_BYTES,
   TOOL_RESULT_ENVELOPE_RESERVE_BYTES,
 } from "./disclosure-budget.js";
 
@@ -113,6 +116,8 @@ export class AgentRuntime {
   private interruption?: { readonly status: "paused" | "aborted"; readonly reason: string };
   private toolResultDisclosureLimit: number | undefined = undefined;
   private toolResultDisclosureReservation = 0;
+  private disclosureBudgetPauseReason: string | undefined;
+  private activeModelTurnId: string | undefined;
 
   public constructor(private readonly dependencies: AgentRuntimeDependencies) {
     this.state = dependencies.state;
@@ -165,6 +170,11 @@ export class AgentRuntime {
         });
         outbound = await this.serializeForDisclosure(bootstrap, "bootstrap");
         await this.queueOutbound(outbound, "turn_0001");
+        if (this.disclosureBudgetPauseReason !== undefined) {
+          return await this.pauseWithInterruptionPriority(
+            this.disclosureBudgetPauseReason,
+          );
+        }
       } else {
         throw new AgentError("RECOVERY_REQUIRED", "Session has no recoverable response, submission, or queued message");
       }
@@ -222,6 +232,7 @@ export class AgentRuntime {
           if (terminal) return terminal;
           throw new AgentError("TRANSPORT_INDETERMINATE", `Unhandled transport state ${response.status}`);
         }
+        this.activeModelTurnId = turnId;
         await this.dependencies.audit.append({
           type: "model.response",
           taskId: this.state.taskId,
@@ -295,6 +306,7 @@ export class AgentRuntime {
           );
           await this.queueOutbound(outbound, nextTurnId(this.state.turnSequence));
           await this.dependencies.artifacts?.remove("response", turnId);
+          this.activeModelTurnId = undefined;
           continue;
         }
 
@@ -324,6 +336,12 @@ export class AgentRuntime {
           },
         );
         await this.dependencies.artifacts?.remove("response", turnId);
+        this.activeModelTurnId = undefined;
+        if (this.disclosureBudgetPauseReason !== undefined) {
+          return await this.pauseWithInterruptionPriority(
+            this.disclosureBudgetPauseReason,
+          );
+        }
         if (this.interruption !== undefined) return await this.finishInterruption();
       }
 
@@ -336,6 +354,13 @@ export class AgentRuntime {
         !["completed", "rolled_back", "blocked", "aborted", "failed", "paused"].includes(this.state.status)
       ) {
         return await this.pauseWithInterruptionPriority(error.message);
+      }
+      if (
+        error instanceof AgentError &&
+        error.code === "BUDGET_EXCEEDED" &&
+        !["completed", "rolled_back", "blocked", "aborted", "failed"].includes(this.state.status)
+      ) {
+        return await this.recoverFromBudgetExhaustion(error);
       }
       const failed = await this.fail(error);
       return failed;
@@ -641,7 +666,7 @@ export class AgentRuntime {
     options: {
       readonly returnedOperationIds?: readonly string[];
       readonly nextStatus?: "awaiting_model";
-      readonly disclosureKind?: "tool_result";
+      readonly disclosureKind?: "tool_result" | "decision";
     } = {},
   ): Promise<void> {
     const artifactId = `queued_${turnId}`;
@@ -889,7 +914,7 @@ export class AgentRuntime {
         readonly outbound: string;
         readonly returnedOperationIds?: readonly string[];
         readonly queueStatus?: "awaiting_model";
-        readonly disclosureKind?: "tool_result";
+        readonly disclosureKind?: "tool_result" | "decision";
       }
     | { readonly terminal: true; readonly result: AgentRunResult }
   > {
@@ -905,6 +930,7 @@ export class AgentRuntime {
         const outcomes = await this.executeCalls(action.calls, turnId);
         await this.move("returning_results");
         let outbound: string;
+        let disclosureKind: "tool_result" | "decision" = "tool_result";
         try {
           outbound = await this.serializeForDisclosure(
             this.dependencies.protocol.renderToolOutcomes({ taskId: this.state.taskId, priorTurnId: turnId, outcomes }),
@@ -912,6 +938,21 @@ export class AgentRuntime {
             this.toolResultDisclosureLimit,
             true,
           );
+        } catch (error) {
+          if (!isBudgetExceeded(error)) throw error;
+          const reason = disclosureBudgetReason(error);
+          outbound = await this.serializeForDisclosure(
+            this.dependencies.protocol.renderToolOutcomes({
+              taskId: this.state.taskId,
+              priorTurnId: turnId,
+              outcomes: budgetExhaustedOutcomes(action.calls, outcomes, error),
+            }),
+            "decision",
+            this.toolResultDisclosureLimit,
+            true,
+          );
+          disclosureKind = "decision";
+          this.disclosureBudgetPauseReason = reason;
         } finally {
           this.toolResultDisclosureLimit = undefined;
           this.toolResultDisclosureReservation = 0;
@@ -921,7 +962,7 @@ export class AgentRuntime {
           outbound,
           returnedOperationIds: action.calls.map((call) => call.operationId),
           queueStatus: "awaiting_model",
-          disclosureKind: "tool_result",
+          disclosureKind,
         };
       }
       case "request_user_input": {
@@ -954,17 +995,26 @@ export class AgentRuntime {
       }
       case "request_capability": {
         await this.move("awaiting_user");
+        const assessment =
+          this.dependencies.policy.assessSessionGrantExpansion?.(
+            action.capability,
+          );
         const decisionRecord = await this.executeUserDecision(
           action.requestId,
           "request_capability",
           action,
           turnId,
-          () => this.dependencies.user.requestCapability({
-            capability: action.capability,
-            reason: action.reason,
-            ...(action.risk === undefined ? {} : { risk: action.risk }),
-            signal: this.controller.signal,
-          }),
+          assessment !== undefined && assessment.outcome !== "change"
+            ? async () => ({
+                decision: "deny" as const,
+                note: assessment.explanation,
+              })
+            : () => this.dependencies.user.requestCapability({
+                capability: action.capability,
+                reason: action.reason,
+                ...(action.risk === undefined ? {} : { risk: action.risk }),
+                signal: this.controller.signal,
+              }),
         );
         this.throwIfInterrupted();
         const userDecision = capabilityDecision(decisionRecord);
@@ -983,6 +1033,14 @@ export class AgentRuntime {
           ...(userDecision.decision === "allow_once"
             ? { reasonCode: "ALLOW_ONCE_REQUIRES_EXACT_OPERATION" }
             : {}),
+          ...(assessment === undefined || assessment.outcome === "change"
+            ? {}
+            : {
+                reasonCode: assessment.reasonCode,
+                ...(assessment.details === undefined
+                  ? {}
+                  : { details: assessment.details }),
+              }),
         };
         await this.dependencies.audit.append({
           type: "capability.decided",
@@ -1112,6 +1170,7 @@ export class AgentRuntime {
     request: unknown,
     turnId: string,
     requester: () => Promise<Readonly<Record<string, unknown>>>,
+    options: { readonly chargeOperation?: boolean } = {},
   ): Promise<Readonly<Record<string, unknown>>> {
     this.throwIfInterrupted();
     const alreadyAccounted =
@@ -1124,7 +1183,9 @@ export class AgentRuntime {
       request,
       this.now(),
     );
-    if (!alreadyAccounted) this.meter.consume("operations");
+    if (!alreadyAccounted && options.chargeOperation !== false) {
+      this.meter.consume("operations");
+    }
     const artifactId = `decision_${requestId}`;
     if (registration.kind === "replay_completed") {
       const decision = await this.readDecisionArtifact(artifactId);
@@ -1227,9 +1288,148 @@ export class AgentRuntime {
     return outcomes;
   }
 
+  private async recoverFromBudgetExhaustion(
+    error: AgentError,
+  ): Promise<AgentRunResult> {
+    const reason = disclosureBudgetReason(error);
+    if (await this.tryRaiseBudgetAndContinue(error, reason)) {
+      this.disclosureBudgetPauseReason = undefined;
+      this.activeModelTurnId = undefined;
+      if (this.state.status !== "paused") await this.move("paused", reason);
+      return this.run();
+    }
+    await this.queueEmergencyBudgetNotice(error).catch(() => false);
+    return this.pauseWithInterruptionPriority(reason);
+  }
+
+  private async tryRaiseBudgetAndContinue(
+    error: AgentError,
+    reason: string,
+  ): Promise<boolean> {
+    const recovery = budgetRecoveryCapability(error);
+    if (
+      recovery === undefined ||
+      this.dependencies.policy.assessSessionGrantExpansion === undefined
+    ) {
+      return false;
+    }
+    const assessment =
+      this.dependencies.policy.assessSessionGrantExpansion(
+        recovery.capability,
+      );
+    if (assessment.outcome !== "change") return false;
+    const recoveryReason =
+      `${reason} Cope can continue from the durable session state if this ` +
+      "session budget is raised.";
+    const decisionRecord = await this.executeUserDecision(
+      budgetRecoveryRequestId(
+        recovery,
+        this.activeModelTurnId,
+        this.state.turnSequence,
+      ),
+      "request_capability",
+      {
+        type: "budget_recovery",
+        capability: recovery.capability,
+        reason: recoveryReason,
+      },
+      this.activeModelTurnId ??
+        this.state.submission?.turnId ??
+        this.state.queuedOutbound?.turnId ??
+        "turn_0000",
+      () => this.dependencies.user.requestCapability({
+        capability: recovery.capability,
+        reason: recoveryReason,
+        risk:
+          "The expansion remains bounded by organization and repository policy. " +
+          "Only an allow-for-session decision can resume this interrupted work.",
+        signal: this.controller.signal,
+      }),
+      { chargeOperation: false },
+    );
+    const decision = capabilityDecision(decisionRecord);
+    let effective = false;
+    if (decision.decision === "allow_session") {
+      effective = await this.dependencies.policy.expandSessionGrant(
+        recovery.capability,
+      );
+    }
+    await this.dependencies.audit.append({
+      type: "capability.decided",
+      taskId: this.state.taskId,
+      ...(this.activeModelTurnId === undefined
+        ? {}
+        : { turnId: this.activeModelTurnId }),
+      data: {
+        decision: decision.decision,
+        effective,
+        recovery: true,
+        metric: recovery.metric,
+        requestedLimit: recovery.requestedLimit,
+      },
+    });
+    return effective;
+  }
+
+  private async queueEmergencyBudgetNotice(
+    error: AgentError,
+  ): Promise<boolean> {
+    if (
+      this.state.queuedOutbound !== undefined ||
+      this.activeModelTurnId === undefined
+    ) {
+      return false;
+    }
+    const priorTurnId = this.activeModelTurnId;
+    const reason = disclosureBudgetReason(error);
+    const notice = this.dependencies.protocol.renderProtocolError({
+      taskId: this.state.taskId,
+      priorTurnId,
+      code: "BUDGET_EXCEEDED",
+      message:
+        `${reason} This source-free notice was delivered from reserved ` +
+        "recovery headroom; completed operations will not be replayed.",
+      repairAttempt: Math.max(1, this.state.protocolRepairStreak + 1),
+    });
+    const outbound = await this.serializeForDisclosure(
+      notice,
+      "emergency",
+      undefined,
+      true,
+    );
+    if (
+      ["executing_tools", "awaiting_user", "validating_completion"].includes(
+        this.state.status,
+      )
+    ) {
+      await this.move("returning_results");
+    }
+    await this.queueOutbound(
+      outbound,
+      nextTurnId(this.state.turnSequence),
+      {
+        ...(this.state.unreturnedOperationIds?.length
+          ? { returnedOperationIds: [...this.state.unreturnedOperationIds] }
+          : {}),
+        ...(this.state.status === "returning_results"
+          ? { nextStatus: "awaiting_model" as const }
+          : {}),
+        disclosureKind: "decision",
+      },
+    );
+    await this.dependencies.artifacts?.remove("response", priorTurnId);
+    this.activeModelTurnId = undefined;
+    return true;
+  }
+
   private async serializeForDisclosure(
     message: string,
-    kind: "bootstrap" | "tool_result" | "repair" | "decision",
+    kind:
+      | "bootstrap"
+      | "tool_result"
+      | "repair"
+      | "decision"
+      | "emergency",
     oneTimeDisclosedBytesLimit?: number,
     deferAudit = false,
   ): Promise<string> {
@@ -1237,6 +1437,22 @@ export class AgentRuntime {
     // handed to the final disclosure guard. The exact serialized size is then
     // charged once, at the browser boundary, rather than per intermediate tool.
     const unredactedBytes = Buffer.byteLength(message);
+    if (
+      kind === "emergency" &&
+      unredactedBytes > EMERGENCY_NOTICE_RESERVE_BYTES
+    ) {
+      throw new AgentError(
+        "BUDGET_EXCEEDED",
+        "Emergency budget notice exceeds its reserved byte cap",
+        {
+          counter: "disclosedBytes",
+          current: this.state.budgetUsage.disclosedBytes,
+          requested: unredactedBytes,
+          limit: EMERGENCY_NOTICE_RESERVE_BYTES,
+          emergency: true,
+        },
+      );
+    }
     if (
       kind === "tool_result" &&
       this.toolResultDisclosureReservation > 0 &&
@@ -1246,18 +1462,43 @@ export class AgentRuntime {
         "BUDGET_EXCEEDED",
         "Rendered tool result exceeded its authorized disclosure reservation",
         {
+          counter: "disclosedBytes",
+          current: this.state.budgetUsage.disclosedBytes,
+          requested: unredactedBytes,
+          limit: this.toolResultDisclosureReservation,
           actual: unredactedBytes,
           reserved: this.toolResultDisclosureReservation,
+          reservation: true,
         },
       );
     }
-    this.meter.assertCanConsume(
-      "disclosedBytes",
+    this.assertDisclosureCanConsume(
+      kind,
       unredactedBytes,
       oneTimeDisclosedBytesLimit,
     );
-    const serialized = await this.dependencies.disclosure.inspectAndSerialize(message, { kind });
+    const disclosureKind = kind === "emergency" ? "decision" : kind;
+    const serialized = await this.dependencies.disclosure.inspectAndSerialize(
+      message,
+      { kind: disclosureKind },
+    );
     const disclosedBytes = Buffer.byteLength(serialized);
+    if (
+      kind === "emergency" &&
+      disclosedBytes > EMERGENCY_NOTICE_RESERVE_BYTES
+    ) {
+      throw new AgentError(
+        "BUDGET_EXCEEDED",
+        "Guarded emergency budget notice exceeds its reserved byte cap",
+        {
+          counter: "disclosedBytes",
+          current: this.state.budgetUsage.disclosedBytes,
+          requested: disclosedBytes,
+          limit: EMERGENCY_NOTICE_RESERVE_BYTES,
+          emergency: true,
+        },
+      );
+    }
     if (
       kind === "tool_result" &&
       this.toolResultDisclosureReservation > 0 &&
@@ -1267,13 +1508,18 @@ export class AgentRuntime {
         "BUDGET_EXCEEDED",
         "Guarded tool result exceeded its authorized disclosure reservation",
         {
+          counter: "disclosedBytes",
+          current: this.state.budgetUsage.disclosedBytes,
+          requested: disclosedBytes,
+          limit: this.toolResultDisclosureReservation,
           actual: disclosedBytes,
           reserved: this.toolResultDisclosureReservation,
+          reservation: true,
         },
       );
     }
-    this.meter.assertCanConsume(
-      "disclosedBytes",
+    this.assertDisclosureCanConsume(
+      kind,
       disclosedBytes,
       oneTimeDisclosedBytesLimit,
     );
@@ -1286,10 +1532,67 @@ export class AgentRuntime {
       await this.dependencies.audit.append({
         type: "disclosure.recorded",
         taskId: this.state.taskId,
-        data: { kind, disclosedBytes, sha256: sha256(serialized) },
+        data: {
+          kind: disclosureKind,
+          disclosedBytes,
+          sha256: sha256(serialized),
+        },
       });
     }
     return serialized;
+  }
+
+  private assertDisclosureCanConsume(
+    kind:
+      | "bootstrap"
+      | "tool_result"
+      | "repair"
+      | "decision"
+      | "emergency",
+    amount: number,
+    oneTimeDisclosedBytesLimit?: number,
+  ): void {
+    if (kind === "emergency") {
+      this.meter.assertCanConsume(
+        "disclosedBytes",
+        amount,
+        oneTimeDisclosedBytesLimit,
+      );
+      return;
+    }
+    // Validate any one-time ceiling with the meter before deriving the
+    // strictly lower data-plane ceiling from it.
+    this.meter.assertCanConsume(
+      "disclosedBytes",
+      0,
+      oneTimeDisclosedBytesLimit,
+    );
+    const totalLimit =
+      oneTimeDisclosedBytesLimit ?? this.state.budgetLimits.maxDisclosedBytes;
+    const reserved =
+      kind === "tool_result"
+        ? CONTROL_PLANE_RESERVE_BYTES
+        : EMERGENCY_NOTICE_RESERVE_BYTES;
+    const dataLimit = Math.max(0, totalLimit - reserved);
+    const current = this.state.budgetUsage.disclosedBytes;
+    if (current + amount > dataLimit) {
+      throw new AgentError(
+        "BUDGET_EXCEEDED",
+        kind === "tool_result"
+          ? "Disclosure data budget exhausted; control-plane headroom is reserved"
+          : "Disclosure control budget exhausted; emergency notice headroom is reserved",
+        {
+          counter: "disclosedBytes",
+          current,
+          requested: amount,
+          limit: dataLimit,
+          totalLimit,
+          reserved,
+          minimum_acceptable:
+            current + amount + reserved,
+        },
+      );
+    }
   }
 
   private async executeCall(
@@ -1503,7 +1806,14 @@ export class AgentRuntime {
         operationId: call.operationId,
         tool: call.name,
         status,
-        data: { code: policy.reasonCode, decision: policy.outcome, message: policy.explanation },
+        data: {
+          code: policy.reasonCode,
+          decision: policy.outcome,
+          message: policy.explanation,
+          ...(!("details" in policy) || policy.details === undefined
+            ? {}
+            : { details: policy.details }),
+        },
         safeMetadata: failed.safeResult ?? {},
       };
     }
@@ -1547,6 +1857,9 @@ export class AgentRuntime {
             code: safe.reasonCode,
             decision: "deny",
             message: errorMessage(error),
+            ...(error instanceof AgentError
+              ? { details: error.details }
+              : {}),
           },
           safeMetadata: failed.safeResult ?? safe,
         };
@@ -1554,11 +1867,40 @@ export class AgentRuntime {
     }
     const specializedCounter = specializedBudgetCounter(call.name);
     if (specializedCounter !== undefined) {
-      this.meter.consume(
-        specializedCounter,
-        1,
-        oneTimeBudgetLimits[specializedCounter],
-      );
+      try {
+        this.meter.consume(
+          specializedCounter,
+          1,
+          oneTimeBudgetLimits[specializedCounter],
+        );
+      } catch (error) {
+        if (!isBudgetExceeded(error)) throw error;
+        const safe = {
+          reasonCode: error.code,
+          counter: specializedCounter,
+        };
+        const failed = await this.dependencies.journal.markFailed(
+          registration.record,
+          this.now(),
+          "budget_exhausted_before_execution",
+          safe,
+        );
+        this.clearPending(call.operationId);
+        this.markOperationAwaitingReturn(call.operationId);
+        await this.persist();
+        return {
+          operationId: call.operationId,
+          tool: call.name,
+          status: "denied",
+          data: {
+            code: error.code,
+            decision: "deny",
+            message: errorMessage(error),
+            details: error.details,
+          },
+          safeMetadata: failed.safeResult ?? safe,
+        };
+      }
     }
     this.throwIfInterrupted();
     let executing: OperationRecord;
@@ -1581,8 +1923,12 @@ export class AgentRuntime {
     this.throwIfInterrupted();
     let operationWasCommitted = false;
     try {
+      const executionCall =
+        policy.outcome === "allow" && policy.effectiveArguments !== undefined
+          ? { ...call, arguments: policy.effectiveArguments }
+          : call;
       const outcome = await this.dependencies.tools.execute(
-        call,
+        executionCall,
         this.controller.signal,
         policy.outcome === "allow" && policy.plannedMutation !== undefined
           ? { plannedMutation: policy.plannedMutation }
@@ -1897,8 +2243,8 @@ export class AgentRuntime {
         "Combined tool-result disclosure reservation is invalid",
       );
     }
-    this.meter.assertCanConsume(
-      "disclosedBytes",
+    this.assertDisclosureCanConsume(
+      "tool_result",
       reservation,
       approvedLimit,
     );
@@ -2077,6 +2423,198 @@ function selectAction(messages: readonly NormalizedModelMessage[]): NormalizedMo
     throw new AgentError("PROTOCOL_INVALID", "A model turn contains more than one dependent action class");
   }
   return actionable[0] ?? messages[0] ?? (() => { throw new AgentError("PROTOCOL_INVALID", "Empty model turn"); })();
+}
+
+function isBudgetExceeded(error: unknown): error is AgentError {
+  return error instanceof AgentError && error.code === "BUDGET_EXCEEDED";
+}
+
+function disclosureBudgetReason(error: AgentError): string {
+  const counter =
+    typeof error.details.counter === "string"
+      ? error.details.counter
+      : "budget";
+  const current =
+    typeof error.details.current === "number"
+      ? error.details.current
+      : undefined;
+  const limit =
+    typeof error.details.totalLimit === "number"
+      ? error.details.totalLimit
+      : typeof error.details.limit === "number"
+        ? error.details.limit
+        : undefined;
+  const minimum =
+    typeof error.details.minimum_acceptable === "number"
+      ? error.details.minimum_acceptable
+      : current === undefined ||
+          typeof error.details.requested !== "number"
+        ? undefined
+        : current + error.details.requested;
+  const usage =
+    current === undefined || limit === undefined
+      ? ""
+      : ` (${current} / ${limit})`;
+  if (error.details.reservation === true) {
+    const actual =
+      typeof error.details.actual === "number"
+        ? error.details.actual
+        : error.details.requested;
+    const reservation =
+      typeof error.details.reserved === "number"
+        ? error.details.reserved
+        : limit;
+    return `BUDGET_EXCEEDED: ${counter} result reservation (${String(actual)} / ${String(reservation)}). Retry with a narrower bounded request or request a larger authorized disclosure allowance, then resume this session.`;
+  }
+  const next =
+    minimum === undefined
+      ? "Raise the applicable limit and resume this session."
+      : `Raise the applicable limit to at least ${minimum} and resume this session.`;
+  return `BUDGET_EXCEEDED: ${counter}${usage}. ${next}`;
+}
+
+function budgetExhaustedOutcomes(
+  calls: readonly NormalizedToolCall[],
+  outcomes: readonly ToolOutcome[],
+  error: AgentError,
+): readonly ToolOutcome[] {
+  const reason = disclosureBudgetReason(error);
+  const details = {
+    ...error.details,
+    resumable: true,
+    ...(error.details.reservation !== true &&
+    typeof error.details.minimum_acceptable === "number"
+      ? {
+          retry_with: {
+            kind: "budget",
+            metric: "disclosed_bytes",
+            requested_limit: error.details.minimum_acceptable,
+          },
+        }
+      : {}),
+  };
+  return calls.map((call, index) => {
+    const original = outcomes[index];
+    const completed = original?.status === "success";
+    return {
+      operationId: call.operationId,
+      tool: call.name,
+      status: completed
+        ? "success"
+        : original?.status ?? "denied",
+      data: completed
+        ? {
+            code: "BUDGET_EXCEEDED",
+            message:
+              "The operation completed, but its source-bearing result was omitted because the disclosure data budget is exhausted.",
+            result_omitted: true,
+            details,
+          }
+        : {
+            code: "BUDGET_EXCEEDED",
+            decision: "deny",
+            message: reason,
+            details,
+          },
+      safeMetadata: {
+        ...(original?.safeMetadata ?? {}),
+        reasonCode: "BUDGET_EXCEEDED",
+        resultOmitted: completed,
+      },
+    };
+  });
+}
+
+interface BudgetRecoveryCapability {
+  readonly metric: BudgetMetric;
+  readonly requestedLimit: number;
+  readonly capability: Readonly<{
+    kind: "budget";
+    metric: BudgetMetric;
+    requested_limit: number;
+  }>;
+}
+
+const POLICY_METRIC_BY_RUNTIME_COUNTER: Readonly<
+  Record<string, BudgetMetric | undefined>
+> = {
+  elapsedMs: "elapsed_ms",
+  turns: "turns",
+  operations: "operations",
+  readFiles: "read_files",
+  disclosedBytes: "disclosed_bytes",
+  changedFiles: "changed_files",
+  changedLines: "changed_lines",
+  commands: "commands",
+  commandOutputBytes: "command_output_bytes",
+  protocolRepairs: "protocol_repairs",
+};
+
+function budgetRecoveryCapability(
+  error: AgentError,
+): BudgetRecoveryCapability | undefined {
+  if (
+    error.details.reservation === true ||
+    error.details.emergency === true
+  ) {
+    return undefined;
+  }
+  const counter =
+    typeof error.details.counter === "string"
+      ? error.details.counter
+      : undefined;
+  const metric =
+    counter === undefined
+      ? undefined
+      : POLICY_METRIC_BY_RUNTIME_COUNTER[counter];
+  if (metric === undefined) return undefined;
+  const current =
+    typeof error.details.current === "number"
+      ? error.details.current
+      : 0;
+  const limit =
+    typeof error.details.totalLimit === "number"
+      ? error.details.totalLimit
+      : typeof error.details.limit === "number"
+        ? error.details.limit
+        : 0;
+  const requested =
+    typeof error.details.minimum_acceptable === "number"
+      ? error.details.minimum_acceptable
+      : Math.max(current, limit) + 1;
+  const requestedLimit =
+    metric === "elapsed_ms"
+      ? Math.max(requested, current + 60_000)
+      : requested;
+  if (
+    !Number.isSafeInteger(requestedLimit) ||
+    requestedLimit < 1
+  ) {
+    return undefined;
+  }
+  return {
+    metric,
+    requestedLimit,
+    capability: {
+      kind: "budget",
+      metric,
+      requested_limit: requestedLimit,
+    },
+  };
+}
+
+function budgetRecoveryRequestId(
+  recovery: BudgetRecoveryCapability,
+  turnId: string | undefined,
+  turnSequence: number,
+): string {
+  const turn =
+    turnId?.replaceAll(/[^A-Za-z0-9_-]/gu, "_") ??
+    `turn_${String(turnSequence).padStart(4, "0")}`;
+  return (
+    `${INTERNAL_OPERATION_ID_PREFIX}budget_recovery_${recovery.metric}_` +
+    `${String(recovery.requestedLimit)}_${turn}`
+  ).slice(0, 128);
 }
 
 function specializedBudgetCounter(tool: string): "commands" | "readFiles" | undefined {
