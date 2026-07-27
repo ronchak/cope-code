@@ -112,6 +112,10 @@ Supported metrics are:
 | `protocol_repairs` | malformed-model-response repairs |
 
 `budget_exceeded` is `ask` or `deny`. A permitted session expansion remains bounded by organization and repository maximums.
+Budget expansion is strictly monotonic: the requested limit must be greater than
+the current session limit. Equal or lower values are rejected and never persisted,
+so an approval cannot accidentally strand a live session below usage already
+consumed.
 
 ## `cba-repository-config/1`
 

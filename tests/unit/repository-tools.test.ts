@@ -25,6 +25,22 @@ import { CommandCatalog } from "../../src/tools/command-catalog.js";
 
 const execFileAsync = promisify(execFile);
 
+test("list_files defaults to a small result window without lowering its explicit maximum", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cba-repository-list-default-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  for (let index = 0; index < 25; index += 1) {
+    await writeFile(path.join(root, `file-${String(index).padStart(2, "0")}.txt`), "x");
+  }
+  const tools = await RepositoryTools.create(await RepositoryBoundary.create(root));
+
+  const defaultListing = await tools.listFiles({ maxDepth: 0 });
+  assert.equal(defaultListing.entries.length, 20);
+  assert.equal(defaultListing.truncated, true);
+
+  const explicitListing = await tools.listFiles({ maxDepth: 0, maxResults: 25 });
+  assert.equal(explicitListing.entries.length, 25);
+});
+
 test("bounded repository tools honor ignores, file limits, ranges, state hashes, and literal search", async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "cba-repository-tools-"));
   context.after(async () => rm(root, { recursive: true, force: true }));

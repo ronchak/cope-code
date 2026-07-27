@@ -268,6 +268,13 @@ test("bootstrap emits no unavailable batch guidance when the active catalog has 
   assert.doesNotMatch(contract, /active tool catalog/u);
 });
 
+test("list_files bootstrap guidance supplies the bounded default result count", () => {
+  assert.deepEqual(
+    TOOL_REGISTRY.list_files.bootstrap_example,
+    { path: ".", max_results: 20 },
+  );
+});
+
 test("parser batch semantics match every registry entry", () => {
   for (const tool of BATCHABLE_TOOL_NAMES) {
     assert.doesNotThrow(

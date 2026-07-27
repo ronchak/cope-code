@@ -230,6 +230,20 @@ test("session budget may grow only up to the strict higher-layer limit", () => {
   const beyondBoundary = evaluator.expandSessionGrant({ kind: "budget", metric: "turns", requested_limit: 1_000 });
   assert.equal(beyondBoundary.decision, "deny");
   assert.equal(beyondBoundary.grant, lowSession);
+
+  for (const requested_limit of [5, 4]) {
+    const nonExpansion = evaluator.expandSessionGrant({
+      kind: "budget",
+      metric: "turns",
+      requested_limit,
+    });
+    assert.equal(nonExpansion.decision, "deny");
+    assert.equal(nonExpansion.grant, lowSession);
+    assert.match(
+      nonExpansion.reasons.map((reason) => reason.message).join(" "),
+      /must increase the current session limit 5/u,
+    );
+  }
 });
 
 test("invalid or incomplete deterministic facts fail closed instead of bypassing policy", () => {

@@ -104,6 +104,26 @@ export class PolicyEngine {
     return effective;
   }
 
+  public getEffectiveDisclosureLimits(): Readonly<{
+    max_bytes_per_operation?: number;
+    max_files_per_operation?: number;
+  }> {
+    const byteLimits = this.layers()
+      .map((layer) => layer.capabilities.disclosure?.max_bytes_per_operation)
+      .filter((limit): limit is number => limit !== undefined);
+    const fileLimits = this.layers()
+      .map((layer) => layer.capabilities.disclosure?.max_files_per_operation)
+      .filter((limit): limit is number => limit !== undefined);
+    return {
+      ...(byteLimits.length === 0
+        ? {}
+        : { max_bytes_per_operation: Math.min(...byteLimits) }),
+      ...(fileLimits.length === 0
+        ? {}
+        : { max_files_per_operation: Math.min(...fileLimits) }),
+    };
+  }
+
   /**
    * Call only after the user has granted the requested expansion. A higher
    * layer deny leaves the grant unchanged; an ask is recorded as a scoped
@@ -472,10 +492,32 @@ export class PolicyEngine {
           resource: disclosure.classification,
         }),
       );
-      if (
-        (policy?.max_bytes_per_operation !== undefined && disclosure.byte_count > policy.max_bytes_per_operation) ||
-        (policy?.max_files_per_operation !== undefined && disclosure.file_count > policy.max_files_per_operation)
-      ) {
+      const operationLimitViolations = [
+        policy?.max_bytes_per_operation !== undefined &&
+        disclosure.byte_count > policy.max_bytes_per_operation
+          ? {
+              label: "byte",
+              limit: policy.max_bytes_per_operation,
+              requested: disclosure.byte_count,
+              unit: "bytes",
+            }
+          : undefined,
+        policy?.max_files_per_operation !== undefined &&
+        disclosure.file_count > policy.max_files_per_operation
+          ? {
+              label: "file",
+              limit: policy.max_files_per_operation,
+              requested: disclosure.file_count,
+              unit: "files",
+            }
+          : undefined,
+      ].filter((violation): violation is {
+        readonly label: string;
+        readonly limit: number;
+        readonly requested: number;
+        readonly unit: string;
+      } => violation !== undefined);
+      for (const violation of operationLimitViolations) {
         const decision = layer.capabilities.budget_exceeded ?? (layer.layer === "session" ? "ask" : "deny");
         checks.push(
           this.resolveCheck({
@@ -484,8 +526,12 @@ export class PolicyEngine {
             decision,
             askCode: "DISCLOSURE_OPERATION_LIMIT_EXCEEDED",
             denyCode: "DISCLOSURE_OPERATION_LIMIT_EXCEEDED",
-            askMessage: `${layer.layer} per-operation disclosure limit would be exceeded.`,
-            denyMessage: `${layer.layer} per-operation disclosure limit would be exceeded.`,
+            askMessage:
+              `${layer.layer} per-operation disclosure ${violation.label} limit ${violation.limit} ` +
+              `would be exceeded by ${violation.requested} ${violation.unit}; retry with a smaller bounded operation.`,
+            denyMessage:
+              `${layer.layer} per-operation disclosure ${violation.label} limit ${violation.limit} ` +
+              `would be exceeded by ${violation.requested} ${violation.unit}; retry with a smaller bounded operation.`,
             capabilityKey: "budget:disclosed_bytes",
           }),
         );
@@ -740,6 +786,27 @@ function expandGrant(
       message: `Capability expansion '${capabilityKey}' is structurally invalid.`,
       capability_key: capabilityKey,
     });
+  }
+
+  if (expansion.kind === "budget") {
+    const currentLimit = session.capabilities.budgets?.[expansion.metric];
+    if (
+      currentLimit === undefined ||
+      expansion.requested_limit <= currentLimit
+    ) {
+      reasons.push({
+        layer: "session",
+        dimension: "budget",
+        decision: "deny",
+        reason_code: "CAPABILITY_EXPANSION_DENIED",
+        message:
+          currentLimit === undefined
+            ? `Budget expansion '${capabilityKey}' cannot establish a new restrictive session limit.`
+            : `Budget expansion '${capabilityKey}' must increase the current session limit ${currentLimit}; requested ${expansion.requested_limit}.`,
+        capability_key: capabilityKey,
+        resource: expansion.metric,
+      });
+    }
   }
 
   if (session.mode === "inspect" && expansion.kind === "path" && expansion.access !== "read") {

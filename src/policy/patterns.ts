@@ -33,6 +33,7 @@ export function isSafePolicyPattern(pattern: string): boolean {
 export function matchPolicyPattern(value: string, pattern: string, caseSensitive = false): boolean {
   const normalizedValue = value.replaceAll("\\", "/");
   const normalizedPattern = pattern.replaceAll("\\", "/");
+  if (normalizedValue === "." && normalizedPattern === "**") return true;
   if (normalizedPattern.endsWith("/**") && normalizedValue === normalizedPattern.slice(0, -3)) return true;
   return minimatch(normalizedValue, normalizedPattern, {
     dot: true,

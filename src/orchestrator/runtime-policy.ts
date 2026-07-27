@@ -10,6 +10,7 @@ import {
 } from "../policy/index.js";
 import {
   BUDGET_METRICS,
+  DEFAULT_LIST_FILES_MAX_RESULTS,
   isToolName,
   TOOL_NAMES,
   toolRequiresContext,
@@ -70,6 +71,15 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
 
   public summarize(): Readonly<Record<string, unknown>> {
     const grant = this.engineValue.session;
+    const disclosureLimits = this.engineValue.getEffectiveDisclosureLimits();
+    const disclosureLimitParts = [
+      disclosureLimits.max_bytes_per_operation === undefined
+        ? undefined
+        : `${disclosureLimits.max_bytes_per_operation} bytes`,
+      disclosureLimits.max_files_per_operation === undefined
+        ? undefined
+        : `${disclosureLimits.max_files_per_operation} files`,
+    ].filter((entry): entry is string => entry !== undefined);
     return {
       mode: grant.mode,
       tools: grant.capabilities.tools?.allow ?? [],
@@ -85,6 +95,12 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
       notes: [
         "Organization, repository, and session rules are combined using the most restrictive decision.",
         "Detected secrets are blocked again on the fully serialized browser submission.",
+        ...(disclosureLimitParts.length === 0
+          ? []
+          : [
+              `Effective per-operation disclosure limits: ${disclosureLimitParts.join(" and ")}. ` +
+              "These hard ceilings are separate from cumulative task budgets; reduce max_bytes or max_results instead of requesting a task-budget expansion.",
+            ]),
       ],
     };
   }
@@ -250,7 +266,8 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
       const byteCount = this.options.defaultSearchBytes ?? 128 * 1024;
       disclosure = disclosureFact(this.classification, byteCount, 1);
     } else if (call.name === "list_files") {
-      const fileCount = positiveInteger(call.arguments.max_results) ?? 500;
+      const fileCount =
+        positiveInteger(call.arguments.max_results) ?? DEFAULT_LIST_FILES_MAX_RESULTS;
       disclosure = disclosureFact(
         this.classification,
         LIST_FILES_RESULT_BYTES,

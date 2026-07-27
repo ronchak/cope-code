@@ -2,6 +2,9 @@
 export const PROTOCOL_VERSION = "cba/1" as const;
 export type ProtocolVersion = typeof PROTOCOL_VERSION;
 
+/** Safe bounded result count used when list_files.max_results is omitted. */
+export const DEFAULT_LIST_FILES_MAX_RESULTS = 20;
+
 export type ToolExecutionSurface = "local" | "orchestrator";
 export type ToolContextRequirement = "path" | "command" | "network" | "change";
 
@@ -66,7 +69,7 @@ export const TOOL_REGISTRY = defineToolRegistry({
     read_only: true,
     batchable: true,
     required_context: ["path"],
-    bootstrap_example: { path: "." },
+    bootstrap_example: { path: ".", max_results: DEFAULT_LIST_FILES_MAX_RESULTS },
   },
   search_text: {
     purpose: "Search approved text and return bounded, located excerpts.",

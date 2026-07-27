@@ -33,10 +33,18 @@ Copilot may send `tool_request`, `user_input_request`, `capability_request`, `pr
 The normal model request is:
 
 ```cba/1
-{"protocol":"cba/1","message_type":"tool_request","message_id":"m_17","task_id":"task_example","turn_id":1,"operations":[{"operation_id":"op_17_list","tool":"list_files","arguments":{"path":"src","max_depth":2,"max_results":100}}]}
+{"protocol":"cba/1","message_type":"tool_request","message_id":"m_17","task_id":"task_example","turn_id":1,"operations":[{"operation_id":"op_17_list","tool":"list_files","arguments":{"path":"src","max_depth":2,"max_results":20}}]}
 ```
 
 Only independent read-only operations may be batched: `list_files`, `search_text`, `read_file`, `git_status`, and `git_diff`. `edit_text`, `apply_patch`, `run_command`, `request_user_input`, `request_capability`, and `complete_task` must be alone so Copilot observes each material outcome before planning a dependent action.
+
+`list_files.max_results` defaults to 20 when omitted; the bootstrap example states
+that bound explicitly. Policy may impose a lower per-operation file ceiling.
+Oversized disclosure denials name the exact byte/file dimension, limit, and
+requested amount so Copilot can retry a smaller operation instead of confusing
+the hard per-operation ceiling with the cumulative disclosure budget.
+The repository-wide read pattern `**` includes the repository root (`.`), so the
+bootstrap inventory call does not require a redundant path approval.
 
 ## V1 tools
 

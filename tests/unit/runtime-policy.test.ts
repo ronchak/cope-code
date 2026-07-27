@@ -26,6 +26,7 @@ async function harness(
     readonly tools?: readonly ToolName[];
     readonly maxMutationFileBytes?: number;
     readonly maxPatchBytes?: number;
+    readonly maxDisclosureFiles?: number;
     readonly budgets?: Readonly<Partial<Record<BudgetMetric, number>>>;
     readonly currentUsage?: PolicyBudgetUsage;
   } = {},
@@ -55,9 +56,21 @@ async function harness(
     ...(options.budgets === undefined ? {} : { budgets: options.budgets }),
     ...(options.tools === undefined ? {} : { tools: options.tools }),
   });
+  const organization = options.maxDisclosureFiles === undefined
+    ? DEFAULT_ORGANIZATION_POLICY
+    : {
+        ...DEFAULT_ORGANIZATION_POLICY,
+        capabilities: {
+          ...DEFAULT_ORGANIZATION_POLICY.capabilities,
+          disclosure: {
+            ...DEFAULT_ORGANIZATION_POLICY.capabilities.disclosure,
+            max_files_per_operation: options.maxDisclosureFiles,
+          },
+        },
+      };
   const policy = new LayeredRuntimePolicy({
     engine: new PolicyEngine({
-      organization: DEFAULT_ORGANIZATION_POLICY,
+      organization,
       repository: DEFAULT_REPOSITORY_POLICY,
       session,
     }),
@@ -105,6 +118,57 @@ test("layered runtime policy denies protected controls and inspect-mode mutation
 test("session grant expansion cannot override higher-layer network denial", async () => {
   const { policy } = await harness();
   assert.equal(await policy.expandSessionGrant({ kind: "network" }), false);
+});
+
+test("default list_files request is bounded and oversized denials name the exact file limit", async () => {
+  const { policy } = await harness("auto", { maxDisclosureFiles: 20 });
+  const defaultDecision = await policy.authorize({
+    operationId: "op_list_default",
+    name: "list_files",
+    arguments: { path: "." },
+  });
+  assert.equal(defaultDecision.outcome, "allow");
+
+  const oversized = await policy.authorize({
+    operationId: "op_list_oversized",
+    name: "list_files",
+    arguments: { path: ".", max_results: 200 },
+  });
+  assert.equal(oversized.outcome, "deny");
+  assert.equal(oversized.reasonCode, "DISCLOSURE_OPERATION_LIMIT_EXCEEDED");
+  assert.match(
+    oversized.explanation,
+    /organization per-operation disclosure file limit 20 would be exceeded by 200 files/u,
+  );
+
+  const notes = policy.summarize().notes;
+  assert.ok(Array.isArray(notes));
+  assert.match(
+    notes.filter((note): note is string => typeof note === "string").join(" "),
+    /20 files.*hard ceilings are separate from cumulative task budgets/u,
+  );
+});
+
+test("standalone budget capability cannot shrink an active disclosure budget", async () => {
+  const { policy } = await harness("auto", {
+    budgets: { disclosed_bytes: 2_000_000 },
+    currentUsage: {
+      ...zeroPolicyBudgetUsage(),
+      disclosed_bytes: 50_000,
+    },
+  });
+  assert.equal(
+    await policy.expandSessionGrant({
+      kind: "budget",
+      metric: "disclosed_bytes",
+      requested_limit: 2_000,
+    }),
+    false,
+  );
+  assert.equal(
+    policy.sessionGrant.capabilities.budgets?.disclosed_bytes,
+    2_000_000,
+  );
 });
 
 test("layered runtime policy plans edit_text exactly, including empty replacements", async () => {
