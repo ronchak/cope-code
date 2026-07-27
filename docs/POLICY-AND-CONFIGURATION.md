@@ -141,7 +141,10 @@ envelope reports this availability for every budget metric. If the current
 limit or usage already reaches that ceiling, expansion is structurally
 unavailable: Cope returns `BUDGET_EXPANSION_UNAVAILABLE`, identifies the
 blocking layer and ceiling, does not prompt for an ineffective approval, and
-pauses with instructions to change the governing policy before resuming.
+pauses with an explicit explanation that the policy-pinned session cannot
+continue. The operator must update the governing policy through the governed
+configuration process and start a new session; resume intentionally rejects
+changed organization or repository policy hashes.
 
 The runtime reserves 64 KiB of the cumulative disclosure limit for its
 source-free control plane, including an 8 KiB emergency slice that ordinary
@@ -155,7 +158,11 @@ condition is reported as invalid configuration before browser work begins.
 For cumulative data-result exhaustion as well as turn, operation,
 elapsed-time, and other recoverable session-budget exhaustion, Cope first
 offers a local raise-and-continue approval when the higher policy layers leave
-headroom. A result that exceeds its already-authorized per-operation
+headroom. The approval targets the effective higher-layer ceiling rather than
+the next single unit, so the operator is not prompted again on every following
+turn or operation. The requested absolute limit remains visible and requires
+an explicit allow-for-session decision. A result that exceeds its
+already-authorized per-operation
 reservation instead receives a narrower-request hint; raising a cumulative
 ceiling cannot make that operation safe. Only `allow_session` is effective, and
 the requested floor is derived from live usage. The exact operator decision is

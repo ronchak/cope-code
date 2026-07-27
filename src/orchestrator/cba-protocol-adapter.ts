@@ -71,6 +71,9 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
         ...(isRecord(summary.operation_limits)
           ? { operation_limits: summary.operation_limits }
           : {}),
+        ...(isRecord(summary.budget_recovery)
+          ? { budget_recovery: summary.budget_recovery }
+          : {}),
         notes: strings(summary.notes),
       },
       budgets: budgetSummary(input.budgetSummary),

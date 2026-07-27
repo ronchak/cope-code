@@ -369,7 +369,7 @@ export class AgentRuntime {
           },
         );
         if (
-          next.disclosureKind === "tool_result" &&
+          next.successfulToolResult === true &&
           (this.state.budgetPauseStreak ?? 0) > 0
         ) {
           this.state.budgetPauseStreak = 0;
@@ -969,6 +969,7 @@ export class AgentRuntime {
         readonly returnedOperationIds?: readonly string[];
         readonly queueStatus?: "awaiting_model";
         readonly disclosureKind?: "tool_result" | "decision";
+        readonly successfulToolResult?: boolean;
       }
     | { readonly terminal: true; readonly result: AgentRunResult }
   > {
@@ -1018,6 +1019,9 @@ export class AgentRuntime {
           returnedOperationIds: action.calls.map((call) => call.operationId),
           queueStatus: "awaiting_model",
           disclosureKind,
+          successfulToolResult:
+            disclosureKind === "tool_result" &&
+            outcomes.some((outcome) => outcome.status === "success"),
         };
       }
       case "request_user_input": {
@@ -1347,7 +1351,20 @@ export class AgentRuntime {
     error: AgentError,
   ): Promise<AgentRunResult | undefined> {
     const reason = disclosureBudgetReason(error);
-    const recovery = await this.tryRaiseBudgetAndContinue(error, reason);
+    let recovery: { readonly raised: boolean; readonly reason: string };
+    try {
+      recovery = await this.tryRaiseBudgetAndContinue(error, reason);
+    } catch (recoveryError) {
+      if (this.interruption !== undefined) {
+        return this.finishInterruption();
+      }
+      await this.queueEmergencyBudgetNotice(error).catch(() => false);
+      return this.pauseForBudget(
+        `${reason} Automatic raise-and-continue could not obtain an operator ` +
+        `decision (${errorMessage(recoveryError)}). Resume this session in an ` +
+        "interactive terminal to retry the recovery decision.",
+      );
+    }
     if (recovery.raised) {
       this.disclosureBudgetPauseReason = undefined;
       this.disclosureBudgetPauseError = undefined;
@@ -1364,7 +1381,7 @@ export class AgentRuntime {
     error: AgentError,
     reason: string,
   ): Promise<{ readonly raised: boolean; readonly reason: string }> {
-    const recovery = budgetRecoveryCapability(error);
+    let recovery = budgetRecoveryCapability(error);
     if (
       recovery === undefined ||
       this.dependencies.policy.assessSessionGrantExpansion === undefined
@@ -1383,6 +1400,32 @@ export class AgentRuntime {
     }
     if (assessment.outcome !== "change") {
       return { raised: false, reason };
+    }
+    const higherLayerCeiling =
+      typeof assessment.details?.higher_layer_ceiling === "number"
+        ? assessment.details.higher_layer_ceiling
+        : undefined;
+    if (
+      higherLayerCeiling !== undefined &&
+      Number.isSafeInteger(higherLayerCeiling) &&
+      higherLayerCeiling > recovery.requestedLimit
+    ) {
+      const ceilingRecovery: BudgetRecoveryCapability = {
+        metric: recovery.metric,
+        requestedLimit: higherLayerCeiling,
+        capability: {
+          kind: "budget",
+          metric: recovery.metric,
+          requested_limit: higherLayerCeiling,
+        },
+      };
+      const ceilingAssessment =
+        this.dependencies.policy.assessSessionGrantExpansion(
+          ceilingRecovery.capability,
+        );
+      if (ceilingAssessment.outcome === "change") {
+        recovery = ceilingRecovery;
+      }
     }
     const recoveryReason =
       `${reason} Cope can continue from the durable session state if this ` +
@@ -2578,8 +2621,9 @@ function unavailableBudgetExpansionReason(
   return (
     `${base} Automatic raise-and-continue is unavailable because the ` +
     `${layer} budget ceiling${ceiling} does not provide headroom. ` +
-    "Update the governing policy ceiling before resuming; no operator approval " +
-    "inside this session can override it."
+    "This policy-pinned session cannot continue. Update the governing policy " +
+    "through the governed configuration process, then start a new session; " +
+    "resuming this session cannot apply changed policy hashes."
   );
 }
 

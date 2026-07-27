@@ -294,6 +294,26 @@ test("standalone budget capability cannot shrink an active disclosure budget", a
       },
     },
   );
+  assert.deepEqual(
+    policy.assessSessionGrantExpansion({
+      kind: "budget",
+      metric: "disclosed_bytes",
+      requested_limit: 2_000_001,
+    }),
+    {
+      outcome: "change",
+      reasonCode: "CAPABILITY_EXPANSION_REQUIRES_APPROVAL",
+      explanation: "The request would expand the effective session grant.",
+      details: {
+        metric: "disclosed_bytes",
+        current_limit: 2_000_000,
+        current_usage: 50_000,
+        minimum_acceptable: 2_000_001,
+        higher_layer_ceiling: 8_000_000,
+        blocking_layer: "organization",
+      },
+    },
+  );
   assert.equal(
     policy.assessSessionGrantExpansion({
       kind: "disclosure",

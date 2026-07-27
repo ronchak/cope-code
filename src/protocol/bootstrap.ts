@@ -19,6 +19,7 @@ export interface BootstrapPolicySummary {
   readonly disclosure_classifications: readonly string[];
   readonly network: "allow" | "ask" | "deny";
   readonly operation_limits?: Readonly<Record<string, unknown>>;
+  readonly budget_recovery?: Readonly<Record<string, unknown>>;
   readonly notes?: readonly string[];
 }
 

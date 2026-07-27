@@ -510,6 +510,7 @@ function runtimeForTest(input: {
   readonly policy?: RuntimePolicy;
   readonly user?: UserInteraction;
   readonly idFactory?: (prefix: string) => string;
+  readonly signal?: AbortSignal;
 }): AgentRuntime {
   return new AgentRuntime({
     state: input.state,
@@ -548,6 +549,7 @@ function runtimeForTest(input: {
     },
     clock: { now: () => new Date("2026-01-01T00:01:00.000Z") },
     idFactory: input.idFactory ?? (() => "submission_1"),
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
     ...(input.artifacts === undefined ? {} : { artifacts: input.artifacts }),
     ...(input.completionHandoffs === undefined ? {} : { completionHandoffs: input.completionHandoffs }),
   });
@@ -1235,8 +1237,9 @@ test("ordinary budget exhaustion can be raised locally and continues without los
   const localState = state(root);
   localState.budgetLimits = {
     ...localState.budgetLimits,
-    maxOperations: 0,
+    maxOperations: 1,
   };
+  localState.budgetUsage.operations = 1;
   const store = new SessionStore(path.join(root, "state"));
   await store.create(localState);
   const artifacts = new SessionArtifactStore(
@@ -1257,7 +1260,7 @@ test("ordinary budget exhaustion can be raised locally and continues without los
   let executions = 0;
   let expandedCapability: Readonly<Record<string, unknown>> | undefined;
   const recoveryRequestId =
-    "_cope_internal_budget_recovery_operations_1_turn_0001";
+    "_cope_internal_budget_recovery_operations_4_turn_0001";
   const policy: RuntimePolicy = {
     summarize: () => ({}),
     authorize: () => ({
@@ -1266,16 +1269,30 @@ test("ordinary budget exhaustion can be raised locally and continues without los
       explanation: "allowed",
       plannedDisclosureBytes: 128 * 1024,
     }),
-    assessSessionGrantExpansion: (capability) => ({
-      outcome:
+    assessSessionGrantExpansion: (capability) => {
+      const change =
         capability.kind === "budget" &&
         capability.metric === "operations" &&
-        capability.requested_limit === 1
-          ? "change"
-          : "deny",
-      reasonCode: "TEST_BUDGET_RECOVERY",
-      explanation: "test recovery assessment",
-    }),
+        (capability.requested_limit === 2 ||
+          capability.requested_limit === 4);
+      return {
+        outcome: change ? "change" : "deny",
+        reasonCode: "TEST_BUDGET_RECOVERY",
+        explanation: "test recovery assessment",
+        ...(change
+          ? {
+              details: {
+                metric: "operations",
+                current_limit: 1,
+                current_usage: 1,
+                minimum_acceptable: 2,
+                higher_layer_ceiling: 4,
+                blocking_layer: "organization",
+              },
+            }
+          : {}),
+      };
+    },
     expandSessionGrant: async (capability) => {
       const storedDecision = await artifacts.get(
         "decision",
@@ -1335,7 +1352,7 @@ test("ordinary budget exhaustion can be raised locally and continues without los
   assert.deepEqual(expandedCapability, {
     kind: "budget",
     metric: "operations",
-    requested_limit: 1,
+    requested_limit: 4,
   });
   assert.equal(localState.completedOperationIds.includes(recoveryRequestId), true);
   const auditEvents = await AuditLog.verify(
@@ -1354,6 +1371,125 @@ test("ordinary budget exhaustion can be raised locally and continues without los
   );
   assert.equal(userDecisionIndex >= 0, true);
   assert.equal(capabilityDecisionIndex > userDecisionIndex, true);
+});
+
+test("budget recovery prompt failure pauses instead of escaping the runtime", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-budget-prompt-failure-"));
+  const localState = state(root);
+  localState.budgetLimits = {
+    ...localState.budgetLimits,
+    maxOperations: 0,
+  };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(
+    path.join(store.sessionDirectory(localState.sessionId), "artifacts"),
+  );
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{
+        operationId: "op_budget_prompt_without_tty",
+        name: "list_files",
+        arguments: {},
+      }],
+    }]),
+  ]);
+  const policy: RuntimePolicy = {
+    summarize: () => ({}),
+    authorize: () => ({
+      outcome: "allow",
+      reasonCode: "ALLOWED",
+      explanation: "allowed",
+    }),
+    assessSessionGrantExpansion: () => ({
+      outcome: "change",
+      reasonCode: "TEST_BUDGET_RECOVERY",
+      explanation: "test recovery assessment",
+    }),
+    expandSessionGrant: async () => false,
+  };
+
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    artifacts,
+    transport,
+    policy,
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => {
+        throw new Error("Interactive input is required but no terminal is attached");
+      },
+    },
+  }).run();
+
+  assert.equal(result.status, "paused", result.reason);
+  assert.equal(localState.failure, undefined);
+  assert.match(result.reason ?? "", /could not obtain an operator decision/iu);
+  assert.match(result.reason ?? "", /interactive terminal/iu);
+  assert.equal(localState.queuedOutbound?.disclosure?.kind, "decision");
+});
+
+test("caller abort during automatic budget recovery returns a resumable interruption", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-budget-prompt-abort-"));
+  const localState = state(root);
+  localState.budgetLimits = {
+    ...localState.budgetLimits,
+    maxOperations: 0,
+  };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(
+    path.join(store.sessionDirectory(localState.sessionId), "artifacts"),
+  );
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{
+        operationId: "op_budget_prompt_abort",
+        name: "list_files",
+        arguments: {},
+      }],
+    }]),
+  ]);
+  const controller = new AbortController();
+  const policy: RuntimePolicy = {
+    summarize: () => ({}),
+    authorize: () => ({
+      outcome: "allow",
+      reasonCode: "ALLOWED",
+      explanation: "allowed",
+    }),
+    assessSessionGrantExpansion: () => ({
+      outcome: "change",
+      reasonCode: "TEST_BUDGET_RECOVERY",
+      explanation: "test recovery assessment",
+    }),
+    expandSessionGrant: async () => false,
+  };
+
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    artifacts,
+    transport,
+    policy,
+    signal: controller.signal,
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => {
+        controller.abort(new Error("Operator interrupted budget recovery"));
+        throw new Error("The recovery prompt was aborted");
+      },
+    },
+  }).run();
+
+  assert.equal(result.status, "paused", result.reason);
+  assert.equal(result.reason, "Operator interrupted budget recovery");
+  assert.equal(localState.failure, undefined);
 });
 
 test("budget exhaustion reports an unraisable higher-layer ceiling without prompting", async () => {
@@ -1433,7 +1569,9 @@ test("budget exhaustion reports an unraisable higher-layer ceiling without promp
   assert.equal(prompts, 0);
   assert.equal(localState.failure, undefined);
   assert.match(result.reason ?? "", /organization budget ceiling \(0\)/u);
-  assert.match(result.reason ?? "", /no operator approval.*can override/iu);
+  assert.match(result.reason ?? "", /policy-pinned session cannot continue/iu);
+  assert.match(result.reason ?? "", /start a new session/iu);
+  assert.match(result.reason ?? "", /resuming this session cannot apply changed policy hashes/iu);
 
   const durableState = await store.read(localState.sessionId);
   const repeated = await runtimeForTest({
@@ -1448,6 +1586,48 @@ test("budget exhaustion reports an unraisable higher-layer ceiling without promp
   assert.equal(repeated.status, "blocked", repeated.reason);
   assert.match(repeated.reason ?? "", /prevent an unbounded resume-and-pause loop/u);
   assert.equal(prompts, 0);
+});
+
+test("denied tool envelopes do not clear the consecutive budget-pause streak", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-budget-streak-denial-"));
+  const localState = state(root);
+  localState.budgetPauseStreak = 1;
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{
+        operationId: "op_denied_without_progress",
+        name: "list_files",
+        arguments: {},
+      }],
+    }]),
+    JSON.stringify([{
+      type: "blocked",
+      reason: "done",
+      recoverable: false,
+    }]),
+  ]);
+
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    policy: {
+      summarize: () => ({}),
+      authorize: () => ({
+        outcome: "deny",
+        reasonCode: "POLICY_DENIED",
+        explanation: "denied",
+      }),
+      expandSessionGrant: async () => false,
+    },
+  }).run();
+
+  assert.equal(result.status, "blocked", result.reason);
+  assert.equal(localState.budgetPauseStreak, 1);
 });
 
 test("specialized budget denial resolves the accepted operation before returning", async () => {

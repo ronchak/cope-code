@@ -357,10 +357,44 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
           "The requested capability is already present in the effective session grant.",
       };
     }
+    const budgetExpansion =
+      expansions.length === 1 && expansions[0]?.kind === "budget"
+        ? expansions[0]
+        : undefined;
+    const budgetDetails =
+      budgetExpansion === undefined
+        ? undefined
+        : (() => {
+            const currentLimit =
+              this.engineValue.getEffectiveBudgetLimits()[
+                budgetExpansion.metric
+              ] ?? DEFAULT_POLICY_BUDGETS[budgetExpansion.metric];
+            const headroom =
+              budgetRecoveryHeadroom(this.engineValue)[
+                budgetExpansion.metric
+              ];
+            return {
+              metric: budgetExpansion.metric,
+              current_limit: currentLimit,
+              current_usage: usage[budgetExpansion.metric],
+              minimum_acceptable:
+                Math.max(currentLimit, usage[budgetExpansion.metric]) + 1,
+              ...(headroom.higher_layer_ceiling === undefined
+                ? {}
+                : {
+                    higher_layer_ceiling:
+                      headroom.higher_layer_ceiling,
+                  }),
+              ...(headroom.blocking_layer === undefined
+                ? {}
+                : { blocking_layer: headroom.blocking_layer }),
+            };
+          })();
     return {
       outcome: "change",
       reasonCode: "CAPABILITY_EXPANSION_REQUIRES_APPROVAL",
       explanation: "The request would expand the effective session grant.",
+      ...(budgetDetails === undefined ? {} : { details: budgetDetails }),
     };
   }
 

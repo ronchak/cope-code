@@ -265,12 +265,11 @@ export class ToolHost {
           ...optionalNumberAs(args, "max_results", "maxResults"),
         });
         const { appliedMaxResults, ...listed } = result;
-        const bounded = boundEntryResult(listed, LIST_FILES_RESULT_BYTES);
-        const output = {
-          ...bounded,
+        const bounded = boundEntryResult({
+          ...listed,
           applied_max_results: appliedMaxResults,
-        };
-        return successOutcome(call, asRecord(output), {
+        }, LIST_FILES_RESULT_BYTES);
+        return successOutcome(call, asRecord(bounded), {
           entryCount: bounded.entries.length,
           truncated: bounded.truncated,
           appliedMaxResults,

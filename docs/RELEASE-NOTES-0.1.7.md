@@ -21,7 +21,8 @@ derive from or are checked against that value.
 - Data-plane disclosure exhaustion and other recoverable session budgets offer
   a local, higher-policy-bounded raise-and-continue approval before pausing. The
   decision is journaled and integrity-bound before the expanded grant is
-  persisted.
+  persisted. The prompt targets the effective higher-layer ceiling, avoiding a
+  new approval request on every subsequent turn or operation.
 - Default organization and repository budgets provide four-times working
   headroom only for elapsed time, turns, operations, and disclosed bytes.
   Read-file, mutation, command, command-output, and protocol-repair ceilings
@@ -29,7 +30,9 @@ derive from or are checked against that value.
 - A configuration with no strict higher-layer headroom is identified in the
   bootstrap contract and returns `BUDGET_EXPANSION_UNAVAILABLE` at exhaustion,
   naming the blocking layer instead of offering or recommending an impossible
-  session approval.
+  session approval. Its diagnostic explains that changed policy cannot be
+  rebound on resume: update policy through the governed configuration process
+  and start a new session.
 - Terminal output now surfaces the budget diagnostic and remediation instead of
   showing only `Task failed`.
 

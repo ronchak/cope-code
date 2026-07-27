@@ -175,15 +175,20 @@ replayed. Ordinary decisions and repairs cannot consume the final 8 KiB
 emergency slice, and the runtime mechanically caps the recovery envelope to
 that slice. Cumulative data-plane and control-plane exhaustion offer the
 operator a monotonic session-budget raise when higher policy layers permit it,
-then continue directly from the durable turn. A per-operation reservation
+targeting the effective higher-layer ceiling in one explicit approval rather
+than prompting for every next unit, then continue directly from the durable
+turn. A per-operation reservation
 mismatch cannot be repaired by a cumulative raise and instead returns a
 narrower-request hint. The approval passes through the normal decision journal and integrity
 artifact before the grant changes, closing the crash window between consent
 and persistence. If a hard organization or repository ceiling prevents
 expansion, Cope does not display an ineffective approval prompt. It pauses with
 `BUDGET_EXPANSION_UNAVAILABLE`, naming the blocking layer and ceiling and
-explaining that governing policy must change before resume, rather than
-transitioning the session to `failed`.
+explaining that the policy-pinned session cannot continue. The operator must
+update governing policy through the governed configuration process and start a
+new session, because resume intentionally rejects changed organization or
+repository policy hashes. The exhausted session remains paused for inspection
+rather than transitioning to `failed`.
 
 The session also persists a consecutive budget-pause streak. A successfully
 returned data result or an effective budget raise clears it. A second budget
