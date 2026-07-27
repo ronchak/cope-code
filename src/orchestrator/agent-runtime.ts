@@ -571,8 +571,25 @@ export class AgentRuntime {
       raw === undefined &&
       (record.status === "accepted" || record.status === "executing")
     ) {
-      const abandoned = automaticBudgetRecoveryDeny(recovery.capability);
-      raw = stableJson(abandoned);
+      let recoveredDecision: Readonly<Record<string, unknown>>;
+      try {
+        recoveredDecision = await this.dependencies.user.requestCapability({
+          capability: recovery.capability,
+          reason:
+            "A prior automatic budget-recovery prompt was interrupted before " +
+            "a durable decision was recorded. Retry that decision to resume.",
+          risk:
+            "The expansion remains bounded by organization and repository " +
+            "policy. Only an allow-for-session decision can expand authority.",
+          signal: this.controller.signal,
+        });
+      } catch (error) {
+        if (this.interruption !== undefined) throw error;
+        recoveredDecision = automaticBudgetRecoveryDeny(
+          recovery.capability,
+        );
+      }
+      raw = stableJson(recoveredDecision);
       await this.requireArtifacts().put("decision", artifactId, raw);
     }
     if (raw === undefined) {

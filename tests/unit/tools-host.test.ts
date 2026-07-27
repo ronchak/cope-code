@@ -129,7 +129,14 @@ test("ToolHost bounds production-shaped list and status results at policy planni
 
 test("ToolHost applies an exact runtime mutation reservation to the current call", async (context) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-tool-host-budget-reservation-"));
-  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  context.after(async () =>
+    rm(temporary, {
+      recursive: true,
+      force: true,
+      maxRetries: process.platform === "win32" ? 10 : 0,
+      retryDelay: 100,
+    }),
+  );
   const root = path.join(temporary, "repo");
   await mkdir(root);
   const target = path.join(root, "file.txt");

@@ -193,9 +193,9 @@ response, the same default-deny cleanup prevents an orphaned request. Both
 data-plane and control-plane recovery entry points share this exception
 boundary. The default-deny artifact carries harness-owned provenance. On
 startup Cope reconciles an interrupted internal recovery decision from that
-artifact—or creates the same fail-closed artifact if its first write did not
-land—verifies it against any completed journal record, clears orphaned pending
-state, and never attributes the synthetic decision to the operator. This
+artifact—or retries the operator prompt if no durable decision exists—verifies
+it against any completed journal record, clears orphaned pending state, and
+never attributes the synthetic decision to the operator. This
 covers interruption before journal completion and after journal completion
 but before session-state persistence. If a hard organization or repository ceiling prevents
 expansion, Cope does not display an ineffective approval prompt. It pauses with

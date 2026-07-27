@@ -1727,7 +1727,10 @@ for (const journalStatus of [
     }).run();
 
     assert.equal(result.status, "completed", result.reason);
-    assert.equal(prompts, 0);
+    assert.equal(
+      prompts,
+      journalStatus === "executing_without_artifact" ? 1 : 0,
+    );
     assert.deepEqual(localState.pendingOperations, []);
     assert.equal(
       localState.completedOperationIds.includes(recoveryRequestId),
@@ -1735,7 +1738,12 @@ for (const journalStatus of [
     );
     const reconciled = await journal.read(recoveryRequestId);
     assert.equal(reconciled.status, "completed");
-    assert.equal(reconciled.safeResult?.decisionHash, decisionHash);
+    assert.equal(
+      reconciled.safeResult?.decisionHash,
+      journalStatus === "executing_without_artifact"
+        ? sha256(stableJson({ decision: "deny" }))
+        : decisionHash,
+    );
   });
 }
 
@@ -1836,8 +1844,22 @@ test("caller abort during automatic budget recovery returns a resumable interrup
         arguments: {},
       }],
     }]),
+    JSON.stringify([{
+      type: "complete_task",
+      operationId: "op_complete_after_budget_prompt_abort",
+      claim: {
+        summary: "Recovered after the interrupted budget prompt.",
+        acceptanceCriteria: [],
+        validation: [],
+        skippedValidation: [],
+        remainingRisks: [],
+        recommendedFollowUp: [],
+      },
+    }]),
   ]);
   const controller = new AbortController();
+  let prompts = 0;
+  let policyState = localState;
   const policy: RuntimePolicy = {
     summarize: () => ({}),
     authorize: () => ({
@@ -1850,7 +1872,13 @@ test("caller abort during automatic budget recovery returns a resumable interrup
       reasonCode: "TEST_BUDGET_RECOVERY",
       explanation: "test recovery assessment",
     }),
-    expandSessionGrant: async () => false,
+    expandSessionGrant: async () => {
+      policyState.budgetLimits = {
+        ...policyState.budgetLimits,
+        maxOperations: 4,
+      };
+      return true;
+    },
   };
 
   const result = await runtimeForTest({
@@ -1864,6 +1892,7 @@ test("caller abort during automatic budget recovery returns a resumable interrup
     user: {
       requestInput: async () => ({}),
       requestCapability: async () => {
+        prompts += 1;
         controller.abort(new Error("Operator interrupted budget recovery"));
         throw new Error("The recovery prompt was aborted");
       },
@@ -1873,6 +1902,28 @@ test("caller abort during automatic budget recovery returns a resumable interrup
   assert.equal(result.status, "paused", result.reason);
   assert.equal(result.reason, "Operator interrupted budget recovery");
   assert.equal(localState.failure, undefined);
+  assert.equal(prompts, 1);
+
+  const durableState = await store.read(localState.sessionId);
+  policyState = durableState;
+  const resumed = await runtimeForTest({
+    root,
+    state: durableState,
+    store,
+    artifacts,
+    transport,
+    policy,
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => {
+        prompts += 1;
+        return { decision: "allow_session" };
+      },
+    },
+  }).run();
+  assert.equal(resumed.status, "completed", resumed.reason);
+  assert.equal(prompts, 2, "resume must retry the interrupted prompt exactly once");
+  assert.deepEqual(durableState.pendingOperations, []);
 });
 
 test("budget exhaustion reports an unraisable higher-layer ceiling without prompting", async () => {
