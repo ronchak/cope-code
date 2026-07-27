@@ -387,7 +387,7 @@ export class AgentRuntime {
             const attempt = await this.attemptBudgetRecovery(
               budgetError,
               this.disclosureBudgetPauseReason,
-              true,
+              false,
             );
             if (attempt.result !== undefined) return attempt.result;
             const recovery = attempt.recovery;

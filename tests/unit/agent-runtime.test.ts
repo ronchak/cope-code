@@ -1603,6 +1603,120 @@ test("tool-result budget recovery prompt failure pauses and resumes without pend
   assert.deepEqual(durableState.pendingOperations, []);
 });
 
+test("tool-result recovery retries a caller-aborted prompt on resume", async () => {
+  const root = await mkdtemp(
+    path.join(tmpdir(), "cba-runtime-result-budget-prompt-abort-"),
+  );
+  const localState = state(root);
+  localState.budgetLimits = {
+    ...localState.budgetLimits,
+    maxDisclosedBytes:
+      Buffer.byteLength("bootstrap") + CONTROL_PLANE_RESERVE_BYTES,
+  };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(
+    path.join(store.sessionDirectory(localState.sessionId), "artifacts"),
+  );
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{
+        operationId: "op_result_budget_prompt_abort",
+        name: "list_files",
+        arguments: {},
+      }],
+    }]),
+    JSON.stringify([{
+      type: "complete_task",
+      operationId: "op_complete_after_result_prompt_abort",
+      claim: {
+        summary: "Recovered after an interrupted result-budget prompt.",
+        acceptanceCriteria: [],
+        validation: [],
+        skippedValidation: [],
+        remainingRisks: [],
+        recommendedFollowUp: [],
+      },
+    }]),
+  ]);
+  const controller = new AbortController();
+  let prompts = 0;
+  let policyState = localState;
+  const policy: RuntimePolicy = {
+    summarize: () => ({}),
+    authorize: () => ({
+      outcome: "allow",
+      reasonCode: "ALLOWED",
+      explanation: "allowed",
+      plannedDisclosureBytes: 0,
+    }),
+    assessSessionGrantExpansion: () => ({
+      outcome: "change",
+      reasonCode: "TEST_BUDGET_RECOVERY",
+      explanation: "test recovery assessment",
+    }),
+    expandSessionGrant: async () => {
+      policyState.budgetLimits = {
+        ...policyState.budgetLimits,
+        maxDisclosedBytes: 4 * 1024 * 1024,
+      };
+      return true;
+    },
+  };
+  const execute: ToolExecutor["execute"] = async (call) => ({
+    operationId: call.operationId,
+    tool: call.name,
+    status: "success",
+    data: { entries: ["src/a.txt"] },
+    safeMetadata: { entryCount: 1 },
+  });
+
+  const paused = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    artifacts,
+    transport,
+    policy,
+    execute,
+    signal: controller.signal,
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => {
+        prompts += 1;
+        controller.abort(new Error("Operator interrupted result recovery"));
+        throw new Error("The recovery prompt was aborted");
+      },
+    },
+  }).run();
+  assert.equal(paused.status, "paused", paused.reason);
+  assert.equal(paused.reason, "Operator interrupted result recovery");
+  assert.equal(prompts, 1);
+
+  const durableState = await store.read(localState.sessionId);
+  policyState = durableState;
+  const resumed = await runtimeForTest({
+    root,
+    state: durableState,
+    store,
+    artifacts,
+    transport,
+    policy,
+    execute,
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => {
+        prompts += 1;
+        return { decision: "allow_session" };
+      },
+    },
+  }).run();
+  assert.equal(resumed.status, "completed", resumed.reason);
+  assert.equal(prompts, 2);
+  assert.deepEqual(durableState.pendingOperations, []);
+});
+
 for (const journalStatus of [
   "executing_without_artifact",
   "executing",
