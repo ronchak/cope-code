@@ -49,7 +49,7 @@ export async function verifyReleaseVersion(root) {
     const releaseNotes = await readText(root, releaseNotesName, errors);
     if (
       releaseNotes !== undefined &&
-      !releaseNotes.startsWith(`# Cope ${packageVersion}\n`)
+      releaseNotes.match(/^[^\r\n]*/u)?.[0] !== `# Cope ${packageVersion}`
     ) {
       errors.push(`${releaseNotesName} heading must match package.json`);
     }

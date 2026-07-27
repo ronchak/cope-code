@@ -101,6 +101,35 @@ test("release verifier rejects a mismatched derived release-note heading", async
   );
 });
 
+test("release verifier accepts the Windows CRLF checkout of release notes", async (context) => {
+  const temporary = await mkdtemp(path.join(tmpdir(), "cope-release-crlf-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  await copyReleaseSurfaces(temporary);
+  const packageJson = JSON.parse(
+    await readFile(path.join(temporary, "package.json"), "utf8"),
+  ) as { version: string };
+  const releaseNotes = path.join(
+    temporary,
+    `docs/RELEASE-NOTES-${packageJson.version}.md`,
+  );
+  await writeFile(
+    releaseNotes,
+    (await readFile(releaseNotes, "utf8")).replaceAll("\n", "\r\n"),
+    "utf8",
+  );
+
+  const result = await execFileAsync(process.execPath, [verifier], {
+    cwd: temporary,
+  });
+  assert.match(
+    result.stdout,
+    new RegExp(
+      `Release version ${escapeRegExp(packageJson.version)} is synchronized\\.`,
+      "u",
+    ),
+  );
+});
+
 test("release verifier rejects a manually duplicated active version", async (context) => {
   const temporary = await mkdtemp(path.join(tmpdir(), "cope-release-literal-"));
   context.after(async () => rm(temporary, { recursive: true, force: true }));
