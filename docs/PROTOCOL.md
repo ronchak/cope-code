@@ -172,6 +172,9 @@ stricter effective policy ceiling and returning fewer entries with
 `list_files` meaning. Likewise, additive effective-limit facts in the
 bootstrap's authoritative operating envelope describe the already-enforced
 local policy; they do not add a model action or weaken a schema invariant.
+The internal repository-result contract is independently versioned. Version
+`repository.v2` makes `appliedMaxResults` mandatory on listing results so local
+consumers can prove which policy-derived bound execution actually used.
 
 Durable local control-plane decisions use an `_cope_internal_` journal
 identifier namespace. Its leading underscore is intentionally outside the

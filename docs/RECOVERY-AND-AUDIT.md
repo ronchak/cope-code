@@ -173,13 +173,22 @@ notice is submitted once before Copilot continues; already-completed tools and
 mutations are recovered from their journal/checkpoint evidence and are not
 replayed. Ordinary decisions and repairs cannot consume the final 8 KiB
 emergency slice, and the runtime mechanically caps the recovery envelope to
-that slice. Where higher policy layers permit it, Cope can ask the operator
-for a monotonic session-budget raise and continue directly from the durable
-turn. The approval passes through the normal decision journal and integrity
+that slice. Cumulative data-plane and control-plane exhaustion offer the
+operator a monotonic session-budget raise when higher policy layers permit it,
+then continue directly from the durable turn. A per-operation reservation
+mismatch cannot be repaired by a cumulative raise and instead returns a
+narrower-request hint. The approval passes through the normal decision journal and integrity
 artifact before the grant changes, closing the crash window between consent
-and persistence. If a hard organization or repository ceiling prevents expansion, Cope
-still pauses with a terminal-visible `BUDGET_EXCEEDED` diagnostic rather than
+and persistence. If a hard organization or repository ceiling prevents
+expansion, Cope does not display an ineffective approval prompt. It pauses with
+`BUDGET_EXPANSION_UNAVAILABLE`, naming the blocking layer and ceiling and
+explaining that governing policy must change before resume, rather than
 transitioning the session to `failed`.
+
+The session also persists a consecutive budget-pause streak. A successfully
+returned data result or an effective budget raise clears it. A second budget
+pause without either form of progress stops the task as `blocked` with a
+diagnosis, preventing an unbounded resume → degrade → pause cycle.
 
 `created` and `preflight` are not resume-supported states. Recovery offers a clean abort for those incomplete startup states unless mutation evidence requires reconciliation. New session publication persists `grant_pending` before the runtime manifest becomes readable, so a crash cannot create a runtime-pinned pre-grant session that is incorrectly advertised as resumable.
 

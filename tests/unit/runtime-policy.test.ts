@@ -34,6 +34,7 @@ async function harness(
     readonly maxPatchBytes?: number;
     readonly maxDisclosureFiles?: number;
     readonly maxDisclosureBytes?: number;
+    readonly higherDisclosedBytes?: number;
     readonly budgets?: Readonly<Partial<Record<BudgetMetric, number>>>;
     readonly currentUsage?: PolicyBudgetUsage;
   } = {},
@@ -65,7 +66,8 @@ async function harness(
   });
   const organization =
     options.maxDisclosureFiles === undefined &&
-    options.maxDisclosureBytes === undefined
+    options.maxDisclosureBytes === undefined &&
+    options.higherDisclosedBytes === undefined
     ? DEFAULT_ORGANIZATION_POLICY
     : {
         ...DEFAULT_ORGANIZATION_POLICY,
@@ -80,6 +82,14 @@ async function harness(
               ? {}
               : { max_bytes_per_operation: options.maxDisclosureBytes }),
           },
+          ...(options.higherDisclosedBytes === undefined
+            ? {}
+            : {
+                budgets: {
+                  ...DEFAULT_ORGANIZATION_POLICY.capabilities.budgets,
+                  disclosed_bytes: options.higherDisclosedBytes,
+                },
+              }),
         },
       };
   const policy = new LayeredRuntimePolicy({
@@ -194,6 +204,21 @@ test("list_files defaults and explicit requests clamp to the effective policy ce
       policy_max_bytes_per_operation: 1_000_000,
     },
   });
+  const recovery = summary.budget_recovery as Readonly<
+    Record<string, Readonly<Record<string, unknown>>>
+  >;
+  assert.deepEqual(recovery.disclosed_bytes, {
+    current_limit: 2_000_000,
+    available: true,
+    higher_layer_ceiling: 8_000_000,
+    blocking_layer: "organization",
+  });
+  assert.deepEqual(recovery.changed_files, {
+    current_limit: 30,
+    available: false,
+    higher_layer_ceiling: 30,
+    blocking_layer: "organization",
+  });
   assert.deepEqual(
     listFilesRuntimeBounds(new PolicyEngine({
       organization: DEFAULT_ORGANIZATION_POLICY,
@@ -275,6 +300,40 @@ test("standalone budget capability cannot shrink an active disclosure budget", a
       classifications: ["internal"],
     }).outcome,
     "no_op",
+  );
+});
+
+test("budget expansion reports when a higher-layer ceiling leaves no valid raise", async () => {
+  const ceiling = 2_000_000;
+  const { policy } = await harness("auto", {
+    budgets: { disclosed_bytes: ceiling },
+    higherDisclosedBytes: ceiling,
+    currentUsage: {
+      ...zeroPolicyBudgetUsage(),
+      disclosed_bytes: ceiling,
+    },
+  });
+
+  assert.deepEqual(
+    policy.assessSessionGrantExpansion({
+      kind: "budget",
+      metric: "disclosed_bytes",
+      requested_limit: ceiling + 1,
+    }),
+    {
+      outcome: "unavailable",
+      reasonCode: "BUDGET_EXPANSION_UNAVAILABLE",
+      explanation:
+        "Budget expansion 'budget:disclosed_bytes' is unavailable: the organization ceiling is 2000000, but a useful expansion must be at least 2000001.",
+      details: {
+        metric: "disclosed_bytes",
+        blocking_layer: "organization",
+        layer_ceiling: ceiling,
+        current_limit: ceiling,
+        current_usage: ceiling,
+        minimum_acceptable: ceiling + 1,
+      },
+    },
   );
 });
 

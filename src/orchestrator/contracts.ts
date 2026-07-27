@@ -77,7 +77,8 @@ export interface ProtocolAdapter {
     readonly priorTurnId: string;
     readonly code: string;
     readonly message: string;
-    readonly repairAttempt: number;
+    readonly repairAttempt?: number;
+    readonly repairable?: boolean;
   }): string;
   renderUserDecision(input: {
     readonly taskId: string;
@@ -140,7 +141,7 @@ export interface RuntimePolicy {
   assessSessionGrantExpansion?(
     capability: Readonly<Record<string, unknown>>,
   ): Readonly<{
-    outcome: "change" | "no_op" | "deny";
+    outcome: "change" | "no_op" | "deny" | "unavailable";
     reasonCode: string;
     explanation: string;
     details?: Readonly<Record<string, unknown>>;

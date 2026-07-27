@@ -18,14 +18,18 @@ derive from or are checked against that value.
 - The compact queued notice identifies current usage, the applicable limit, and
   the minimum useful expansion. Resuming submits that already-charged notice
   without replaying or recharging completed work.
-- Turn, operation, elapsed-time, and other session budgets offer a local,
-  higher-policy-bounded raise-and-continue approval before pausing. The
+- Data-plane disclosure exhaustion and other recoverable session budgets offer
+  a local, higher-policy-bounded raise-and-continue approval before pausing. The
   decision is journaled and integrity-bound before the expanded grant is
   persisted.
-- Default organization and repository budgets are now approval ceilings
-  derived at four times the initial session working grant, so the shipped
-  configuration provides bounded recovery headroom instead of pinning every
-  layer to the same exhausted value.
+- Default organization and repository budgets provide four-times working
+  headroom only for elapsed time, turns, operations, and disclosed bytes.
+  Read-file, mutation, command, command-output, and protocol-repair ceilings
+  retain their previous absolute bounds.
+- A configuration with no strict higher-layer headroom is identified in the
+  bootstrap contract and returns `BUDGET_EXPANSION_UNAVAILABLE` at exhaustion,
+  naming the blocking layer instead of offering or recommending an impossible
+  session approval.
 - Terminal output now surfaces the budget diagnostic and remediation instead of
   showing only `Task failed`.
 

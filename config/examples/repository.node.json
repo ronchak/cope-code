@@ -131,13 +131,13 @@
         "elapsed_ms": 14400000,
         "turns": 160,
         "operations": 640,
-        "read_files": 320,
-        "changed_files": 120,
-        "changed_lines": 8000,
+        "read_files": 80,
+        "changed_files": 30,
+        "changed_lines": 2000,
         "disclosed_bytes": 8000000,
-        "commands": 120,
-        "command_output_bytes": 4000000,
-        "protocol_repairs": 16
+        "commands": 30,
+        "command_output_bytes": 1000000,
+        "protocol_repairs": 4
       },
       "budget_exceeded": "ask"
     }

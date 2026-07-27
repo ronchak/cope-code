@@ -159,6 +159,8 @@ export interface SessionState {
     readonly sourceArtifacts: "remove" | "retain";
   };
   protocolRepairStreak: number;
+  /** Consecutive budget pauses without a successfully returned data result. */
+  budgetPauseStreak?: number;
 }
 
 export const zeroBudgetUsage = (): BudgetUsage => ({

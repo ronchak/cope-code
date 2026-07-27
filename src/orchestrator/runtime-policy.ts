@@ -77,6 +77,7 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
     const grant = this.engineValue.session;
     const disclosureLimits = this.engineValue.getEffectiveDisclosureLimits();
     const listBounds = listFilesRuntimeBounds(this.engineValue);
+    const budgetRecovery = budgetRecoveryHeadroom(this.engineValue);
     const disclosureLimitParts = [
       disclosureLimits.max_bytes_per_operation === undefined
         ? undefined
@@ -120,6 +121,7 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
               }),
         },
       },
+      budget_recovery: budgetRecovery,
       notes: [
         "Organization, repository, and session rules are combined using the most restrictive decision.",
         "Detected secrets are blocked again on the fully serialized browser submission.",
@@ -129,6 +131,14 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
               `Effective per-operation disclosure limits: ${disclosureLimitParts.join(" and ")}. ` +
               "These hard ceilings are separate from cumulative task budgets; reduce max_bytes or max_results instead of requesting a task-budget expansion.",
             ]),
+        ...Object.entries(budgetRecovery)
+          .filter(([, entry]) => entry.available === false)
+          .map(
+            ([metric, entry]) =>
+              `Raise-and-continue is unavailable for ${metric}: the active limit ` +
+              `${entry.current_limit} has no headroom below the ` +
+              `${entry.blocking_layer} ceiling ${entry.higher_layer_ceiling}.`,
+          ),
       ],
     };
   }
@@ -186,6 +196,22 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
     call: NormalizedToolCall,
   ): Promise<AuthorizationDecision> {
     try {
+      if (
+        call.name === "list_files" &&
+        listFilesRuntimeBounds(engine).disabled === true
+      ) {
+        return {
+          outcome: "deny",
+          reasonCode: "DISCLOSURE_OPERATION_LIMIT_EXCEEDED",
+          explanation:
+            "Repository listing is disabled because the effective policy file ceiling is 0.",
+          details: {
+            dimension: "files",
+            limit: 0,
+            requested: call.arguments.max_results ?? "default",
+          },
+        };
+      }
       const effectiveCall = effectiveToolCall(engine, call);
       const operation = await this.buildOperation(effectiveCall, false);
       const preliminary = engine.evaluate(operation);
@@ -236,7 +262,7 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
   public assessSessionGrantExpansion(
     capability: Readonly<Record<string, unknown>>,
   ): Readonly<{
-    outcome: "change" | "no_op" | "deny";
+    outcome: "change" | "no_op" | "deny" | "unavailable";
     reasonCode: string;
     explanation: string;
     details?: Readonly<Record<string, unknown>>;
@@ -251,13 +277,27 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
     }
     let engine = this.engineValue;
     let changesEffectiveCapabilities = false;
+    const usage = this.options.currentUsage();
     for (const expansion of expansions) {
-      const usage = this.options.currentUsage();
-      const result = engine.expandSessionGrantWithUsage(expansion, usage);
+      const result = engine.expandSessionGrant(expansion, usage);
       if (result.decision === "deny") {
         const strictReasons = result.reasons.filter(
           (reason) => reason.decision === "deny",
         );
+        const unavailable = strictReasons.find(
+          (reason) =>
+            reason.reason_code === "BUDGET_EXPANSION_UNAVAILABLE",
+        );
+        if (unavailable !== undefined) {
+          return {
+            outcome: "unavailable",
+            reasonCode: unavailable.reason_code,
+            explanation: unavailable.message,
+            ...(unavailable.details === undefined
+              ? {}
+              : { details: unavailable.details }),
+          };
+        }
         const monotonicNoOp =
           expansion.kind === "budget" &&
           strictReasons.length > 0 &&
@@ -332,7 +372,7 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
 
     let engine = this.engineValue;
     for (const expansion of expansions) {
-      const result = engine.expandSessionGrantWithUsage(
+      const result = engine.expandSessionGrant(
         expansion,
         this.options.currentUsage(),
       );
@@ -529,6 +569,72 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
   }
 }
 
+function budgetRecoveryHeadroom(
+  engine: PolicyEngine,
+): Readonly<
+  Record<
+    BudgetMetric,
+    {
+      readonly current_limit: number;
+      readonly available: boolean;
+      readonly higher_layer_ceiling?: number;
+      readonly blocking_layer?: "organization" | "repository";
+    }
+  >
+> {
+  const effective = engine.getEffectiveBudgetLimits();
+  return Object.fromEntries(
+    BUDGET_METRICS.map((metric) => {
+      const current =
+        effective[metric] ?? DEFAULT_POLICY_BUDGETS[metric];
+      const higherLayers = [
+        {
+          layer: "organization" as const,
+          limit: engine.organization.capabilities.budgets?.[metric],
+        },
+        {
+          layer: "repository" as const,
+          limit: engine.repository.capabilities.budgets?.[metric],
+        },
+      ].filter(
+        (entry): entry is {
+          readonly layer: "organization" | "repository";
+          readonly limit: number;
+        } => entry.limit !== undefined,
+      );
+      const blocking =
+        higherLayers.length === 0
+          ? undefined
+          : higherLayers.reduce((lowest, entry) =>
+              entry.limit < lowest.limit ? entry : lowest,
+            );
+      return [
+        metric,
+        {
+          current_limit: current,
+          available: blocking === undefined || current < blocking.limit,
+          ...(blocking === undefined
+            ? {}
+            : {
+                higher_layer_ceiling: blocking.limit,
+                blocking_layer: blocking.layer,
+              }),
+        },
+      ];
+    }),
+  ) as Readonly<
+    Record<
+      BudgetMetric,
+      {
+        readonly current_limit: number;
+        readonly available: boolean;
+        readonly higher_layer_ceiling?: number;
+        readonly blocking_layer?: "organization" | "repository";
+      }
+    >
+  >;
+}
+
 interface EditTextInput {
   readonly path: string;
   readonly base_sha256: string;
@@ -644,10 +750,9 @@ export function listFilesRuntimeBounds(engine: PolicyEngine): ListFilesRuntimeBo
     engine.getEffectiveDisclosureLimits().max_files_per_operation ??
     MAX_LIST_FILES_RESULTS;
   const disabled = policyCeiling === 0;
-  const maxResults = Math.max(
-    1,
-    Math.min(MAX_LIST_FILES_RESULTS, policyCeiling),
-  );
+  const maxResults = disabled
+    ? 0
+    : Math.min(MAX_LIST_FILES_RESULTS, policyCeiling);
   return {
     maxResults,
     defaultResults: Math.min(DEFAULT_LIST_FILES_MAX_RESULTS, maxResults),

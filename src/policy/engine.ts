@@ -132,18 +132,7 @@ export class PolicyEngine {
    * layer deny leaves the grant unchanged; an ask is recorded as a scoped
    * approval so it does not prompt repeatedly during this session.
    */
-  public expandSessionGrant(expansion: SessionCapabilityExpansion, grantedAt = new Date().toISOString()): SessionExpansionResult {
-    return expandGrant(
-      this.organization,
-      this.repository,
-      this.session,
-      expansion,
-      grantedAt,
-      this.repositoryPathKey,
-    );
-  }
-
-  public expandSessionGrantWithUsage(
+  public expandSessionGrant(
     expansion: SessionCapabilityExpansion,
     currentUsage: BudgetUsage,
     grantedAt = new Date().toISOString(),
@@ -812,7 +801,7 @@ function expandGrant(
   expansion: SessionCapabilityExpansion,
   grantedAt: string,
   pathKey: (value: string) => string,
-  currentUsage?: BudgetUsage,
+  currentUsage: BudgetUsage,
 ): SessionExpansionResult {
   const capabilityKey = expansionKey(expansion, pathKey);
   const reasons: PolicyCheck[] = [];
@@ -841,18 +830,60 @@ function expandGrant(
   }
 
   if (expansion.kind === "budget") {
+    const higherLayerLimits = [
+      {
+        layer: "organization" as const,
+        limit: organization.capabilities.budgets?.[expansion.metric],
+      },
+      {
+        layer: "repository" as const,
+        limit: repository.capabilities.budgets?.[expansion.metric],
+      },
+    ].filter(
+      (entry): entry is { readonly layer: "organization" | "repository"; readonly limit: number } =>
+        entry.limit !== undefined,
+    );
     const configuredLimits = [
-      organization.capabilities.budgets?.[expansion.metric],
-      repository.capabilities.budgets?.[expansion.metric],
+      ...higherLayerLimits.map((entry) => entry.limit),
       session.capabilities.budgets?.[expansion.metric],
     ].filter((limit): limit is number => limit !== undefined);
     const currentLimit =
       configuredLimits.length === 0
         ? DEFAULT_POLICY_BUDGETS[expansion.metric]
         : Math.min(...configuredLimits);
-    const usage = currentUsage?.[expansion.metric] ?? 0;
+    const usage = currentUsage[expansion.metric];
     const minimumAcceptable = Math.max(currentLimit, usage) + 1;
-    if (expansion.requested_limit < minimumAcceptable) {
+    const blockingHigherLayer =
+      higherLayerLimits.length === 0
+        ? undefined
+        : higherLayerLimits.reduce((lowest, entry) =>
+            entry.limit < lowest.limit ? entry : lowest,
+          );
+    if (
+      blockingHigherLayer !== undefined &&
+      minimumAcceptable > blockingHigherLayer.limit
+    ) {
+      reasons.push({
+        layer: blockingHigherLayer.layer,
+        dimension: "budget",
+        decision: "deny",
+        reason_code: "BUDGET_EXPANSION_UNAVAILABLE",
+        message:
+          `Budget expansion '${capabilityKey}' is unavailable: the ` +
+          `${blockingHigherLayer.layer} ceiling is ${blockingHigherLayer.limit}, ` +
+          `but a useful expansion must be at least ${minimumAcceptable}.`,
+        capability_key: capabilityKey,
+        resource: expansion.metric,
+        details: {
+          metric: expansion.metric,
+          blocking_layer: blockingHigherLayer.layer,
+          layer_ceiling: blockingHigherLayer.limit,
+          current_limit: currentLimit,
+          current_usage: usage,
+          minimum_acceptable: minimumAcceptable,
+        },
+      });
+    } else if (expansion.requested_limit < minimumAcceptable) {
       reasons.push({
         layer: "session",
         dimension: "budget",
@@ -864,6 +895,13 @@ function expandGrant(
           `and ${expansion.requested_limit} was requested.`,
         capability_key: capabilityKey,
         resource: expansion.metric,
+        details: {
+          metric: expansion.metric,
+          requested_limit: expansion.requested_limit,
+          current_limit: currentLimit,
+          current_usage: usage,
+          minimum_acceptable: minimumAcceptable,
+        },
       });
     }
   }

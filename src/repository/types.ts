@@ -1,4 +1,4 @@
-export const REPOSITORY_CONTRACT_VERSION = "repository.v1" as const;
+export const REPOSITORY_CONTRACT_VERSION = "repository.v2" as const;
 
 export interface FileState {
   readonly sha256: string;

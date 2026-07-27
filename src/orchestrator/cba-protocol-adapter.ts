@@ -140,8 +140,13 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
       createProtocolErrorMessage(correlationFor(input.taskId, input.priorTurnId, "protocol_error"), {
         code,
         message: input.message,
-        repairable: true,
-        details: { repair_attempt: input.repairAttempt, source_code: input.code },
+        repairable: input.repairable ?? true,
+        details: {
+          ...(input.repairAttempt === undefined
+            ? {}
+            : { repair_attempt: input.repairAttempt }),
+          source_code: input.code,
+        },
       }),
     ), input.taskId, input.priorTurnId);
   }

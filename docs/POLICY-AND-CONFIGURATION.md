@@ -127,21 +127,37 @@ report `current_limit`, `current_usage`, and `minimum_acceptable`.
 
 The shipped defaults distinguish the initial session working grant from its
 higher-layer approval ceiling. Sessions start with the conservative
-`DEFAULT_POLICY_BUDGETS`; organization and repository defaults derive a
-four-times-larger ceiling from that same metric table. Cope therefore cannot
-raise a budget silently, but an explicit raise-and-continue approval has real,
-bounded headroom under the default configuration.
+`DEFAULT_POLICY_BUDGETS`. Organization and repository defaults provide four
+times that working grant only for elapsed time, turns, operations, and
+disclosed bytes. Read-file, mutation, command, command-output, and
+protocol-repair ceilings retain their original absolute values. Cope therefore
+cannot silently enlarge a security-sensitive activity ceiling; the shipped
+configuration provides bounded recovery headroom only where session longevity
+or disclosure delivery requires it.
+
+Raise-and-continue requires strict headroom between the live session limit and
+the most restrictive organization/repository ceiling. The bootstrap operating
+envelope reports this availability for every budget metric. If the current
+limit or usage already reaches that ceiling, expansion is structurally
+unavailable: Cope returns `BUDGET_EXPANSION_UNAVAILABLE`, identifies the
+blocking layer and ceiling, does not prompt for an ineffective approval, and
+pauses with instructions to change the governing policy before resuming.
 
 The runtime reserves 64 KiB of the cumulative disclosure limit for its
 source-free control plane, including an 8 KiB emergency slice that ordinary
 decisions and repairs cannot consume. Data-bearing tool results cannot consume
 the 64 KiB window. If any ordinary outbound message reaches its applicable
 ceiling, Cope emits a byte-capped `cba/1` notice from the emergency slice and
-pauses rather than failing.
+pauses rather than failing. Session startup rejects a disclosure budget that
+cannot hold the rendered bootstrap in addition to the 64 KiB reserve, so this
+condition is reported as invalid configuration before browser work begins.
 
-For turn, operation, elapsed-time, and other recoverable session-budget
-exhaustion, Cope first offers a local raise-and-continue approval when the
-higher policy layers leave headroom. Only `allow_session` is effective, and
+For cumulative data-result exhaustion as well as turn, operation,
+elapsed-time, and other recoverable session-budget exhaustion, Cope first
+offers a local raise-and-continue approval when the higher policy layers leave
+headroom. A result that exceeds its already-authorized per-operation
+reservation instead receives a narrower-request hint; raising a cumulative
+ceiling cannot make that operation safe. Only `allow_session` is effective, and
 the requested floor is derived from live usage. The exact operator decision is
 journaled, hashed, and stored as a recovery artifact before an expanded grant
 is persisted. Higher-layer ceilings remain non-overridable. Resume keeps the

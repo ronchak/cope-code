@@ -1119,6 +1119,28 @@ test("runtime executes the exact list_files arguments derived by policy", async 
   assert.match(transport.submittedContents[1] ?? "", /applied_max_results/u);
 });
 
+test("startup rejects a disclosure budget that cannot preserve control-plane headroom", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-invalid-disclosure-budget-"));
+  const localState = state(root);
+  localState.budgetLimits = {
+    ...localState.budgetLimits,
+    maxDisclosedBytes: CONTROL_PLANE_RESERVE_BYTES,
+  };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport: new QueueTransport([]),
+  }).run();
+
+  assert.equal(result.status, "failed");
+  assert.match(result.reason ?? "", /cannot fit the bootstrap/u);
+  assert.equal(localState.failure?.code, "CONFIG_INVALID");
+});
+
 test("control-plane exhaustion queues a capped cba notice across process restart", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-emergency-budget-"));
   const localState = state(root);
@@ -1126,8 +1148,8 @@ test("control-plane exhaustion queues a capped cba notice across process restart
     ...localState.budgetLimits,
     maxDisclosedBytes:
       Buffer.byteLength("bootstrap") +
-      EMERGENCY_NOTICE_RESERVE_BYTES +
-      32,
+      CONTROL_PLANE_RESERVE_BYTES +
+      5_000,
   };
   const store = new SessionStore(path.join(root, "state"));
   await store.create(localState);
@@ -1160,7 +1182,7 @@ test("control-plane exhaustion queues a capped cba notice across process restart
     user: {
       requestInput: async () => {
         prompts += 1;
-        return { choice: "yes", explanation: "x".repeat(256) };
+        return { choice: "yes", explanation: "x".repeat(70 * 1024) };
       },
       requestCapability: async () => ({ decision: "deny" }),
     },
@@ -1184,6 +1206,8 @@ test("control-plane exhaustion queues a capped cba notice across process restart
   assert.match(notice, /^```cba\/1\n/u);
   assert.match(notice, /BUDGET_EXCEEDED/u);
   assert.match(notice, /source_code/u);
+  assert.match(notice, /"repairable":false/u);
+  assert.doesNotMatch(notice, /repair_attempt/u);
 
   const resumed = await runtimeForTest({
     root,
@@ -1332,6 +1356,100 @@ test("ordinary budget exhaustion can be raised locally and continues without los
   assert.equal(capabilityDecisionIndex > userDecisionIndex, true);
 });
 
+test("budget exhaustion reports an unraisable higher-layer ceiling without prompting", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-budget-unavailable-"));
+  const localState = state(root);
+  localState.budgetLimits = {
+    ...localState.budgetLimits,
+    maxOperations: 0,
+  };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(
+    path.join(store.sessionDirectory(localState.sessionId), "artifacts"),
+  );
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{
+        operationId: "op_unraisable_budget",
+        name: "list_files",
+        arguments: {},
+      }],
+    }]),
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{
+        operationId: "op_unraisable_budget_again",
+        name: "list_files",
+        arguments: {},
+      }],
+    }]),
+  ]);
+  let prompts = 0;
+  const policy: RuntimePolicy = {
+    summarize: () => ({}),
+    authorize: () => ({
+      outcome: "allow",
+      reasonCode: "ALLOWED",
+      explanation: "allowed",
+      plannedDisclosureBytes: 128 * 1024,
+    }),
+    assessSessionGrantExpansion: () => ({
+      outcome: "unavailable",
+      reasonCode: "BUDGET_EXPANSION_UNAVAILABLE",
+      explanation:
+        "The organization ceiling does not provide recovery headroom.",
+      details: {
+        metric: "operations",
+        blocking_layer: "organization",
+        layer_ceiling: 0,
+        current_limit: 0,
+        current_usage: 0,
+        minimum_acceptable: 1,
+      },
+    }),
+    expandSessionGrant: async () => false,
+  };
+  const user: UserInteraction = {
+    requestInput: async () => ({}),
+    requestCapability: async () => {
+      prompts += 1;
+      return { decision: "allow_session" };
+    },
+  };
+
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    artifacts,
+    transport,
+    policy,
+    user,
+  }).run();
+
+  assert.equal(result.status, "paused", result.reason);
+  assert.equal(prompts, 0);
+  assert.equal(localState.failure, undefined);
+  assert.match(result.reason ?? "", /organization budget ceiling \(0\)/u);
+  assert.match(result.reason ?? "", /no operator approval.*can override/iu);
+
+  const durableState = await store.read(localState.sessionId);
+  const repeated = await runtimeForTest({
+    root,
+    state: durableState,
+    store,
+    artifacts,
+    transport,
+    policy,
+    user,
+  }).run();
+  assert.equal(repeated.status, "blocked", repeated.reason);
+  assert.match(repeated.reason ?? "", /prevent an unbounded resume-and-pause loop/u);
+  assert.equal(prompts, 0);
+});
+
 test("specialized budget denial resolves the accepted operation before returning", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-read-budget-"));
   const localState = state(root);
@@ -1472,7 +1590,7 @@ test("one-time disclosure approval covers the complete rendered tool result", as
   localState.budgetLimits = {
     ...localState.budgetLimits,
     maxDisclosedBytes:
-      bootstrapBytes + EMERGENCY_NOTICE_RESERVE_BYTES,
+      bootstrapBytes + CONTROL_PLANE_RESERVE_BYTES,
   };
   let priorPersistedDisclosureBytes = 0;
   let chargedResultCommitObserved = false;
@@ -1568,9 +1686,14 @@ test("one-time disclosure approval covers the complete rendered tool result", as
   assert.equal(chargedResultCommitObserved, true);
   assert.equal(
     localState.budgetLimits.maxDisclosedBytes,
-    bootstrapBytes + EMERGENCY_NOTICE_RESERVE_BYTES,
+    bootstrapBytes + CONTROL_PLANE_RESERVE_BYTES,
   );
-  assert.equal(localState.budgetUsage.disclosedBytes > localState.budgetLimits.maxDisclosedBytes, true);
+  assert.equal(
+    localState.budgetUsage.disclosedBytes >
+      localState.budgetLimits.maxDisclosedBytes -
+        CONTROL_PLANE_RESERVE_BYTES,
+    true,
+  );
   assert.equal(localState.budgetUsage.disclosedBytes <= approvedLimit, true);
 });
 

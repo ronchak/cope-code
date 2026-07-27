@@ -13,6 +13,10 @@ export const OPERATION_ID_PATTERN_SOURCE = "^[A-Za-z0-9][A-Za-z0-9_-]{2,127}$" a
 export const INTERNAL_OPERATION_ID_PREFIX = "_cope_internal_" as const;
 
 const OPERATION_ID_PATTERN = new RegExp(OPERATION_ID_PATTERN_SOURCE, "u");
+const INTERNAL_OPERATION_ID_PATTERN = new RegExp(
+  `^${INTERNAL_OPERATION_ID_PREFIX}[A-Za-z0-9_-]+$`,
+  "u",
+);
 
 export function isOperationId(value: unknown): value is string {
   return typeof value === "string" && OPERATION_ID_PATTERN.test(value);
@@ -22,7 +26,7 @@ export function isInternalOperationId(value: unknown): value is string {
   return (
     typeof value === "string" &&
     value.length <= OPERATION_ID_MAX_LENGTH &&
-    /^_cope_internal_[A-Za-z0-9_-]+$/u.test(value)
+    INTERNAL_OPERATION_ID_PATTERN.test(value)
   );
 }
 

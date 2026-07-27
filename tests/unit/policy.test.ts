@@ -4,6 +4,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { TOOL_NAMES, TOOL_REGISTRY } from "../../src/protocol/index.js";
+import { DEFAULT_MAX_CHECKPOINT_FILES } from "../../src/repository/checkpoint.js";
 import {
   DEFAULT_ORGANIZATION_POLICY,
   DEFAULT_HIGHER_LAYER_BUDGETS,
@@ -50,7 +51,7 @@ test("default policy documents and generated session grant validate", () => {
   assert.equal(validateSessionGrant(session()).valid, true);
 });
 
-test("default session budgets retain bounded approval headroom across shipped policies", () => {
+test("default session budgets retain narrowly scoped approval headroom across shipped policies", () => {
   const defaultSession = session();
   assert.deepEqual(
     defaultSession.capabilities.budgets,
@@ -64,15 +65,22 @@ test("default session budgets retain bounded approval headroom across shipped po
     DEFAULT_REPOSITORY_POLICY.capabilities.budgets,
     DEFAULT_HIGHER_LAYER_BUDGETS,
   );
-  for (const metric of Object.keys(DEFAULT_POLICY_BUDGETS) as Array<
-    keyof typeof DEFAULT_POLICY_BUDGETS
-  >) {
-    assert.equal(
-      DEFAULT_HIGHER_LAYER_BUDGETS[metric],
-      DEFAULT_POLICY_BUDGETS[metric] * 4,
-      metric,
-    );
-  }
+  assert.deepEqual(DEFAULT_HIGHER_LAYER_BUDGETS, {
+    elapsed_ms: 14_400_000,
+    turns: 160,
+    operations: 640,
+    read_files: 80,
+    changed_files: 30,
+    changed_lines: 2_000,
+    disclosed_bytes: 8_000_000,
+    commands: 30,
+    command_output_bytes: 1_000_000,
+    protocol_repairs: 4,
+  });
+  assert.ok(
+    DEFAULT_HIGHER_LAYER_BUDGETS.changed_files <
+      DEFAULT_MAX_CHECKPOINT_FILES,
+  );
 
   const organizationExample = JSON.parse(
     readFileSync(
@@ -94,7 +102,7 @@ test("default session budgets retain bounded approval headroom across shipped po
 
   const evaluator = engine(defaultSession);
   const recoveryLimit = DEFAULT_POLICY_BUDGETS.disclosed_bytes + 1;
-  const recovery = evaluator.expandSessionGrantWithUsage(
+  const recovery = evaluator.expandSessionGrant(
     {
       kind: "budget",
       metric: "disclosed_bytes",
@@ -281,7 +289,11 @@ test("classification, secret, disclosure, change, and cumulative budgets are enf
 
   const usage = { ...zeroPolicyBudgetUsage(), changed_lines: DEFAULT_POLICY_BUDGETS.changed_lines + 1 };
   const overBudget = evaluator.evaluate(operation({ projected_usage: usage }));
-  assert.equal(overBudget.decision, "ask");
+  assert.equal(
+    overBudget.decision,
+    "deny",
+    "mutation ceilings remain non-overridable at the higher layers",
+  );
   assert.ok(overBudget.reasons.some((reason) => reason.reason_code === "BUDGET_EXCEEDED"));
 });
 
@@ -291,6 +303,7 @@ test("session capability expansion is durable but bounded by higher policies", (
 
   const disclosureExpansion = evaluator.expandSessionGrant(
     { kind: "disclosure", classification: "confidential" },
+    zeroPolicyBudgetUsage(),
     "2026-07-17T00:00:00.000Z",
   );
   assert.equal(disclosureExpansion.decision, "ask");
@@ -307,11 +320,17 @@ test("session capability expansion is durable but bounded by higher policies", (
   );
   assert.equal(nowAllowed.decision, "allow");
 
-  const network = evaluator.expandSessionGrant({ kind: "network", host: "registry.npmjs.org" });
+  const network = evaluator.expandSessionGrant(
+    { kind: "network", host: "registry.npmjs.org" },
+    zeroPolicyBudgetUsage(),
+  );
   assert.equal(network.decision, "deny");
   assert.equal(network.grant, original);
 
-  const protectedPath = evaluator.expandSessionGrant({ kind: "path", access: "write", path: ".git/config" });
+  const protectedPath = evaluator.expandSessionGrant(
+    { kind: "path", access: "write", path: ".git/config" },
+    zeroPolicyBudgetUsage(),
+  );
   assert.equal(protectedPath.decision, "deny");
   assert.equal(protectedPath.grant, original);
 });
@@ -319,20 +338,29 @@ test("session capability expansion is durable but bounded by higher policies", (
 test("session budget may grow only up to the strict higher-layer limit", () => {
   const lowSession = session("auto", { budgets: { turns: 5 } });
   const evaluator = engine(lowSession);
-  const withinBoundary = evaluator.expandSessionGrant({ kind: "budget", metric: "turns", requested_limit: 10 });
+  const withinBoundary = evaluator.expandSessionGrant(
+    { kind: "budget", metric: "turns", requested_limit: 10 },
+    zeroPolicyBudgetUsage(),
+  );
   assert.equal(withinBoundary.decision, "allow");
   assert.equal(withinBoundary.grant.capabilities.budgets?.turns, 10);
 
-  const beyondBoundary = evaluator.expandSessionGrant({ kind: "budget", metric: "turns", requested_limit: 1_000 });
+  const beyondBoundary = evaluator.expandSessionGrant(
+    { kind: "budget", metric: "turns", requested_limit: 1_000 },
+    zeroPolicyBudgetUsage(),
+  );
   assert.equal(beyondBoundary.decision, "deny");
   assert.equal(beyondBoundary.grant, lowSession);
 
   for (const requested_limit of [5, 4]) {
-    const nonExpansion = evaluator.expandSessionGrant({
-      kind: "budget",
-      metric: "turns",
-      requested_limit,
-    });
+    const nonExpansion = evaluator.expandSessionGrant(
+      {
+        kind: "budget",
+        metric: "turns",
+        requested_limit,
+      },
+      zeroPolicyBudgetUsage(),
+    );
     assert.equal(nonExpansion.decision, "deny");
     assert.equal(nonExpansion.grant, lowSession);
     assert.match(
@@ -341,7 +369,7 @@ test("session budget may grow only up to the strict higher-layer limit", () => {
     );
   }
 
-  const usageBound = evaluator.expandSessionGrantWithUsage(
+  const usageBound = evaluator.expandSessionGrant(
     { kind: "budget", metric: "turns", requested_limit: 7 },
     { ...zeroPolicyBudgetUsage(), turns: 7 },
   );
@@ -350,7 +378,7 @@ test("session budget may grow only up to the strict higher-layer limit", () => {
     usageBound.reasons.map((reason) => reason.message).join(" "),
     /must be at least 8.*current usage is 7/u,
   );
-  const aboveUsage = evaluator.expandSessionGrantWithUsage(
+  const aboveUsage = evaluator.expandSessionGrant(
     { kind: "budget", metric: "turns", requested_limit: 8 },
     { ...zeroPolicyBudgetUsage(), turns: 7 },
   );

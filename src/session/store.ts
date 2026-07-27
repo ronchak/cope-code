@@ -61,6 +61,7 @@ const SESSION_KEYS = [
   "completionHandoff",
   "terminalCleanup",
   "protocolRepairStreak",
+  "budgetPauseStreak",
 ] as const;
 
 interface LockRecord {
@@ -402,7 +403,10 @@ function assertValidSessionState(value: Partial<SessionState>): asserts value is
     !Array.isArray(value.mutations) || value.mutations.length > 100_000 ||
     !Array.isArray(value.validations) || value.validations.length > 100_000 ||
     !Number.isSafeInteger(value.protocolRepairStreak) ||
-    (value.protocolRepairStreak ?? -1) < 0
+    (value.protocolRepairStreak ?? -1) < 0 ||
+    (value.budgetPauseStreak !== undefined &&
+      (!Number.isSafeInteger(value.budgetPauseStreak) ||
+        value.budgetPauseStreak < 0))
   ) {
     throw new AgentError("RECOVERY_REQUIRED", "Session state failed structural validation");
   }
