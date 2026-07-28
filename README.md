@@ -188,6 +188,7 @@ Architecture and controls remain documented under `docs`:
 - `docs/WINDOWS-TARGET.md`
 - `docs/MACOS-TARGET.md`
 - `docs/LIVE-PILOT-ACCEPTANCE.md`
+- `docs/PRD-0.1.9-PROTOCOL-INGESTION.md`
 - `docs/RELEASE-NOTES-0.1.8.md`
 - `docs/RELEASE-NOTES-0.1.7.md`
 - `docs/RELEASE-NOTES-0.1.6.md`
