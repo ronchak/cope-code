@@ -113,6 +113,19 @@ test("informational answers complete only when the session has not mutated proje
   assert.equal(unsupported.accepted, false);
   assert.match(unsupported.reasons.join(" "), /unknown tool result/iu);
 
+  const unprovenObservation = verifyCompletion(answerState, {
+    ...answerClaim,
+    basis: { observedFiles: ["invented.md"] },
+  }, repository, requirements);
+  assert.equal(unprovenObservation.accepted, false);
+  assert.match(unprovenObservation.reasons.join(" "), /cite a completed tool result/iu);
+
+  const userContextOnly = verifyCompletion(answerState, {
+    ...answerClaim,
+    basis: { userProvidedContext: true },
+  }, repository, requirements);
+  assert.equal(userContextOnly.accepted, true);
+
   answerState.mutations.push({
     operationId: "op_patch",
     checkpointId: "checkpoint_1",

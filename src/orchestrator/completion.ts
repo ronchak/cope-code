@@ -105,16 +105,22 @@ export function verifyCompletion(
       reasons.push("An informational answer cannot complete a task after project files were mutated.");
     }
     const basis = claim.basis;
+    const observedFiles = basis?.observedFiles ?? [];
+    const toolResultRefs = basis?.toolResultRefs ?? [];
     const hasBasis = basis !== undefined && (
-      (basis.observedFiles?.length ?? 0) > 0 ||
-      (basis.toolResultRefs?.length ?? 0) > 0 ||
+      toolResultRefs.length > 0 ||
       basis.userProvidedContext === true
     );
     if (!hasBasis) {
       reasons.push("An informational answer must identify its evidence basis.");
     }
+    if (observedFiles.length > 0 && toolResultRefs.length === 0) {
+      reasons.push(
+        "The informational answer must cite a completed tool result when it claims observed files.",
+      );
+    }
     const completed = new Set(state.completedOperationIds);
-    const unknownRefs = basis?.toolResultRefs?.filter((reference) => !completed.has(reference)) ?? [];
+    const unknownRefs = toolResultRefs.filter((reference) => !completed.has(reference));
     if (unknownRefs.length > 0) {
       reasons.push(
         `The informational answer cites unknown tool result reference(s): ${unknownRefs.join(", ")}.`,

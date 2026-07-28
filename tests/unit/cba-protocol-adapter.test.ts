@@ -271,6 +271,31 @@ test("legacy task and turn identity are rebound only for marker-proven live turn
   );
 });
 
+test("CBA adapter selects the parser from the executable envelope instead of surrounding prose", () => {
+  const legacy = serializeProtocolEnvelope({
+    protocol: "cba/1",
+    message_type: "tool_request",
+    message_id: "msg_legacy_with_migration_note",
+    task_id: "task_12345678",
+    turn_id: 5,
+    operations: [{ operation_id: "op_legacy_status", tool: "git_status", arguments: {} }],
+  });
+  const response = [
+    "Migration note: future responses should use ```cba-agent/1 after this legacy turn.",
+    legacy,
+  ].join("\n\n");
+
+  const parsed = new CbaProtocolAdapter().parseModelTurn(response, {
+    taskId: "task_12345678",
+    turnId: "turn_0005",
+  });
+  assert.equal(parsed.messages[0]?.type, "tool_request");
+  if (parsed.messages[0]?.type === "tool_request") {
+    assert.equal(parsed.messages[0].calls[0]?.operationId, "op_legacy_status");
+    assert.equal(parsed.messages[0].calls[0]?.name, "git_status");
+  }
+});
+
 test("generic Copilot fallback is a repairable typed diagnostic", () => {
   const adapter = new CbaProtocolAdapter();
   assert.throws(

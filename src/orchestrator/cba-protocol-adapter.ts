@@ -1,5 +1,7 @@
 import {
+  DEFAULT_MAX_PROTOCOL_INPUT_BYTES,
   PROTOCOL_ERROR_CODES,
+  MODEL_FACING_PROTOCOL_VERSION,
   ProtocolParseError,
   parseProtocolEnvelope,
   extractCbaEnvelope,
@@ -90,6 +92,18 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
       readonly recoveryReplay?: boolean;
     },
   ): ParsedModelTurn {
+    const actualBytes = Buffer.byteLength(raw, "utf8");
+    if (actualBytes > DEFAULT_MAX_PROTOCOL_INPUT_BYTES) {
+      throw new ProtocolParseError(
+        "INPUT_TOO_LARGE",
+        `The response is ${actualBytes} bytes, exceeding the ${DEFAULT_MAX_PROTOCOL_INPUT_BYTES}-byte protocol input limit.`,
+        {
+          actual_bytes: actualBytes,
+          maximum_bytes: DEFAULT_MAX_PROTOCOL_INPUT_BYTES,
+        },
+        false,
+      );
+    }
     const numericTurn = parseTurnId(expected.turnId);
     const seen = expected.recoveryReplay === true ? undefined : this.options.seenOperationIds?.();
     const parseContext = {
@@ -101,7 +115,20 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
     };
     let message: ProtocolMessage;
     let normalizations: ParsedModelTurn["normalizations"];
-    if (raw.includes("```cba-agent/")) {
+    if (isGenericCopilotFallback(raw)) {
+      throw new ProtocolParseError(
+        "INVALID_MESSAGE",
+        "Copilot returned its generic service fallback instead of an agent response.",
+        {
+          stage: "model_response_classification",
+          diagnostic_code: "COPILOT_GENERIC_FALLBACK",
+          repairable: true,
+          suggested_action: "Retry the bounded turn; if the fallback repeats, inspect the browser service state.",
+        },
+      );
+    }
+    const envelopeVersion = extractCbaEnvelope(raw).version;
+    if (envelopeVersion === MODEL_FACING_PROTOCOL_VERSION) {
       const facing = parseModelFacingEnvelope(raw);
       const canonical = normalizeModelFacingMessage(facing, {
         taskId: expected.taskId,
@@ -110,18 +137,6 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
       });
       message = parseProtocolEnvelope(serializeProtocolEnvelope(canonical), parseContext);
     } else {
-      if (isGenericCopilotFallback(raw)) {
-        throw new ProtocolParseError(
-          "INVALID_MESSAGE",
-          "Copilot returned its generic service fallback instead of an agent response.",
-          {
-            stage: "model_response_classification",
-            diagnostic_code: "COPILOT_GENERIC_FALLBACK",
-            repairable: true,
-            suggested_action: "Retry the bounded turn; if the fallback repeats, inspect the browser service state.",
-          },
-        );
-      }
       try {
         message = parseProtocolEnvelope(raw, parseContext);
       } catch (error) {

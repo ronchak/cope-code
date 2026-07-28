@@ -137,7 +137,7 @@ export function extractProtocolEnvelope(input: string): ExtractedEnvelope {
  */
 export function extractCbaEnvelope(
   input: string,
-  expectedVersion: string,
+  expectedVersion?: string,
 ): ExtractedEnvelope {
   const scan = scanMarkdownFences(input);
   const protocolCount = scan.envelopes.length + (scan.truncatedProtocol === undefined ? 0 : 1);
@@ -159,7 +159,7 @@ export function extractCbaEnvelope(
   if (envelope === undefined) {
     throw new ProtocolParseError("MISSING_ENVELOPE", "No CBA protocol envelope was found.");
   }
-  if (envelope.version !== expectedVersion) {
+  if (expectedVersion !== undefined && envelope.version !== expectedVersion) {
     throw new ProtocolParseError(
       "UNSUPPORTED_VERSION",
       `Unsupported protocol version '${envelope.version}'; expected '${expectedVersion}'.`,
