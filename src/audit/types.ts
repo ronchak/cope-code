@@ -8,6 +8,7 @@ export const AUDIT_EVENT_TYPES = [
   "model.submission",
   "model.response",
   "protocol.error",
+  "protocol.normalized",
   "tool.requested",
   "policy.decision",
   "tool.completed",

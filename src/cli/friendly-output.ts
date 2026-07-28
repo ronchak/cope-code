@@ -46,19 +46,51 @@ export function renderHumanResult(value: Readonly<Record<string, unknown>>): str
   const current = recordValue(repository?.current);
   const entries = Array.isArray(current?.entries) ? current.entries : undefined;
   if (entries !== undefined && entries.length > 0) {
-    lines.push(`\n${bold("Changed files")}`);
-    for (const entry of entries.slice(0, 20)) {
-      const record = recordValue(entry);
-      const file = stringValue(record?.path);
-      const state = stringValue(record?.kind) ?? stringValue(record?.status);
-      if (file !== undefined) lines.push(`  ${cyan(symbols.bullet)} ${file}${state === undefined ? "" : ` ${dim(`(${state})`)}`}`);
-    }
-    if (entries.length > 20) lines.push(`  ${dim(`…and ${entries.length - 20} more`)}`);
+    const preExisting = new Set(stringArray(repository?.preExistingChanges));
+    const agentChanged = new Set(stringArray(repository?.agentChangedPaths));
+    const classified = entries.map((entry) => recordValue(entry)).filter(
+      (entry): entry is Readonly<Record<string, unknown>> => entry !== undefined,
+    );
+    renderChangedFileGroup(
+      lines,
+      "Changed by this task",
+      classified.filter((entry) => agentChanged.has(stringValue(entry.path) ?? "")),
+    );
+    renderChangedFileGroup(
+      lines,
+      "Already changed before this task",
+      classified.filter((entry) => {
+        const file = stringValue(entry.path) ?? "";
+        return !agentChanged.has(file) && preExisting.has(file);
+      }),
+    );
+    renderChangedFileGroup(
+      lines,
+      "Not attributed to this task",
+      classified.filter((entry) => {
+        const file = stringValue(entry.path) ?? "";
+        return !agentChanged.has(file) && !preExisting.has(file);
+      }),
+    );
   }
 
   const validation = Array.isArray(handoff?.validation) ? handoff.validation : undefined;
-  if (validation !== undefined && validation.length > 0) {
-    lines.push(`\n${bold("Validation")}`);
+  if (validation !== undefined) {
+    lines.push(`\n${bold("Project validation")}`);
+    if (validation.length === 0) {
+      const effectiveGrant = recordValue(handoff?.effectiveGrant);
+      const capabilities = recordValue(effectiveGrant?.capabilities);
+      const commands = recordValue(capabilities?.commands);
+      const ids = recordValue(commands?.ids);
+      const categories = recordValue(commands?.categories);
+      const available = [
+        ...stringArray(ids?.allow),
+        ...stringArray(categories?.allow),
+      ];
+      lines.push(available.length === 0
+        ? `  ${dim("Not run — no validation commands were available.")}`
+        : `  ${dim("Not run — no project validation command was executed.")}`);
+    }
     for (const item of validation.slice(-5)) {
       const record = recordValue(item);
       const command = stringValue(record?.commandId) ?? "command";
@@ -69,6 +101,23 @@ export function renderHumanResult(value: Readonly<Record<string, unknown>>): str
 
   if (lines.length === 0) return `${JSON.stringify(value, null, 2)}\n`;
   return `${lines.join("\n")}\n`;
+}
+
+function renderChangedFileGroup(
+  lines: string[],
+  title: string,
+  entries: readonly Readonly<Record<string, unknown>>[],
+): void {
+  if (entries.length === 0) return;
+  lines.push(`\n${bold(title)}`);
+  for (const entry of entries.slice(0, 20)) {
+    const file = stringValue(entry.path);
+    const state = stringValue(entry.kind) ?? stringValue(entry.status);
+    if (file !== undefined) {
+      lines.push(`  ${cyan(symbols.bullet)} ${file}${state === undefined ? "" : ` ${dim(`(${state})`)}`}`);
+    }
+  }
+  if (entries.length > 20) lines.push(`  ${dim(`…and ${entries.length - 20} more`)}`);
 }
 
 export function renderHumanError(error: unknown): string {
@@ -153,3 +202,6 @@ function recordValue(value: unknown): Readonly<Record<string, unknown>> | undefi
 }
 function stringValue(value: unknown): string | undefined { return typeof value === "string" ? value : undefined; }
 function numberValue(value: unknown): number | undefined { return typeof value === "number" ? value : undefined; }
+function stringArray(value: unknown): readonly string[] {
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
+}

@@ -665,6 +665,65 @@ test("runtime completes a multi-turn autonomous tool loop", async () => {
   assert.equal(durableHandoff.verification.accepted, true);
 });
 
+test("recoverable model blocking pauses with a durable reassessment turn and does not replay the response", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-recoverable-block-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(path.join(store.sessionDirectory(localState.sessionId), "artifacts"));
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "blocked",
+      reasonCode: "WAIT_FOR_ACCESS",
+      summary: "Repository access is temporarily unavailable.",
+      needed: ["repository access"],
+      recoverable: true,
+    }]),
+    JSON.stringify([{
+      type: "complete_task",
+      operationId: "op_complete_after_reassessment",
+      claim: {
+        summary: "Access was reassessed and the task can now complete.",
+        acceptanceCriteria: [],
+        validation: [],
+        skippedValidation: [],
+        remainingRisks: [],
+        recommendedFollowUp: [],
+      },
+    }]),
+  ]);
+  let submissionSequence = 0;
+  const idFactory = (): string => `submission_recoverable_${String(++submissionSequence)}`;
+
+  const paused = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+    idFactory,
+  }).run();
+  assert.equal(paused.status, "paused", paused.reason);
+  assert.match(paused.reason ?? "", /WAIT_FOR_ACCESS/u);
+  assert.equal(localState.queuedOutbound?.turnId, "turn_0002");
+  assert.equal(await artifacts.getOptional("response", "turn_0001"), undefined);
+  const reassessment = await artifacts.get("outbox", localState.queuedOutbound?.artifactId ?? "");
+  assert.match(reassessment, /previously reported blocker.*recoverable/iu);
+
+  const completed = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+    idFactory,
+  }).run();
+  assert.equal(completed.status, "completed", completed.reason);
+  assert.equal(localState.turnSequence, 2);
+  assert.equal(transport.submittedContents.length, 2);
+  assert.match(transport.submittedContents[1] ?? "", /previously reported blocker.*recoverable/iu);
+});
+
 test("runtime journals every local tool according to registry read-only metadata", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-registry-"));
   const localState = state(root);
@@ -1159,7 +1218,7 @@ test("startup rejects a disclosure budget that cannot preserve control-plane hea
   assert.equal(localState.failure?.code, "CONFIG_INVALID");
 });
 
-test("control-plane exhaustion queues a capped cba notice across process restart", async () => {
+test("control-plane exhaustion queues a capped model-facing notice across process restart", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-emergency-budget-"));
   const localState = state(root);
   localState.budgetLimits = {
@@ -1221,7 +1280,8 @@ test("control-plane exhaustion queues a capped cba notice across process restart
     Buffer.byteLength(notice) <= EMERGENCY_NOTICE_RESERVE_BYTES,
     true,
   );
-  assert.match(notice, /^```cba\/1\n/u);
+  assert.match(notice, /^COPE HARNESS MESSAGE — cba-agent\/1\n/u);
+  assert.doesNotMatch(notice, /"task_id"|"turn_id"|"message_id"/u);
   assert.match(notice, /BUDGET_EXCEEDED/u);
   assert.match(notice, /source_code/u);
   assert.match(notice, /"repairable":false/u);
@@ -3046,6 +3106,7 @@ test("runtime sends protocol repair feedback and continues", async () => {
   const localState = state(root);
   const store = new SessionStore(path.join(root, "state"));
   await store.create(localState);
+  const progress: import("../../src/orchestrator/agent-runtime.js").RuntimeProgressEvent[] = [];
   const validCompletion = JSON.stringify([
     {
       type: "complete_task",
@@ -3084,11 +3145,19 @@ test("runtime sends protocol repair feedback and continues", async () => {
     completionRequirements: { requiredCommandIds: [], requireValidationAfterLastMutation: true, requireCleanPendingOperations: true },
     clock: { now: () => new Date("2026-01-01T00:01:00.000Z") },
     idFactory: (() => { let value = 0; return () => `submission_${++value}`; })(),
+    onProgress: (event) => { progress.push(event); },
   });
 
   const result = await runtime.run();
   assert.equal(result.status, "completed");
   assert.equal(localState.budgetUsage.protocolRepairs, 1);
+  assert.equal(
+    progress.some((event) =>
+      event.kind === "model" &&
+      event.detail.actionType === "protocol_repair" &&
+      event.detail.repairBudgetAvailable === true),
+    true,
+  );
 });
 
 test("runtime does not send or charge a repair after the protocol-repair budget is exhausted", async () => {

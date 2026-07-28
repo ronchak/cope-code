@@ -30,7 +30,14 @@ Top-level and turn fields are strict. `submission_status` may be `submitted`, `n
 - `timed-out`: optional `incomplete`; or
 - `indeterminate`: optional `diagnostic_code`.
 
-Strings may contain `{{TASK_ID}}`, `{{TURN_ID}}`, and `{{SUBMISSION_ID}}`. `{{TURN_ID}}` is the transport identifier such as `turn_0001`; a `cba/1` envelope's `turn_id` is numeric and should be authored as `1`, `2`, and so on.
+Strings may contain `{{TASK_ID}}`, `{{TURN_ID}}`, and `{{SUBMISSION_ID}}` for
+transport-level fixture assertions. A completed response may use
+`{{OPERATION_REF}}` when the submitted harness message contains exactly one
+successful tool result; the fixture transport substitutes that result's
+harness-generated reference and fails closed for zero or multiple successful
+results. Model responses should use `cba-agent/1` and omit task, turn, message,
+and operation IDs; the harness derives those values. Historical `cba/1`
+responses remain accepted as migration fixtures.
 
 `example-discovery-session.json` is a two-turn, read-only completion example. Use it only with a synthetic repository whose completion policy has no required command IDs:
 

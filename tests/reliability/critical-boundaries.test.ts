@@ -16,6 +16,11 @@ import { OperationJournal } from "../../src/session/operation-journal.js";
 import { SessionStore } from "../../src/session/store.js";
 import { ScriptedFixtureTransport } from "../../src/transport/scripted-fixture.js";
 import {
+  MODEL_FACING_PROTOCOL_VERSION,
+  normalizeModelFacingMessage,
+  parseModelFacingEnvelope,
+} from "../../src/protocol/index.js";
+import {
   RELIABILITY_ITERATIONS,
   RELIABILITY_SEED,
   deriveScenarioSeed,
@@ -56,6 +61,28 @@ const noReplayBoundaries = new Set<(typeof runtimeBoundaries)[number]>([
   "journal-completed",
   "state-operation-completed",
 ]);
+
+test("model-facing operation identity is byte-stable across cached recovery replay", () => {
+  const raw = `\`\`\`${MODEL_FACING_PROTOCOL_VERSION}
+{"kind":"agent_intent","intent":"observe","observations":[{"tool":"git_status","arguments":{}},{"tool":"read_file","arguments":{"path":"README.md"}}],"reason":"Recover the same bounded observations."}
+\`\`\``;
+  const parsed = parseModelFacingEnvelope(raw);
+  const beforeInterruption = normalizeModelFacingMessage(parsed, {
+    taskId: "task_recovery_identity",
+    turnId: 11,
+    rawResponse: raw,
+  });
+  const afterRestart = normalizeModelFacingMessage(parseModelFacingEnvelope(raw), {
+    taskId: "task_recovery_identity",
+    turnId: 11,
+    rawResponse: raw,
+  });
+  assert.deepEqual(afterRestart, beforeInterruption);
+  assert.equal(beforeInterruption.message_type, "tool_request");
+  if (beforeInterruption.message_type === "tool_request") {
+    assert.equal(new Set(beforeInterruption.operations.map((entry) => entry.operation_id)).size, 2);
+  }
+});
 
 test("hard-exit runtime matrix reconstructs real durable commits without duplicate delivery or mutation", async () => {
   await reliabilityScenario("runtime-hard-exit-matrix", RELIABILITY_SEED, async (random) => {

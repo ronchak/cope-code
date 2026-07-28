@@ -241,9 +241,17 @@ const validationReportSchema = strictObject(
   ["command_id", "status", "summary"],
 );
 
+const answerBasisSchema = strictObject({
+  observed_files: optionalStringArray(pathString),
+  tool_result_refs: optionalStringArray(identifier),
+  user_provided_context: { type: "boolean" },
+});
+
 const completeTaskSchema = strictObject(
   {
+    kind: { enum: ["work", "answer"] },
     summary: shortString,
+    basis: answerBasisSchema,
     acceptance_criteria: { type: "array", maxItems: 256, items: acceptanceCriterionSchema },
     validation: { type: "array", maxItems: 256, items: validationReportSchema },
     skipped_validation: optionalStringArray(shortString),

@@ -272,19 +272,24 @@ export class AgentRuntime {
           turnId,
           data: { responseId: response.responseId, bytes: Buffer.byteLength(response.content), sha256: sha256(response.content) },
         });
-        this.emitProgress("model", {
-          status: "received",
-          responseBytes: Buffer.byteLength(response.content),
-        }, { turnId });
         if (this.interruption !== undefined) return await this.finishInterruption();
 
         let messages: readonly NormalizedModelMessage[];
         try {
-          messages = this.dependencies.protocol.parseModelTurn(response.content, {
+          const parsedTurn = this.dependencies.protocol.parseModelTurn(response.content, {
             taskId: this.state.taskId,
             turnId,
             ...(recoveryReplay ? { recoveryReplay: true } : {}),
-          }).messages;
+          });
+          messages = parsedTurn.messages;
+          for (const normalization of parsedTurn.normalizations ?? []) {
+            await this.dependencies.audit.append({
+              type: "protocol.normalized",
+              taskId: this.state.taskId,
+              turnId,
+              data: { ...normalization },
+            });
+          }
           this.state.protocolRepairStreak = 0;
         } catch (error) {
           const repairable = this.dependencies.protocol.isRepairableParseError(error);
@@ -293,6 +298,13 @@ export class AgentRuntime {
             repairAttempt !== undefined &&
             repairAttempt <= this.state.budgetLimits.maxProtocolRepairs &&
             this.meter.remaining("protocolRepairs") > 0;
+          this.emitProgress("model", {
+            status: "invalid",
+            actionType: "protocol_repair",
+            repairable,
+            repairBudgetAvailable,
+            ...(repairAttempt === undefined ? {} : { repairAttempt }),
+          }, { turnId });
           await this.dependencies.audit.append({
             type: "protocol.error",
             taskId: this.state.taskId,
@@ -300,6 +312,8 @@ export class AgentRuntime {
             data: {
               error: errorMessage(error),
               repairable,
+              stage: "model_response_normalization",
+              ...(error instanceof AgentError ? { details: error.details } : {}),
               ...(repairAttempt === undefined
                 ? {}
                 : {
@@ -314,7 +328,11 @@ export class AgentRuntime {
             throw new AgentError(
               "PROTOCOL_INVALID",
               `Non-repairable protocol violation: ${errorMessage(error)}`,
-              {},
+              {
+                stage: "model_response_normalization",
+                repairable: false,
+                ...(error instanceof AgentError ? error.details : {}),
+              },
               { cause: error },
             );
           }
@@ -334,6 +352,10 @@ export class AgentRuntime {
               code: "INVALID_ENVELOPE",
               message: errorMessage(error),
               repairAttempt: this.state.protocolRepairStreak,
+              details: {
+                stage: "model_response_normalization",
+                ...(error instanceof AgentError ? error.details : {}),
+              },
             }),
             "repair",
           );
@@ -344,6 +366,7 @@ export class AgentRuntime {
         }
 
         const action = selectAction(messages);
+        this.emitProgress("model", modelProgressDetail(action), { turnId });
         if (this.interruption !== undefined) return await this.finishInterruption();
         const next = await this.handleAction(action, turnId);
         if (next.terminal) {
@@ -415,7 +438,7 @@ export class AgentRuntime {
         (error.code === "TRANSPORT_INDETERMINATE" || error.code === "RECOVERY_REQUIRED") &&
         !["completed", "rolled_back", "blocked", "aborted", "failed", "paused"].includes(this.state.status)
       ) {
-        return await this.pauseWithInterruptionPriority(error.message);
+        return await this.pauseWithInterruptionPriority(actionableErrorMessage(error));
       }
       if (
         error instanceof AgentError &&
@@ -1296,6 +1319,7 @@ export class AgentRuntime {
           await this.move("completed");
           this.emitProgress("completion", {
             accepted: true,
+            completionKind: action.claim.kind ?? "work",
             changedFileCount: verification.actual.changedPaths.length,
             successfulCommandCount: verification.actual.successfulCommands.length,
             failedCommandCount: verification.actual.failedCommands.length,
@@ -1320,8 +1344,38 @@ export class AgentRuntime {
         return { terminal: false, outbound };
       }
       case "blocked": {
-        await this.move("blocked", action.reason);
-        return { terminal: true, result: this.result(action.reason) };
+        const reasonCode = "reasonCode" in action ? action.reasonCode : "MODEL_BLOCKED";
+        const summary = "summary" in action ? action.summary : action.reason;
+        const needed = "needed" in action ? action.needed : [];
+        const reason = `${reasonCode}: ${summary}${
+          needed.length === 0 ? "" : ` Needed: ${needed.join(", ")}`
+        }`;
+        if (!action.recoverable) {
+          await this.move("blocked", reason);
+          return { terminal: true, result: this.result(reason) };
+        }
+        const outbound = await this.serializeForDisclosure(
+          this.dependencies.protocol.renderProtocolError({
+            taskId: this.state.taskId,
+            priorTurnId: turnId,
+            code: "ACTION_REQUIRED",
+            message: "The previously reported blocker was marked recoverable. Reassess it after resume and either request the exact needed capability/input or continue with an available action.",
+            repairAttempt: 0,
+            details: {
+              reason_code: reasonCode,
+              summary,
+              needed,
+              recoverable: true,
+            },
+          }),
+          "repair",
+        );
+        await this.queueOutbound(outbound, nextTurnId(this.state.turnSequence));
+        await this.dependencies.artifacts?.remove("response", turnId);
+        return {
+          terminal: true,
+          result: await this.pauseWithInterruptionPriority(reason),
+        };
       }
       case "progress": {
         this.state.lastModelSummaryHash = sha256(action.summary);
@@ -2630,11 +2684,25 @@ export class AgentRuntime {
     }
     if (result.status === "blocked" || result.status === "timed-out") {
       return this.pauseWithInterruptionPriority(
-        result.status === "blocked" ? result.reason : result.diagnosticCode,
+        transportResultReason(result),
       );
     }
     if (result.status === "indeterminate") {
-      throw new AgentError("TRANSPORT_INDETERMINATE", result.diagnosticCode);
+      throw new AgentError(
+        "TRANSPORT_INDETERMINATE",
+        transportResultReason(result),
+        {
+          diagnosticCode: result.diagnosticCode,
+          ...(result.diagnostic === undefined ? {} : {
+            stage: result.diagnostic.stage,
+            repairable: result.diagnostic.repairable,
+            expected: result.diagnostic.expected,
+            actual: result.diagnostic.actual,
+            suggestedAction: result.diagnostic.suggestedAction,
+            next: transportSuggestedNext(result.diagnostic.suggestedAction),
+          }),
+        },
+      );
     }
     return undefined;
   }
@@ -2801,12 +2869,69 @@ export class AgentRuntime {
   }
 }
 
+function transportResultReason(
+  result: Exclude<ReceiveResult, { status: "completed" | "cancelled" }>,
+): string {
+  const code = result.status === "blocked"
+    ? result.diagnosticCode ?? result.reason
+    : result.diagnosticCode;
+  const summary = result.diagnostic?.summary;
+  const next = result.diagnostic === undefined
+    ? undefined
+    : transportSuggestedNext(result.diagnostic.suggestedAction);
+  return `${code}${summary === undefined ? "" : `: ${summary}`}${next === undefined ? "" : ` Next: ${next}`}`;
+}
+
+function transportSuggestedNext(action: string): string | undefined {
+  switch (action) {
+    case "resume_exact_session":
+      return "Run cope sessions --all, then resume the exact paused session.";
+    case "preserve_session_and_inspect_browser_transcript":
+      return "Preserve the paused session and inspect the visible Copilot transcript before deciding whether to resume or abort.";
+    default:
+      return undefined;
+  }
+}
+
+function actionableErrorMessage(error: AgentError): string {
+  const next = typeof error.details.next === "string"
+    ? error.details.next
+    : typeof error.details.suggestedAction === "string"
+      ? transportSuggestedNext(error.details.suggestedAction)
+      : undefined;
+  return `${error.message}${next === undefined ? "" : ` Next: ${next}`}`;
+}
+
 function selectAction(messages: readonly NormalizedModelMessage[]): NormalizedModelMessage {
   const actionable = messages.filter((message) => message.type !== "progress");
   if (actionable.length > 1) {
     throw new AgentError("PROTOCOL_INVALID", "A model turn contains more than one dependent action class");
   }
   return actionable[0] ?? messages[0] ?? (() => { throw new AgentError("PROTOCOL_INVALID", "Empty model turn"); })();
+}
+
+function modelProgressDetail(
+  action: NormalizedModelMessage,
+): Readonly<Record<string, unknown>> {
+  switch (action.type) {
+    case "tool_request":
+      return {
+        status: "parsed",
+        actionType: "tool_request",
+        tools: action.calls.map((call) => call.name),
+        operationCount: action.calls.length,
+      };
+    case "complete_task":
+      return {
+        status: "parsed",
+        actionType: action.claim.kind === "answer" ? "answer" : "completion",
+      };
+    case "request_user_input":
+    case "request_capability":
+    case "blocked":
+    case "progress":
+      return { status: "parsed", actionType: action.type };
+  }
 }
 
 function isBudgetExceeded(error: unknown): error is AgentError {

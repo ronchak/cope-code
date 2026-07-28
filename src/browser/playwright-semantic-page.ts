@@ -536,6 +536,10 @@ export class PlaywrightSemanticPage implements SemanticPage {
       {
         diagnosticCode: "BROWSER_OPERATION_TIMEOUT",
         dispatchAttempted: dispatchAttempted(),
+        stage: "browser_operation",
+        repairable: true,
+        next: "Run cope sessions --all, then resume the exact paused session after the dedicated browser closes.",
+        suggestedAction: "resume_exact_session",
         ...(this.#operationTimeoutOrigin?.() ?? operationTraceDetails(trace)),
       },
       cause === undefined ? undefined : { cause },

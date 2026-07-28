@@ -220,7 +220,21 @@ function sanitizeHandoff(
 
 function redactClaim(claim: CompletionClaim, redact: (value: string) => string): CompletionClaim {
   return {
+    ...(claim.kind === undefined ? {} : { kind: claim.kind }),
     summary: redact(claim.summary),
+    ...(claim.basis === undefined ? {} : {
+      basis: {
+        ...(claim.basis.observedFiles === undefined
+          ? {}
+          : { observedFiles: claim.basis.observedFiles.map(redact) }),
+        ...(claim.basis.toolResultRefs === undefined
+          ? {}
+          : { toolResultRefs: claim.basis.toolResultRefs.map(redact) }),
+        ...(claim.basis.userProvidedContext === undefined
+          ? {}
+          : { userProvidedContext: claim.basis.userProvidedContext }),
+      },
+    }),
     acceptanceCriteria: claim.acceptanceCriteria.map((entry) => ({
       criterion: redact(entry.criterion),
       status: entry.status,
@@ -318,7 +332,9 @@ function isIsoTimestamp(value: unknown): value is string {
 function isCompletionClaim(value: unknown): value is CompletionClaim {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const candidate = value as Partial<CompletionClaim>;
-  return typeof candidate.summary === "string" &&
+  return (candidate.kind === undefined || candidate.kind === "work" || candidate.kind === "answer") &&
+    (candidate.basis === undefined || isCompletionBasis(candidate.basis)) &&
+    typeof candidate.summary === "string" &&
     Array.isArray(candidate.acceptanceCriteria) &&
     candidate.acceptanceCriteria.every((entry) =>
       typeof entry.criterion === "string" &&
@@ -334,9 +350,20 @@ function isCompletionClaim(value: unknown): value is CompletionClaim {
     stringArray(candidate.skippedValidation) &&
     stringArray(candidate.remainingRisks) &&
     stringArray(candidate.recommendedFollowUp) &&
-    hasExactKeys(candidate as unknown as Record<string, unknown>, [
+    hasRequiredAndOptionalKeys(candidate as unknown as Record<string, unknown>, [
       "summary", "acceptanceCriteria", "validation", "skippedValidation", "remainingRisks", "recommendedFollowUp",
-    ]);
+    ], ["kind", "basis"]);
+}
+
+function isCompletionBasis(value: unknown): value is NonNullable<CompletionClaim["basis"]> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as NonNullable<CompletionClaim["basis"]>;
+  return (candidate.observedFiles === undefined || stringArray(candidate.observedFiles)) &&
+    (candidate.toolResultRefs === undefined || stringArray(candidate.toolResultRefs)) &&
+    (candidate.userProvidedContext === undefined || typeof candidate.userProvidedContext === "boolean") &&
+    hasExactKeys(candidate as unknown as Record<string, unknown>, [
+      "observedFiles", "toolResultRefs", "userProvidedContext",
+    ], true);
 }
 
 function isCompletionVerification(value: unknown): value is CompletionVerification {
@@ -371,6 +398,17 @@ function hasExactKeys(
   const keys = Object.keys(value);
   return keys.every((key) => allowed.includes(key)) &&
     (allowMissingOptional || allowed.every((key) => keys.includes(key)));
+}
+
+function hasRequiredAndOptionalKeys(
+  value: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[],
+): boolean {
+  const keys = Object.keys(value);
+  const allowed = [...required, ...optional];
+  return keys.every((key) => allowed.includes(key)) &&
+    required.every((key) => keys.includes(key));
 }
 
 async function atomicWrite(filename: string, content: string): Promise<void> {

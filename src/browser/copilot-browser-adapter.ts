@@ -653,6 +653,9 @@ export class CopilotBrowserAdapter implements ModelTransport {
         return this.#receiveBase(request, {
           status: "indeterminate",
           diagnosticCode: correlation.diagnosticCode,
+          ...(correlation.diagnostic === undefined
+            ? {}
+            : { diagnostic: correlation.diagnostic }),
         }, conversationId);
       }
       if (correlation.status === "candidate") {
@@ -1260,7 +1263,11 @@ function associatedResponse(
 ):
   | { readonly status: "pending" }
   | { readonly status: "candidate"; readonly content: string }
-  | { readonly status: "indeterminate"; readonly diagnosticCode: string } {
+  | {
+      readonly status: "indeterminate";
+      readonly diagnosticCode: string;
+      readonly diagnostic?: import("../transport/model-transport.js").TransportDiagnostic;
+    } {
   const responses = responseEnvelopeTexts(observation);
   const baselinePrefixMatches =
     responses.length >= record.baselineResponseCount &&
@@ -1279,10 +1286,10 @@ function associatedResponse(
       : { status: "candidate", content };
   }
 
-  // M365 virtualizes the oldest assistant envelope once its bounded transcript
-  // window is full. Locally retained per-envelope digests can prove the exact
-  // one-position suffix shift without weakening restart recovery, whose marker
-  // intentionally carries only the aggregate baseline and still fails closed.
+  // M365 may virtualize multiple oldest assistant envelopes once its bounded
+  // transcript window is full. Locally retained per-envelope digests prove
+  // only an exact suffix alignment; ambiguous repeated histories still fail
+  // closed.
   const baselineDigests = record.baselineResponseSha256s;
   if (
     baselineDigests !== undefined &&
@@ -1290,29 +1297,73 @@ function associatedResponse(
     baselineDigests.length >= 2
   ) {
     const currentDigests = responses.map((response) => sha256(response));
-    const retainedBaseline = baselineDigests.slice(1);
-    if (
-      currentDigests.length === retainedBaseline.length &&
-      digestSequencesEqual(currentDigests, retainedBaseline)
-    ) {
-      return { status: "pending" };
+    const pendingRetained = currentDigests.length > 0 &&
+      currentDigests.length < baselineDigests.length
+      ? baselineDigests.slice(baselineDigests.length - currentDigests.length)
+      : undefined;
+    const pendingMatches = pendingRetained !== undefined &&
+      digestSequencesEqual(currentDigests, pendingRetained);
+    const candidatePrefix = currentDigests.slice(0, -1);
+    const candidateRetained = candidatePrefix.length > 0 &&
+      candidatePrefix.length < baselineDigests.length
+      ? baselineDigests.slice(baselineDigests.length - candidatePrefix.length)
+      : undefined;
+    const candidateMatches = candidateRetained !== undefined &&
+      digestSequencesEqual(candidatePrefix, candidateRetained);
+    if (pendingMatches && candidateMatches) {
+      return {
+        status: "indeterminate",
+        diagnosticCode: "RESPONSE_SEQUENCE_AMBIGUOUS",
+        diagnostic: responseBaselineDiagnostic(
+          "The virtualized response history matched more than one safe alignment.",
+          record,
+          responses.length,
+        ),
+      };
     }
-    if (
-      currentDigests.length === baselineDigests.length &&
-      digestSequencesEqual(currentDigests.slice(0, -1), retainedBaseline)
-    ) {
+    if (candidateMatches) {
       const content = responses.at(-1)!;
       return content.length === 0
         ? { status: "pending" }
         : { status: "candidate", content };
     }
+    if (pendingMatches) return { status: "pending" };
   }
 
+  const truncated = responses.length < record.baselineResponseCount;
   return {
     status: "indeterminate",
-    diagnosticCode: responses.length < record.baselineResponseCount
+    diagnosticCode: truncated
       ? "RESPONSE_BASELINE_TRUNCATED"
       : "RESPONSE_BASELINE_CHANGED",
+    diagnostic: responseBaselineDiagnostic(
+      truncated
+        ? "The visible browser retained fewer response envelopes than the recorded baseline, and no exact suffix alignment was provable."
+        : "The visible response history no longer matches the recorded baseline.",
+      record,
+      responses.length,
+    ),
+  };
+}
+
+function responseBaselineDiagnostic(
+  summary: string,
+  record: SubmissionRecord,
+  observedResponseCount: number,
+): import("../transport/model-transport.js").TransportDiagnostic {
+  return {
+    stage: "browser_response_capture",
+    summary,
+    repairable: false,
+    suggestedAction: "preserve_session_and_inspect_browser_transcript",
+    expected: {
+      baseline_response_count: record.baselineResponseCount,
+      baseline_known: record.baselineKnown,
+    },
+    actual: {
+      observed_response_count: observedResponseCount,
+      per_response_digests_available: record.baselineResponseSha256s !== undefined,
+    },
   };
 }
 

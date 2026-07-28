@@ -76,9 +76,14 @@ export class TerminalUserInteraction implements UserInteraction {
       return;
     }
 
-    const mode = stringValue(parsed.mode) ?? "unknown";
+    const requestedMode = stringValue(parsed.requested_mode) ?? stringValue(parsed.mode) ?? "unknown";
+    const effectiveMode = stringValue(parsed.effective_mode) ??
+      (requestedMode === "inspect" ? "inspect-only" : requestedMode);
     keyValue("Project", stringValue(parsed.repository_root) ?? "unknown", this.output);
-    keyValue("Mode", humanMode(mode), this.output);
+    keyValue("Effective mode", humanMode(effectiveMode), this.output);
+    if (requestedMode !== effectiveMode) {
+      keyValue("Requested mode", humanMode(requestedMode), this.output);
+    }
     const branch = stringValue(parsed.branch);
     if (branch !== undefined) keyValue("Branch", branch, this.output);
 
@@ -87,19 +92,27 @@ export class TerminalUserInteraction implements UserInteraction {
     const creatable = stringArray(parsed.creatable_paths);
     const deletable = stringArray(parsed.deletable_paths);
     const commands = stringArray(parsed.command_ids);
+    const commandCategories = stringArray(parsed.command_categories)
+      .map((category) => `category:${category}`);
     const disclosure = stringArray(parsed.disclosure_classifications);
     const network = recordValue(parsed.network);
 
     this.output.write("\n");
     keyValue("Read", compactList(readable, "none"), this.output);
-    keyValue("Edit", mode === "inspect" ? "none, read-only session" : compactList(writable, "none"), this.output);
+    const canWrite = parsed.can_write === true;
+    const canRunCommands = parsed.can_run_commands === true;
+    keyValue("Edit", canWrite ? compactList(writable, "granted create/delete paths only") : "none, inspect-only task", this.output);
     if (creatable.length > 0) keyValue("Create", compactList(creatable, "none"), this.output);
     if (deletable.length > 0) keyValue("Delete", compactList(deletable, "none"), this.output);
-    keyValue("Commands", compactList(commands, "none"), this.output);
+    keyValue(
+      "Commands",
+      canRunCommands ? compactList([...commands, ...commandCategories], "granted by policy") : "none, inspect-only task",
+      this.output,
+    );
     if (disclosure.length > 0) keyValue("Copilot data", compactList(disclosure, "none"), this.output);
     keyValue("Network", stringValue(network?.session_access) ?? "deny", this.output);
 
-    if (mode !== "inspect" && writable.length > 0) {
+    if (canWrite) {
       this.output.write(`\n${dim("Cope checkpoints file edits before applying them and asks again when policy requires more access.")}\n`);
     } else {
       this.output.write(`\n${dim("This session cannot modify project files.")}\n`);
@@ -206,6 +219,9 @@ function compactObject(value: Readonly<Record<string, unknown>>): string {
 }
 
 function humanMode(mode: string): string {
+  if (mode === "inspect-only") return "inspect-only";
+  if (mode === "edit-capable") return "edit-capable";
+  if (mode === "policy-auto") return "policy-auto";
   if (mode === "inspect") return "inspect, read-only";
   if (mode === "edit") return "edit, approvals as needed";
   if (mode === "auto") return "auto, within project policy";

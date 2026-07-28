@@ -231,6 +231,8 @@ export async function composeRuntime(options: ComposeRuntimeOptions): Promise<Co
     // journal can replay read-only work or classify a mutation indeterminate.
     seenOperationIds: () => new Set(state.completedOperationIds),
     pathKey: repository.boundary.pathKey.bind(repository.boundary),
+    allowLegacyCorrelationRebind:
+      options.transport.transportKind === "visible-browser-m365-copilot/v1",
   });
   const runtime = new AgentRuntime({
     state,
@@ -324,15 +326,33 @@ export function effectiveGrantSummary(
       timeout_ms: command.timeoutMs ?? null,
       max_timeout_ms: command.maxTimeoutMs ?? null,
     }));
+  const readablePaths = grant.capabilities.paths?.read?.allow ?? [];
+  const writablePaths = grant.capabilities.paths?.write?.allow ?? [];
+  const creatablePaths = grant.capabilities.paths?.create?.allow ?? [];
+  const deletablePaths = grant.capabilities.paths?.delete?.allow ?? [];
+  const commandIds = grant.capabilities.commands?.ids?.allow ?? [];
+  const commandCategories = grant.capabilities.commands?.categories?.allow ?? [];
+  const canWrite = grant.mode !== "inspect" &&
+    writablePaths.length + creatablePaths.length + deletablePaths.length > 0;
+  const canRunCommands = grant.mode !== "inspect" &&
+    commandIds.length + commandCategories.length > 0;
+  const effectiveMode = canWrite || canRunCommands
+    ? grant.mode === "auto" ? "policy-auto" : "edit-capable"
+    : "inspect-only";
   return JSON.stringify({
     schema_version: "cba-effective-grant/1",
     mode: grant.mode,
+    requested_mode: grant.mode,
+    effective_mode: effectiveMode,
+    can_read: readablePaths.length > 0,
+    can_write: canWrite,
+    can_run_commands: canRunCommands,
     repository_root: grant.repository_root,
     branch: grant.branch ?? null,
-    readable_paths: grant.capabilities.paths?.read?.allow ?? [],
-    writable_paths: grant.capabilities.paths?.write?.allow ?? [],
-    creatable_paths: grant.capabilities.paths?.create?.allow ?? [],
-    deletable_paths: grant.capabilities.paths?.delete?.allow ?? [],
+    readable_paths: readablePaths,
+    writable_paths: writablePaths,
+    creatable_paths: creatablePaths,
+    deletable_paths: deletablePaths,
     path_scope: {
       mandatory_excluded: DEFAULT_REPOSITORY_EXCLUSIONS,
       mandatory_protected: DEFAULT_PROTECTED_RULES.map((rule) => rule.pattern),
@@ -350,8 +370,8 @@ export function effectiveGrantSummary(
       },
       precedence: "deny > ask > allow; every descendant path is evaluated independently",
     },
-    command_ids: grant.capabilities.commands?.ids?.allow ?? [],
-    command_categories: grant.capabilities.commands?.categories?.allow ?? [],
+    command_ids: commandIds,
+    command_categories: commandCategories,
     session_command_definitions: sessionCommandDefinitions,
     command_constraints_by_layer: {
       organization: configuration.organizationPolicy.capabilities.commands ?? {},

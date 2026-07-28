@@ -211,7 +211,10 @@ export async function ensureRepositoryConfiguration(options: {
   keyValue("Access", profile === "inspect" ? "inspect only" : "edit", output);
   keyValue("Validation commands", result.commandCount, output);
   if (result.commandCount > 0) info(`Detected ${result.commandCount} package validation command${result.commandCount === 1 ? "" : "s"}.`, output);
-  else hint("No package validation scripts were detected. Cope can still work on the files.", output);
+  else warning(
+    "No project validation commands were detected. Cope can still work, but completion will report project validation as not run and will not imply tests passed.",
+    output,
+  );
   return result;
 }
 

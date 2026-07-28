@@ -6,7 +6,10 @@ import test from "node:test";
 import { SecretScanner } from "../../src/security/secrets.js";
 import { BudgetMeter } from "../../src/session/budgets.js";
 import { SessionArtifactStore } from "../../src/session/artifact-store.js";
-import { CompletionHandoffStore } from "../../src/session/completion-handoff-store.js";
+import {
+  CompletionHandoffStore,
+  isCompletionHandoffRecord,
+} from "../../src/session/completion-handoff-store.js";
 import { SessionStore } from "../../src/session/store.js";
 import { allowedTransitions, isTerminal, transitionSession } from "../../src/session/state-machine.js";
 import {
@@ -222,6 +225,41 @@ test("hosts without directory fsync commit completion handoffs inline with sessi
     },
   };
   await assert.rejects(() => sessionStore.write(tampered), /reference is malformed/u);
+});
+
+test("0.1.7-shaped completion handoffs remain readable without new optional claim fields", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-session-legacy-017-claim-"));
+  const handoffs = new CompletionHandoffStore(
+    path.join(root, "handoff"),
+    "session_12345678",
+    new SecretScanner(Buffer.alloc(32, 23)),
+    false,
+  );
+  const reference = await handoffs.save({
+    summary: "Legacy 0.1.7 completion",
+    acceptanceCriteria: [],
+    validation: [],
+    skippedValidation: [],
+    remainingRisks: [],
+    recommendedFollowUp: [],
+  }, {
+    accepted: true,
+    reasons: [],
+    actual: {
+      changedPaths: [],
+      agentChangedPaths: [],
+      preExistingPaths: [],
+      successfulCommands: [],
+      failedCommands: [],
+      gitStatusSummary: "clean",
+      repositoryFingerprint: "f".repeat(64),
+    },
+  }, "2026-01-01T00:00:02.000Z");
+
+  const record = await handoffs.read(reference);
+  assert.equal(isCompletionHandoffRecord(record), true);
+  assert.equal(record.claim.kind, undefined);
+  assert.equal(record.claim.basis, undefined);
 });
 
 test("file-backed handoff creation flushes its parent before publishing the file", async () => {

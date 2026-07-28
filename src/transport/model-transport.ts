@@ -67,6 +67,15 @@ interface ReceiveResultBase extends TurnCorrelation {
   readonly conversationId?: string;
 }
 
+export interface TransportDiagnostic {
+  readonly stage: string;
+  readonly summary: string;
+  readonly repairable: boolean;
+  readonly suggestedAction: string;
+  readonly expected?: Readonly<Record<string, unknown>>;
+  readonly actual?: Readonly<Record<string, unknown>>;
+}
+
 export interface CompletedReceiveResult extends ReceiveResultBase {
   readonly status: "completed";
   readonly responseId: string;
@@ -78,16 +87,19 @@ export interface BlockedReceiveResult extends ReceiveResultBase {
   readonly reason: TransportBlockReason;
   readonly retryable: boolean;
   readonly diagnosticCode?: string;
+  readonly diagnostic?: TransportDiagnostic;
 }
 
 export interface TimedOutReceiveResult extends ReceiveResultBase {
   readonly status: "timed-out";
   readonly diagnosticCode: "NO_RESPONSE" | "RESPONSE_INCOMPLETE";
+  readonly diagnostic?: TransportDiagnostic;
 }
 
 export interface IndeterminateReceiveResult extends ReceiveResultBase {
   readonly status: "indeterminate";
   readonly diagnosticCode: string;
+  readonly diagnostic?: TransportDiagnostic;
 }
 
 export interface CancelledReceiveResult extends ReceiveResultBase {

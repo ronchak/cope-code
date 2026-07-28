@@ -404,7 +404,14 @@ export interface ValidationReport {
 }
 
 export interface CompleteTaskArguments {
+  /** Distinguishes informational answers from completion reports without changing lifecycle state. */
+  readonly kind?: "work" | "answer";
   readonly summary: string;
+  readonly basis?: {
+    readonly observed_files?: readonly string[];
+    readonly tool_result_refs?: readonly string[];
+    readonly user_provided_context?: boolean;
+  };
   readonly acceptance_criteria: readonly AcceptanceCriterionReport[];
   readonly validation: readonly ValidationReport[];
   readonly skipped_validation: readonly string[];

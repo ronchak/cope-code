@@ -527,6 +527,7 @@ test("Chrome launch accepts a signed upgrade race and uses exactly the reverifie
     assert.equal(observed[0]?.profile, await realpath(profile));
     assert.equal(observed[0]?.options.executablePath, await realpath(executable));
     assert.equal(observed[0]?.options.headless, false);
+    assert.equal(observed[0]?.options.chromiumSandbox, true);
     assert.equal(observed[0]?.options.acceptDownloads, false);
     assert.equal("channel" in (observed[0]?.options ?? {}), false);
   } finally {

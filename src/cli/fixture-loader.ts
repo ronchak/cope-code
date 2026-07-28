@@ -28,7 +28,9 @@ export interface LoadedCliFixture {
 /**
  * Loads a reusable, text-only model fixture. Correlation fields are generated
  * by the harness; response text may use {{TASK_ID}}, {{TURN_ID}}, and
- * {{SUBMISSION_ID}} placeholders.
+ * {{SUBMISSION_ID}} placeholders. A completed response may also use
+ * {{OPERATION_REF}} when its submitted harness message contains exactly one
+ * successful tool result.
  */
 export async function loadCliFixture(
   filename: string,

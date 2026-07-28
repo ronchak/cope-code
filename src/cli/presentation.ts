@@ -107,7 +107,7 @@ export function startupPanel(options: StartupPanelOptions, output: Writable): vo
 export function readySummary(context: ChatContext, output: Writable): void {
   section("Workspace", output);
   keyValue("Project", context.repositoryRoot, output);
-  keyValue("Mode", context.mode, output);
+  keyValue("Product mode", modePresentation(context.mode), output);
   keyValue("Transport", context.transport, output);
 }
 
@@ -125,10 +125,10 @@ export function chatFooter(context: ChatContext, width = terminalColumns()): str
   const project = path.basename(context.repositoryRoot) || context.repositoryRoot;
   const transport = context.demo ? "demo offline" : context.transport;
   const available = Math.max(1, width - 2);
-  const full = `${context.mode} mode  ·  ${transport}  ·  ${project}  ·  Enter submit  ·  /help commands  ·  Ctrl+C cancel`;
+  const full = `${modePresentation(context.mode)}  ·  ${transport}  ·  ${project}  ·  Enter submit  ·  /help commands  ·  Ctrl+C cancel`;
   if (displayWidth(full) <= available) return full;
   return truncateEnd(
-    `Enter submit  ·  Ctrl+C cancel  ·  ${context.mode} mode  ·  ${transport}  ·  ${project}`,
+    `Enter submit  ·  Ctrl+C cancel  ·  ${modePresentation(context.mode)}  ·  ${transport}  ·  ${project}`,
     available,
   );
 }
@@ -184,7 +184,7 @@ function renderWideStartup(
     "",
     dim("Workspace"),
     truncateMiddle(options.repositoryRoot, leftWidth),
-    dim(`${options.mode} mode  ·  ${options.transport}`),
+    dim(`${modePresentation(options.mode)}  ·  ${options.transport}`),
   ];
   const right = options.demo
     ? [
@@ -227,7 +227,7 @@ function renderCompactStartup(
     dim("Copilot coding, without the copy and paste loop"),
     "",
     `${dim("Project:")} ${truncateMiddle(options.repositoryRoot, Math.max(8, innerWidth - 9))}`,
-    `${dim("Mode:")} ${options.mode}`,
+    `${dim("Product mode:")} ${modePresentation(options.mode)}`,
     `${dim("Transport:")} ${options.transport}`,
     repeatToWidth(characters.horizontal, innerWidth),
     bold(cyan(options.demo ? "Demo workspace" : "Ready to work")),
@@ -235,6 +235,12 @@ function renderCompactStartup(
     dim(options.demo ? "No browser, network, or file changes." : "/help commands  ·  /mode access  ·  /resume recent work"),
   ];
   for (const row of rows) framedLine(row, innerWidth, characters, output);
+}
+
+function modePresentation(mode: AutonomyMode): string {
+  if (mode === "inspect") return "inspect-only";
+  if (mode === "edit") return "edit-capable";
+  return "policy-auto";
 }
 
 function framedLine(

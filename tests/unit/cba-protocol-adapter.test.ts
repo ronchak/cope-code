@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { CbaProtocolAdapter } from "../../src/orchestrator/cba-protocol-adapter.js";
 import {
+  MODEL_FACING_PROTOCOL_VERSION,
   ORCHESTRATOR_TOOL_NAMES,
   ProtocolParseError,
   TOOL_REGISTRY,
@@ -37,26 +38,23 @@ test("CBA adapter renders bootstrap and normalizes a typed tool request", () => 
   });
   assert.match(bootstrap, /only software-engineering reasoning component/);
   assert.match(bootstrap, /"iterations"|"turns"/);
+  assert.match(bootstrap, new RegExp(MODEL_FACING_PROTOCOL_VERSION.replace("/", "\\/"), "u"));
+  assert.doesNotMatch(bootstrap, /Use task_id|operation_id values/u);
   assert.match(
     bootstrap,
     /"budget_recovery":\{"disclosed_bytes":\{"available":true,"blocking_layer":"organization","current_limit":2000000,"higher_layer_ceiling":8000000\}\}/u,
   );
 
-  const response = serializeProtocolEnvelope({
-    protocol: "cba/1",
-    message_type: "tool_request",
-    message_id: "msg_1",
-    task_id: "task_12345678",
-    turn_id: 1,
-    operations: [{ operation_id: "op_1", tool: "list_files", arguments: { path: "." } }],
-  });
+  const response = `\`\`\`${MODEL_FACING_PROTOCOL_VERSION}
+{"kind":"agent_intent","intent":"list_files","arguments":{"path":"."},"reason":"Inspect the bounded repository root."}
+\`\`\``;
   const parsed = adapter.parseModelTurn(response, { taskId: "task_12345678", turnId: "turn_0001" });
-  assert.deepEqual(parsed.messages, [
-    {
-      type: "tool_request",
-      calls: [{ operationId: "op_1", name: "list_files", arguments: { path: "." } }],
-    },
-  ]);
+  assert.equal(parsed.messages[0]?.type, "tool_request");
+  if (parsed.messages[0]?.type === "tool_request") {
+    assert.match(parsed.messages[0].calls[0]?.operationId ?? "", /^op_1_1_[a-f0-9]{20}$/u);
+    assert.equal(parsed.messages[0].calls[0]?.name, "list_files");
+    assert.deepEqual(parsed.messages[0].calls[0]?.arguments, { path: "." });
+  }
 });
 
 test("CBA adapter ignores unknown policy-summary tools and scopes bootstrap guidance to active tools", () => {
@@ -76,8 +74,8 @@ test("CBA adapter ignores unknown policy-summary tools and scopes bootstrap guid
     },
     budgetSummary: {},
   });
-  assert.match(bootstrap, /active tool catalog \(git_status\)/u);
-  assert.match(bootstrap, /"tool":"git_status"/u);
+  assert.match(bootstrap, /active batchable catalog \(git_status\)/u);
+  assert.match(bootstrap, /"intent":"git_status"/u);
   assert.doesNotMatch(bootstrap, /forged_tool/u);
   assert.doesNotMatch(bootstrap, /active tool catalog \([^)]*list_files/u);
   assert.doesNotMatch(bootstrap, /budget_recovery/u);
@@ -150,11 +148,9 @@ test("CBA adapter maps completion claims and emits structured rejection results"
       },
     },
   });
-  const wire = parseProtocolEnvelope(rejection, {
-    expected_task_id: "task_12345678",
-    expected_turn_id: 2,
-  });
-  assert.equal(wire.message_type, "tool_result");
+  assert.match(rejection, /"kind":"harness_completion_rejected"/u);
+  assert.match(rejection, /COMPLETION_NOT_VERIFIED/u);
+  assert.doesNotMatch(rejection, /"task_id"|"message_id"/u);
 });
 
 test("CBA adapter enforces prior operation IDs through the protocol parser", () => {
@@ -233,4 +229,107 @@ test("CBA adapter repairs only parser failures explicitly marked repairable", ()
   for (const error of cases) {
     assert.equal(adapter.isRepairableParseError(error), false);
   }
+});
+
+test("legacy task and turn identity are rebound only for marker-proven live turns", () => {
+  const legacy = serializeProtocolEnvelope({
+    protocol: "cba/1",
+    message_type: "tool_request",
+    message_id: "msg_stale",
+    task_id: "task_stale",
+    turn_id: 99,
+    operations: [{ operation_id: "op_legacy_read", tool: "git_status", arguments: {} }],
+  });
+  const live = new CbaProtocolAdapter({ allowLegacyCorrelationRebind: true });
+  const rebound = live.parseModelTurn(legacy, {
+    taskId: "task_active",
+    turnId: "turn_0004",
+  });
+  assert.equal(rebound.messages[0]?.type, "tool_request");
+  assert.deepEqual(rebound.normalizations, [{
+    kind: "legacy_correlation_rebound",
+    receivedTaskId: "task_stale",
+    expectedTaskId: "task_active",
+    receivedTurnId: 99,
+    expectedTurnId: 4,
+  }]);
+
+  assert.throws(
+    () => new CbaProtocolAdapter().parseModelTurn(legacy, {
+      taskId: "task_active",
+      turnId: "turn_0004",
+    }),
+    /does not match active task/u,
+  );
+  assert.throws(
+    () => live.parseModelTurn(legacy, {
+      taskId: "task_active",
+      turnId: "turn_0004",
+      recoveryReplay: true,
+    }),
+    /does not match active task/u,
+  );
+});
+
+test("CBA adapter selects the parser from the executable envelope instead of surrounding prose", () => {
+  const legacy = serializeProtocolEnvelope({
+    protocol: "cba/1",
+    message_type: "tool_request",
+    message_id: "msg_legacy_with_migration_note",
+    task_id: "task_12345678",
+    turn_id: 5,
+    operations: [{ operation_id: "op_legacy_status", tool: "git_status", arguments: {} }],
+  });
+  const response = [
+    "Migration note: future responses should use ```cba-agent/1 after this legacy turn.",
+    legacy,
+  ].join("\n\n");
+
+  const parsed = new CbaProtocolAdapter().parseModelTurn(response, {
+    taskId: "task_12345678",
+    turnId: "turn_0005",
+  });
+  assert.equal(parsed.messages[0]?.type, "tool_request");
+  if (parsed.messages[0]?.type === "tool_request") {
+    assert.equal(parsed.messages[0].calls[0]?.operationId, "op_legacy_status");
+    assert.equal(parsed.messages[0].calls[0]?.name, "git_status");
+  }
+});
+
+test("generic Copilot fallback is a repairable typed diagnostic", () => {
+  const adapter = new CbaProtocolAdapter();
+  assert.throws(
+    () => adapter.parseModelTurn(
+      "Sorry, I wasn't able to respond to that. Is there something else I can help with?",
+      { taskId: "task_active", turnId: "turn_0001" },
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof ProtocolParseError);
+      assert.equal(error.repairable, true);
+      assert.equal(error.details.diagnostic_code, "COPILOT_GENERIC_FALLBACK");
+      return true;
+    },
+  );
+});
+
+test("model-facing harness results expose operation references without transport correlation", () => {
+  const rendered = new CbaProtocolAdapter().renderToolOutcomes({
+    taskId: "task_private",
+    priorTurnId: "turn_0003",
+    outcomes: [{
+      operationId: "op_generated",
+      tool: "list_files",
+      status: "denied",
+      data: {
+        code: "DISCLOSURE_OPERATION_LIMIT_EXCEEDED",
+        message: "Reduce max_results.",
+        details: { retry_with: { max_results: 20 } },
+      },
+      safeMetadata: {},
+    }],
+  });
+  assert.match(rendered, /"kind":"harness_tool_results"/u);
+  assert.match(rendered, /"retry_allowed":true/u);
+  assert.match(rendered, /"max_results":20/u);
+  assert.doesNotMatch(rendered, /task_private|"task_id"|"turn_id"|"message_id"/u);
 });
