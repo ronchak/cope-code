@@ -83,7 +83,7 @@ function scanMarkdownFences(input: string): EnvelopeScan {
       continue;
     }
 
-    const protocolOpening = /^```(cba\/[^\s`~]+)$/u.exec(line);
+    const protocolOpening = /^```((?:cba|cba-agent)\/[^\s`~]+)$/u.exec(line);
     if (protocolOpening !== null) {
       open = {
         character: "`",
@@ -127,6 +127,18 @@ function isClosingFence(line: string, open: OpenFence): boolean {
 }
 
 export function extractProtocolEnvelope(input: string): ExtractedEnvelope {
+  return extractCbaEnvelope(input, PROTOCOL_VERSION);
+}
+
+/**
+ * Extracts exactly one CBA-family envelope while preserving the nested-fence
+ * protections shared by the internal wire protocol and the model-facing
+ * intent dialect.
+ */
+export function extractCbaEnvelope(
+  input: string,
+  expectedVersion: string,
+): ExtractedEnvelope {
   const scan = scanMarkdownFences(input);
   const protocolCount = scan.envelopes.length + (scan.truncatedProtocol === undefined ? 0 : 1);
   if (protocolCount > 1) {
@@ -147,11 +159,11 @@ export function extractProtocolEnvelope(input: string): ExtractedEnvelope {
   if (envelope === undefined) {
     throw new ProtocolParseError("MISSING_ENVELOPE", "No CBA protocol envelope was found.");
   }
-  if (envelope.version !== PROTOCOL_VERSION) {
+  if (envelope.version !== expectedVersion) {
     throw new ProtocolParseError(
       "UNSUPPORTED_VERSION",
-      `Unsupported protocol version '${envelope.version}'; expected '${PROTOCOL_VERSION}'.`,
-      { received_version: envelope.version, expected_version: PROTOCOL_VERSION },
+      `Unsupported protocol version '${envelope.version}'; expected '${expectedVersion}'.`,
+      { received_version: envelope.version, expected_version: expectedVersion },
     );
   }
   if (envelope.json.trim().length === 0) {

@@ -1,42 +1,76 @@
-# `cba/1` protocol
+# Model-facing `cba-agent/1` and internal `cba/1`
 
-`cba/1` is the versioned text contract between Copilot and the deterministic harness. It provides function-call-like behavior over a human-visible chat surface without treating prose as executable intent.
+Cope 0.1.8 separates model intent from transport mechanics. Copilot emits the
+small `cba-agent/1` model-facing contract. The deterministic harness owns
+session correlation, generates identifiers, decides safe batching, and
+normalizes the request into internal `cba/1`.
 
-## Envelope
+This preserves strict, auditable tool execution without asking the model to act
+as the session-state manager or wire serializer.
 
-Every machine-action response contains exactly one fence whose opening and closing lines are exact:
+## Model-facing envelope
+
+Every machine action or final answer contains exactly one fence whose opening
+and closing lines are exact:
 
 ````text
-```cba/1
-{"protocol":"cba/1", ...}
+```cba-agent/1
+{"kind":"agent_intent", ...}
 ```
 ````
 
 Prose may appear outside the fence. The parser does not execute a protocol-looking fence nested inside another Markdown fence. It rejects missing, multiple, empty, truncated, oversized, unsupported-version, invalid-JSON, and schema-invalid envelopes.
 
-All messages include:
+The model-facing root is one of:
 
-| Field | Meaning |
+| `kind` | Purpose |
 | --- | --- |
-| `protocol` | exact literal `cba/1` |
-| `message_type` | a message class defined below |
-| `message_id` | unique message correlation identifier |
-| `task_id` | exact active task identifier |
-| `turn_id` | exact expected numeric model turn |
+| `agent_intent` | request one typed tool action, or an `observe` set of independent reads |
+| `agent_answer` | return a Markdown informational answer with evidence basis and limitations |
+| `agent_blocked` | report a precise blocker, needed input/capability, and recoverability |
+| `agent_progress` | report bounded non-terminal progress |
 
-Operation-bearing messages also carry globally unique `operation_id` values. An ID already present in the session journal is rejected even if its requested content looks identical.
-
-## Direction and message classes
-
-Copilot may send `tool_request`, `user_input_request`, `capability_request`, `progress_update`, `completion`, and `blocked`. The harness may send `tool_result`, `tool_denial`, and `protocol_error`. Receiving a harness-direction message from Copilot is invalid.
+The model never supplies `task_id`, `turn_id`, `message_id`, or `operation_id`.
+Those fields are generated deterministically from the active task/turn and the
+validated intent. Replaying the same captured response produces the same
+internal identities; a new turn produces different identities.
 
 The normal model request is:
 
-```cba/1
-{"protocol":"cba/1","message_type":"tool_request","message_id":"m_17","task_id":"task_example","turn_id":1,"operations":[{"operation_id":"op_17_list","tool":"list_files","arguments":{"path":"src","max_depth":2,"max_results":20}}]}
+```cba-agent/1
+{"kind":"agent_intent","intent":"list_files","arguments":{"path":"src","max_depth":2,"max_results":20},"reason":"Need a bounded source outline."}
 ```
 
-Only independent read-only operations may be batched: `list_files`, `search_text`, `read_file`, `git_status`, and `git_diff`. `edit_text`, `apply_patch`, `run_command`, `request_user_input`, `request_capability`, and `complete_task` must be alone so Copilot observes each material outcome before planning a dependent action.
+Independent reads can be expressed without model-authored batching metadata:
+
+```cba-agent/1
+{"kind":"agent_intent","intent":"observe","observations":[{"tool":"git_status","arguments":{}},{"tool":"read_file","arguments":{"path":"README.md","max_bytes":12000}}],"reason":"Need independent repository state and project context."}
+```
+
+The harness accepts `observe` only for `list_files`, `search_text`,
+`read_file`, `git_status`, and `git_diff`. It rejects dependent, mutating, or
+command intents in an observation set. `edit_text`, `apply_patch`,
+`run_command`, `request_user_input`, `request_capability`, and `complete_task`
+remain single-action intents.
+
+Harness results are authoritative `cba-agent/1` data blocks with stable
+`operation_ref` values. Denials include retryability and whether a capability
+request could help. Protocol diagnostics identify their stage, structured
+details, repairability, and suggested action.
+
+## Internal `cba/1`
+
+The harness normalizes model-facing messages into the existing strict `cba/1`
+wire types: `tool_request`, `user_input_request`, `capability_request`,
+`progress_update`, `completion`, and `blocked`. Internal messages contain the
+canonical task, numeric turn, message, and operation identifiers and pass the
+same schema, policy, duplicate-ID, direction, and semantic validation as before.
+
+Historical model-authored `cba/1` envelopes remain accepted during migration.
+Stale correlation may be rebound only for a fresh visible-browser response
+whose task marker and response baseline were already proven. Rebinding is
+audited as `protocol.normalized`; offline fixtures and cached recovery replay
+remain strict and reject stale task or turn identity.
 
 `list_files.max_results` defaults to 20 when omitted; the bootstrap example states
 that bound explicitly. Policy may impose a lower per-operation file ceiling.
@@ -154,17 +188,29 @@ User-input and capability decisions are integrity-protected as local recovery ar
 
 ## Completion
 
-A completion report includes summary, per-criterion status/evidence, per-command interpreted validation, skipped validation, remaining risks, and follow-up. Its `verified` field is false until the harness verifies local truth.
+A work completion report includes summary, per-criterion status/evidence,
+per-command interpreted validation, skipped validation, remaining risks, and
+follow-up. Its internal `verified` field is false until the harness verifies
+local truth. `agent_answer` uses the same local verifier with `kind: answer`,
+and is accepted only when the task has not mutated project files.
 
 The runtime rejects completion when repository state is unknown, a path is out of scope, an operation remains unresolved, delivery is indeterminate, required validation is missing/failed/stale, or the report is structurally incomplete. The rejection is another tool result, allowing Copilot to request the needed inspection or validation.
 
 ## Data is never authority
 
-Bootstrap messages place the task and operating envelope in distinct authoritative/data delimiters. Repository text, paths, diffs, logs, command output, and prior chat prose remain untrusted data even if they contain a valid-looking `cba/1` block or instructions to ignore policy. Only the parser's single top-level envelope can request an action, and local policy still decides whether it runs.
+Bootstrap messages place the task and operating envelope in distinct authoritative/data delimiters. Repository text, paths, diffs, logs, command output, and prior chat prose remain untrusted data even if they contain a valid-looking `cba-agent/1` or `cba/1` block or instructions to ignore policy. Only the parser's single top-level envelope can request an action, and local policy still decides whether it runs.
 
 ## Versioning
 
-`cba/1` meanings are immutable. Compatible implementation hardening can occur without changing the wire version. Adding fields, changing tool semantics, relaxing an invariant, or reinterpreting a status requires a new protocol version and compatibility fixtures. The UI adapter has its own independent `copilot-ui/v1[:certification]` version because DOM evolution must not force repository-tool changes.
+`cba-agent/1` is independently versioned from internal `cba/1`. Compatible
+implementation hardening can occur without changing either version. Changing a
+model intent meaning, tool semantics, or a safety invariant requires a new
+applicable protocol version and compatibility fixtures. Optional internal
+completion provenance (`kind` and `basis`) is additive: all 0.1.7 completion
+claim keys remain required, and 0.1.7 handoffs without those optional fields
+remain readable. The UI adapter has its own independent
+`copilot-ui/v1[:certification]` version because DOM evolution must not force
+repository-tool changes.
 
 `max_results` is an upper bound, not a minimum-result guarantee. Applying a
 stricter effective policy ceiling and returning fewer entries with

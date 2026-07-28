@@ -1,29 +1,26 @@
 import {
   PROTOCOL_ERROR_CODES,
   ProtocolParseError,
-  createProtocolErrorMessage,
-  createToolDenialMessage,
-  createToolResultMessage,
   parseProtocolEnvelope,
+  extractCbaEnvelope,
+  normalizeModelFacingMessage,
+  parseModelFacingEnvelope,
   renderBootstrapContract,
   renderProtocolReminder,
   serializeProtocolEnvelope,
+  validateProtocolMessage,
   isLocalToolName,
   isOrchestratorToolName,
   isToolName,
-  type CapabilityRequestMessage,
   type CompleteTaskArguments,
-  type CompletionMessage,
-  type ProtocolCorrelation,
   type ProtocolErrorCode,
   type ProtocolMessage,
   type RequestCapabilityArguments,
   type OrchestratorToolName,
   type ToolName as WireToolName,
   type ToolOperation,
-  type ToolOutcomeStatus,
 } from "../protocol/index.js";
-import { sha256 } from "../shared/crypto.js";
+import { sha256, stableJson } from "../shared/crypto.js";
 import { AgentError } from "../shared/errors.js";
 import type {
   NormalizedModelMessage,
@@ -45,6 +42,11 @@ const MODEL_MESSAGE_TYPES = new Set<ProtocolMessage["message_type"]>([
 export interface CbaProtocolAdapterOptions {
   readonly seenOperationIds?: () => ReadonlySet<string>;
   readonly pathKey?: (value: string) => string;
+  /**
+   * Legacy correlation rebinding is allowed only for live browser responses
+   * whose marker/baseline proof was established before protocol parsing.
+   */
+  readonly allowLegacyCorrelationRebind?: boolean;
 }
 
 export class CbaProtocolAdapter implements ProtocolAdapter {
@@ -90,18 +92,70 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
   ): ParsedModelTurn {
     const numericTurn = parseTurnId(expected.turnId);
     const seen = expected.recoveryReplay === true ? undefined : this.options.seenOperationIds?.();
-    const message = parseProtocolEnvelope(raw, {
+    const parseContext = {
       expected_task_id: expected.taskId,
       expected_turn_id: numericTurn,
       accepted_message_types: MODEL_MESSAGE_TYPES,
       ...(seen === undefined ? {} : { seen_operation_ids: seen }),
       ...(this.options.pathKey === undefined ? {} : { path_key: this.options.pathKey }),
-    });
+    };
+    let message: ProtocolMessage;
+    let normalizations: ParsedModelTurn["normalizations"];
+    if (raw.includes("```cba-agent/")) {
+      const facing = parseModelFacingEnvelope(raw);
+      const canonical = normalizeModelFacingMessage(facing, {
+        taskId: expected.taskId,
+        turnId: numericTurn,
+        rawResponse: raw,
+      });
+      message = parseProtocolEnvelope(serializeProtocolEnvelope(canonical), parseContext);
+    } else {
+      if (isGenericCopilotFallback(raw)) {
+        throw new ProtocolParseError(
+          "INVALID_MESSAGE",
+          "Copilot returned its generic service fallback instead of an agent response.",
+          {
+            stage: "model_response_classification",
+            diagnostic_code: "COPILOT_GENERIC_FALLBACK",
+            repairable: true,
+            suggested_action: "Retry the bounded turn; if the fallback repeats, inspect the browser service state.",
+          },
+        );
+      }
+      try {
+        message = parseProtocolEnvelope(raw, parseContext);
+      } catch (error) {
+        if (
+          !(error instanceof ProtocolParseError) ||
+          !["TASK_MISMATCH", "TURN_MISMATCH"].includes(error.protocolCode) ||
+          this.options.allowLegacyCorrelationRebind !== true ||
+          expected.recoveryReplay === true
+        ) {
+          throw error;
+        }
+        const legacy = parseLegacyWithoutExpectedCorrelation(raw, this.options.pathKey);
+        const rebound = {
+          ...legacy,
+          task_id: expected.taskId,
+          turn_id: numericTurn,
+          message_id: `msg_legacy_${String(numericTurn)}_${sha256(raw).slice(0, 16)}`,
+        } as ProtocolMessage;
+        message = parseProtocolEnvelope(serializeProtocolEnvelope(rebound), parseContext);
+        normalizations = [{
+          kind: "legacy_correlation_rebound",
+          receivedTaskId: legacy.task_id,
+          expectedTaskId: expected.taskId,
+          receivedTurnId: legacy.turn_id,
+          expectedTurnId: numericTurn,
+        }];
+      }
+    }
     return {
       protocolVersion: "cba/1",
       taskId: expected.taskId,
       turnId: expected.turnId,
       messages: [normalizeMessage(message)],
+      ...(normalizations === undefined ? {} : { normalizations }),
     };
   }
 
@@ -110,28 +164,10 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
   }
 
   public renderToolOutcomes(input: Parameters<ProtocolAdapter["renderToolOutcomes"]>[0]): string {
-    const correlation = correlationFor(input.taskId, input.priorTurnId, "result");
-    const allDenied = input.outcomes.length > 0 && input.outcomes.every((outcome) => outcome.status === "denied");
-    if (allDenied) {
-      return withReminder(serializeProtocolEnvelope(
-        createToolDenialMessage(
-          correlation,
-          input.outcomes.map((outcome) => ({
-            operation_id: outcome.operationId,
-            tool: outcome.tool,
-            decision: outcome.data.decision === "ask" ? "ask" : "deny",
-            reason_code: String(outcome.data.code ?? "POLICY_DENIED"),
-            message: String(outcome.data.message ?? "The operation is outside the effective grant."),
-            ...(isRecord(outcome.data.details)
-              ? { details: outcome.data.details }
-              : {}),
-          })),
-        ),
-      ), input.taskId, input.priorTurnId);
-    }
-    return withReminder(serializeProtocolEnvelope(
-      createToolResultMessage(correlation, input.outcomes.map(toolResultItem)),
-    ), input.taskId, input.priorTurnId);
+    return withReminder({
+      kind: "harness_tool_results",
+      results: input.outcomes.map(modelToolResult),
+    });
   }
 
   public renderProtocolError(input: Parameters<ProtocolAdapter["renderProtocolError"]>[0]): string {
@@ -139,8 +175,9 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
     const code = (PROTOCOL_ERROR_CODES as readonly string[]).includes(requestedCode)
       ? requestedCode
       : "INVALID_MESSAGE";
-    return withReminder(serializeProtocolEnvelope(
-      createProtocolErrorMessage(correlationFor(input.taskId, input.priorTurnId, "protocol_error"), {
+    return withReminder({
+      kind: "harness_protocol_error",
+      error: {
         code,
         message: input.message,
         repairable: input.repairable ?? true,
@@ -149,42 +186,34 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
             ? {}
             : { repair_attempt: input.repairAttempt }),
           source_code: input.code,
+          ...(input.details ?? {}),
         },
-      }),
-    ), input.taskId, input.priorTurnId);
+      },
+    });
   }
 
   public renderUserDecision(input: Parameters<ProtocolAdapter["renderUserDecision"]>[0]): string {
-    return withReminder(serializeProtocolEnvelope(
-      createToolResultMessage(correlationFor(input.taskId, input.priorTurnId, "decision"), [
-        {
-          operation_id: input.requestId,
-          tool: input.kind === "user_input" ? "request_user_input" : "request_capability",
-          status: "success",
-          output: input.decision,
-        },
-      ]),
-    ), input.taskId, input.priorTurnId);
+    return withReminder({
+      kind: "harness_decision",
+      operation_ref: input.requestId,
+      request_kind: input.kind,
+      decision: input.decision,
+    });
   }
 
   public renderCompletionRejected(input: Parameters<ProtocolAdapter["renderCompletionRejected"]>[0]): string {
-    return withReminder(serializeProtocolEnvelope(
-      createToolResultMessage(correlationFor(input.taskId, input.priorTurnId, "completion_rejected"), [
-        {
-          operation_id: input.operationId,
-          tool: "complete_task",
-          status: "failure",
-          error: {
-            code: "COMPLETION_NOT_VERIFIED",
-            message: "The deterministic harness did not accept the completion claim.",
-            details: {
-              reasons: input.verification.reasons,
-              actual: input.verification.actual,
-            },
-          },
+    return withReminder({
+      kind: "harness_completion_rejected",
+      operation_ref: input.operationId,
+      error: {
+        code: "COMPLETION_NOT_VERIFIED",
+        message: "The deterministic harness did not accept the completion claim.",
+        details: {
+          reasons: input.verification.reasons,
+          actual: input.verification.actual,
         },
-      ]),
-    ), input.taskId, input.priorTurnId);
+      },
+    });
   }
 }
 
@@ -231,7 +260,9 @@ function normalizeMessage(message: ProtocolMessage): NormalizedModelMessage {
     case "blocked":
       return {
         type: "blocked",
-        reason: `${message.reason_code}: ${message.summary}${message.needed.length === 0 ? "" : ` Needed: ${message.needed.join(", ")}`}`,
+        reasonCode: message.reason_code,
+        summary: message.summary,
+        needed: message.needed,
         recoverable: message.recoverable,
       };
     case "tool_result":
@@ -286,7 +317,21 @@ function normalizeCompletion(operationId: string, report: CompleteTaskArguments)
     type: "complete_task",
     operationId,
     claim: {
+      ...(report.kind === undefined ? {} : { kind: report.kind }),
       summary: report.summary,
+      ...(report.basis === undefined ? {} : {
+        basis: {
+          ...(report.basis.observed_files === undefined
+            ? {}
+            : { observedFiles: report.basis.observed_files }),
+          ...(report.basis.tool_result_refs === undefined
+            ? {}
+            : { toolResultRefs: report.basis.tool_result_refs }),
+          ...(report.basis.user_provided_context === undefined
+            ? {}
+            : { userProvidedContext: report.basis.user_provided_context }),
+        },
+      }),
       acceptanceCriteria: report.acceptance_criteria.map((criterion) => ({
         criterion: criterion.criterion,
         status: criterion.status,
@@ -304,34 +349,80 @@ function normalizeCompletion(operationId: string, report: CompleteTaskArguments)
   };
 }
 
-function toolResultItem(outcome: ToolOutcome) {
-  const status: ToolOutcomeStatus = outcome.status === "denied" ? "failure" : outcome.status;
-  const success = status === "success";
+function parseLegacyWithoutExpectedCorrelation(
+  raw: string,
+  pathKey: ((value: string) => string) | undefined,
+): ProtocolMessage {
+  const envelope = extractCbaEnvelope(raw, "cba/1");
+  const decoded = JSON.parse(envelope.json) as unknown;
+  const validation = validateProtocolMessage(decoded);
+  if (!validation.valid || validation.value === undefined) {
+    throw new ProtocolParseError(
+      "SCHEMA_INVALID",
+      "The legacy cba/1 message does not conform to the internal schema.",
+      { errors: validation.errors },
+    );
+  }
+  return parseProtocolEnvelope(raw, {
+    expected_task_id: validation.value.task_id,
+    expected_turn_id: validation.value.turn_id,
+    accepted_message_types: MODEL_MESSAGE_TYPES,
+    ...(pathKey === undefined ? {} : { path_key: pathKey }),
+  });
+}
+
+function isGenericCopilotFallback(raw: string): boolean {
+  if (raw.includes("```cba/") || raw.includes("```cba-agent/")) return false;
+  const normalized = raw
+    .trim()
+    .replaceAll("’", "'")
+    .replace(/\s+/gu, " ");
+  return /^Sorry, I (?:wasn't|was not) able to respond to that\.? Is there something else I can help with\??$/iu.test(
+    normalized,
+  );
+}
+
+function modelToolResult(outcome: ToolOutcome) {
+  const success = outcome.status === "success";
+  const denied = outcome.status === "denied";
   return {
-    operation_id: outcome.operationId,
-    tool: outcome.tool as WireToolName,
-    status,
+    operation_ref: outcome.operationId,
+    tool: outcome.tool,
+    status: outcome.status,
     ...(success ? { output: outcome.data } : {
       error: {
-        code: String(outcome.data.code ?? outcome.status.toUpperCase()),
+        code: String(outcome.data.code ?? (denied ? "POLICY_DENIED" : outcome.status.toUpperCase())),
         message: String(outcome.data.message ?? `Tool ended with ${outcome.status}`),
-        details: outcome.data,
+        retry_allowed: retryAllowed(outcome),
+        request_capability_would_help:
+          denied && outcome.data.decision === "ask",
+        ...(isRecord(outcome.data.details)
+          ? { details: outcome.data.details }
+          : { details: outcome.data }),
       },
     }),
   };
 }
 
-function correlationFor(taskId: string, turnId: string, kind: string): ProtocolCorrelation {
-  const numeric = parseTurnId(turnId);
-  return {
-    task_id: taskId,
-    turn_id: numeric,
-    message_id: `h_${kind}_${numeric}_${sha256(`${taskId}:${turnId}:${kind}`).slice(0, 12)}`,
-  };
+function retryAllowed(outcome: ToolOutcome): boolean {
+  if (outcome.status === "conflict" || outcome.status === "timeout") return true;
+  if (outcome.status !== "denied") return false;
+  return outcome.data.decision === "ask" ||
+    isRecord(outcome.data.details) &&
+      isRecord(outcome.data.details.retry_with);
 }
 
-function withReminder(envelope: string, taskId: string, priorTurnId: string): string {
-  return `${envelope}\n\n${renderProtocolReminder(taskId, parseTurnId(priorTurnId) + 1)}`;
+function withReminder(
+  payload: Readonly<Record<string, unknown>>,
+): string {
+  return [
+    "COPE HARNESS MESSAGE — cba-agent/1",
+    "<authoritative_harness_message_json>",
+    stableJson(payload),
+    "</authoritative_harness_message_json>",
+    "",
+    renderProtocolReminder(),
+  ].join("\n");
 }
 
 function parseTurnId(value: string): number {

@@ -24,13 +24,38 @@ export type NormalizedModelMessage =
     }
   | { readonly type: "progress"; readonly summary: string }
   | { readonly type: "complete_task"; readonly operationId: string; readonly claim: CompletionClaim }
-  | { readonly type: "blocked"; readonly reason: string; readonly recoverable: boolean };
+  | {
+      readonly type: "blocked";
+      readonly reasonCode: string;
+      readonly summary: string;
+      readonly needed: readonly string[];
+      readonly recoverable: boolean;
+    }
+  /**
+   * Compatibility shape used by 0.1.7 protocol adapters and offline replay
+   * fixtures. New adapters normalize blocked responses into the structured
+   * shape above.
+   */
+  | {
+      readonly type: "blocked";
+      readonly reason: string;
+      readonly recoverable: boolean;
+    };
+
+export interface ParsedModelNormalization {
+  readonly kind: "legacy_correlation_rebound";
+  readonly receivedTaskId: string;
+  readonly expectedTaskId: string;
+  readonly receivedTurnId: number;
+  readonly expectedTurnId: number;
+}
 
 export interface ParsedModelTurn {
   readonly protocolVersion: "cba/1";
   readonly taskId: string;
   readonly turnId: string;
   readonly messages: readonly NormalizedModelMessage[];
+  readonly normalizations?: readonly ParsedModelNormalization[];
 }
 
 export interface ToolOutcome {
@@ -79,6 +104,7 @@ export interface ProtocolAdapter {
     readonly message: string;
     readonly repairAttempt?: number;
     readonly repairable?: boolean;
+    readonly details?: Readonly<Record<string, unknown>>;
   }): string;
   renderUserDecision(input: {
     readonly taskId: string;

@@ -73,6 +73,59 @@ test("completion verifier accepts known, in-scope, freshly validated state", () 
   assert.deepEqual(result.actual.successfulCommands, ["test"]);
 });
 
+test("informational answers complete only when the session has not mutated project files", () => {
+  const answerState = state();
+  answerState.mutationSequence = 0;
+  answerState.validations = [];
+  const answerClaim: CompletionClaim = {
+    ...claim,
+    kind: "answer",
+    basis: {
+      observedFiles: ["README.md"],
+      toolResultRefs: ["op_read_readme"],
+    },
+    validation: [],
+  };
+  answerState.completedOperationIds.push("op_read_readme");
+  const repository = {
+    pathKey: completionPathKey,
+    known: true,
+    fingerprint: currentFingerprint,
+    excludedStateFingerprint: excludedFingerprint,
+    hasConflicts: false,
+    changedPaths: [],
+    outOfScopePaths: [],
+    gitStatusSummary: "clean",
+  };
+  const requirements = {
+    requiredCommandIds: [],
+    requireValidationAfterLastMutation: true,
+    requireCleanPendingOperations: true,
+  };
+
+  const accepted = verifyCompletion(answerState, answerClaim, repository, requirements);
+  assert.equal(accepted.accepted, true);
+
+  const unsupported = verifyCompletion(answerState, {
+    ...answerClaim,
+    basis: { toolResultRefs: ["op_invented"] },
+  }, repository, requirements);
+  assert.equal(unsupported.accepted, false);
+  assert.match(unsupported.reasons.join(" "), /unknown tool result/iu);
+
+  answerState.mutations.push({
+    operationId: "op_patch",
+    checkpointId: "checkpoint_1",
+    changedPaths: ["src/a.ts"],
+    changedLines: 1,
+    completedAt: "2026-01-01T00:01:00.000Z",
+    repositoryFingerprint: currentFingerprint,
+  });
+  const rejected = verifyCompletion(answerState, answerClaim, repository, requirements);
+  assert.equal(rejected.accepted, false);
+  assert.match(rejected.reasons.join(" "), /informational answer.*mutated/iu);
+});
+
 test("completion verifier rejects stale validation and unresolved work", () => {
   const current = state();
   current.mutationSequence = 2;

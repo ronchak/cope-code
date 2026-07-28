@@ -7,16 +7,16 @@
       "response": {
         "status": "completed",
         "response_id": "fixture-response-{{TURN_ID}}",
-        "content": "I will inspect the bounded repository inventory.\n\n```cba/1\n{\"protocol\":\"cba/1\",\"message_type\":\"tool_request\",\"message_id\":\"fixture_message_0001\",\"task_id\":\"{{TASK_ID}}\",\"turn_id\":1,\"operations\":[{\"operation_id\":\"fixture_operation_list_0001\",\"tool\":\"list_files\",\"arguments\":{\"path\":\".\",\"max_depth\":2,\"max_results\":100}}]}\n```"
+        "content": "I will inspect the bounded repository inventory.\n\n```cba-agent/1\n{\"kind\":\"agent_intent\",\"intent\":\"list_files\",\"arguments\":{\"path\":\".\",\"max_depth\":2,\"max_results\":20},\"reason\":\"Need a bounded repository outline before answering.\"}\n```"
       }
     },
     {
-      "expected_content_contains": "\"message_type\":\"tool_result\"",
+      "expected_content_contains": "\"kind\":\"harness_tool_results\"",
       "conversation_id": "fixture-conversation-example",
       "response": {
         "status": "completed",
         "response_id": "fixture-response-{{TURN_ID}}",
-        "content": "The requested repository inventory was returned by the local harness.\n\n```cba/1\n{\"protocol\":\"cba/1\",\"message_type\":\"tool_request\",\"message_id\":\"fixture_message_0002\",\"task_id\":\"{{TASK_ID}}\",\"turn_id\":2,\"operations\":[{\"operation_id\":\"fixture_operation_complete_0002\",\"tool\":\"complete_task\",\"arguments\":{\"summary\":\"Inspected the bounded repository inventory without modifying files.\",\"acceptance_criteria\":[{\"criterion\":\"Repository inventory was inspected\",\"status\":\"satisfied\",\"evidence\":\"list_files completed successfully in turn 1\"}],\"validation\":[],\"skipped_validation\":[\"No validation command was required for this read-only fixture\"],\"remaining_risks\":[],\"follow_up\":[]}}]}\n```"
+        "content": "The requested repository inventory was returned by the local harness.\n\n```cba-agent/1\n{\"kind\":\"agent_answer\",\"content_markdown\":\"Inspected the bounded repository inventory without modifying files.\",\"basis\":{\"observed_files\":[\"README.md\"]},\"acceptance_criteria\":[{\"criterion\":\"Repository inventory was inspected\",\"status\":\"satisfied\",\"evidence\":\"The bounded list_files intent completed successfully.\"}],\"validation\":[],\"skipped_validation\":[\"No project validation command was required for this read-only fixture.\"],\"limitations\":[],\"follow_up\":[]}\n```"
       }
     }
   ]

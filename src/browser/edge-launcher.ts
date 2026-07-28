@@ -129,6 +129,7 @@ export class EdgeCopilotTransport implements ModelTransport {
         {
           executablePath: config.browserExecutable,
           headless: false,
+          chromiumSandbox: true,
           acceptDownloads: false,
           timeout: config.waits.actionMs,
         },

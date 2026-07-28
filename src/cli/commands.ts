@@ -1508,9 +1508,36 @@ function progressReporter(json: boolean, io: CliIo): (event: RuntimeProgressEven
       destination.write(`${marker} ${String(event.detail.tool)}: ${outcome}\n`);
       return;
     } else if (event.kind === "model") {
-      detail = "Copilot responded";
+      const actionType = String(event.detail.actionType ?? "response");
+      if (actionType === "tool_request") {
+        const tools = Array.isArray(event.detail.tools)
+          ? event.detail.tools.filter((tool): tool is string => typeof tool === "string")
+          : [];
+        detail = tools.length === 0
+          ? "Copilot requested a project operation"
+          : `Copilot requested: ${tools.join(", ")}`;
+      } else if (actionType === "answer") {
+        detail = "Copilot submitted an informational answer";
+      } else if (actionType === "completion") {
+        detail = "Copilot submitted a completion report";
+      } else if (actionType === "protocol_repair") {
+        detail = event.detail.repairBudgetAvailable === true
+          ? "Copilot response needs protocol repair"
+          : "Copilot response failed protocol validation";
+      } else {
+        detail = `Copilot action: ${actionType.replaceAll("_", " ")}`;
+      }
     } else {
-      detail = event.detail.accepted === true ? "Completion verified" : "Completion needs more work";
+      if (event.detail.accepted !== true) {
+        detail = "Completion evidence needs more work";
+      } else {
+        const passed = Number(event.detail.successfulCommandCount ?? 0);
+        const failed = Number(event.detail.failedCommandCount ?? 0);
+        const kind = event.detail.completionKind === "answer" ? "Answer accepted" : "Protocol completion accepted";
+        detail = passed + failed === 0
+          ? `${kind}; project validation not run`
+          : `${kind}; project validation ${String(passed)} passed, ${String(failed)} failed`;
+      }
     }
     destination.write(`${cyan(symbols.arrow)} ${detail}\n`);
   };
@@ -1575,7 +1602,7 @@ function humanProgressState(state: string): string {
     case "executing_tools": return "Working in the project";
     case "returning_results": return "Returning tool results";
     case "awaiting_user": return "Waiting for your input";
-    case "validating_completion": return "Verifying the result";
+    case "validating_completion": return "Checking protocol completion and project evidence";
     case "completed": return "Task completed";
     case "paused": return "Task paused";
     default: return state.replaceAll("_", " ");

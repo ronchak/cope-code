@@ -85,7 +85,7 @@ test("CLI fallback terminalization cleans recovery data after a transient failed
   await writeFile(fixtureFile, JSON.stringify({
     schema_version: "cba-scripted-fixture/1",
     turns: [{
-      expected_content_contains: "cba/1",
+      expected_content_contains: "cba-agent/1",
       response: {
         status: "completed",
         content: serializeProtocolEnvelope(mismatched),

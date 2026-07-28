@@ -382,6 +382,53 @@ test("response correlation accepts one proven M365 rolling-window shift", async 
   }
 });
 
+test("response correlation accepts multiple proven M365 rolling-window shifts", async () => {
+  const page = new DynamicFakePage();
+  page.responses.push(
+    "prior response 2",
+    "prior response 3",
+    "prior response 4",
+    "prior response 5",
+  );
+  const { adapter } = makeHarness(page);
+  assert.equal((await adapter.submit(request)).status, "submitted");
+  page.responses.splice(0, 3);
+
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "completed");
+  if (response.status === "completed") {
+    assert.equal(response.content, "completed response envelope");
+  }
+});
+
+test("unprovable response-baseline truncation includes actionable bounded diagnostics", async () => {
+  const page = new DynamicFakePage();
+  page.responses.push("prior response 2", "prior response 3", "prior response 4");
+  const { adapter } = makeHarness(page);
+  assert.equal((await adapter.submit(request)).status, "submitted");
+  page.responses.splice(0, 3, "unrelated visible response");
+
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "indeterminate");
+  if (response.status === "indeterminate") {
+    assert.equal(response.diagnosticCode, "RESPONSE_BASELINE_TRUNCATED");
+    assert.equal(response.diagnostic?.stage, "browser_response_capture");
+    assert.equal(response.diagnostic?.repairable, false);
+    assert.equal(
+      response.diagnostic?.suggestedAction,
+      "preserve_session_and_inspect_browser_transcript",
+    );
+    assert.deepEqual(response.diagnostic?.expected, {
+      baseline_response_count: 4,
+      baseline_known: true,
+    });
+    assert.deepEqual(response.diagnostic?.actual, {
+      observed_response_count: 3,
+      per_response_digests_available: true,
+    });
+  }
+});
+
 test("duplicate task markers are ambiguous and never confirm a response", async () => {
   const { adapter, page } = makeHarness();
   const receipt = await adapter.submit(request);

@@ -1,7 +1,13 @@
 import type { SessionState, ValidationRecord } from "../session/types.js";
 
 export interface CompletionClaim {
+  readonly kind?: "work" | "answer";
   readonly summary: string;
+  readonly basis?: {
+    readonly observedFiles?: readonly string[];
+    readonly toolResultRefs?: readonly string[];
+    readonly userProvidedContext?: boolean;
+  };
   readonly acceptanceCriteria: readonly {
     readonly criterion: string;
     readonly status: "satisfied" | "not_satisfied" | "unknown";
@@ -93,6 +99,27 @@ export function verifyCompletion(
   }
   if (state.submission?.state === "indeterminate") {
     reasons.push("The most recent browser submission has indeterminate delivery state.");
+  }
+  if (claim.kind === "answer") {
+    if (state.mutations.length > 0) {
+      reasons.push("An informational answer cannot complete a task after project files were mutated.");
+    }
+    const basis = claim.basis;
+    const hasBasis = basis !== undefined && (
+      (basis.observedFiles?.length ?? 0) > 0 ||
+      (basis.toolResultRefs?.length ?? 0) > 0 ||
+      basis.userProvidedContext === true
+    );
+    if (!hasBasis) {
+      reasons.push("An informational answer must identify its evidence basis.");
+    }
+    const completed = new Set(state.completedOperationIds);
+    const unknownRefs = basis?.toolResultRefs?.filter((reference) => !completed.has(reference)) ?? [];
+    if (unknownRefs.length > 0) {
+      reasons.push(
+        `The informational answer cites unknown tool result reference(s): ${unknownRefs.join(", ")}.`,
+      );
+    }
   }
 
   const latestValidation = state.validations.at(-1);

@@ -83,7 +83,7 @@ test("runnable CLI completes a policy-loaded offline fixture session", async (co
   await writeFile(fixtureFile, JSON.stringify({
     schema_version: "cba-scripted-fixture/1",
     turns: [{
-      expected_content_contains: "cba/1",
+      expected_content_contains: "cba-agent/1",
       response: {
         status: "completed",
         content: serializeProtocolEnvelope(completion).replace("TASK_ID_PLACEHOLDER", "{{TASK_ID}}"),

@@ -17,7 +17,6 @@ import {
   createDefaultSessionGrant,
   type BudgetUsage as PolicyBudgetUsage,
 } from "../../src/policy/index.js";
-import { serializeProtocolEnvelope, type ProtocolMessage } from "../../src/protocol/index.js";
 import { DEFAULT_GIT_EXECUTABLE, RepositoryContext } from "../../src/repository/index.js";
 import { ContentSecurity, DisclosureLedger, SecretScanner } from "../../src/security/index.js";
 import { sha256, stableJson } from "../../src/shared/crypto.js";
@@ -212,12 +211,12 @@ test("offline fixture completes discovery, edit, failed validation, correction, 
   assert.equal(transport.remainingTurns, 0);
   assert.equal(await readFile(path.join(repositoryRoot, "src", "answer.js"), "utf8"), corrected);
   assert.equal(state.mutations.length, 2);
-  assert.deepEqual(state.mutations.map((mutation) => mutation.operationId), [
-    "op_patch_first",
-    "op_edit_correct",
-  ]);
-  assert.equal((await journal.read("op_edit_correct")).mutating, true);
-  assert.equal((await journal.read("op_edit_correct")).status, "completed");
+  assert.match(state.mutations[0]?.operationId ?? "", /^op_3_1_[a-f0-9]{20}$/u);
+  assert.match(state.mutations[1]?.operationId ?? "", /^op_5_1_[a-f0-9]{20}$/u);
+  const correctedOperationId = state.mutations[1]?.operationId;
+  assert.ok(correctedOperationId);
+  assert.equal((await journal.read(correctedOperationId)).mutating, true);
+  assert.equal((await journal.read(correctedOperationId)).status, "completed");
   assert.equal(state.validations.length, 2);
   assert.equal(state.validations[0]?.outcome, "failure");
   assert.equal(state.validations[1]?.outcome, "success");
@@ -227,7 +226,7 @@ test("offline fixture completes discovery, edit, failed validation, correction, 
   assert.equal(auditEvents.length > 20, true);
   assert.deepEqual(
     auditEvents
-      .filter((event) => event.operationId === "op_edit_correct")
+      .filter((event) => event.operationId === correctedOperationId)
       .map((event) => event.type)
       .filter((type) => type === "checkpoint.created" || type === "mutation.completed"),
     ["checkpoint.created", "mutation.completed"],
@@ -243,68 +242,58 @@ function scriptedTurns(
   corrected: string,
   criterion: string,
 ): readonly ScriptedFixtureTurn[] {
-  const messages: ProtocolMessage[] = [
-    request(taskId, 1, "op_list", "list_files", { path: "src", max_depth: 2, max_results: 20 }),
-    request(taskId, 2, "op_read", "read_file", { path: "src/answer.js", max_bytes: 4_096 }),
-    request(taskId, 3, "op_patch_first", "apply_patch", {
+  const messages = [
+    intent("list_files", { path: "src", max_depth: 2, max_results: 20 }),
+    intent("read_file", { path: "src/answer.js", max_bytes: 4_096 }),
+    intent("apply_patch", {
       changes: [{ kind: "update", path: "src/answer.js", base_sha256: initialHash, content: firstAttempt }],
     }),
-    request(taskId, 4, "op_validate_fail", "run_command", { command_id: "validate-answer" }),
-    request(taskId, 5, "op_edit_correct", "edit_text", {
+    intent("run_command", { command_id: "validate-answer" }),
+    intent("edit_text", {
       path: "src/answer.js",
       base_sha256: firstAttemptHash,
       old_text: "answer = 2",
       new_text: "answer = 42",
       expected_occurrences: 1,
     }),
-    request(taskId, 6, "op_validate_pass", "run_command", { command_id: "validate-answer" }),
-    request(taskId, 7, "op_diff", "git_diff", {
+    intent("run_command", { command_id: "validate-answer" }),
+    intent("git_diff", {
       scope: "working_tree",
       paths: ["src/answer.js"],
       max_bytes: 8_192,
     }),
-    {
-      protocol: "cba/1",
-      message_type: "completion",
-      message_id: "model_message_8",
-      task_id: taskId,
-      turn_id: 8,
-      operation_id: "op_complete",
-      report: {
-        summary: "Updated the answer to 42 after correcting the failed first validation, then validated the final repository state.",
-        acceptance_criteria: [{ criterion, status: "satisfied", evidence: "validate-answer passed after the final mutation" }],
-        validation: [{ command_id: "validate-answer", status: "passed", summary: "Latest run exited 0" }],
-        skipped_validation: [],
-        remaining_risks: [],
-        follow_up: [],
-      },
-      verified: false,
-    },
+    intent("complete_task", {
+      summary: "Updated the answer to 42 after correcting the failed first validation, then validated the final repository state.",
+      acceptance_criteria: [{ criterion, status: "satisfied", evidence: "validate-answer passed after the final mutation" }],
+      validation: [{ command_id: "validate-answer", status: "passed", summary: "Latest run exited 0" }],
+      skipped_validation: [],
+      remaining_risks: [],
+      follow_up: [],
+    }),
   ];
-  return messages.map((message, index) => ({
+  return messages.map((content, index) => ({
     taskId,
     turnId: `turn_${String(index + 1).padStart(4, "0")}`,
     submissionId: `submission_${String(index + 1)}`,
     conversationId: "offline-e2e-conversation",
-    response: { status: "completed", content: serializeProtocolEnvelope(message) },
+    response: { status: "completed", content },
   }));
 }
 
-function request(
-  taskId: string,
-  turnId: number,
-  operationId: string,
-  tool: "list_files" | "read_file" | "apply_patch" | "edit_text" | "run_command" | "git_diff",
+function intent(
+  tool: "list_files" | "read_file" | "apply_patch" | "edit_text" | "run_command" | "git_diff" | "complete_task",
   args: Readonly<Record<string, unknown>>,
-): ProtocolMessage {
-  return {
-    protocol: "cba/1",
-    message_type: "tool_request",
-    message_id: `model_message_${String(turnId)}`,
-    task_id: taskId,
-    turn_id: turnId,
-    operations: [{ operation_id: operationId, tool, arguments: args as never } as never],
-  };
+): string {
+  return [
+    "```cba-agent/1",
+    stableJson({
+      kind: "agent_intent",
+      intent: tool,
+      arguments: args,
+      reason: `The next bounded ${tool} action is needed to make progress.`,
+    }),
+    "```",
+  ].join("\n");
 }
 
 function policyUsage(state: SessionState): PolicyBudgetUsage {

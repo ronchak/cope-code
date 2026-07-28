@@ -6,6 +6,7 @@ import test from "node:test";
 
 import { CLI_VERSION, executeCommand } from "../../src/cli/commands.js";
 import { renderHumanResult } from "../../src/cli/friendly-output.js";
+import { TerminalUserInteraction } from "../../src/cli/terminal-user.js";
 import { configuredBrowserLabel, interactiveSetupCommand } from "../../src/cli/interactive.js";
 import { chatFooter, renderUserMessage, setupHero, startupPanel } from "../../src/cli/presentation.js";
 import { chatPromptStartRow, inputViewport } from "../../src/cli/prompts.js";
@@ -113,7 +114,6 @@ test("demo mode previews the terminal interface without live setup", async () =>
   assert.equal(exitCode, 0);
   assert.match(output.value, /Demo mode/u);
   assert.match(output.value, /Demo workspace/u);
-  assert.match(output.value, /demo \(offline\)/u);
   assert.match(output.value, /no browser will open/u);
 });
 
@@ -169,7 +169,7 @@ test("startup panel is responsive and preserves Cope workspace information", () 
   assert.match(wide.value, /Welcome to Cope/u);
   assert.match(wide.value, /Demo workspace/u);
   assert.match(wide.value, /browser-agent/u);
-  assert.match(wide.value, /edit mode/u);
+  assert.match(wide.value, /edit-capable/u);
 
   const compact = new MemoryOutput();
   startupPanel({
@@ -180,9 +180,84 @@ test("startup panel is responsive and preserves Cope workspace information", () 
     columns: 48,
   }, compact);
   assert.match(compact.value, /Project:/u);
-  assert.match(compact.value, /Mode:\s+inspect/u);
+  assert.match(compact.value, /Product mode:\s+inspect-only/u);
   assert.match(compact.value, /Ready to work/u);
   assert.doesNotMatch(compact.value, /Demo workspace/u);
+});
+
+test("task access renders one effective capability summary", async () => {
+  const output = new MemoryOutput();
+  const user = new TerminalUserInteraction({ output });
+  assert.equal(await user.approveInitialGrant(JSON.stringify({
+    schema_version: "cba-effective-grant/1",
+    mode: "edit",
+    requested_mode: "edit",
+    effective_mode: "inspect-only",
+    can_read: true,
+    can_write: false,
+    can_run_commands: false,
+    repository_root: "/project",
+    readable_paths: ["**"],
+    writable_paths: [],
+    creatable_paths: [],
+    deletable_paths: [],
+    command_ids: ["npm.test"],
+    disclosure_classifications: ["internal"],
+    network: { session_access: "deny" },
+  }), true), true);
+  const rendered = stripAnsi(output.value);
+  assert.match(rendered, /Effective mode:\s+inspect-only/u);
+  assert.match(rendered, /Requested mode:\s+edit, approvals as needed/u);
+  assert.match(rendered, /Edit:\s+none, inspect-only task/u);
+  assert.match(rendered, /Commands:\s+none, inspect-only task/u);
+  assert.doesNotMatch(rendered, /Mode:\s+edit, approvals as needed/u);
+});
+
+test("completion output classifies file provenance and reports absent project validation", () => {
+  const rendered = stripAnsi(renderHumanResult({
+    status: "completed",
+    modelSummary: "Inspection complete.",
+    handoff: {
+      effectiveGrant: {
+        capabilities: { commands: { ids: { allow: [] } } },
+      },
+      repository: {
+        preExistingChanges: ["before.txt"],
+        agentChangedPaths: ["agent.txt"],
+        current: {
+          entries: [
+            { path: "agent.txt", kind: "ordinary" },
+            { path: "before.txt", kind: "ordinary" },
+            { path: ".vscode/settings.json", kind: "untracked" },
+          ],
+        },
+      },
+      validation: [],
+    },
+  }));
+  assert.match(rendered, /Changed by this task[\s\S]*agent\.txt/u);
+  assert.match(rendered, /Already changed before this task[\s\S]*before\.txt/u);
+  assert.match(rendered, /Not attributed to this task[\s\S]*\.vscode\/settings\.json/u);
+  assert.match(rendered, /Project validation[\s\S]*Not run — no validation commands were available/u);
+  assert.doesNotMatch(rendered, /^Changed files$/mu);
+
+  const categoryGrant = stripAnsi(renderHumanResult({
+    status: "completed",
+    handoff: {
+      effectiveGrant: {
+        capabilities: {
+          commands: {
+            ids: { allow: [] },
+            categories: { allow: ["test"] },
+          },
+        },
+      },
+      repository: { current: { entries: [] } },
+      validation: [],
+    },
+  }));
+  assert.match(categoryGrant, /Not run — no project validation command was executed/u);
+  assert.doesNotMatch(categoryGrant, /no validation commands were available/u);
 });
 
 test("startup panel credits Ronak Chakraborty in the responsive top bar", () => {
