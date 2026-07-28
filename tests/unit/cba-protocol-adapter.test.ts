@@ -24,11 +24,23 @@ test("CBA adapter renders bootstrap and normalizes a typed tool request", () => 
       command_ids: [],
       disclosure_classifications: ["internal"],
       network: "deny",
+      budget_recovery: {
+        disclosed_bytes: {
+          current_limit: 2_000_000,
+          available: true,
+          higher_layer_ceiling: 8_000_000,
+          blocking_layer: "organization",
+        },
+      },
     },
     budgetSummary: { limits: { maxTurns: 10, maxOperations: 20 } },
   });
   assert.match(bootstrap, /only software-engineering reasoning component/);
   assert.match(bootstrap, /"iterations"|"turns"/);
+  assert.match(
+    bootstrap,
+    /"budget_recovery":\{"disclosed_bytes":\{"available":true,"blocking_layer":"organization","current_limit":2000000,"higher_layer_ceiling":8000000\}\}/u,
+  );
 
   const response = serializeProtocolEnvelope({
     protocol: "cba/1",
@@ -68,6 +80,7 @@ test("CBA adapter ignores unknown policy-summary tools and scopes bootstrap guid
   assert.match(bootstrap, /"tool":"git_status"/u);
   assert.doesNotMatch(bootstrap, /forged_tool/u);
   assert.doesNotMatch(bootstrap, /active tool catalog \([^)]*list_files/u);
+  assert.doesNotMatch(bootstrap, /budget_recovery/u);
 });
 
 test("CBA adapter routes every registry orchestrator tool outside ToolHost calls", () => {

@@ -12,6 +12,7 @@ import { RepositoryContext } from "../../src/repository/context.js";
 import { GitInspector } from "../../src/repository/git.js";
 import { PatchEngine } from "../../src/repository/patch-engine.js";
 import { RepositoryTools } from "../../src/repository/repository-tools.js";
+import { REPOSITORY_CONTRACT_VERSION } from "../../src/repository/types.js";
 import { ContentSecurity } from "../../src/security/content-security.js";
 import { DisclosureLedger } from "../../src/security/disclosure-ledger.js";
 import { ProtectedPathPolicy } from "../../src/security/protected-paths.js";
@@ -69,9 +70,10 @@ test("ToolHost bounds production-shaped list and status results at policy planni
   const host = new ToolHost({
     repository: {
       listFiles: async () => ({
-        contractVersion: "repository/1",
+        contractVersion: REPOSITORY_CONTRACT_VERSION,
         root: "",
         entries: listEntries,
+        appliedMaxResults: 500,
         truncated: false,
         excludedCount: 0,
       }),
@@ -99,6 +101,7 @@ test("ToolHost bounds production-shaped list and status results at policy planni
   });
   assert.equal(listed.status, "success");
   assert.equal(listed.data.truncated, true);
+  assert.equal(listed.data.applied_max_results, 500);
   assert.equal(
     (listed.data.entries as readonly unknown[]).length < listEntries.length,
     true,
@@ -126,7 +129,14 @@ test("ToolHost bounds production-shaped list and status results at policy planni
 
 test("ToolHost applies an exact runtime mutation reservation to the current call", async (context) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-tool-host-budget-reservation-"));
-  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  context.after(async () =>
+    rm(temporary, {
+      recursive: true,
+      force: true,
+      maxRetries: process.platform === "win32" ? 10 : 0,
+      retryDelay: 100,
+    }),
+  );
   const root = path.join(temporary, "repo");
   await mkdir(root);
   const target = path.join(root, "file.txt");

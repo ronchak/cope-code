@@ -73,7 +73,11 @@ function expandedEngine(facts: { caseSensitive: boolean; unicodeNormalizationAli
     pathKey: identity.pathKey,
   });
   const expansion: SessionCapabilityExpansion = { kind: "path", access: "write", path };
-  const expanded = engine.expandSessionGrant(expansion, "2026-07-18T00:00:00.000Z");
+  const expanded = engine.expandSessionGrant(
+    expansion,
+    zeroPolicyBudgetUsage(),
+    "2026-07-18T00:00:00.000Z",
+  );
   assert.notEqual(expanded.decision, "deny");
   return new PolicyEngine({
     organization,

@@ -2,7 +2,7 @@ import { mkdir, open, readFile, rename } from "node:fs/promises";
 import path from "node:path";
 import { newId, sha256, stableJson } from "../shared/crypto.js";
 import { AgentError } from "../shared/errors.js";
-import { isOperationId } from "../shared/operation-id.js";
+import { isJournalOperationId } from "../shared/operation-id.js";
 
 export type OperationStatus = "accepted" | "executing" | "completed" | "failed" | "indeterminate";
 
@@ -259,7 +259,7 @@ export class OperationJournal {
 }
 
 function assertOperationId(operationId: string): void {
-  if (!isOperationId(operationId)) {
+  if (!isJournalOperationId(operationId)) {
     throw new AgentError("PROTOCOL_INVALID", "Unsafe operation identifier");
   }
 }
@@ -290,7 +290,7 @@ function isOperationRecord(value: unknown): value is OperationRecord {
   if (
     item.schemaVersion !== 1 ||
     typeof item.sessionId !== "string" || !/^[A-Za-z0-9_-]{8,128}$/u.test(item.sessionId) ||
-    !isOperationId(item.operationId) ||
+    !isJournalOperationId(item.operationId) ||
     typeof item.tool !== "string" || item.tool.length === 0 || item.tool.length > 128 ||
     typeof item.mutating !== "boolean" ||
     typeof item.requestHash !== "string" || !/^[a-f0-9]{64}$/u.test(item.requestHash) ||

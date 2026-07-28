@@ -165,6 +165,59 @@ Session status alone is not proof that browser work can resume. Cope derives a s
 - `reconcile_required` means runtime evidence is unreadable or mutation evidence makes automatic discard unsafe.
 - `terminal` means no recovery action is needed.
 
+Disclosure-budget exhaustion is a nonterminal recovery condition. A
+data-bearing result that would cross the reserved data ceiling is replaced by
+a compact source-free notice, durably queued, and the session moves to
+`paused`. The pause does not apply terminal cleanup. On resume, the queued
+notice is submitted once before Copilot continues; already-completed tools and
+mutations are recovered from their journal/checkpoint evidence and are not
+replayed. Ordinary decisions and repairs cannot consume the final 8 KiB
+emergency slice, and the runtime mechanically caps the recovery envelope to
+that slice. Cumulative data-plane and control-plane exhaustion offer the
+operator a monotonic session-budget raise when higher policy layers permit it,
+targeting the effective higher-layer ceiling in one explicit approval rather
+than prompting for every next unit, then continue directly from the durable
+turn. A per-operation reservation
+mismatch cannot be repaired by a cumulative raise and instead returns a
+narrower-request hint. The approval passes through the normal decision journal and integrity
+artifact before the grant changes, closing the crash window between consent
+and persistence. If the automatic recovery prompt itself cannot run (for
+example, no interactive terminal is attached), Cope durably abandons that
+synthetic request with an integrity-bound default-deny decision, clears it from
+pending work, preserves any already queued budget notice, and pauses. That
+specific recovery request is durably denied and cannot re-prompt: resume may
+continue on a new model turn when a notice is queued; otherwise the operator
+must start a new task from an interactive terminal. The default-deny artifact makes the same-turn replay safe
+if interruption occurs before the notice replaces the source response. A
+caller interruption retains a still-available source response so the decision
+can be retried after resume; when a degraded result has already replaced that
+response, the same default-deny cleanup prevents an orphaned request. Both
+data-plane and control-plane recovery entry points share this exception
+boundary. The default-deny artifact carries harness-owned provenance. On
+startup Cope reconciles an interrupted internal recovery decision from that
+artifact—or retries the operator prompt if no durable decision exists—verifies
+it against any completed journal record, clears orphaned pending state, and
+never attributes the synthetic decision to the operator. This
+covers interruption before journal completion and after journal completion
+but before session-state persistence. If a hard organization or repository ceiling prevents
+expansion, Cope does not display an ineffective approval prompt. It pauses with
+`BUDGET_EXPANSION_UNAVAILABLE`, naming the blocking layer and ceiling and
+explaining that the policy-pinned session cannot continue. The operator must
+update governing policy through the governed configuration process and start a
+new session, because resume intentionally rejects changed organization or
+repository policy hashes. The exhausted session remains paused for inspection
+rather than transitioning to `failed`.
+
+An unreadable or hash-mismatched recovery-decision artifact always pauses
+fail-closed for operator reconciliation; repeated resume does not guess,
+replace, or discard the decision. Use the explicit abort/reconciliation
+workflow rather than repeatedly resuming unchanged corrupt evidence.
+
+The session also persists a consecutive budget-pause streak. A successfully
+returned data result or an effective budget raise clears it. A second budget
+pause without either form of progress stops the task as `blocked` with a
+diagnosis, preventing an unbounded resume → degrade → pause cycle.
+
 `created` and `preflight` are not resume-supported states. Recovery offers a clean abort for those incomplete startup states unless mutation evidence requires reconciliation. New session publication persists `grant_pending` before the runtime manifest becomes readable, so a crash cannot create a runtime-pinned pre-grant session that is incorrectly advertised as resumable.
 
 Setup performs this scan under the configuration lock before browser discovery, prompts, or launch, then repeats it while holding the lock immediately before committing setup. If live session publication currently owns that lock, early setup deflects as concurrent configuration use instead of inspecting and misclassifying partial startup evidence. A new live session acquires the same lock before it publishes `session.json` and holds it until the pinned runtime manifest and grant-pending state are durable. Setup and session startup therefore have one ordering boundary: setup commits before any session state is exposed, or a complete recoverable session exists before setup can proceed. `cope sessions --all`, `cope resume`, and `cope doctor` use the same assessment—including local signed-executable verification—so their guidance cannot disagree. Recovery classification remains independent of current Copilot-page identity heuristics: the dedicated browser profile is the durable authentication boundary, while page readiness is verified when live work begins.

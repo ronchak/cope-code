@@ -202,6 +202,7 @@ export const POLICY_REASON_CODES = [
   "BUDGET_EXCEEDED",
   "CAPABILITY_APPROVED_FOR_SESSION",
   "CAPABILITY_EXPANSION_DENIED",
+  "BUDGET_EXPANSION_UNAVAILABLE",
   "CAPABILITY_EXPANSION_REQUIRES_APPROVAL",
 ] as const;
 
@@ -215,6 +216,7 @@ export interface PolicyCheck {
   readonly message: string;
   readonly capability_key?: string;
   readonly resource?: string;
+  readonly details?: Readonly<Record<string, unknown>>;
 }
 
 export interface EffectivePolicy {

@@ -10,6 +10,7 @@ import {
 } from "../transport/model-transport.js";
 import { newId, sha256, stableJson } from "../shared/crypto.js";
 import { AgentError, errorMessage } from "../shared/errors.js";
+import { INTERNAL_OPERATION_ID_PREFIX } from "../shared/operation-id.js";
 import type { Clock } from "../shared/time.js";
 import { systemClock } from "../shared/time.js";
 import { BudgetMeter } from "../session/budgets.js";
@@ -59,6 +60,8 @@ import type {
   UserInteraction,
 } from "./contracts.js";
 import {
+  CONTROL_PLANE_RESERVE_BYTES,
+  EMERGENCY_NOTICE_RESERVE_BYTES,
   TOOL_RESULT_ENVELOPE_RESERVE_BYTES,
 } from "./disclosure-budget.js";
 
@@ -113,6 +116,9 @@ export class AgentRuntime {
   private interruption?: { readonly status: "paused" | "aborted"; readonly reason: string };
   private toolResultDisclosureLimit: number | undefined = undefined;
   private toolResultDisclosureReservation = 0;
+  private disclosureBudgetPauseReason: string | undefined;
+  private disclosureBudgetPauseError: AgentError | undefined;
+  private activeModelTurnId: string | undefined;
 
   public constructor(private readonly dependencies: AgentRuntimeDependencies) {
     this.state = dependencies.state;
@@ -128,6 +134,21 @@ export class AgentRuntime {
   }
 
   public async run(): Promise<AgentRunResult> {
+    try {
+      for (;;) {
+        const result = await this.runUntilBudgetBoundary();
+        if (result !== undefined) return result;
+      }
+    } finally {
+      try {
+        if (isTerminal(this.state.status)) await this.cleanupTerminalArtifacts();
+      } finally {
+        await this.dependencies.transport.close().catch(() => undefined);
+      }
+    }
+  }
+
+  private async runUntilBudgetBoundary(): Promise<AgentRunResult | undefined> {
     try {
       const startupResult = await this.advanceStartup();
       if (startupResult !== undefined) return startupResult;
@@ -163,8 +184,30 @@ export class AgentRuntime {
           policySummary: this.dependencies.policy.summarize(),
           budgetSummary: { limits: this.state.budgetLimits, usage: this.state.budgetUsage },
         });
+        const minimumBootstrapBudget =
+          CONTROL_PLANE_RESERVE_BYTES + Buffer.byteLength(bootstrap);
+        if (
+          this.state.budgetLimits.maxDisclosedBytes <
+          minimumBootstrapBudget
+        ) {
+          throw new AgentError(
+            "CONFIG_INVALID",
+            "The disclosed-bytes budget cannot fit the bootstrap while preserving control-plane recovery headroom",
+            {
+              configured: this.state.budgetLimits.maxDisclosedBytes,
+              minimum: minimumBootstrapBudget,
+              controlPlaneReserve: CONTROL_PLANE_RESERVE_BYTES,
+              bootstrapBytes: Buffer.byteLength(bootstrap),
+            },
+          );
+        }
         outbound = await this.serializeForDisclosure(bootstrap, "bootstrap");
         await this.queueOutbound(outbound, "turn_0001");
+        if (this.disclosureBudgetPauseReason !== undefined) {
+          return await this.pauseWithInterruptionPriority(
+            this.disclosureBudgetPauseReason,
+          );
+        }
       } else {
         throw new AgentError("RECOVERY_REQUIRED", "Session has no recoverable response, submission, or queued message");
       }
@@ -222,6 +265,7 @@ export class AgentRuntime {
           if (terminal) return terminal;
           throw new AgentError("TRANSPORT_INDETERMINATE", `Unhandled transport state ${response.status}`);
         }
+        this.activeModelTurnId = turnId;
         await this.dependencies.audit.append({
           type: "model.response",
           taskId: this.state.taskId,
@@ -295,6 +339,7 @@ export class AgentRuntime {
           );
           await this.queueOutbound(outbound, nextTurnId(this.state.turnSequence));
           await this.dependencies.artifacts?.remove("response", turnId);
+          this.activeModelTurnId = undefined;
           continue;
         }
 
@@ -323,7 +368,42 @@ export class AgentRuntime {
               : { disclosureKind: next.disclosureKind }),
           },
         );
+        if (
+          next.successfulToolResult === true &&
+          (this.state.budgetPauseStreak ?? 0) > 0
+        ) {
+          this.state.budgetPauseStreak = 0;
+          await this.persist();
+        }
         await this.dependencies.artifacts?.remove("response", turnId);
+        this.activeModelTurnId = undefined;
+        if (this.disclosureBudgetPauseReason !== undefined) {
+          const budgetError = this.disclosureBudgetPauseError;
+          if (budgetError !== undefined) {
+            // A true cumulative exhaustion can be raised here. A result that
+            // exceeded its per-operation reservation cannot be repaired by a
+            // cumulative raise, so budgetRecoveryCapability deliberately
+            // declines it and the model receives the narrower-request hint.
+            const attempt = await this.attemptBudgetRecovery(
+              budgetError,
+              this.disclosureBudgetPauseReason,
+              false,
+            );
+            if (attempt.result !== undefined) return attempt.result;
+            const recovery = attempt.recovery;
+            if (recovery.raised) {
+              this.disclosureBudgetPauseReason = undefined;
+              this.disclosureBudgetPauseError = undefined;
+              this.state.budgetPauseStreak = 0;
+              await this.persist();
+              continue;
+            }
+            this.disclosureBudgetPauseReason = recovery.reason;
+          }
+          return await this.pauseForBudget(
+            this.disclosureBudgetPauseReason,
+          );
+        }
         if (this.interruption !== undefined) return await this.finishInterruption();
       }
 
@@ -337,14 +417,16 @@ export class AgentRuntime {
       ) {
         return await this.pauseWithInterruptionPriority(error.message);
       }
+      if (
+        error instanceof AgentError &&
+        error.code === "BUDGET_EXCEEDED" &&
+        !["completed", "rolled_back", "blocked", "aborted", "failed"].includes(this.state.status)
+      ) {
+        const recovered = await this.recoverFromBudgetExhaustion(error);
+        return recovered;
+      }
       const failed = await this.fail(error);
       return failed;
-    } finally {
-      try {
-        if (isTerminal(this.state.status)) await this.cleanupTerminalArtifacts();
-      } finally {
-        await this.dependencies.transport.close().catch(() => undefined);
-      }
     }
   }
 
@@ -389,6 +471,10 @@ export class AgentRuntime {
   private async findUncertainMutation(): Promise<SessionState["pendingOperations"][number] | undefined> {
     for (const pending of this.state.pendingOperations) {
       const record = await this.dependencies.journal.read(pending.operationId);
+      if (isBudgetRecoveryOperation(pending.operationId, pending.tool)) {
+        await this.reconcileBudgetRecoveryDecision(pending, record);
+        continue;
+      }
       if (
         !pending.mutating &&
         !record.mutating &&
@@ -461,6 +547,123 @@ export class AgentRuntime {
       return indeterminate;
     }
     return undefined;
+  }
+
+  private async reconcileBudgetRecoveryDecision(
+    pending: SessionState["pendingOperations"][number],
+    initialRecord: OperationRecord,
+  ): Promise<void> {
+    const recovery = budgetRecoveryFromRequestId(pending.operationId);
+    if (recovery === undefined) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "An internal budget-recovery operation has an invalid identifier",
+        { operationId: pending.operationId },
+      );
+    }
+    const artifactId = `decision_${pending.operationId}`;
+    let raw = await this.dependencies.artifacts?.getOptional(
+      "decision",
+      artifactId,
+    );
+    let record = initialRecord;
+    if (
+      raw === undefined &&
+      (record.status === "accepted" || record.status === "executing")
+    ) {
+      let recoveredDecision: Readonly<Record<string, unknown>>;
+      try {
+        recoveredDecision = await this.dependencies.user.requestCapability({
+          capability: recovery.capability,
+          reason:
+            "A prior automatic budget-recovery prompt was interrupted before " +
+            "a durable decision was recorded. Retry that decision to resume.",
+          risk:
+            "The expansion remains bounded by organization and repository " +
+            "policy. Only an allow-for-session decision can expand authority.",
+          signal: this.controller.signal,
+        });
+      } catch (error) {
+        if (this.interruption !== undefined) throw error;
+        recoveredDecision = automaticBudgetRecoveryDeny(
+          recovery.capability,
+        );
+      }
+      raw = stableJson(recoveredDecision);
+      await this.requireArtifacts().put("decision", artifactId, raw);
+    }
+    if (raw === undefined) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "A completed budget-recovery decision lacks its recovery artifact",
+        { operationId: pending.operationId },
+      );
+    }
+    const decisionRecord = parseDecisionArtifact(raw);
+    const decision = capabilityDecision(decisionRecord);
+    const decisionHash = sha256(stableJson(decisionRecord));
+    const abandoned = isAutomaticBudgetRecoveryDeny(decisionRecord);
+    if (record.status === "accepted") {
+      record = await this.dependencies.journal.markExecuting(
+        record,
+        this.now(),
+      );
+    }
+    if (record.status === "executing") {
+      record = await this.dependencies.journal.markCompleted(
+        record,
+        this.now(),
+        abandoned ? "unavailable" : "answered",
+        {
+          decisionHash,
+          ...(abandoned ? { abandoned: true } : {}),
+          reconciled: true,
+        },
+      );
+    } else if (
+      (record.status === "completed" || record.status === "failed") &&
+      record.safeResult?.decisionHash !== decisionHash
+    ) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Budget-recovery decision does not match its durable journal record",
+        { operationId: pending.operationId },
+      );
+    } else if (
+      record.status !== "completed" &&
+      record.status !== "failed"
+    ) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        `Cannot reconcile budget recovery from ${record.status}`,
+        { operationId: pending.operationId },
+      );
+    }
+
+    this.clearPending(pending.operationId);
+    if (!this.state.completedOperationIds.includes(pending.operationId)) {
+      this.state.completedOperationIds.push(pending.operationId);
+    }
+    let effective = false;
+    if (!abandoned && decision.decision === "allow_session") {
+      effective = await this.dependencies.policy.expandSessionGrant(
+        recovery.capability,
+      );
+    }
+    await this.dependencies.audit.append({
+      type: "session.recovered",
+      taskId: this.state.taskId,
+      operationId: pending.operationId,
+      data: {
+        decision: abandoned ? "abandon" : "reconcile_decision",
+        reasonCode: abandoned
+          ? "USER_INTERACTION_FAILED"
+          : "BUDGET_RECOVERY_DECISION_RECONCILED",
+        decisionHash,
+        effective,
+      },
+    });
+    await this.persist();
   }
 
   private async exchange(turnId: string, content: string): Promise<ReceiveResult> {
@@ -641,7 +844,7 @@ export class AgentRuntime {
     options: {
       readonly returnedOperationIds?: readonly string[];
       readonly nextStatus?: "awaiting_model";
-      readonly disclosureKind?: "tool_result";
+      readonly disclosureKind?: "tool_result" | "decision";
     } = {},
   ): Promise<void> {
     const artifactId = `queued_${turnId}`;
@@ -889,7 +1092,8 @@ export class AgentRuntime {
         readonly outbound: string;
         readonly returnedOperationIds?: readonly string[];
         readonly queueStatus?: "awaiting_model";
-        readonly disclosureKind?: "tool_result";
+        readonly disclosureKind?: "tool_result" | "decision";
+        readonly successfulToolResult?: boolean;
       }
     | { readonly terminal: true; readonly result: AgentRunResult }
   > {
@@ -905,6 +1109,7 @@ export class AgentRuntime {
         const outcomes = await this.executeCalls(action.calls, turnId);
         await this.move("returning_results");
         let outbound: string;
+        let disclosureKind: "tool_result" | "decision" = "tool_result";
         try {
           outbound = await this.serializeForDisclosure(
             this.dependencies.protocol.renderToolOutcomes({ taskId: this.state.taskId, priorTurnId: turnId, outcomes }),
@@ -912,6 +1117,22 @@ export class AgentRuntime {
             this.toolResultDisclosureLimit,
             true,
           );
+        } catch (error) {
+          if (!isBudgetExceeded(error)) throw error;
+          const reason = disclosureBudgetReason(error);
+          outbound = await this.serializeForDisclosure(
+            this.dependencies.protocol.renderToolOutcomes({
+              taskId: this.state.taskId,
+              priorTurnId: turnId,
+              outcomes: budgetExhaustedOutcomes(action.calls, outcomes, error),
+            }),
+            "decision",
+            this.toolResultDisclosureLimit,
+            true,
+          );
+          disclosureKind = "decision";
+          this.disclosureBudgetPauseReason = reason;
+          this.disclosureBudgetPauseError = error;
         } finally {
           this.toolResultDisclosureLimit = undefined;
           this.toolResultDisclosureReservation = 0;
@@ -921,7 +1142,10 @@ export class AgentRuntime {
           outbound,
           returnedOperationIds: action.calls.map((call) => call.operationId),
           queueStatus: "awaiting_model",
-          disclosureKind: "tool_result",
+          disclosureKind,
+          successfulToolResult:
+            disclosureKind === "tool_result" &&
+            outcomes.some((outcome) => outcome.status === "success"),
         };
       }
       case "request_user_input": {
@@ -954,17 +1178,26 @@ export class AgentRuntime {
       }
       case "request_capability": {
         await this.move("awaiting_user");
+        const assessment =
+          this.dependencies.policy.assessSessionGrantExpansion?.(
+            action.capability,
+          );
         const decisionRecord = await this.executeUserDecision(
           action.requestId,
           "request_capability",
           action,
           turnId,
-          () => this.dependencies.user.requestCapability({
-            capability: action.capability,
-            reason: action.reason,
-            ...(action.risk === undefined ? {} : { risk: action.risk }),
-            signal: this.controller.signal,
-          }),
+          assessment !== undefined && assessment.outcome !== "change"
+            ? async () => ({
+                decision: "deny" as const,
+                note: assessment.explanation,
+              })
+            : () => this.dependencies.user.requestCapability({
+                capability: action.capability,
+                reason: action.reason,
+                ...(action.risk === undefined ? {} : { risk: action.risk }),
+                signal: this.controller.signal,
+              }),
         );
         this.throwIfInterrupted();
         const userDecision = capabilityDecision(decisionRecord);
@@ -983,6 +1216,14 @@ export class AgentRuntime {
           ...(userDecision.decision === "allow_once"
             ? { reasonCode: "ALLOW_ONCE_REQUIRES_EXACT_OPERATION" }
             : {}),
+          ...(assessment === undefined || assessment.outcome === "change"
+            ? {}
+            : {
+                reasonCode: assessment.reasonCode,
+                ...(assessment.details === undefined
+                  ? {}
+                  : { details: assessment.details }),
+              }),
         };
         await this.dependencies.audit.append({
           type: "capability.decided",
@@ -1112,6 +1353,12 @@ export class AgentRuntime {
     request: unknown,
     turnId: string,
     requester: () => Promise<Readonly<Record<string, unknown>>>,
+    options: {
+      readonly chargeOperation?: boolean;
+      readonly abandonOnRequesterError?: boolean;
+      readonly abandonOnInterruption?: boolean;
+      readonly recoveryCapability?: BudgetRecoveryCapability["capability"];
+    } = {},
   ): Promise<Readonly<Record<string, unknown>>> {
     this.throwIfInterrupted();
     const alreadyAccounted =
@@ -1124,7 +1371,9 @@ export class AgentRuntime {
       request,
       this.now(),
     );
-    if (!alreadyAccounted) this.meter.consume("operations");
+    if (!alreadyAccounted && options.chargeOperation !== false) {
+      this.meter.consume("operations");
+    }
     const artifactId = `decision_${requestId}`;
     if (registration.kind === "replay_completed") {
       const decision = await this.readDecisionArtifact(artifactId);
@@ -1138,13 +1387,28 @@ export class AgentRuntime {
       if (!this.state.completedOperationIds.includes(requestId)) {
         this.state.completedOperationIds.push(requestId);
       }
-      await this.dependencies.audit.append({
-        type: "user.decision_replayed",
-        taskId: this.state.taskId,
-        turnId,
-        operationId: requestId,
-        data: { tool, decisionHash },
-      });
+      if (registration.record.safeResult?.abandoned === true) {
+        await this.dependencies.audit.append({
+          type: "session.recovered",
+          taskId: this.state.taskId,
+          turnId,
+          operationId: requestId,
+          data: {
+            decision: "replay_abandoned",
+            reasonCode: "USER_INTERACTION_FAILED",
+            tool,
+            decisionHash,
+          },
+        });
+      } else {
+        await this.dependencies.audit.append({
+          type: "user.decision_replayed",
+          taskId: this.state.taskId,
+          turnId,
+          operationId: requestId,
+          data: { tool, decisionHash },
+        });
+      }
       await this.persist();
       return decision;
     }
@@ -1168,9 +1432,73 @@ export class AgentRuntime {
     this.throwIfInterrupted();
     const cached = await this.dependencies.artifacts?.getOptional("decision", artifactId);
     this.throwIfInterrupted();
-    const decision = cached === undefined
-      ? await requester()
-      : parseDecisionArtifact(cached);
+    let decision: Readonly<Record<string, unknown>>;
+    if (cached === undefined) {
+      try {
+        decision = await requester();
+      } catch (error) {
+        if (
+          options.abandonOnRequesterError === true &&
+          (
+            this.interruption === undefined ||
+            options.abandonOnInterruption === true
+          )
+        ) {
+          const abandonedDecision = automaticBudgetRecoveryDeny(
+            options.recoveryCapability,
+          );
+          const abandonedDecisionHash =
+            sha256(stableJson(abandonedDecision));
+          await this.requireArtifacts().put(
+            "decision",
+            artifactId,
+            stableJson(abandonedDecision),
+          );
+          await this.dependencies.journal.markCompleted(
+            executing,
+            this.now(),
+            "unavailable",
+            {
+              decisionHash: abandonedDecisionHash,
+              abandoned: true,
+              errorCode:
+                error instanceof AgentError
+                  ? error.code
+                  : "INTERNAL_ERROR",
+            },
+          );
+          this.clearPending(requestId);
+          if (!this.state.completedOperationIds.includes(requestId)) {
+            this.state.completedOperationIds.push(requestId);
+          }
+          await this.dependencies.audit.append({
+            type: "session.recovered",
+            taskId: this.state.taskId,
+            turnId,
+            operationId: requestId,
+            data: {
+              decision: "abandon",
+              reasonCode: "USER_INTERACTION_FAILED",
+              tool,
+              decisionHash: abandonedDecisionHash,
+            },
+          });
+          await this.persist();
+          throw new AgentError(
+            "RECOVERY_REQUIRED",
+            errorMessage(error),
+            {
+              automaticRecoveryDecisionAbandoned: true,
+              requestId,
+            },
+            { cause: error },
+          );
+        }
+        throw error;
+      }
+    } else {
+      decision = parseDecisionArtifact(cached);
+    }
     this.throwIfInterrupted();
     if (cached === undefined) {
       await this.requireArtifacts().put("decision", artifactId, stableJson(decision));
@@ -1227,9 +1555,248 @@ export class AgentRuntime {
     return outcomes;
   }
 
+  private async recoverFromBudgetExhaustion(
+    error: AgentError,
+  ): Promise<AgentRunResult | undefined> {
+    const reason = disclosureBudgetReason(error);
+    const attempt = await this.attemptBudgetRecovery(error, reason, false);
+    if (attempt.result !== undefined) return attempt.result;
+    const recovery = attempt.recovery;
+    if (recovery.raised) {
+      this.disclosureBudgetPauseReason = undefined;
+      this.disclosureBudgetPauseError = undefined;
+      this.state.budgetPauseStreak = 0;
+      this.activeModelTurnId = undefined;
+      if (this.state.status !== "paused") await this.move("paused", reason);
+      return undefined;
+    }
+    await this.queueEmergencyBudgetNotice(error).catch(() => false);
+    return this.pauseForBudget(recovery.reason);
+  }
+
+  private async attemptBudgetRecovery(
+    error: AgentError,
+    reason: string,
+    abandonOnInterruption: boolean,
+  ): Promise<
+    | {
+        readonly recovery: {
+          readonly raised: boolean;
+          readonly reason: string;
+        };
+        readonly result?: never;
+      }
+    | {
+        readonly recovery?: never;
+        readonly result: AgentRunResult;
+      }
+  > {
+    try {
+      return {
+        recovery: await this.tryRaiseBudgetAndContinue(
+          error,
+          reason,
+          abandonOnInterruption,
+        ),
+      };
+    } catch (recoveryError) {
+      if (this.interruption !== undefined) {
+        return { result: await this.finishInterruption() };
+      }
+      const abandoned =
+        recoveryError instanceof AgentError &&
+        recoveryError.details.automaticRecoveryDecisionAbandoned === true;
+      return {
+        recovery: {
+          raised: false,
+          reason: abandoned
+            ? (
+                `${reason} Automatic raise-and-continue could not obtain an ` +
+                `operator decision (${errorMessage(recoveryError)}). The ` +
+                "current recovery request was durably denied fail-closed and " +
+                "cannot be retried. If Cope queued a budget notice, resume may " +
+                "continue on a new turn; otherwise start a new task from an " +
+                "interactive terminal."
+              )
+            : (
+                `${reason} Automatic raise-and-continue could not obtain an ` +
+                `operator decision (${errorMessage(recoveryError)}). Resume ` +
+                "this session in an interactive terminal to retry the " +
+                "recovery decision."
+              ),
+        },
+      };
+    }
+  }
+
+  private async tryRaiseBudgetAndContinue(
+    error: AgentError,
+    reason: string,
+    abandonOnInterruption: boolean,
+  ): Promise<{ readonly raised: boolean; readonly reason: string }> {
+    let recovery = budgetRecoveryCapability(error);
+    if (
+      recovery === undefined ||
+      this.dependencies.policy.assessSessionGrantExpansion === undefined
+    ) {
+      return { raised: false, reason };
+    }
+    const assessment =
+      this.dependencies.policy.assessSessionGrantExpansion(
+        recovery.capability,
+      );
+    if (assessment.outcome === "unavailable") {
+      return {
+        raised: false,
+        reason: unavailableBudgetExpansionReason(error, assessment),
+      };
+    }
+    if (assessment.outcome !== "change") {
+      return { raised: false, reason };
+    }
+    const higherLayerCeiling =
+      typeof assessment.details?.higher_layer_ceiling === "number"
+        ? assessment.details.higher_layer_ceiling
+        : undefined;
+    if (
+      higherLayerCeiling !== undefined &&
+      Number.isSafeInteger(higherLayerCeiling) &&
+      higherLayerCeiling > recovery.requestedLimit
+    ) {
+      const ceilingRecovery: BudgetRecoveryCapability = {
+        metric: recovery.metric,
+        requestedLimit: higherLayerCeiling,
+        capability: {
+          kind: "budget",
+          metric: recovery.metric,
+          requested_limit: higherLayerCeiling,
+        },
+      };
+      const ceilingAssessment =
+        this.dependencies.policy.assessSessionGrantExpansion(
+          ceilingRecovery.capability,
+        );
+      if (ceilingAssessment.outcome === "change") {
+        recovery = ceilingRecovery;
+      }
+    }
+    const recoveryReason =
+      `${reason} Cope can continue from the durable session state if this ` +
+      "session budget is raised.";
+    const decisionRecord = await this.executeUserDecision(
+      budgetRecoveryRequestId(
+        recovery,
+        this.activeModelTurnId,
+        this.state.turnSequence,
+      ),
+      "request_capability",
+      {
+        type: "budget_recovery",
+        capability: recovery.capability,
+        reason: recoveryReason,
+      },
+      this.activeModelTurnId ??
+        this.state.submission?.turnId ??
+        this.state.queuedOutbound?.turnId ??
+        "turn_0000",
+      () => this.dependencies.user.requestCapability({
+        capability: recovery.capability,
+        reason: recoveryReason,
+        risk:
+          "The expansion remains bounded by organization and repository policy. " +
+          "Only an allow-for-session decision can resume this interrupted work.",
+        signal: this.controller.signal,
+      }),
+      {
+        chargeOperation: false,
+        abandonOnRequesterError: true,
+        abandonOnInterruption,
+        recoveryCapability: recovery.capability,
+      },
+    );
+    const decision = capabilityDecision(decisionRecord);
+    let effective = false;
+    if (decision.decision === "allow_session") {
+      effective = await this.dependencies.policy.expandSessionGrant(
+        recovery.capability,
+      );
+    }
+    await this.dependencies.audit.append({
+      type: "capability.decided",
+      taskId: this.state.taskId,
+      ...(this.activeModelTurnId === undefined
+        ? {}
+        : { turnId: this.activeModelTurnId }),
+      data: {
+        decision: decision.decision,
+        effective,
+        recovery: true,
+        metric: recovery.metric,
+        requestedLimit: recovery.requestedLimit,
+      },
+    });
+    return { raised: effective, reason };
+  }
+
+  private async queueEmergencyBudgetNotice(
+    error: AgentError,
+  ): Promise<boolean> {
+    if (
+      this.state.queuedOutbound !== undefined ||
+      this.activeModelTurnId === undefined
+    ) {
+      return false;
+    }
+    const priorTurnId = this.activeModelTurnId;
+    const reason = disclosureBudgetReason(error);
+    const notice = this.dependencies.protocol.renderProtocolError({
+      taskId: this.state.taskId,
+      priorTurnId,
+      code: "BUDGET_EXCEEDED",
+      message:
+        `${reason} This source-free notice was delivered from reserved ` +
+        "recovery headroom; completed operations will not be replayed.",
+      repairable: false,
+    });
+    const outbound = await this.serializeForDisclosure(
+      notice,
+      "emergency",
+      undefined,
+      true,
+    );
+    if (
+      ["executing_tools", "awaiting_user", "validating_completion"].includes(
+        this.state.status,
+      )
+    ) {
+      await this.move("returning_results");
+    }
+    await this.queueOutbound(
+      outbound,
+      nextTurnId(this.state.turnSequence),
+      {
+        ...(this.state.unreturnedOperationIds?.length
+          ? { returnedOperationIds: [...this.state.unreturnedOperationIds] }
+          : {}),
+        ...(this.state.status === "returning_results"
+          ? { nextStatus: "awaiting_model" as const }
+          : {}),
+        disclosureKind: "decision",
+      },
+    );
+    await this.dependencies.artifacts?.remove("response", priorTurnId);
+    this.activeModelTurnId = undefined;
+    return true;
+  }
+
   private async serializeForDisclosure(
     message: string,
-    kind: "bootstrap" | "tool_result" | "repair" | "decision",
+    kind:
+      | "bootstrap"
+      | "tool_result"
+      | "repair"
+      | "decision"
+      | "emergency",
     oneTimeDisclosedBytesLimit?: number,
     deferAudit = false,
   ): Promise<string> {
@@ -1237,6 +1804,22 @@ export class AgentRuntime {
     // handed to the final disclosure guard. The exact serialized size is then
     // charged once, at the browser boundary, rather than per intermediate tool.
     const unredactedBytes = Buffer.byteLength(message);
+    if (
+      kind === "emergency" &&
+      unredactedBytes > EMERGENCY_NOTICE_RESERVE_BYTES
+    ) {
+      throw new AgentError(
+        "BUDGET_EXCEEDED",
+        "Emergency budget notice exceeds its reserved byte cap",
+        {
+          counter: "disclosedBytes",
+          current: this.state.budgetUsage.disclosedBytes,
+          requested: unredactedBytes,
+          limit: EMERGENCY_NOTICE_RESERVE_BYTES,
+          emergency: true,
+        },
+      );
+    }
     if (
       kind === "tool_result" &&
       this.toolResultDisclosureReservation > 0 &&
@@ -1246,18 +1829,43 @@ export class AgentRuntime {
         "BUDGET_EXCEEDED",
         "Rendered tool result exceeded its authorized disclosure reservation",
         {
+          counter: "disclosedBytes",
+          current: this.state.budgetUsage.disclosedBytes,
+          requested: unredactedBytes,
+          limit: this.toolResultDisclosureReservation,
           actual: unredactedBytes,
           reserved: this.toolResultDisclosureReservation,
+          reservation: true,
         },
       );
     }
-    this.meter.assertCanConsume(
-      "disclosedBytes",
+    this.assertDisclosureCanConsume(
+      kind,
       unredactedBytes,
       oneTimeDisclosedBytesLimit,
     );
-    const serialized = await this.dependencies.disclosure.inspectAndSerialize(message, { kind });
+    const disclosureKind = kind === "emergency" ? "decision" : kind;
+    const serialized = await this.dependencies.disclosure.inspectAndSerialize(
+      message,
+      { kind: disclosureKind },
+    );
     const disclosedBytes = Buffer.byteLength(serialized);
+    if (
+      kind === "emergency" &&
+      disclosedBytes > EMERGENCY_NOTICE_RESERVE_BYTES
+    ) {
+      throw new AgentError(
+        "BUDGET_EXCEEDED",
+        "Guarded emergency budget notice exceeds its reserved byte cap",
+        {
+          counter: "disclosedBytes",
+          current: this.state.budgetUsage.disclosedBytes,
+          requested: disclosedBytes,
+          limit: EMERGENCY_NOTICE_RESERVE_BYTES,
+          emergency: true,
+        },
+      );
+    }
     if (
       kind === "tool_result" &&
       this.toolResultDisclosureReservation > 0 &&
@@ -1267,13 +1875,18 @@ export class AgentRuntime {
         "BUDGET_EXCEEDED",
         "Guarded tool result exceeded its authorized disclosure reservation",
         {
+          counter: "disclosedBytes",
+          current: this.state.budgetUsage.disclosedBytes,
+          requested: disclosedBytes,
+          limit: this.toolResultDisclosureReservation,
           actual: disclosedBytes,
           reserved: this.toolResultDisclosureReservation,
+          reservation: true,
         },
       );
     }
-    this.meter.assertCanConsume(
-      "disclosedBytes",
+    this.assertDisclosureCanConsume(
+      kind,
       disclosedBytes,
       oneTimeDisclosedBytesLimit,
     );
@@ -1286,10 +1899,67 @@ export class AgentRuntime {
       await this.dependencies.audit.append({
         type: "disclosure.recorded",
         taskId: this.state.taskId,
-        data: { kind, disclosedBytes, sha256: sha256(serialized) },
+        data: {
+          kind: disclosureKind,
+          disclosedBytes,
+          sha256: sha256(serialized),
+        },
       });
     }
     return serialized;
+  }
+
+  private assertDisclosureCanConsume(
+    kind:
+      | "bootstrap"
+      | "tool_result"
+      | "repair"
+      | "decision"
+      | "emergency",
+    amount: number,
+    oneTimeDisclosedBytesLimit?: number,
+  ): void {
+    if (kind === "emergency") {
+      this.meter.assertCanConsume(
+        "disclosedBytes",
+        amount,
+        oneTimeDisclosedBytesLimit,
+      );
+      return;
+    }
+    // Validate any one-time ceiling with the meter before deriving the
+    // strictly lower data-plane ceiling from it.
+    this.meter.assertCanConsume(
+      "disclosedBytes",
+      0,
+      oneTimeDisclosedBytesLimit,
+    );
+    const totalLimit =
+      oneTimeDisclosedBytesLimit ?? this.state.budgetLimits.maxDisclosedBytes;
+    const reserved =
+      kind === "tool_result"
+        ? CONTROL_PLANE_RESERVE_BYTES
+        : EMERGENCY_NOTICE_RESERVE_BYTES;
+    const dataLimit = Math.max(0, totalLimit - reserved);
+    const current = this.state.budgetUsage.disclosedBytes;
+    if (current + amount > dataLimit) {
+      throw new AgentError(
+        "BUDGET_EXCEEDED",
+        kind === "tool_result"
+          ? "Disclosure data budget exhausted; control-plane headroom is reserved"
+          : "Disclosure control budget exhausted; emergency notice headroom is reserved",
+        {
+          counter: "disclosedBytes",
+          current,
+          requested: amount,
+          limit: dataLimit,
+          totalLimit,
+          reserved,
+          minimum_acceptable:
+            current + amount + reserved,
+        },
+      );
+    }
   }
 
   private async executeCall(
@@ -1503,7 +2173,14 @@ export class AgentRuntime {
         operationId: call.operationId,
         tool: call.name,
         status,
-        data: { code: policy.reasonCode, decision: policy.outcome, message: policy.explanation },
+        data: {
+          code: policy.reasonCode,
+          decision: policy.outcome,
+          message: policy.explanation,
+          ...(!("details" in policy) || policy.details === undefined
+            ? {}
+            : { details: policy.details }),
+        },
         safeMetadata: failed.safeResult ?? {},
       };
     }
@@ -1547,6 +2224,9 @@ export class AgentRuntime {
             code: safe.reasonCode,
             decision: "deny",
             message: errorMessage(error),
+            ...(error instanceof AgentError
+              ? { details: error.details }
+              : {}),
           },
           safeMetadata: failed.safeResult ?? safe,
         };
@@ -1554,11 +2234,40 @@ export class AgentRuntime {
     }
     const specializedCounter = specializedBudgetCounter(call.name);
     if (specializedCounter !== undefined) {
-      this.meter.consume(
-        specializedCounter,
-        1,
-        oneTimeBudgetLimits[specializedCounter],
-      );
+      try {
+        this.meter.consume(
+          specializedCounter,
+          1,
+          oneTimeBudgetLimits[specializedCounter],
+        );
+      } catch (error) {
+        if (!isBudgetExceeded(error)) throw error;
+        const safe = {
+          reasonCode: error.code,
+          counter: specializedCounter,
+        };
+        const failed = await this.dependencies.journal.markFailed(
+          registration.record,
+          this.now(),
+          "budget_exhausted_before_execution",
+          safe,
+        );
+        this.clearPending(call.operationId);
+        this.markOperationAwaitingReturn(call.operationId);
+        await this.persist();
+        return {
+          operationId: call.operationId,
+          tool: call.name,
+          status: "denied",
+          data: {
+            code: error.code,
+            decision: "deny",
+            message: errorMessage(error),
+            details: error.details,
+          },
+          safeMetadata: failed.safeResult ?? safe,
+        };
+      }
     }
     this.throwIfInterrupted();
     let executing: OperationRecord;
@@ -1581,8 +2290,12 @@ export class AgentRuntime {
     this.throwIfInterrupted();
     let operationWasCommitted = false;
     try {
+      const executionCall =
+        policy.outcome === "allow" && policy.effectiveArguments !== undefined
+          ? { ...call, arguments: policy.effectiveArguments }
+          : call;
       const outcome = await this.dependencies.tools.execute(
-        call,
+        executionCall,
         this.controller.signal,
         policy.outcome === "allow" && policy.plannedMutation !== undefined
           ? { plannedMutation: policy.plannedMutation }
@@ -1897,8 +2610,8 @@ export class AgentRuntime {
         "Combined tool-result disclosure reservation is invalid",
       );
     }
-    this.meter.assertCanConsume(
-      "disclosedBytes",
+    this.assertDisclosureCanConsume(
+      "tool_result",
       reservation,
       approvedLimit,
     );
@@ -1946,6 +2659,23 @@ export class AgentRuntime {
       return this.abort(currentInterruption.reason);
     }
     return this.result(currentInterruption?.reason ?? effectiveReason);
+  }
+
+  private async pauseForBudget(reason: string): Promise<AgentRunResult> {
+    const nextStreak = (this.state.budgetPauseStreak ?? 0) + 1;
+    this.state.budgetPauseStreak = nextStreak;
+    if (nextStreak >= 2) {
+      const repeatedReason =
+        `${reason} Budget recovery paused twice without a successfully ` +
+        "returned data result; Cope stopped this task to prevent an unbounded " +
+        "resume-and-pause loop.";
+      if (!isTerminal(this.state.status)) {
+        await this.move("blocked", repeatedReason);
+      }
+      return this.result(repeatedReason);
+    }
+    await this.persist();
+    return this.pauseWithInterruptionPriority(reason);
   }
 
   private async finishInterruption(): Promise<AgentRunResult> {
@@ -2077,6 +2807,325 @@ function selectAction(messages: readonly NormalizedModelMessage[]): NormalizedMo
     throw new AgentError("PROTOCOL_INVALID", "A model turn contains more than one dependent action class");
   }
   return actionable[0] ?? messages[0] ?? (() => { throw new AgentError("PROTOCOL_INVALID", "Empty model turn"); })();
+}
+
+function isBudgetExceeded(error: unknown): error is AgentError {
+  return error instanceof AgentError && error.code === "BUDGET_EXCEEDED";
+}
+
+function disclosureBudgetReason(error: AgentError): string {
+  const counter =
+    typeof error.details.counter === "string"
+      ? error.details.counter
+      : "budget";
+  const current =
+    typeof error.details.current === "number"
+      ? error.details.current
+      : undefined;
+  const limit =
+    typeof error.details.totalLimit === "number"
+      ? error.details.totalLimit
+      : typeof error.details.limit === "number"
+        ? error.details.limit
+        : undefined;
+  const minimum =
+    typeof error.details.minimum_acceptable === "number"
+      ? error.details.minimum_acceptable
+      : current === undefined ||
+          typeof error.details.requested !== "number"
+        ? undefined
+        : current + error.details.requested;
+  const usage =
+    current === undefined || limit === undefined
+      ? ""
+      : ` (${current} / ${limit})`;
+  if (error.details.reservation === true) {
+    const actual =
+      typeof error.details.actual === "number"
+        ? error.details.actual
+        : error.details.requested;
+    const reservation =
+      typeof error.details.reserved === "number"
+        ? error.details.reserved
+        : limit;
+    return `BUDGET_EXCEEDED: ${counter} result reservation (${String(actual)} / ${String(reservation)}). Retry with a narrower bounded request or request a larger authorized disclosure allowance, then resume this session.`;
+  }
+  const next =
+    minimum === undefined
+      ? "Raise the applicable limit and resume this session."
+      : `Raise the applicable limit to at least ${minimum} and resume this session.`;
+  return `BUDGET_EXCEEDED: ${counter}${usage}. ${next}`;
+}
+
+function unavailableBudgetExpansionReason(
+  error: AgentError,
+  assessment: {
+    readonly explanation: string;
+    readonly details?: Readonly<Record<string, unknown>>;
+  },
+): string {
+  const base = disclosureBudgetReason(error).replace(
+    / Raise the applicable limit(?: to at least \d+)? and resume this session\.$/u,
+    "",
+  );
+  const layer =
+    typeof assessment.details?.blocking_layer === "string"
+      ? assessment.details.blocking_layer
+      : "higher-layer policy";
+  const ceiling =
+    typeof assessment.details?.layer_ceiling === "number"
+      ? ` (${assessment.details.layer_ceiling})`
+      : "";
+  return (
+    `${base} Automatic raise-and-continue is unavailable because the ` +
+    `${layer} budget ceiling${ceiling} does not provide headroom. ` +
+    "This policy-pinned session cannot continue. Update the governing policy " +
+    "through the governed configuration process, then start a new session; " +
+    "resuming this session cannot apply changed policy hashes."
+  );
+}
+
+function budgetExhaustedOutcomes(
+  calls: readonly NormalizedToolCall[],
+  outcomes: readonly ToolOutcome[],
+  error: AgentError,
+): readonly ToolOutcome[] {
+  const reason = disclosureBudgetReason(error);
+  const numericDetail = (key: string): Readonly<Record<string, number>> =>
+    typeof error.details[key] === "number"
+      ? { [key]: error.details[key] }
+      : {};
+  const safeDetails = {
+    ...(typeof error.details.counter === "string"
+      ? { counter: error.details.counter }
+      : {}),
+    ...numericDetail("current"),
+    ...numericDetail("requested"),
+    ...numericDetail("limit"),
+    ...numericDetail("totalLimit"),
+    ...numericDetail("reserved"),
+    ...numericDetail("actual"),
+    ...(typeof error.details.reservation === "boolean"
+      ? { reservation: error.details.reservation }
+      : {}),
+    ...numericDetail("minimum_acceptable"),
+    ...(typeof error.details.dimension === "string"
+      ? { dimension: error.details.dimension }
+      : {}),
+  };
+  const details = {
+    ...safeDetails,
+    resumable: true,
+    ...(error.details.reservation !== true &&
+    typeof error.details.minimum_acceptable === "number"
+      ? {
+          retry_with: {
+            kind: "budget",
+            metric: "disclosed_bytes",
+            requested_limit: error.details.minimum_acceptable,
+          },
+        }
+      : {}),
+  };
+  return calls.map((call, index) => {
+    const original = outcomes[index];
+    const completed = original?.status === "success";
+    return {
+      operationId: call.operationId,
+      tool: call.name,
+      status: completed
+        ? "success"
+        : original?.status ?? "denied",
+      data: completed
+        ? {
+            code: "BUDGET_EXCEEDED",
+            message:
+              "The operation completed, but its source-bearing result was omitted because the disclosure data budget is exhausted.",
+            result_omitted: true,
+            details,
+          }
+        : {
+            code: "BUDGET_EXCEEDED",
+            decision: "deny",
+            message: reason,
+            details,
+          },
+      safeMetadata: {
+        ...(original?.safeMetadata ?? {}),
+        reasonCode: "BUDGET_EXCEEDED",
+        resultOmitted: completed,
+      },
+    };
+  });
+}
+
+interface BudgetRecoveryCapability {
+  readonly metric: BudgetMetric;
+  readonly requestedLimit: number;
+  readonly capability: Readonly<{
+    kind: "budget";
+    metric: BudgetMetric;
+    requested_limit: number;
+  }>;
+}
+
+const AUTOMATIC_BUDGET_RECOVERY_DENY_KIND =
+  "automatic_budget_recovery_default_deny" as const;
+
+function automaticBudgetRecoveryDeny(
+  capability: BudgetRecoveryCapability["capability"] | undefined,
+): Readonly<Record<string, unknown>> {
+  return {
+    decision: "deny",
+    note:
+      "Automatic budget-recovery approval was unavailable; no capability " +
+      "was granted.",
+    _cope_recovery: {
+      version: 1,
+      kind: AUTOMATIC_BUDGET_RECOVERY_DENY_KIND,
+      ...(capability === undefined ? {} : { capability }),
+    },
+  };
+}
+
+function isAutomaticBudgetRecoveryDeny(
+  value: Readonly<Record<string, unknown>>,
+): boolean {
+  const metadata = value._cope_recovery;
+  return (
+    value.decision === "deny" &&
+    metadata !== null &&
+    typeof metadata === "object" &&
+    !Array.isArray(metadata) &&
+    (metadata as Readonly<Record<string, unknown>>).version === 1 &&
+    (metadata as Readonly<Record<string, unknown>>).kind ===
+      AUTOMATIC_BUDGET_RECOVERY_DENY_KIND
+  );
+}
+
+function isBudgetRecoveryOperation(
+  operationId: string,
+  tool: string,
+): boolean {
+  return (
+    tool === "request_capability" &&
+    operationId.startsWith(
+      `${INTERNAL_OPERATION_ID_PREFIX}budget_recovery_`,
+    )
+  );
+}
+
+function budgetRecoveryFromRequestId(
+  operationId: string,
+): BudgetRecoveryCapability | undefined {
+  const prefix = `${INTERNAL_OPERATION_ID_PREFIX}budget_recovery_`;
+  if (!operationId.startsWith(prefix)) return undefined;
+  const suffix = operationId.slice(prefix.length);
+  const metrics = Object.values(POLICY_METRIC_BY_RUNTIME_COUNTER)
+    .filter((metric): metric is BudgetMetric => metric !== undefined)
+    .sort((left, right) => right.length - left.length);
+  for (const metric of metrics) {
+    const metricPrefix = `${metric}_`;
+    if (!suffix.startsWith(metricPrefix)) continue;
+    const requestedText = suffix.slice(metricPrefix.length).match(/^\d+/u)?.[0];
+    if (requestedText === undefined) return undefined;
+    const requestedLimit = Number(requestedText);
+    if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1) {
+      return undefined;
+    }
+    return {
+      metric,
+      requestedLimit,
+      capability: {
+        kind: "budget",
+        metric,
+        requested_limit: requestedLimit,
+      },
+    };
+  }
+  return undefined;
+}
+
+const POLICY_METRIC_BY_RUNTIME_COUNTER: Readonly<
+  Record<string, BudgetMetric | undefined>
+> = {
+  elapsedMs: "elapsed_ms",
+  turns: "turns",
+  operations: "operations",
+  readFiles: "read_files",
+  disclosedBytes: "disclosed_bytes",
+  changedFiles: "changed_files",
+  changedLines: "changed_lines",
+  commands: "commands",
+  commandOutputBytes: "command_output_bytes",
+  protocolRepairs: "protocol_repairs",
+};
+
+function budgetRecoveryCapability(
+  error: AgentError,
+): BudgetRecoveryCapability | undefined {
+  if (
+    error.details.reservation === true ||
+    error.details.emergency === true
+  ) {
+    return undefined;
+  }
+  const counter =
+    typeof error.details.counter === "string"
+      ? error.details.counter
+      : undefined;
+  const metric =
+    counter === undefined
+      ? undefined
+      : POLICY_METRIC_BY_RUNTIME_COUNTER[counter];
+  if (metric === undefined) return undefined;
+  const current =
+    typeof error.details.current === "number"
+      ? error.details.current
+      : 0;
+  const limit =
+    typeof error.details.totalLimit === "number"
+      ? error.details.totalLimit
+      : typeof error.details.limit === "number"
+        ? error.details.limit
+        : 0;
+  const requested =
+    typeof error.details.minimum_acceptable === "number"
+      ? error.details.minimum_acceptable
+      : Math.max(current, limit) + 1;
+  const requestedLimit =
+    metric === "elapsed_ms"
+      ? Math.max(requested, current + 60_000)
+      : requested;
+  if (
+    !Number.isSafeInteger(requestedLimit) ||
+    requestedLimit < 1
+  ) {
+    return undefined;
+  }
+  return {
+    metric,
+    requestedLimit,
+    capability: {
+      kind: "budget",
+      metric,
+      requested_limit: requestedLimit,
+    },
+  };
+}
+
+function budgetRecoveryRequestId(
+  recovery: BudgetRecoveryCapability,
+  turnId: string | undefined,
+  turnSequence: number,
+): string {
+  const turn =
+    turnId?.replaceAll(/[^A-Za-z0-9_-]/gu, "_") ??
+    `turn_${String(turnSequence).padStart(4, "0")}`;
+  return (
+    `${INTERNAL_OPERATION_ID_PREFIX}budget_recovery_${recovery.metric}_` +
+    `${String(recovery.requestedLimit)}_${turn}`
+  ).slice(0, 128);
 }
 
 function specializedBudgetCounter(tool: string): "commands" | "readFiles" | undefined {

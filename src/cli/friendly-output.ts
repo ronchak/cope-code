@@ -10,6 +10,11 @@ export function renderHumanResult(value: Readonly<Record<string, unknown>>): str
     stringValue(recordValue(recordValue(value.completionReport)?.claim)?.summary) ??
     stringValue(recordValue(recordValue(recordValue(value.handoff)?.completionReport)?.claim)?.summary);
   const message = stringValue(value.message);
+  const reason = stringValue(value.reason) ??
+    stringValue(recordValue(value.handoff)?.pauseReason);
+  const failure = recordValue(value.failure) ??
+    recordValue(recordValue(value.handoff)?.failure);
+  const failureCode = stringValue(failure?.code);
   const lines: string[] = [];
 
   if (status !== undefined) {
@@ -19,6 +24,21 @@ export function renderHumanResult(value: Readonly<Record<string, unknown>>): str
   }
   if (modelSummary !== undefined) lines.push(`\n${modelSummary}`);
   if (message !== undefined && message !== modelSummary) lines.push(`\n${message}`);
+  if (
+    reason !== undefined &&
+    reason !== message &&
+    reason !== modelSummary
+  ) {
+    lines.push(`\n${reason}`);
+  }
+  if (
+    failureCode !== undefined &&
+    ![reason, message, modelSummary].some((value_) =>
+      value_?.includes(failureCode) === true
+    )
+  ) {
+    lines.push(`\n${dim(`Diagnostic: ${failureCode}`)}`);
+  }
   if (sessionId !== undefined) lines.push(`\n${dim(`Session ${sessionId}`)}`);
 
   const handoff = recordValue(value.handoff);

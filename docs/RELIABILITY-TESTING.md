@@ -6,7 +6,7 @@ Cope's reliability harness exercises selected high-risk local runtime, transport
 
 - `npm run test:reliability` runs one deterministic pass over each hard-exit boundary plus 24 seeded iterations for each bounded fuzz/soak scenario.
 - `npm run test:reliability:soak` runs 200 iterations for local or scheduled soak evidence.
-- `npm run test:coverage` runs the reliability suite plus current 0.1.6 session/setup recovery tests with explicit production-file denominators and minimum line, branch, and function floors.
+- `npm run test:coverage` runs the reliability suite plus current session/setup and disclosure-budget recovery tests with explicit production-file denominators and minimum line, branch, and function floors.
 
 Set `COPE_RELIABILITY_SEED` to an integer from 1 through 4294967295 to reproduce a run. Each scenario derives a nonzero unsigned seed from that base value; failure diagnostics record both values, and the base value is the one to reuse. `COPE_RELIABILITY_ITERATIONS` accepts 1 through 500. Failures write an allowlisted, source-free JSON diagnostic containing only scenario/seed identifiers, error type, and an error-message fingerprint to `COPE_RELIABILITY_ARTIFACT_DIR` when configured. On failure, CI retains only those JSON files for seven days; raw test and coverage output is not copied into the artifact.
 

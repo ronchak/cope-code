@@ -5,7 +5,7 @@ import {
 } from "../security/disclosure-ledger.js";
 import { sha256, stableJson } from "../shared/crypto.js";
 import { AgentError } from "../shared/errors.js";
-import { isOperationId } from "../shared/operation-id.js";
+import { isJournalOperationId, isOperationId } from "../shared/operation-id.js";
 import { SESSION_SCHEMA_VERSION, type BudgetLimits, type BudgetUsage, type SessionState } from "../session/types.js";
 
 export const REVIEW_PACKAGE_VERSION = "cba-review-package/1" as const;
@@ -275,7 +275,7 @@ function verifyAuditEvents(events: readonly AuditEvent[], state: SessionState): 
       event.previousHash !== previousHash ||
       !(AUDIT_EVENT_TYPES as readonly string[]).includes(event.type) ||
       !isIsoTimestamp(event.timestamp) ||
-      (event.operationId !== undefined && !isOperationId(event.operationId)) ||
+      (event.operationId !== undefined && !isJournalOperationId(event.operationId)) ||
       !HASH_PATTERN.test(event.eventHash)
     ) {
       throw new AgentError("RECOVERY_REQUIRED", "Review-package audit metadata is inconsistent");
@@ -379,13 +379,13 @@ function assertSafeSessionState(state: SessionState): void {
   ) {
     throw new AgentError("RECOVERY_REQUIRED", "Review-package session state is invalid");
   }
-  if (!state.completedOperationIds.every(isOperationId)) {
+  if (!state.completedOperationIds.every(isJournalOperationId)) {
     throw new AgentError("RECOVERY_REQUIRED", "Review-package completed-operation metadata is unsafe");
   }
   if (
     state.unreturnedOperationIds !== undefined &&
     (
-      !state.unreturnedOperationIds.every(isOperationId) ||
+      !state.unreturnedOperationIds.every(isJournalOperationId) ||
       state.unreturnedOperationIds.some(
         (operationId) => !state.completedOperationIds.includes(operationId),
       )
@@ -425,7 +425,7 @@ function assertSafeSessionState(state: SessionState): void {
   }
   for (const operation of state.pendingOperations) {
     if (
-      !isOperationId(operation.operationId) ||
+      !isJournalOperationId(operation.operationId) ||
       !isSafeId(operation.tool) ||
       !HASH_PATTERN.test(operation.requestHash) ||
       !isIsoTimestamp(operation.acceptedAt)

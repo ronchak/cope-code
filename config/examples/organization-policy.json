@@ -124,13 +124,13 @@
       "on_limit_exceeded": "deny"
     },
     "budgets": {
-      "elapsed_ms": 3600000,
-      "turns": 40,
-      "operations": 160,
+      "elapsed_ms": 14400000,
+      "turns": 160,
+      "operations": 640,
       "read_files": 80,
       "changed_files": 30,
       "changed_lines": 2000,
-      "disclosed_bytes": 2000000,
+      "disclosed_bytes": 8000000,
       "commands": 30,
       "command_output_bytes": 1000000,
       "protocol_repairs": 4

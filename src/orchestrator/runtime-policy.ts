@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import {
   PolicyEngine,
+  DEFAULT_POLICY_BUDGETS,
   normalizeRepositoryPath,
   type BudgetUsage as PolicyBudgetUsage,
   type EffectivePolicy,
@@ -10,6 +11,8 @@ import {
 } from "../policy/index.js";
 import {
   BUDGET_METRICS,
+  DEFAULT_LIST_FILES_MAX_RESULTS,
+  MAX_LIST_FILES_RESULTS,
   isToolName,
   TOOL_NAMES,
   toolRequiresContext,
@@ -20,6 +23,7 @@ import { countChangedLines, planExactTextEdit } from "../repository/exact-text-e
 import type { RepositoryReadOperation } from "../repository/repository-tools.js";
 import { readTextFile } from "../repository/text-file.js";
 import { AgentError, errorMessage } from "../shared/errors.js";
+import { stableJson } from "../shared/crypto.js";
 import type { CommandCatalog } from "../tools/command-catalog.js";
 import type {
   AuthorizationDecision,
@@ -27,9 +31,10 @@ import type {
   RuntimePolicy,
 } from "./contracts.js";
 import {
+  CONTROL_PLANE_RESERVE_BYTES,
   GIT_STATUS_RESULT_BYTES,
-  LIST_FILES_RESULT_BYTES,
   plannedToolResultDisclosureBytes,
+  projectedListFilesResultBytes,
 } from "./disclosure-budget.js";
 
 const OPERATION_SCOPED_BUDGET_METRICS = new Set<BudgetMetric>([
@@ -70,6 +75,17 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
 
   public summarize(): Readonly<Record<string, unknown>> {
     const grant = this.engineValue.session;
+    const disclosureLimits = this.engineValue.getEffectiveDisclosureLimits();
+    const listBounds = listFilesRuntimeBounds(this.engineValue);
+    const budgetRecovery = budgetRecoveryHeadroom(this.engineValue);
+    const disclosureLimitParts = [
+      disclosureLimits.max_bytes_per_operation === undefined
+        ? undefined
+        : `${disclosureLimits.max_bytes_per_operation} bytes`,
+      disclosureLimits.max_files_per_operation === undefined
+        ? undefined
+        : `${disclosureLimits.max_files_per_operation} files`,
+    ].filter((entry): entry is string => entry !== undefined);
     return {
       mode: grant.mode,
       tools: grant.capabilities.tools?.allow ?? [],
@@ -82,9 +98,47 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
       command_ids: grant.capabilities.commands?.ids?.allow ?? [],
       disclosure_classifications: grant.capabilities.disclosure?.classifications?.allow ?? [],
       network: grant.capabilities.network?.access ?? "deny",
+      operation_limits: {
+        list_files: {
+          default_max_results:
+            listBounds.disabled === true ? 0 : listBounds.defaultResults,
+          maximum_results:
+            listBounds.disabled === true ? 0 : listBounds.maxResults,
+          ...(listBounds.disabled === true
+            ? { listing_disabled_by_policy: true }
+            : {}),
+          ...(disclosureLimits.max_files_per_operation === undefined
+            ? {}
+            : {
+                policy_max_files_per_operation:
+                  disclosureLimits.max_files_per_operation,
+              }),
+          ...(disclosureLimits.max_bytes_per_operation === undefined
+            ? {}
+            : {
+                policy_max_bytes_per_operation:
+                  disclosureLimits.max_bytes_per_operation,
+              }),
+        },
+      },
+      budget_recovery: budgetRecovery,
       notes: [
         "Organization, repository, and session rules are combined using the most restrictive decision.",
         "Detected secrets are blocked again on the fully serialized browser submission.",
+        ...(disclosureLimitParts.length === 0
+          ? []
+          : [
+              `Effective per-operation disclosure limits: ${disclosureLimitParts.join(" and ")}. ` +
+              "These hard ceilings are separate from cumulative task budgets; reduce max_bytes or max_results instead of requesting a task-budget expansion.",
+            ]),
+        ...Object.entries(budgetRecovery)
+          .filter(([, entry]) => entry.available === false)
+          .map(
+            ([metric, entry]) =>
+              `Raise-and-continue is unavailable for ${metric}: the active limit ` +
+              `${entry.current_limit} has no headroom below the ` +
+              `${entry.blocking_layer} ceiling ${entry.higher_layer_ceiling}.`,
+          ),
       ],
     };
   }
@@ -142,15 +196,44 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
     call: NormalizedToolCall,
   ): Promise<AuthorizationDecision> {
     try {
-      const operation = await this.buildOperation(call, false);
+      if (
+        call.name === "list_files" &&
+        listFilesRuntimeBounds(engine).disabled === true
+      ) {
+        return {
+          outcome: "deny",
+          reasonCode: "DISCLOSURE_OPERATION_LIMIT_EXCEEDED",
+          explanation:
+            "Repository listing is disabled because the effective policy file ceiling is 0.",
+          details: {
+            dimension: "files",
+            limit: 0,
+            requested: call.arguments.max_results ?? "default",
+          },
+        };
+      }
+      const effectiveCall = effectiveToolCall(engine, call);
+      const operation = await this.buildOperation(effectiveCall, false);
       const preliminary = engine.evaluate(operation);
       if (preliminary.decision !== "allow" || !toolRequiresContext(call.name, "change")) {
-        return decisionFor(preliminary, call, this.options.commandCatalog, operation);
+        return decisionFor(
+          preliminary,
+          effectiveCall,
+          this.options.commandCatalog,
+          operation,
+          effectiveCall === call ? undefined : effectiveCall.arguments,
+        );
       }
       // Exact line accounting requires local before-images. It is performed
       // only after all higher-layer path and change-kind checks allow access.
-      const exact = await this.buildOperation(call, true);
-      return decisionFor(engine.evaluate(exact), call, this.options.commandCatalog, exact);
+      const exact = await this.buildOperation(effectiveCall, true);
+      return decisionFor(
+        engine.evaluate(exact),
+        effectiveCall,
+        this.options.commandCatalog,
+        exact,
+        effectiveCall === call ? undefined : effectiveCall.arguments,
+      );
     } catch (error) {
       if (error instanceof AgentError && error.code === "STALE_STATE") {
         return {
@@ -176,6 +259,145 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
     return true;
   }
 
+  public assessSessionGrantExpansion(
+    capability: Readonly<Record<string, unknown>>,
+  ): Readonly<{
+    outcome: "change" | "no_op" | "deny" | "unavailable";
+    reasonCode: string;
+    explanation: string;
+    details?: Readonly<Record<string, unknown>>;
+  }> {
+    const expansions = parseExpansions(capability, this.options.commandCatalog);
+    if (expansions.length === 0) {
+      return {
+        outcome: "deny",
+        reasonCode: "CAPABILITY_EXPANSION_INVALID",
+        explanation: "The requested capability expansion is structurally invalid.",
+      };
+    }
+    let engine = this.engineValue;
+    let changesEffectiveCapabilities = false;
+    const usage = this.options.currentUsage();
+    for (const expansion of expansions) {
+      const result = engine.expandSessionGrant(expansion, usage);
+      if (result.decision === "deny") {
+        const strictReasons = result.reasons.filter(
+          (reason) => reason.decision === "deny",
+        );
+        const unavailable = strictReasons.find(
+          (reason) =>
+            reason.reason_code === "BUDGET_EXPANSION_UNAVAILABLE",
+        );
+        if (unavailable !== undefined) {
+          return {
+            outcome: "unavailable",
+            reasonCode: unavailable.reason_code,
+            explanation: unavailable.message,
+            ...(unavailable.details === undefined
+              ? {}
+              : { details: unavailable.details }),
+          };
+        }
+        const monotonicNoOp =
+          expansion.kind === "budget" &&
+          strictReasons.length > 0 &&
+          strictReasons.every((reason) => reason.layer === "session");
+        const currentLimit =
+          expansion.kind === "budget"
+            ? engine.getEffectiveBudgetLimits()[expansion.metric] ??
+              DEFAULT_POLICY_BUDGETS[expansion.metric]
+            : undefined;
+        const currentUsage =
+          expansion.kind === "budget"
+            ? usage[expansion.metric]
+            : undefined;
+        return {
+          outcome: monotonicNoOp ? "no_op" : "deny",
+          reasonCode: monotonicNoOp
+            ? "CAPABILITY_REQUEST_NO_OP"
+            : "CAPABILITY_EXPANSION_DENIED",
+          explanation:
+            strictReasons.map((reason) => reason.message).join(" ") ||
+            "The requested capability expansion is not permitted.",
+          ...(expansion.kind !== "budget" ||
+          currentLimit === undefined ||
+          currentUsage === undefined
+            ? {}
+            : {
+                details: {
+                  metric: expansion.metric,
+                  requested_limit: expansion.requested_limit,
+                  current_limit: currentLimit,
+                  current_usage: currentUsage,
+                  minimum_acceptable:
+                    Math.max(currentLimit, currentUsage) + 1,
+                },
+              }),
+        };
+      }
+      const next = new PolicyEngine({
+        organization: engine.organization,
+        repository: engine.repository,
+        session: result.grant,
+        pathKey: this.options.boundary.pathKey.bind(this.options.boundary),
+      });
+      if (
+        stableJson(next.session.capabilities) !==
+        stableJson(engine.session.capabilities)
+      ) {
+        changesEffectiveCapabilities = true;
+      }
+      engine = next;
+    }
+    if (!changesEffectiveCapabilities) {
+      return {
+        outcome: "no_op",
+        reasonCode: "CAPABILITY_REQUEST_NO_OP",
+        explanation:
+          "The requested capability is already present in the effective session grant.",
+      };
+    }
+    const budgetExpansion =
+      expansions.length === 1 && expansions[0]?.kind === "budget"
+        ? expansions[0]
+        : undefined;
+    const budgetDetails =
+      budgetExpansion === undefined
+        ? undefined
+        : (() => {
+            const currentLimit =
+              this.engineValue.getEffectiveBudgetLimits()[
+                budgetExpansion.metric
+              ] ?? DEFAULT_POLICY_BUDGETS[budgetExpansion.metric];
+            const headroom =
+              budgetRecoveryHeadroom(this.engineValue)[
+                budgetExpansion.metric
+              ];
+            return {
+              metric: budgetExpansion.metric,
+              current_limit: currentLimit,
+              current_usage: usage[budgetExpansion.metric],
+              minimum_acceptable:
+                Math.max(currentLimit, usage[budgetExpansion.metric]) + 1,
+              ...(headroom.higher_layer_ceiling === undefined
+                ? {}
+                : {
+                    higher_layer_ceiling:
+                      headroom.higher_layer_ceiling,
+                  }),
+              ...(headroom.blocking_layer === undefined
+                ? {}
+                : { blocking_layer: headroom.blocking_layer }),
+            };
+          })();
+    return {
+      outcome: "change",
+      reasonCode: "CAPABILITY_EXPANSION_REQUIRES_APPROVAL",
+      explanation: "The request would expand the effective session grant.",
+      ...(budgetDetails === undefined ? {} : { details: budgetDetails }),
+    };
+  }
+
   private expandedEngine(
     capability: Readonly<Record<string, unknown>>,
   ): PolicyEngine | undefined {
@@ -184,7 +406,10 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
 
     let engine = this.engineValue;
     for (const expansion of expansions) {
-      const result = engine.expandSessionGrant(expansion);
+      const result = engine.expandSessionGrant(
+        expansion,
+        this.options.currentUsage(),
+      );
       if (result.decision === "deny") return undefined;
       engine = new PolicyEngine({
         organization: engine.organization,
@@ -250,10 +475,13 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
       const byteCount = this.options.defaultSearchBytes ?? 128 * 1024;
       disclosure = disclosureFact(this.classification, byteCount, 1);
     } else if (call.name === "list_files") {
-      const fileCount = positiveInteger(call.arguments.max_results) ?? 500;
+      const fileCount = requiredPositiveInteger(
+        call.arguments.max_results,
+        "max_results",
+      );
       disclosure = disclosureFact(
         this.classification,
-        LIST_FILES_RESULT_BYTES,
+        projectedListFilesResultBytes(fileCount),
         fileCount,
       );
     } else if (call.name === "git_diff") {
@@ -319,7 +547,7 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
     if (!Number.isSafeInteger(usage.disclosed_bytes + plannedDisclosureBytes)) {
       throw new AgentError("BUDGET_EXCEEDED", "Projected disclosure usage is too large");
     }
-    usage.disclosed_bytes += plannedDisclosureBytes;
+    usage.disclosed_bytes += plannedDisclosureBytes + CONTROL_PLANE_RESERVE_BYTES;
 
     return {
       tool: call.name,
@@ -373,6 +601,72 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
       Math.min(maxFileBytes, this.options.maxPatchBytes ?? 4 * 1024 * 1024),
     ).changedLines;
   }
+}
+
+function budgetRecoveryHeadroom(
+  engine: PolicyEngine,
+): Readonly<
+  Record<
+    BudgetMetric,
+    {
+      readonly current_limit: number;
+      readonly available: boolean;
+      readonly higher_layer_ceiling?: number;
+      readonly blocking_layer?: "organization" | "repository";
+    }
+  >
+> {
+  const effective = engine.getEffectiveBudgetLimits();
+  return Object.fromEntries(
+    BUDGET_METRICS.map((metric) => {
+      const current =
+        effective[metric] ?? DEFAULT_POLICY_BUDGETS[metric];
+      const higherLayers = [
+        {
+          layer: "organization" as const,
+          limit: engine.organization.capabilities.budgets?.[metric],
+        },
+        {
+          layer: "repository" as const,
+          limit: engine.repository.capabilities.budgets?.[metric],
+        },
+      ].filter(
+        (entry): entry is {
+          readonly layer: "organization" | "repository";
+          readonly limit: number;
+        } => entry.limit !== undefined,
+      );
+      const blocking =
+        higherLayers.length === 0
+          ? undefined
+          : higherLayers.reduce((lowest, entry) =>
+              entry.limit < lowest.limit ? entry : lowest,
+            );
+      return [
+        metric,
+        {
+          current_limit: current,
+          available: blocking === undefined || current < blocking.limit,
+          ...(blocking === undefined
+            ? {}
+            : {
+                higher_layer_ceiling: blocking.limit,
+                blocking_layer: blocking.layer,
+              }),
+        },
+      ];
+    }),
+  ) as Readonly<
+    Record<
+      BudgetMetric,
+      {
+        readonly current_limit: number;
+        readonly available: boolean;
+        readonly higher_layer_ceiling?: number;
+        readonly blocking_layer?: "organization" | "repository";
+      }
+    >
+  >;
 }
 
 interface EditTextInput {
@@ -429,12 +723,14 @@ function decisionFor(
   call: NormalizedToolCall,
   catalog: CommandCatalog,
   operation: PolicyOperation,
+  effectiveArguments?: Readonly<Record<string, unknown>>,
 ): AuthorizationDecision {
   if (policy.decision === "allow") {
     return {
       outcome: "allow",
       reasonCode: "ALLOWED",
       explanation: "Operation is inside the effective grant.",
+      ...(effectiveArguments === undefined ? {} : { effectiveArguments }),
       ...(operation.planned_disclosure_bytes === undefined
         ? {}
         : { plannedDisclosureBytes: operation.planned_disclosure_bytes }),
@@ -456,6 +752,7 @@ function decisionFor(
       outcome: "deny",
       reasonCode: primary?.reason_code ?? "POLICY_DENIED",
       explanation,
+      ...(primary?.details === undefined ? {} : { details: primary.details }),
     };
   }
   const expansion = expansionFor(primary?.capability_key, call, catalog, operation);
@@ -466,6 +763,51 @@ function decisionFor(
     capability: {
       key: primary?.capability_key ?? "unknown",
       ...(expansion === undefined ? {} : { expansion }),
+    },
+    ...(primary?.details === undefined ? {} : { details: primary.details }),
+  };
+}
+
+export interface ListFilesRuntimeBounds {
+  readonly defaultResults: number;
+  readonly maxResults: number;
+  readonly disabled?: true;
+}
+
+/**
+ * One policy-derived bound used by both authorization and repository
+ * execution. The product default is a cap, never authority to exceed a
+ * stricter effective policy.
+ */
+export function listFilesRuntimeBounds(engine: PolicyEngine): ListFilesRuntimeBounds {
+  const policyCeiling =
+    engine.getEffectiveDisclosureLimits().max_files_per_operation ??
+    MAX_LIST_FILES_RESULTS;
+  const disabled = policyCeiling === 0;
+  const maxResults = disabled
+    ? 0
+    : Math.min(MAX_LIST_FILES_RESULTS, policyCeiling);
+  return {
+    maxResults,
+    defaultResults: Math.min(DEFAULT_LIST_FILES_MAX_RESULTS, maxResults),
+    ...(disabled ? { disabled: true as const } : {}),
+  };
+}
+
+function effectiveToolCall(
+  engine: PolicyEngine,
+  call: NormalizedToolCall,
+): NormalizedToolCall {
+  if (call.name !== "list_files") return call;
+  const bounds = listFilesRuntimeBounds(engine);
+  const requested = positiveInteger(call.arguments.max_results);
+  const applied = Math.min(requested ?? bounds.defaultResults, bounds.maxResults);
+  if (call.arguments.max_results === applied) return call;
+  return {
+    ...call,
+    arguments: {
+      ...call.arguments,
+      max_results: applied,
     },
   };
 }
@@ -614,6 +956,14 @@ function optionalString(value: unknown): string | undefined {
 
 function positiveInteger(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+function requiredPositiveInteger(value: unknown, name: string): number {
+  const parsed = positiveInteger(value);
+  if (parsed === undefined) {
+    throw new AgentError("PROTOCOL_INVALID", `${name} must be a positive integer`);
+  }
+  return parsed;
 }
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {

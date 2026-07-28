@@ -7,6 +7,10 @@ import { AuditLog } from "../../src/audit/audit-log.js";
 import { LOCAL_TOOL_NAMES, TOOL_REGISTRY } from "../../src/protocol/index.js";
 import { sha256, stableJson } from "../../src/shared/crypto.js";
 import { AgentRuntime } from "../../src/orchestrator/agent-runtime.js";
+import {
+  CONTROL_PLANE_RESERVE_BYTES,
+  EMERGENCY_NOTICE_RESERVE_BYTES,
+} from "../../src/orchestrator/disclosure-budget.js";
 import { CbaProtocolAdapter } from "../../src/orchestrator/cba-protocol-adapter.js";
 import type {
   CompletionClaim,
@@ -408,6 +412,22 @@ class ToolExecutionWriteGateStore extends SessionStore {
   }
 }
 
+class RejectFirstRecoveryOutboxArtifactStore extends SessionArtifactStore {
+  private rejected = false;
+
+  public override async put(
+    kind: "outbox" | "response" | "decision",
+    id: string,
+    content: string,
+  ): Promise<void> {
+    if (!this.rejected && kind === "outbox" && id === "queued_turn_0002") {
+      this.rejected = true;
+      throw new Error("injected recovery outbox failure");
+    }
+    await super.put(kind, id, content);
+  }
+}
+
 class TurnAccountingWriteGateStore extends SessionStore {
   private turnWriteSeen = false;
   private markTurnWriteStarted!: () => void;
@@ -506,6 +526,7 @@ function runtimeForTest(input: {
   readonly policy?: RuntimePolicy;
   readonly user?: UserInteraction;
   readonly idFactory?: (prefix: string) => string;
+  readonly signal?: AbortSignal;
 }): AgentRuntime {
   return new AgentRuntime({
     state: input.state,
@@ -544,6 +565,7 @@ function runtimeForTest(input: {
     },
     clock: { now: () => new Date("2026-01-01T00:01:00.000Z") },
     idFactory: input.idFactory ?? (() => "submission_1"),
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
     ...(input.artifacts === undefined ? {} : { artifacts: input.artifacts }),
     ...(input.completionHandoffs === undefined ? {} : { completionHandoffs: input.completionHandoffs }),
   });
@@ -944,13 +966,1362 @@ test("read batches reserve aggregate disclosure before each execution", async ()
   assert.equal(outcomes[1]?.data?.code, "BUDGET_EXCEEDED");
 });
 
+test("outbound disclosure exhaustion pauses durably and resumes without replaying completed work", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-budget-pause-"));
+  const localState = state(root);
+  const bootstrapBytes = Buffer.byteLength("bootstrap");
+  localState.budgetLimits = {
+    ...localState.budgetLimits,
+    maxDisclosedBytes:
+      bootstrapBytes +
+      CONTROL_PLANE_RESERVE_BYTES +
+      (64 * 1024) +
+      5_000,
+  };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(
+    path.join(store.sessionDirectory(localState.sessionId), "artifacts"),
+  );
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{
+        operationId: "op_budget_pause",
+        name: "list_files",
+        arguments: {},
+      }],
+    }]),
+    JSON.stringify([{
+      type: "complete_task",
+      operationId: "op_complete_after_budget_pause",
+      claim: {
+        summary: "Resumed after a durable budget pause.",
+        acceptanceCriteria: [],
+        validation: [],
+        skippedValidation: [],
+        remainingRisks: [],
+        recommendedFollowUp: [],
+      },
+    }]),
+  ]);
+  let executions = 0;
+  let submissionSequence = 0;
+  const idFactory = (): string => `submission_budget_${++submissionSequence}`;
+  const policy: RuntimePolicy = {
+    summarize: () => ({}),
+    authorize: () => ({
+      outcome: "allow",
+      reasonCode: "ALLOWED",
+      explanation: "allowed",
+      plannedDisclosureBytes: 64 * 1024,
+    }),
+    expandSessionGrant: async () => false,
+  };
+  const execute: ToolExecutor["execute"] = async (call) => {
+    executions += 1;
+    return {
+      operationId: call.operationId,
+      tool: call.name,
+      status: "success",
+      data: { content: "x".repeat(80 * 1024) },
+      safeMetadata: { entryCount: 1 },
+    };
+  };
+
+  const paused = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+    policy,
+    execute,
+    idFactory,
+  }).run();
+
+  assert.equal(paused.status, "paused");
+  assert.match(paused.reason ?? "", /BUDGET_EXCEEDED: disclosedBytes/u);
+  assert.equal(localState.failure, undefined);
+  assert.equal(executions, 1);
+  assert.deepEqual(transport.submittedContents, ["bootstrap"]);
+  const queued = localState.queuedOutbound;
+  assert.notEqual(queued, undefined);
+  assert.equal(
+    queued!.disclosure?.kind,
+    "decision",
+    "the source-free exhaustion notice must be audited as control-plane data",
+  );
+  const notice = await artifacts.get("outbox", queued!.artifactId);
+  assert.match(notice, /result_omitted/u);
+  assert.match(notice, /BUDGET_EXCEEDED/u);
+  assert.equal(localState.pendingOperations.length, 0);
+  assert.deepEqual(localState.completedOperationIds, ["op_budget_pause"]);
+  const usageAtPause = localState.budgetUsage.disclosedBytes;
+  const durableState = await store.read(localState.sessionId);
+  assert.equal(durableState.status, "paused");
+  assert.equal(durableState.queuedOutbound?.disclosure?.kind, "decision");
+
+  const resumed = await runtimeForTest({
+    root,
+    state: durableState,
+    store,
+    transport,
+    artifacts,
+    policy,
+    execute,
+    idFactory,
+  }).run();
+
+  assert.equal(resumed.status, "completed", resumed.reason);
+  assert.equal(executions, 1, "resume must not replay the completed operation");
+  assert.equal(transport.submittedContents[1], notice);
+  assert.equal(
+    durableState.budgetUsage.disclosedBytes,
+    usageAtPause,
+    "a queued control-plane notice must not be charged twice",
+  );
+});
+
+test("runtime executes the exact list_files arguments derived by policy", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-effective-list-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{
+        operationId: "op_effective_list",
+        name: "list_files",
+        arguments: { path: ".", max_results: 200 },
+      }],
+    }]),
+    JSON.stringify([{ type: "blocked", reason: "done", recoverable: false }]),
+  ]);
+  let executedArguments: Readonly<Record<string, unknown>> | undefined;
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    policy: {
+      summarize: () => ({}),
+      authorize: () => ({
+        outcome: "allow",
+        reasonCode: "ALLOWED",
+        explanation: "clamped to the effective organization ceiling",
+        effectiveArguments: { path: ".", max_results: 20 },
+        plannedDisclosureBytes: 128 * 1024,
+      }),
+      expandSessionGrant: async () => false,
+    },
+    execute: async (call) => {
+      executedArguments = call.arguments;
+      return {
+        operationId: call.operationId,
+        tool: call.name,
+        status: "success",
+        data: {
+          entries: [],
+          truncated: true,
+          applied_max_results: 20,
+        },
+        safeMetadata: { entryCount: 0 },
+      };
+    },
+  }).run();
+
+  assert.equal(result.status, "blocked", result.reason);
+  assert.deepEqual(executedArguments, { path: ".", max_results: 20 });
+  assert.match(transport.submittedContents[1] ?? "", /applied_max_results/u);
+});
+
+test("startup rejects a disclosure budget that cannot preserve control-plane headroom", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-invalid-disclosure-budget-"));
+  const localState = state(root);
+  localState.budgetLimits = {
+    ...localState.budgetLimits,
+    maxDisclosedBytes: CONTROL_PLANE_RESERVE_BYTES,
+  };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport: new QueueTransport([]),
+  }).run();
+
+  assert.equal(result.status, "failed");
+  assert.match(result.reason ?? "", /cannot fit the bootstrap/u);
+  assert.equal(localState.failure?.code, "CONFIG_INVALID");
+});
+
+test("control-plane exhaustion queues a capped cba notice across process restart", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-emergency-budget-"));
+  const localState = state(root);
+  localState.budgetLimits = {
+    ...localState.budgetLimits,
+    maxDisclosedBytes:
+      Buffer.byteLength("bootstrap") +
+      CONTROL_PLANE_RESERVE_BYTES +
+      5_000,
+  };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(
+    path.join(store.sessionDirectory(localState.sessionId), "artifacts"),
+  );
+  const productionProtocol = new CbaProtocolAdapter();
+  const emergencyProtocol: ProtocolAdapter = {
+    ...protocol,
+    renderProtocolError: (input) =>
+      productionProtocol.renderProtocolError(input),
+  };
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "request_user_input",
+      requestId: "op_emergency_decision",
+      question: "Continue?",
+    }]),
+    JSON.stringify([{ type: "blocked", reason: "notice received", recoverable: false }]),
+  ]);
+  let prompts = 0;
+
+  const paused = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    artifacts,
+    transport,
+    protocol: emergencyProtocol,
+    user: {
+      requestInput: async () => {
+        prompts += 1;
+        return { choice: "yes", explanation: "x".repeat(70 * 1024) };
+      },
+      requestCapability: async () => ({ decision: "deny" }),
+    },
+  }).run();
+
+  assert.equal(paused.status, "paused", paused.reason);
+  assert.equal(localState.failure, undefined);
+  assert.equal(prompts, 1);
+  assert.deepEqual(transport.submittedContents, ["bootstrap"]);
+  const durableState = await store.read(localState.sessionId);
+  assert.equal(durableState.status, "paused");
+  assert.equal(durableState.queuedOutbound?.disclosure?.kind, "decision");
+  const notice = await artifacts.get(
+    "outbox",
+    durableState.queuedOutbound!.artifactId,
+  );
+  assert.equal(
+    Buffer.byteLength(notice) <= EMERGENCY_NOTICE_RESERVE_BYTES,
+    true,
+  );
+  assert.match(notice, /^```cba\/1\n/u);
+  assert.match(notice, /BUDGET_EXCEEDED/u);
+  assert.match(notice, /source_code/u);
+  assert.match(notice, /"repairable":false/u);
+  assert.doesNotMatch(notice, /repair_attempt/u);
+
+  const resumed = await runtimeForTest({
+    root,
+    state: durableState,
+    store,
+    artifacts,
+    transport,
+    protocol: emergencyProtocol,
+    user: {
+      requestInput: async () => {
+        prompts += 1;
+        return {};
+      },
+      requestCapability: async () => ({ decision: "deny" }),
+    },
+  }).run();
+
+  assert.equal(resumed.status, "blocked", resumed.reason);
+  assert.equal(prompts, 1, "the answered request must not replay after restart");
+  assert.equal(transport.submittedContents[1], notice);
+});
+
+test("ordinary budget exhaustion can be raised locally and continues without losing the turn", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-budget-raise-"));
+  const localState = state(root);
+  localState.budgetLimits = {
+    ...localState.budgetLimits,
+    maxOperations: 1,
+  };
+  localState.budgetUsage.operations = 1;
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(
+    path.join(store.sessionDirectory(localState.sessionId), "artifacts"),
+  );
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{
+        operationId: "op_after_budget_raise",
+        name: "list_files",
+        arguments: {},
+      }],
+    }]),
+    JSON.stringify([{ type: "blocked", reason: "done", recoverable: false }]),
+  ]);
+  let prompts = 0;
+  let executions = 0;
+  let expandedCapability: Readonly<Record<string, unknown>> | undefined;
+  const recoveryRequestId =
+    "_cope_internal_budget_recovery_operations_4_turn_0001";
+  const policy: RuntimePolicy = {
+    summarize: () => ({}),
+    authorize: () => ({
+      outcome: "allow",
+      reasonCode: "ALLOWED",
+      explanation: "allowed",
+      plannedDisclosureBytes: 128 * 1024,
+    }),
+    assessSessionGrantExpansion: (capability) => {
+      const change =
+        capability.kind === "budget" &&
+        capability.metric === "operations" &&
+        (capability.requested_limit === 2 ||
+          capability.requested_limit === 4);
+      return {
+        outcome: change ? "change" : "deny",
+        reasonCode: "TEST_BUDGET_RECOVERY",
+        explanation: "test recovery assessment",
+        ...(change
+          ? {
+              details: {
+                metric: "operations",
+                current_limit: 1,
+                current_usage: 1,
+                minimum_acceptable: 2,
+                higher_layer_ceiling: 4,
+                blocking_layer: "organization",
+              },
+            }
+          : {}),
+      };
+    },
+    expandSessionGrant: async (capability) => {
+      const storedDecision = await artifacts.get(
+        "decision",
+        `decision_${recoveryRequestId}`,
+      );
+      assert.equal(storedDecision, stableJson({ decision: "allow_session" }));
+      const decisionRecord = await new OperationJournal(
+        path.join(root, "operations"),
+        localState.sessionId,
+      ).read(recoveryRequestId);
+      assert.equal(decisionRecord.status, "completed");
+      assert.equal(
+        decisionRecord.safeResult?.decisionHash,
+        sha256(storedDecision),
+        "the exact operator approval must be durable before grant expansion",
+      );
+      expandedCapability = capability;
+      localState.budgetLimits = {
+        ...localState.budgetLimits,
+        maxOperations: Number(capability.requested_limit),
+      };
+      await store.write(localState);
+      return true;
+    },
+  };
+
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    artifacts,
+    transport,
+    policy,
+    execute: async (call) => {
+      executions += 1;
+      return {
+        operationId: call.operationId,
+        tool: call.name,
+        status: "success",
+        data: { entries: [] },
+        safeMetadata: {},
+      };
+    },
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => {
+        prompts += 1;
+        return { decision: "allow_session" };
+      },
+    },
+  }).run();
+
+  assert.equal(result.status, "blocked", result.reason);
+  assert.equal(localState.failure, undefined);
+  assert.equal(prompts, 1);
+  assert.equal(executions, 1);
+  assert.deepEqual(expandedCapability, {
+    kind: "budget",
+    metric: "operations",
+    requested_limit: 4,
+  });
+  assert.equal(localState.completedOperationIds.includes(recoveryRequestId), true);
+  const auditEvents = await AuditLog.verify(
+    path.join(root, "audit.jsonl"),
+    localState.sessionId,
+  );
+  const userDecisionIndex = auditEvents.findIndex(
+    (event) =>
+      event.type === "user.decided" &&
+      event.operationId === recoveryRequestId,
+  );
+  const capabilityDecisionIndex = auditEvents.findIndex(
+    (event) =>
+      event.type === "capability.decided" &&
+      event.data.recovery === true,
+  );
+  assert.equal(userDecisionIndex >= 0, true);
+  assert.equal(capabilityDecisionIndex > userDecisionIndex, true);
+});
+
+test("budget recovery prompt failure pauses instead of escaping the runtime", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-budget-prompt-failure-"));
+  const localState = state(root);
+  localState.budgetLimits = {
+    ...localState.budgetLimits,
+    maxOperations: 0,
+  };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(
+    path.join(store.sessionDirectory(localState.sessionId), "artifacts"),
+  );
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{
+        operationId: "op_budget_prompt_without_tty",
+        name: "list_files",
+        arguments: {},
+      }],
+    }]),
+    JSON.stringify([{
+      type: "complete_task",
+      operationId: "op_complete_after_prompt_failure",
+      claim: {
+        summary: "Recovered after a non-interactive budget prompt.",
+        acceptanceCriteria: [],
+        validation: [],
+        skippedValidation: [],
+        remainingRisks: [],
+        recommendedFollowUp: [],
+      },
+    }]),
+  ]);
+  const policy: RuntimePolicy = {
+    summarize: () => ({}),
+    authorize: () => ({
+      outcome: "allow",
+      reasonCode: "ALLOWED",
+      explanation: "allowed",
+    }),
+    assessSessionGrantExpansion: () => ({
+      outcome: "change",
+      reasonCode: "TEST_BUDGET_RECOVERY",
+      explanation: "test recovery assessment",
+    }),
+    expandSessionGrant: async () => false,
+  };
+
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    artifacts,
+    transport,
+    policy,
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => {
+        throw new Error("Interactive input is required but no terminal is attached");
+      },
+    },
+  }).run();
+
+  assert.equal(result.status, "paused", result.reason);
+  assert.equal(localState.failure, undefined);
+  assert.match(result.reason ?? "", /could not obtain an operator decision/iu);
+  assert.match(result.reason ?? "", /durably denied fail-closed/iu);
+  assert.match(result.reason ?? "", /cannot be retried/iu);
+  assert.equal(localState.queuedOutbound?.disclosure?.kind, "decision");
+  assert.deepEqual(localState.pendingOperations, []);
+  const recoveryRequestId =
+    "_cope_internal_budget_recovery_operations_1_turn_0001";
+  const abandonedRecord = await new OperationJournal(
+    path.join(root, "operations"),
+    localState.sessionId,
+  ).read(recoveryRequestId);
+  assert.equal(abandonedRecord.status, "completed");
+  assert.equal(abandonedRecord.outcome, "unavailable");
+  assert.equal(abandonedRecord.safeResult?.abandoned, true);
+  assert.equal(
+    await artifacts.get("decision", `decision_${recoveryRequestId}`),
+    stableJson({
+      decision: "deny",
+      note:
+        "Automatic budget-recovery approval was unavailable; no " +
+        "capability was granted.",
+      _cope_recovery: {
+        version: 1,
+        kind: "automatic_budget_recovery_default_deny",
+        capability: {
+          kind: "budget",
+          metric: "operations",
+          requested_limit: 1,
+        },
+      },
+    }),
+  );
+
+  const durableState = await store.read(localState.sessionId);
+  const resumed = await runtimeForTest({
+    root,
+    state: durableState,
+    store,
+    artifacts,
+    transport,
+    policy,
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => ({ decision: "deny" }),
+    },
+  }).run();
+  assert.equal(resumed.status, "completed", resumed.reason);
+  assert.deepEqual(durableState.pendingOperations, []);
+});
+
+test("tool-result budget recovery prompt failure pauses and resumes without pending poison", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-result-budget-prompt-failure-"));
+  const localState = state(root);
+  localState.budgetLimits = {
+    ...localState.budgetLimits,
+    maxDisclosedBytes:
+      Buffer.byteLength("bootstrap") +
+      CONTROL_PLANE_RESERVE_BYTES,
+  };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(
+    path.join(store.sessionDirectory(localState.sessionId), "artifacts"),
+  );
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{
+        operationId: "op_result_budget_prompt_without_tty",
+        name: "list_files",
+        arguments: {},
+      }],
+    }]),
+    JSON.stringify([{
+      type: "complete_task",
+      operationId: "op_complete_after_result_prompt_failure",
+      claim: {
+        summary: "Recovered after a result-budget prompt failure.",
+        acceptanceCriteria: [],
+        validation: [],
+        skippedValidation: [],
+        remainingRisks: [],
+        recommendedFollowUp: [],
+      },
+    }]),
+  ]);
+  const policy: RuntimePolicy = {
+    summarize: () => ({}),
+    authorize: () => ({
+      outcome: "allow",
+      reasonCode: "ALLOWED",
+      explanation: "allowed",
+      plannedDisclosureBytes: 0,
+    }),
+    assessSessionGrantExpansion: () => ({
+      outcome: "change",
+      reasonCode: "TEST_BUDGET_RECOVERY",
+      explanation: "test recovery assessment",
+    }),
+    expandSessionGrant: async () => false,
+  };
+  const execute: ToolExecutor["execute"] = async (call) => ({
+    operationId: call.operationId,
+    tool: call.name,
+    status: "success",
+    data: { entries: ["src/a.txt"] },
+    safeMetadata: { entryCount: 1 },
+  });
+
+  const paused = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    artifacts,
+    transport,
+    policy,
+    execute,
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => {
+        throw new Error("Interactive input is required but no terminal is attached");
+      },
+    },
+  }).run();
+
+  assert.equal(paused.status, "paused", paused.reason);
+  assert.equal(localState.failure, undefined);
+  assert.match(paused.reason ?? "", /could not obtain an operator decision/iu);
+  assert.match(paused.reason ?? "", /durably denied fail-closed/iu);
+  assert.deepEqual(localState.pendingOperations, []);
+  assert.equal(localState.queuedOutbound?.disclosure?.kind, "decision");
+
+  const durableState = await store.read(localState.sessionId);
+  const resumed = await runtimeForTest({
+    root,
+    state: durableState,
+    store,
+    artifacts,
+    transport,
+    policy,
+    execute,
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => ({ decision: "deny" }),
+    },
+  }).run();
+  assert.equal(resumed.status, "completed", resumed.reason);
+  assert.deepEqual(durableState.pendingOperations, []);
+});
+
+test("tool-result recovery retries a caller-aborted prompt on resume", async () => {
+  const root = await mkdtemp(
+    path.join(tmpdir(), "cba-runtime-result-budget-prompt-abort-"),
+  );
+  const localState = state(root);
+  localState.budgetLimits = {
+    ...localState.budgetLimits,
+    maxDisclosedBytes:
+      Buffer.byteLength("bootstrap") + CONTROL_PLANE_RESERVE_BYTES,
+  };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(
+    path.join(store.sessionDirectory(localState.sessionId), "artifacts"),
+  );
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{
+        operationId: "op_result_budget_prompt_abort",
+        name: "list_files",
+        arguments: {},
+      }],
+    }]),
+    JSON.stringify([{
+      type: "complete_task",
+      operationId: "op_complete_after_result_prompt_abort",
+      claim: {
+        summary: "Recovered after an interrupted result-budget prompt.",
+        acceptanceCriteria: [],
+        validation: [],
+        skippedValidation: [],
+        remainingRisks: [],
+        recommendedFollowUp: [],
+      },
+    }]),
+  ]);
+  const controller = new AbortController();
+  let prompts = 0;
+  let policyState = localState;
+  const policy: RuntimePolicy = {
+    summarize: () => ({}),
+    authorize: () => ({
+      outcome: "allow",
+      reasonCode: "ALLOWED",
+      explanation: "allowed",
+      plannedDisclosureBytes: 0,
+    }),
+    assessSessionGrantExpansion: () => ({
+      outcome: "change",
+      reasonCode: "TEST_BUDGET_RECOVERY",
+      explanation: "test recovery assessment",
+    }),
+    expandSessionGrant: async () => {
+      policyState.budgetLimits = {
+        ...policyState.budgetLimits,
+        maxDisclosedBytes: 4 * 1024 * 1024,
+      };
+      return true;
+    },
+  };
+  const execute: ToolExecutor["execute"] = async (call) => ({
+    operationId: call.operationId,
+    tool: call.name,
+    status: "success",
+    data: { entries: ["src/a.txt"] },
+    safeMetadata: { entryCount: 1 },
+  });
+
+  const paused = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    artifacts,
+    transport,
+    policy,
+    execute,
+    signal: controller.signal,
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => {
+        prompts += 1;
+        controller.abort(new Error("Operator interrupted result recovery"));
+        throw new Error("The recovery prompt was aborted");
+      },
+    },
+  }).run();
+  assert.equal(paused.status, "paused", paused.reason);
+  assert.equal(paused.reason, "Operator interrupted result recovery");
+  assert.equal(prompts, 1);
+
+  const durableState = await store.read(localState.sessionId);
+  policyState = durableState;
+  const resumed = await runtimeForTest({
+    root,
+    state: durableState,
+    store,
+    artifacts,
+    transport,
+    policy,
+    execute,
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => {
+        prompts += 1;
+        return { decision: "allow_session" };
+      },
+    },
+  }).run();
+  assert.equal(resumed.status, "completed", resumed.reason);
+  assert.equal(prompts, 2);
+  assert.deepEqual(durableState.pendingOperations, []);
+});
+
+for (const journalStatus of [
+  "executing_without_artifact",
+  "executing",
+  "completed",
+] as const) {
+  test(`startup reconciles an abandoned recovery decision from ${journalStatus} journal state`, async () => {
+    const root = await mkdtemp(
+      path.join(tmpdir(), `cba-runtime-budget-reconcile-${journalStatus}-`),
+    );
+    const localState = state(root);
+    localState.status = "paused";
+    localState.pauseReason = "Budget recovery was interrupted";
+    localState.turnSequence = 1;
+    localState.budgetUsage = {
+      ...localState.budgetUsage,
+      turns: 1,
+    };
+    const recoveryRequestId =
+      "_cope_internal_budget_recovery_operations_4_turn_0001";
+    const request = {
+      type: "budget_recovery",
+      capability: {
+        kind: "budget",
+        metric: "operations",
+        requested_limit: 4,
+      },
+      reason: "test recovery",
+    };
+    const journal = new OperationJournal(
+      path.join(root, "operations"),
+      localState.sessionId,
+    );
+    const registration = await journal.register(
+      recoveryRequestId,
+      "request_capability",
+      false,
+      request,
+      "2026-01-01T00:00:00.000Z",
+    );
+    assert.equal(registration.kind, "new");
+    if (registration.kind !== "new") return;
+    const executing = await journal.markExecuting(
+      registration.record,
+      "2026-01-01T00:00:01.000Z",
+    );
+    const abandonedDecision = {
+      decision: "deny",
+      note:
+        "Automatic budget-recovery approval was unavailable; no " +
+        "capability was granted.",
+      _cope_recovery: {
+        version: 1,
+        kind: "automatic_budget_recovery_default_deny",
+        capability: request.capability,
+      },
+    };
+    const decisionHash = sha256(stableJson(abandonedDecision));
+    if (journalStatus === "completed") {
+      await journal.markCompleted(
+        executing,
+        "2026-01-01T00:00:02.000Z",
+        "unavailable",
+        { decisionHash, abandoned: true },
+      );
+    }
+    localState.pendingOperations = [{
+      operationId: recoveryRequestId,
+      tool: "request_capability",
+      mutating: false,
+      requestHash: executing.requestHash,
+      status: "executing",
+      acceptedAt: executing.acceptedAt,
+    }];
+    localState.queuedOutbound = {
+      turnId: "turn_0001",
+      artifactId: "queued_turn_0001",
+      messageHash: sha256("budget notice"),
+      createdAt: "2026-01-01T00:00:03.000Z",
+    };
+    const store = new SessionStore(path.join(root, "state"));
+    await store.create(localState);
+    const artifacts = new SessionArtifactStore(
+      path.join(store.sessionDirectory(localState.sessionId), "artifacts"),
+    );
+    if (journalStatus !== "executing_without_artifact") {
+      await artifacts.put(
+        "decision",
+        `decision_${recoveryRequestId}`,
+        stableJson(abandonedDecision),
+      );
+    }
+    await artifacts.put("outbox", "queued_turn_0001", "budget notice");
+    let prompts = 0;
+    const transport = new QueueTransport([
+      JSON.stringify([{
+        type: "complete_task",
+        operationId: `op_complete_reconciled_${journalStatus}`,
+        claim: {
+          summary: "Recovered an interrupted automatic budget decision.",
+          acceptanceCriteria: [],
+          validation: [],
+          skippedValidation: [],
+          remainingRisks: [],
+          recommendedFollowUp: [],
+        },
+      }]),
+    ]);
+
+    const result = await runtimeForTest({
+      root,
+      state: localState,
+      store,
+      artifacts,
+      transport,
+      user: {
+        requestInput: async () => ({}),
+        requestCapability: async () => {
+          prompts += 1;
+          return { decision: "deny" };
+        },
+      },
+    }).run();
+
+    assert.equal(result.status, "completed", result.reason);
+    assert.equal(
+      prompts,
+      journalStatus === "executing_without_artifact" ? 1 : 0,
+    );
+    assert.deepEqual(localState.pendingOperations, []);
+    assert.equal(
+      localState.completedOperationIds.includes(recoveryRequestId),
+      true,
+    );
+    const reconciled = await journal.read(recoveryRequestId);
+    assert.equal(reconciled.status, "completed");
+    assert.equal(
+      reconciled.safeResult?.decisionHash,
+      journalStatus === "executing_without_artifact"
+        ? sha256(stableJson({ decision: "deny" }))
+        : decisionHash,
+    );
+  });
+}
+
+test("abandoned recovery decision replays safely when emergency notice queueing fails", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-budget-abandoned-replay-"));
+  const localState = state(root);
+  localState.budgetLimits = {
+    ...localState.budgetLimits,
+    maxOperations: 0,
+  };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new RejectFirstRecoveryOutboxArtifactStore(
+    path.join(store.sessionDirectory(localState.sessionId), "artifacts"),
+  );
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{
+        operationId: "op_budget_abandoned_replay",
+        name: "list_files",
+        arguments: {},
+      }],
+    }]),
+  ]);
+  let prompts = 0;
+  const policy: RuntimePolicy = {
+    summarize: () => ({}),
+    authorize: () => ({
+      outcome: "allow",
+      reasonCode: "ALLOWED",
+      explanation: "allowed",
+    }),
+    assessSessionGrantExpansion: () => ({
+      outcome: "change",
+      reasonCode: "TEST_BUDGET_RECOVERY",
+      explanation: "test recovery assessment",
+    }),
+    expandSessionGrant: async () => false,
+  };
+  const user: UserInteraction = {
+    requestInput: async () => ({}),
+    requestCapability: async () => {
+      prompts += 1;
+      throw new Error("Interactive input is required but no terminal is attached");
+    },
+  };
+
+  const paused = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    artifacts,
+    transport,
+    policy,
+    user,
+  }).run();
+  assert.equal(paused.status, "paused", paused.reason);
+  assert.match(paused.reason ?? "", /cannot be retried/iu);
+  assert.equal(localState.queuedOutbound, undefined);
+  assert.deepEqual(localState.pendingOperations, []);
+  assert.equal(prompts, 1);
+
+  const durableState = await store.read(localState.sessionId);
+  const repeated = await runtimeForTest({
+    root,
+    state: durableState,
+    store,
+    artifacts,
+    transport,
+    policy,
+    user,
+  }).run();
+  assert.equal(repeated.status, "blocked", repeated.reason);
+  assert.match(repeated.reason ?? "", /prevent an unbounded resume-and-pause loop/u);
+  assert.doesNotMatch(repeated.reason ?? "", /decision artifact is unreadable/u);
+  assert.deepEqual(durableState.pendingOperations, []);
+  assert.equal(prompts, 1, "the integrity-bound default deny must replay without prompting");
+});
+
+test("caller abort during automatic budget recovery returns a resumable interruption", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-budget-prompt-abort-"));
+  const localState = state(root);
+  localState.budgetLimits = {
+    ...localState.budgetLimits,
+    maxOperations: 0,
+  };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(
+    path.join(store.sessionDirectory(localState.sessionId), "artifacts"),
+  );
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{
+        operationId: "op_budget_prompt_abort",
+        name: "list_files",
+        arguments: {},
+      }],
+    }]),
+    JSON.stringify([{
+      type: "complete_task",
+      operationId: "op_complete_after_budget_prompt_abort",
+      claim: {
+        summary: "Recovered after the interrupted budget prompt.",
+        acceptanceCriteria: [],
+        validation: [],
+        skippedValidation: [],
+        remainingRisks: [],
+        recommendedFollowUp: [],
+      },
+    }]),
+  ]);
+  const controller = new AbortController();
+  let prompts = 0;
+  let policyState = localState;
+  const policy: RuntimePolicy = {
+    summarize: () => ({}),
+    authorize: () => ({
+      outcome: "allow",
+      reasonCode: "ALLOWED",
+      explanation: "allowed",
+    }),
+    assessSessionGrantExpansion: () => ({
+      outcome: "change",
+      reasonCode: "TEST_BUDGET_RECOVERY",
+      explanation: "test recovery assessment",
+    }),
+    expandSessionGrant: async () => {
+      policyState.budgetLimits = {
+        ...policyState.budgetLimits,
+        maxOperations: 4,
+      };
+      return true;
+    },
+  };
+
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    artifacts,
+    transport,
+    policy,
+    signal: controller.signal,
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => {
+        prompts += 1;
+        controller.abort(new Error("Operator interrupted budget recovery"));
+        throw new Error("The recovery prompt was aborted");
+      },
+    },
+  }).run();
+
+  assert.equal(result.status, "paused", result.reason);
+  assert.equal(result.reason, "Operator interrupted budget recovery");
+  assert.equal(localState.failure, undefined);
+  assert.equal(prompts, 1);
+
+  const durableState = await store.read(localState.sessionId);
+  policyState = durableState;
+  const resumed = await runtimeForTest({
+    root,
+    state: durableState,
+    store,
+    artifacts,
+    transport,
+    policy,
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => {
+        prompts += 1;
+        return { decision: "allow_session" };
+      },
+    },
+  }).run();
+  assert.equal(resumed.status, "completed", resumed.reason);
+  assert.equal(prompts, 2, "resume must retry the interrupted prompt exactly once");
+  assert.deepEqual(durableState.pendingOperations, []);
+});
+
+test("budget exhaustion reports an unraisable higher-layer ceiling without prompting", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-budget-unavailable-"));
+  const localState = state(root);
+  localState.budgetLimits = {
+    ...localState.budgetLimits,
+    maxOperations: 0,
+  };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(
+    path.join(store.sessionDirectory(localState.sessionId), "artifacts"),
+  );
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{
+        operationId: "op_unraisable_budget",
+        name: "list_files",
+        arguments: {},
+      }],
+    }]),
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{
+        operationId: "op_unraisable_budget_again",
+        name: "list_files",
+        arguments: {},
+      }],
+    }]),
+  ]);
+  let prompts = 0;
+  const policy: RuntimePolicy = {
+    summarize: () => ({}),
+    authorize: () => ({
+      outcome: "allow",
+      reasonCode: "ALLOWED",
+      explanation: "allowed",
+      plannedDisclosureBytes: 128 * 1024,
+    }),
+    assessSessionGrantExpansion: () => ({
+      outcome: "unavailable",
+      reasonCode: "BUDGET_EXPANSION_UNAVAILABLE",
+      explanation:
+        "The organization ceiling does not provide recovery headroom.",
+      details: {
+        metric: "operations",
+        blocking_layer: "organization",
+        layer_ceiling: 0,
+        current_limit: 0,
+        current_usage: 0,
+        minimum_acceptable: 1,
+      },
+    }),
+    expandSessionGrant: async () => false,
+  };
+  const user: UserInteraction = {
+    requestInput: async () => ({}),
+    requestCapability: async () => {
+      prompts += 1;
+      return { decision: "allow_session" };
+    },
+  };
+
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    artifacts,
+    transport,
+    policy,
+    user,
+  }).run();
+
+  assert.equal(result.status, "paused", result.reason);
+  assert.equal(prompts, 0);
+  assert.equal(localState.failure, undefined);
+  assert.match(result.reason ?? "", /organization budget ceiling \(0\)/u);
+  assert.match(result.reason ?? "", /policy-pinned session cannot continue/iu);
+  assert.match(result.reason ?? "", /start a new session/iu);
+  assert.match(result.reason ?? "", /resuming this session cannot apply changed policy hashes/iu);
+
+  const durableState = await store.read(localState.sessionId);
+  const repeated = await runtimeForTest({
+    root,
+    state: durableState,
+    store,
+    artifacts,
+    transport,
+    policy,
+    user,
+  }).run();
+  assert.equal(repeated.status, "blocked", repeated.reason);
+  assert.match(repeated.reason ?? "", /prevent an unbounded resume-and-pause loop/u);
+  assert.equal(prompts, 0);
+});
+
+test("denied tool envelopes do not clear the consecutive budget-pause streak", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-budget-streak-denial-"));
+  const localState = state(root);
+  localState.budgetPauseStreak = 1;
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{
+        operationId: "op_denied_without_progress",
+        name: "list_files",
+        arguments: {},
+      }],
+    }]),
+    JSON.stringify([{
+      type: "blocked",
+      reason: "done",
+      recoverable: false,
+    }]),
+  ]);
+
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    policy: {
+      summarize: () => ({}),
+      authorize: () => ({
+        outcome: "deny",
+        reasonCode: "POLICY_DENIED",
+        explanation: "denied",
+      }),
+      expandSessionGrant: async () => false,
+    },
+  }).run();
+
+  assert.equal(result.status, "blocked", result.reason);
+  assert.equal(localState.budgetPauseStreak, 1);
+});
+
+test("specialized budget denial resolves the accepted operation before returning", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-read-budget-"));
+  const localState = state(root);
+  localState.budgetLimits = {
+    ...localState.budgetLimits,
+    maxReadFiles: 0,
+  };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{
+        operationId: "op_read_budget_denied",
+        name: "read_file",
+        arguments: { path: "README.md" },
+      }],
+    }]),
+    JSON.stringify([{ type: "blocked", reason: "done", recoverable: false }]),
+  ]);
+  let executions = 0;
+
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    policy: {
+      summarize: () => ({}),
+      authorize: () => ({
+        outcome: "allow",
+        reasonCode: "ALLOWED",
+        explanation: "allowed",
+        plannedDisclosureBytes: 128 * 1024,
+      }),
+      expandSessionGrant: async () => false,
+    },
+    execute: async (call) => {
+      executions += 1;
+      return {
+        operationId: call.operationId,
+        tool: call.name,
+        status: "success",
+        data: {},
+        safeMetadata: {},
+      };
+    },
+  }).run();
+
+  assert.equal(result.status, "blocked", result.reason);
+  assert.equal(executions, 0);
+  assert.deepEqual(localState.pendingOperations, []);
+  assert.deepEqual(localState.completedOperationIds, [
+    "op_read_budget_denied",
+  ]);
+  assert.match(transport.submittedContents[1] ?? "", /BUDGET_EXCEEDED/u);
+});
+
+test("standalone no-op capability requests are rejected without prompting the operator", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-capability-noop-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "request_capability",
+      requestId: "op_capability_noop",
+      capability: {
+        kind: "disclosure",
+        classifications: ["internal"],
+      },
+      reason: "already granted",
+    }]),
+    JSON.stringify([{
+      type: "complete_task",
+      operationId: "op_complete_after_noop",
+      claim: {
+        summary: "No-op capability request was handled locally.",
+        acceptanceCriteria: [],
+        validation: [],
+        skippedValidation: [],
+        remainingRisks: [],
+        recommendedFollowUp: [],
+      },
+    }]),
+  ]);
+  let prompts = 0;
+  let expansions = 0;
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts: new SessionArtifactStore(path.join(root, "artifacts")),
+    policy: {
+      summarize: () => ({}),
+      authorize: () => ({
+        outcome: "allow",
+        reasonCode: "ALLOWED",
+        explanation: "allowed",
+      }),
+      assessSessionGrantExpansion: () => ({
+        outcome: "no_op",
+        reasonCode: "CAPABILITY_REQUEST_NO_OP",
+        explanation: "The capability is already granted.",
+      }),
+      expandSessionGrant: async () => {
+        expansions += 1;
+        return false;
+      },
+    },
+    user: {
+      requestInput: async () => ({}),
+      requestCapability: async () => {
+        prompts += 1;
+        return { decision: "allow_session" };
+      },
+    },
+    idFactory: (() => {
+      let sequence = 0;
+      return () => `submission_noop_${++sequence}`;
+    })(),
+  }).run();
+
+  assert.equal(result.status, "completed", result.reason);
+  assert.equal(prompts, 0);
+  assert.equal(expansions, 0);
+  assert.match(
+    transport.submittedContents[1] ?? "",
+    /CAPABILITY_REQUEST_NO_OP/u,
+  );
+});
+
 test("one-time disclosure approval covers the complete rendered tool result", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-disclosure-envelope-"));
   const localState = state(root);
   const bootstrapBytes = Buffer.byteLength("bootstrap");
   localState.budgetLimits = {
     ...localState.budgetLimits,
-    maxDisclosedBytes: bootstrapBytes,
+    maxDisclosedBytes:
+      bootstrapBytes + CONTROL_PLANE_RESERVE_BYTES,
   };
   let priorPersistedDisclosureBytes = 0;
   let chargedResultCommitObserved = false;
@@ -983,7 +2354,7 @@ test("one-time disclosure approval covers the complete rendered tool result", as
   ]);
   const plannedDisclosureBytes = 64 * 1024;
   const approvedLimit =
-    bootstrapBytes + plannedDisclosureBytes;
+    bootstrapBytes + plannedDisclosureBytes + CONTROL_PLANE_RESERVE_BYTES;
   let executions = 0;
   const runtime = runtimeForTest({
     root,
@@ -1030,7 +2401,7 @@ test("one-time disclosure approval covers the complete rendered tool result", as
         operationId: call.operationId,
         tool: call.name,
         status: "success",
-        data: { entries: ["src/a.txt"] },
+        data: { content: "x".repeat(16 * 1024) },
         safeMetadata: { entryCount: 1 },
       };
     },
@@ -1044,8 +2415,16 @@ test("one-time disclosure approval covers the complete rendered tool result", as
   assert.equal(result.status, "blocked", result.reason);
   assert.equal(executions, 1);
   assert.equal(chargedResultCommitObserved, true);
-  assert.equal(localState.budgetLimits.maxDisclosedBytes, bootstrapBytes);
-  assert.equal(localState.budgetUsage.disclosedBytes > localState.budgetLimits.maxDisclosedBytes, true);
+  assert.equal(
+    localState.budgetLimits.maxDisclosedBytes,
+    bootstrapBytes + CONTROL_PLANE_RESERVE_BYTES,
+  );
+  assert.equal(
+    localState.budgetUsage.disclosedBytes >
+      localState.budgetLimits.maxDisclosedBytes -
+        CONTROL_PLANE_RESERVE_BYTES,
+    true,
+  );
   assert.equal(localState.budgetUsage.disclosedBytes <= approvedLimit, true);
 });
 
@@ -3620,7 +4999,7 @@ test("completed mutation result replays after the post-persist pre-queue crash w
     changedPaths: ["src/index.ts"],
     repositoryFingerprint: "d".repeat(64),
     plannedDisclosureBytes: 64 * 1024,
-    runtimeBudgetLimits: { disclosedBytes: 64 * 1024 },
+    runtimeBudgetLimits: { disclosedBytes: 2 * 64 * 1024 },
   });
   localState.budgetUsage = { ...localState.budgetUsage, operations: 1 };
   localState.pendingOperations = [];

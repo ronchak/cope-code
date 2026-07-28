@@ -8,7 +8,10 @@ import {
 } from "../orchestrator/agent-runtime.js";
 import { CbaProtocolAdapter } from "../orchestrator/cba-protocol-adapter.js";
 import type { UserInteraction } from "../orchestrator/contracts.js";
-import { LayeredRuntimePolicy } from "../orchestrator/runtime-policy.js";
+import {
+  LayeredRuntimePolicy,
+  listFilesRuntimeBounds,
+} from "../orchestrator/runtime-policy.js";
 import {
   PolicyEngine,
   type BudgetLimits as PolicyBudgetLimits,
@@ -90,6 +93,12 @@ export async function composeRuntime(options: ComposeRuntimeOptions): Promise<Co
   const contentSecurity = new ContentSecurity(new SecretScanner(fingerprintKey), disclosureLedger, {
     classification: configuration.repository.classification,
   });
+  const preliminaryEngine = new PolicyEngine({
+    organization: configuration.organizationPolicy,
+    repository: configuration.repository.policy,
+    session: options.grant,
+  });
+  const listFilesBounds = listFilesRuntimeBounds(preliminaryEngine);
 
   const protectedRules = combinedPathPatterns(configuration, "protected", options.grant).map((pattern): ProtectedPathRule => ({
     pattern,
@@ -109,6 +118,8 @@ export async function composeRuntime(options: ComposeRuntimeOptions): Promise<Co
       maxSearchOutputBytes: configuration.repository.limits.max_search_output_bytes,
       maxFileBytes: configuration.repository.limits.max_file_bytes,
       maxReadBytes: configuration.repository.limits.max_read_bytes,
+      defaultListResults: listFilesBounds.defaultResults,
+      maxListResults: listFilesBounds.maxResults,
       isPathReadable: (candidate, operation) =>
         pathPolicy?.isReadPathAllowed(operation, candidate) ?? false,
     },

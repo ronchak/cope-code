@@ -2,6 +2,10 @@ import { opendir, stat } from "node:fs/promises";
 
 import { minimatch } from "minimatch";
 
+import {
+  DEFAULT_LIST_FILES_MAX_RESULTS,
+  MAX_LIST_FILES_RESULTS,
+} from "../protocol/types.js";
 import { AgentError } from "../shared/errors.js";
 import type { RepositoryBoundary } from "./boundary.js";
 import { RepositoryIgnore } from "./ignore.js";
@@ -34,6 +38,7 @@ export interface RepositoryToolsOptions {
   readonly extraIgnorePatterns?: readonly string[];
   readonly defaultExclusionOverrides?: readonly string[];
   readonly maxListDepth?: number;
+  readonly defaultListResults?: number;
   readonly maxListResults?: number;
   readonly maxSearchFiles?: number;
   readonly maxSearchResults?: number;
@@ -58,6 +63,7 @@ export class RepositoryTools {
     operation: RepositoryReadOperation,
   ) => boolean;
   private readonly maxListDepth: number;
+  private readonly defaultListResults: number;
   private readonly maxListResults: number;
   private readonly maxSearchFiles: number;
   private readonly maxSearchResults: number;
@@ -75,7 +81,11 @@ export class RepositoryTools {
     this.contentProcessor = options.contentProcessor;
     this.isPathReadable = options.isPathReadable ?? (() => true);
     this.maxListDepth = options.maxListDepth ?? 6;
-    this.maxListResults = options.maxListResults ?? 500;
+    this.maxListResults = options.maxListResults ?? MAX_LIST_FILES_RESULTS;
+    this.defaultListResults = Math.min(
+      options.defaultListResults ?? DEFAULT_LIST_FILES_MAX_RESULTS,
+      this.maxListResults,
+    );
     this.maxSearchFiles = options.maxSearchFiles ?? 2_000;
     this.maxSearchResults = options.maxSearchResults ?? 100;
     this.maxSearchOutputBytes = options.maxSearchOutputBytes ?? 128 * 1024;
@@ -107,7 +117,7 @@ export class RepositoryTools {
     }
     const maxDepth = boundedPositiveInteger(request.maxDepth, this.maxListDepth, "maxDepth", true);
     const maxResults = boundedPositiveInteger(
-      request.maxResults,
+      request.maxResults ?? this.defaultListResults,
       this.maxListResults,
       "maxResults",
     );
@@ -202,6 +212,7 @@ export class RepositoryTools {
       contractVersion: REPOSITORY_CONTRACT_VERSION,
       root: start.relativePath,
       entries,
+      appliedMaxResults: maxResults,
       truncated,
       excludedCount,
     };

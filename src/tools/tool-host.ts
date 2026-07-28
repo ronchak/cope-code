@@ -264,10 +264,15 @@ export class ToolHost {
           ...optionalNumberAs(args, "max_depth", "maxDepth"),
           ...optionalNumberAs(args, "max_results", "maxResults"),
         });
-        const bounded = boundEntryResult(result, LIST_FILES_RESULT_BYTES);
+        const { appliedMaxResults, ...listed } = result;
+        const bounded = boundEntryResult({
+          ...listed,
+          applied_max_results: appliedMaxResults,
+        }, LIST_FILES_RESULT_BYTES);
         return successOutcome(call, asRecord(bounded), {
           entryCount: bounded.entries.length,
           truncated: bounded.truncated,
+          appliedMaxResults,
         });
       }
       case "search_text": {

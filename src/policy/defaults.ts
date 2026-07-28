@@ -59,6 +59,31 @@ export const DEFAULT_POLICY_BUDGETS: Readonly<Record<BudgetMetric, number>> = {
   protocol_repairs: 4,
 };
 
+/**
+ * Organization and repository defaults are approval ceilings, while
+ * DEFAULT_POLICY_BUDGETS is the smaller per-session working grant. Only
+ * non-mutating session-longevity and disclosure metrics receive recovery
+ * headroom. Mutation, command, read, output, and protocol-repair ceilings retain
+ * their original non-overridable bounds.
+ */
+export const DEFAULT_BUDGET_APPROVAL_MULTIPLIER = 4;
+export const DEFAULT_HIGHER_LAYER_BUDGETS: Readonly<Record<BudgetMetric, number>> = {
+  elapsed_ms:
+    DEFAULT_POLICY_BUDGETS.elapsed_ms * DEFAULT_BUDGET_APPROVAL_MULTIPLIER,
+  turns: DEFAULT_POLICY_BUDGETS.turns * DEFAULT_BUDGET_APPROVAL_MULTIPLIER,
+  operations:
+    DEFAULT_POLICY_BUDGETS.operations * DEFAULT_BUDGET_APPROVAL_MULTIPLIER,
+  read_files: DEFAULT_POLICY_BUDGETS.read_files,
+  changed_files: DEFAULT_POLICY_BUDGETS.changed_files,
+  changed_lines: DEFAULT_POLICY_BUDGETS.changed_lines,
+  disclosed_bytes:
+    DEFAULT_POLICY_BUDGETS.disclosed_bytes *
+    DEFAULT_BUDGET_APPROVAL_MULTIPLIER,
+  commands: DEFAULT_POLICY_BUDGETS.commands,
+  command_output_bytes: DEFAULT_POLICY_BUDGETS.command_output_bytes,
+  protocol_repairs: DEFAULT_POLICY_BUDGETS.protocol_repairs,
+};
+
 export const DEFAULT_ORGANIZATION_POLICY: PolicyDocument = {
   schema_version: POLICY_SCHEMA_VERSION,
   policy_id: "default-organization",
@@ -94,7 +119,7 @@ export const DEFAULT_ORGANIZATION_POLICY: PolicyDocument = {
       max_changed_lines_per_operation: 2_000,
       on_limit_exceeded: "deny",
     },
-    budgets: DEFAULT_POLICY_BUDGETS,
+    budgets: DEFAULT_HIGHER_LAYER_BUDGETS,
     budget_exceeded: "deny",
   },
 };
@@ -118,7 +143,7 @@ export const DEFAULT_REPOSITORY_POLICY: PolicyDocument = {
       local_commits: "deny",
       on_limit_exceeded: "ask",
     },
-    budgets: DEFAULT_POLICY_BUDGETS,
+    budgets: DEFAULT_HIGHER_LAYER_BUDGETS,
     budget_exceeded: "deny",
   },
 };

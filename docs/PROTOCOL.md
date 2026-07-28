@@ -33,10 +33,18 @@ Copilot may send `tool_request`, `user_input_request`, `capability_request`, `pr
 The normal model request is:
 
 ```cba/1
-{"protocol":"cba/1","message_type":"tool_request","message_id":"m_17","task_id":"task_example","turn_id":1,"operations":[{"operation_id":"op_17_list","tool":"list_files","arguments":{"path":"src","max_depth":2,"max_results":100}}]}
+{"protocol":"cba/1","message_type":"tool_request","message_id":"m_17","task_id":"task_example","turn_id":1,"operations":[{"operation_id":"op_17_list","tool":"list_files","arguments":{"path":"src","max_depth":2,"max_results":20}}]}
 ```
 
 Only independent read-only operations may be batched: `list_files`, `search_text`, `read_file`, `git_status`, and `git_diff`. `edit_text`, `apply_patch`, `run_command`, `request_user_input`, `request_capability`, and `complete_task` must be alone so Copilot observes each material outcome before planning a dependent action.
+
+`list_files.max_results` defaults to 20 when omitted; the bootstrap example states
+that bound explicitly. Policy may impose a lower per-operation file ceiling.
+Oversized disclosure denials name the exact byte/file dimension, limit, and
+requested amount so Copilot can retry a smaller operation instead of confusing
+the hard per-operation ceiling with the cumulative disclosure budget.
+The repository-wide read pattern `**` includes the repository root (`.`), so the
+bootstrap inventory call does not require a redundant path approval.
 
 ## V1 tools
 
@@ -157,5 +165,21 @@ Bootstrap messages place the task and operating envelope in distinct authoritati
 ## Versioning
 
 `cba/1` meanings are immutable. Compatible implementation hardening can occur without changing the wire version. Adding fields, changing tool semantics, relaxing an invariant, or reinterpreting a status requires a new protocol version and compatibility fixtures. The UI adapter has its own independent `copilot-ui/v1[:certification]` version because DOM evolution must not force repository-tool changes.
+
+`max_results` is an upper bound, not a minimum-result guarantee. Applying a
+stricter effective policy ceiling and returning fewer entries with
+`truncated`/`applied_max_results` metadata preserves the existing bounded
+`list_files` meaning. Likewise, additive effective-limit facts in the
+bootstrap's authoritative operating envelope describe the already-enforced
+local policy; they do not add a model action or weaken a schema invariant.
+The internal repository-result contract is independently versioned. Version
+`repository.v2` makes `appliedMaxResults` mandatory on listing results so local
+consumers can prove which policy-derived bound execution actually used.
+
+Durable local control-plane decisions use an `_cope_internal_` journal
+identifier namespace. Its leading underscore is intentionally outside the
+cba/1 model operation-ID grammar, so no formerly valid wire identifier is
+reserved or reinterpreted. This prevents untrusted requests—including
+case-folded names on Windows—from colliding with journaled recovery authority.
 
 Browser product selection is deliberately outside this wire contract. Edge and Chrome use the same bootstrap, envelopes, tool meanings, submission correlation, response capture, classifier, and agent loop. Browser product, executable identity, dedicated profile, and browser/UI contract are local configuration/runtime concerns. The persisted runtime-manifest value `edge` remains a compatibility discriminator for the live visible-browser transport, including Chrome-backed sessions; it is not a product claim and is not emitted to the model or users. Adding Chrome therefore does not change `cba/1` semantics.

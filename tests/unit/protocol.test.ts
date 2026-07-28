@@ -268,6 +268,13 @@ test("bootstrap emits no unavailable batch guidance when the active catalog has 
   assert.doesNotMatch(contract, /active tool catalog/u);
 });
 
+test("list_files bootstrap guidance supplies the bounded default result count", () => {
+  assert.deepEqual(
+    TOOL_REGISTRY.list_files.bootstrap_example,
+    { path: ".", max_results: 20 },
+  );
+});
+
 test("parser batch semantics match every registry entry", () => {
   for (const tool of BATCHABLE_TOOL_NAMES) {
     assert.doesNotThrow(
@@ -340,4 +347,26 @@ test("stateful parser records IDs only after the full request validates", () => 
       }),
     "DUPLICATE_OPERATION_ID",
   );
+});
+
+test("model actions cannot claim the harness-internal operation namespace", () => {
+  for (const operationId of [
+    "_cope_internal_budget_recovery_operations_1_turn_0001",
+    "_COPE_INTERNAL_budget_recovery_operations_1_turn_0001",
+    "_CoPe_InTeRnAl_budget_recovery_operations_1_turn_0001",
+  ]) {
+    const parser = new ProtocolParser();
+    expectCode(
+      () =>
+        parser.parse(
+          wire(request([{
+            operation_id: operationId,
+            tool: "git_status",
+            arguments: {},
+          }])),
+          { expected_task_id: "task_1", expected_turn_id: 7 },
+        ),
+      "SCHEMA_INVALID",
+    );
+  }
 });

@@ -1,4 +1,4 @@
-export const REPOSITORY_CONTRACT_VERSION = "repository.v1" as const;
+export const REPOSITORY_CONTRACT_VERSION = "repository.v2" as const;
 
 export interface FileState {
   readonly sha256: string;
@@ -22,6 +22,8 @@ export interface ListFilesResult {
   readonly contractVersion: typeof REPOSITORY_CONTRACT_VERSION;
   readonly root: string;
   readonly entries: readonly RepositoryFile[];
+  /** Deterministic bound actually applied by the repository adapter. */
+  readonly appliedMaxResults: number;
   readonly truncated: boolean;
   readonly excludedCount: number;
 }

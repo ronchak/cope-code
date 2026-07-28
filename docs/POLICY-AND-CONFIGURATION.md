@@ -84,6 +84,14 @@ Policy can constrain command `ids`, `categories`, `risks`, `side_effects`, and `
 
 Classification is an onboarding assertion, not automatic data-loss-prevention certification. The repository data owner must choose it and decide whether Copilot Chat is an approved destination.
 
+`list_files` is a bounded, read-only operation with explicit truncation. Its
+omitted default and any larger requested `max_results` are deterministically
+clamped downward to the most restrictive effective file ceiling before both
+authorization and execution. The result includes `applied_max_results`; it
+never treats a request as authority to exceed policy. Other operations that
+cannot safely express truncation continue to deny oversized requests with
+structured limit and retry details.
+
 ### Network
 
 `network.access` and optional host rules evaluate catalog metadata. A command marked `networkRequired: true` must name its target hosts and obtain all applicable policy permission.
@@ -112,6 +120,57 @@ Supported metrics are:
 | `protocol_repairs` | malformed-model-response repairs |
 
 `budget_exceeded` is `ask` or `deny`. A permitted session expansion remains bounded by organization and repository maximums.
+Budget expansion is strictly monotonic against live state: the requested limit
+must be greater than both the effective current limit and current usage. Equal,
+lower, or already-consumed values are rejected and never persisted. Denials
+report `current_limit`, `current_usage`, and `minimum_acceptable`.
+
+The shipped defaults distinguish the initial session working grant from its
+higher-layer approval ceiling. Sessions start with the conservative
+`DEFAULT_POLICY_BUDGETS`. Organization and repository defaults provide four
+times that working grant only for elapsed time, turns, operations, and
+disclosed bytes. Read-file, mutation, command, command-output, and
+protocol-repair ceilings retain their original absolute values. Cope therefore
+cannot silently enlarge a security-sensitive activity ceiling; the shipped
+configuration provides bounded recovery headroom only where session longevity
+or disclosure delivery requires it.
+
+Raise-and-continue requires strict headroom between the live session limit and
+the most restrictive organization/repository ceiling. The bootstrap operating
+envelope reports this availability for every budget metric. If the current
+limit or usage already reaches that ceiling, expansion is structurally
+unavailable: Cope returns `BUDGET_EXPANSION_UNAVAILABLE`, identifies the
+blocking layer and ceiling, does not prompt for an ineffective approval, and
+pauses with an explicit explanation that the policy-pinned session cannot
+continue. The operator must update the governing policy through the governed
+configuration process and start a new session; resume intentionally rejects
+changed organization or repository policy hashes.
+
+The runtime reserves 64 KiB of the cumulative disclosure limit for its
+source-free control plane, including an 8 KiB emergency slice that ordinary
+decisions and repairs cannot consume. Data-bearing tool results cannot consume
+the 64 KiB window. If any ordinary outbound message reaches its applicable
+ceiling, Cope emits a byte-capped `cba/1` notice from the emergency slice and
+pauses rather than failing. Session startup rejects a disclosure budget that
+cannot hold the rendered bootstrap in addition to the 64 KiB reserve, so this
+condition is reported as invalid configuration before browser work begins.
+
+For cumulative data-result exhaustion as well as turn, operation,
+elapsed-time, and other recoverable session-budget exhaustion, Cope first
+offers a local raise-and-continue approval when the higher policy layers leave
+headroom. The approval targets the effective higher-layer ceiling rather than
+the next single unit, so the operator is not prompted again on every following
+turn or operation. The requested absolute limit remains visible and requires
+an explicit allow-for-session decision. A result that exceeds its
+already-authorized per-operation
+reservation instead receives a narrower-request hint; raising a cumulative
+ceiling cannot make that operation safe. Only `allow_session` is effective, and
+the requested floor is derived from live usage. The exact operator decision is
+journaled, hashed, and stored as a recovery artifact before an expanded grant
+is persisted. Higher-layer ceilings remain non-overridable. Resume keeps the
+same journal, checkpoints,
+completed-operation evidence, and queued outbound, so work is neither
+discarded nor replayed.
 
 ## `cba-repository-config/1`
 

@@ -76,7 +76,7 @@ export interface QueuedOutbound {
   readonly messageHash: string;
   readonly createdAt: string;
   readonly disclosure?: {
-    readonly kind: "tool_result";
+    readonly kind: "tool_result" | "decision";
     readonly disclosedBytes: number;
     readonly sha256: string;
   };
@@ -159,6 +159,8 @@ export interface SessionState {
     readonly sourceArtifacts: "remove" | "retain";
   };
   protocolRepairStreak: number;
+  /** Consecutive budget pauses without a successfully returned data result. */
+  budgetPauseStreak?: number;
 }
 
 export const zeroBudgetUsage = (): BudgetUsage => ({
