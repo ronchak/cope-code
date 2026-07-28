@@ -16,7 +16,7 @@
       "response": {
         "status": "completed",
         "response_id": "fixture-response-{{TURN_ID}}",
-        "content": "The requested repository inventory was returned by the local harness.\n\n```cba-agent/1\n{\"kind\":\"agent_answer\",\"content_markdown\":\"Inspected the bounded repository inventory without modifying files.\",\"basis\":{\"observed_files\":[\"README.md\"]},\"acceptance_criteria\":[{\"criterion\":\"Repository inventory was inspected\",\"status\":\"satisfied\",\"evidence\":\"The bounded list_files intent completed successfully.\"}],\"validation\":[],\"skipped_validation\":[\"No project validation command was required for this read-only fixture.\"],\"limitations\":[],\"follow_up\":[]}\n```"
+        "content": "The requested repository inventory was returned by the local harness.\n\n```cba-agent/1\n{\"kind\":\"agent_answer\",\"content_markdown\":\"Inspected the bounded repository inventory without modifying files.\",\"basis\":{\"observed_files\":[\"README.md\"],\"tool_result_refs\":[\"{{OPERATION_REF}}\"]},\"acceptance_criteria\":[{\"criterion\":\"Repository inventory was inspected\",\"status\":\"satisfied\",\"evidence\":\"The bounded list_files intent completed successfully.\"}],\"validation\":[],\"skipped_validation\":[\"No project validation command was required for this read-only fixture.\"],\"limitations\":[],\"follow_up\":[]}\n```"
       }
     }
   ]

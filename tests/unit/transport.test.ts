@@ -77,6 +77,62 @@ test("scripted fixture executes correlated offline turns deterministically", asy
   assert.equal(transport.remainingTurns, 0);
 });
 
+test("scripted fixture resolves a sole successful harness operation reference", async () => {
+  const transport = new ScriptedFixtureTransport([{
+    taskId: "task-evidence",
+    turnId: "turn-1",
+    submissionId: "submission-evidence",
+    response: {
+      status: "completed",
+      content: "evidence={{OPERATION_REF}}",
+    },
+  }], fixedClock);
+  const request = {
+    taskId: "task-evidence",
+    turnId: "turn-1",
+    submissionId: "submission-evidence",
+    content: [
+      "<authoritative_harness_message_json>",
+      "{\"kind\":\"harness_tool_results\",\"results\":[{\"operation_ref\":\"op_readme\",\"tool\":\"read_file\",\"status\":\"success\",\"output\":{}}]}",
+      "</authoritative_harness_message_json>",
+    ].join("\n"),
+  } as const;
+
+  await transport.submit(request);
+  const response = await transport.receive(request);
+  assert.equal(response.status, "completed");
+  if (response.status === "completed") {
+    assert.equal(response.content, "evidence=op_readme");
+  }
+});
+
+test("scripted fixture operation reference substitution fails closed on ambiguous evidence", async () => {
+  const transport = new ScriptedFixtureTransport([{
+    taskId: "task-evidence",
+    turnId: "turn-1",
+    submissionId: "submission-evidence",
+    response: {
+      status: "completed",
+      content: "evidence={{OPERATION_REF}}",
+    },
+  }], fixedClock);
+
+  await assert.rejects(
+    transport.submit({
+      taskId: "task-evidence",
+      turnId: "turn-1",
+      submissionId: "submission-evidence",
+      content: [
+        "<authoritative_harness_message_json>",
+        "{\"kind\":\"harness_tool_results\",\"results\":[{\"operation_ref\":\"op_one\",\"status\":\"success\"},{\"operation_ref\":\"op_two\",\"status\":\"success\"}]}",
+        "</authoritative_harness_message_json>",
+      ].join("\n"),
+    }),
+    /exactly one successful tool result/u,
+  );
+  assert.equal(transport.remainingTurns, 1);
+});
+
 test("scripted fixture rejects task/turn mismatch without consuming the script", async () => {
   const transport = new ScriptedFixtureTransport([
     {

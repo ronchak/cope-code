@@ -1,5 +1,6 @@
 import { AgentError } from "../shared/errors.js";
 import { sha256 } from "../shared/crypto.js";
+import { isOperationId } from "../shared/operation-id.js";
 import { isoNow, type Clock } from "../shared/time.js";
 import {
   MODEL_TRANSPORT_CONTRACT_VERSION,
@@ -40,6 +41,7 @@ interface FixtureTurnState {
   readonly turn: ScriptedFixtureTurn;
   submitCalls: number;
   received: boolean;
+  operationRef?: string;
 }
 
 /** Deterministic model fixture used to exercise the complete loop offline. */
@@ -82,6 +84,12 @@ export class ScriptedFixtureTransport implements ModelTransport {
     const state = this.#currentTurn();
     assertTurnMatches(state.turn, request);
     assertContentMatches(state.turn.expectedContent, request.content);
+    if (
+      state.turn.response.status === "completed" &&
+      state.turn.response.content.includes("{{OPERATION_REF}}")
+    ) {
+      state.operationRef = soleSuccessfulOperationRef(request.content);
+    }
     state.submitCalls += 1;
     this.#contentDigests.set(request.submissionId, sha256(request.content));
 
@@ -158,7 +166,10 @@ export class ScriptedFixtureTransport implements ModelTransport {
         return this.#baseResult(request, {
           status: "completed",
           responseId: response.responseId ?? `fixture-response-${this.#cursor}`,
-          content: response.content,
+          content: response.content.replaceAll(
+            "{{OPERATION_REF}}",
+            state.operationRef ?? "{{OPERATION_REF}}",
+          ),
         });
       case "blocked": {
         const base = {
@@ -294,4 +305,55 @@ function assertContentMatches(expected: string | RegExp | undefined, actual: str
 
 function fixtureMarker(request: SubmissionRequest): string {
   return `fixture:${request.taskId}:${request.turnId}:${request.submissionId}`;
+}
+
+function soleSuccessfulOperationRef(content: string): string {
+  const opening = "<authoritative_harness_message_json>";
+  const closing = "</authoritative_harness_message_json>";
+  const start = content.indexOf(opening);
+  const end = content.indexOf(closing, start + opening.length);
+  if (
+    start < 0 ||
+    end < 0 ||
+    content.indexOf(opening, start + opening.length) >= 0 ||
+    content.indexOf(closing, end + closing.length) >= 0
+  ) {
+    throw new AgentError(
+      "CONFIG_INVALID",
+      "Fixture {{OPERATION_REF}} requires exactly one authoritative harness message",
+    );
+  }
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(content.slice(start + opening.length, end).trim()) as unknown;
+  } catch (error) {
+    throw new AgentError(
+      "CONFIG_INVALID",
+      "Fixture {{OPERATION_REF}} could not parse the authoritative harness message",
+      {},
+      { cause: error },
+    );
+  }
+  if (decoded === null || typeof decoded !== "object" || Array.isArray(decoded)) {
+    throw new AgentError("CONFIG_INVALID", "Fixture {{OPERATION_REF}} harness message is not an object");
+  }
+  const message = decoded as Readonly<Record<string, unknown>>;
+  const results = message.kind === "harness_tool_results" && Array.isArray(message.results)
+    ? message.results
+    : [];
+  const successfulRefs = results.flatMap((result) => {
+    if (result === null || typeof result !== "object" || Array.isArray(result)) return [];
+    const record = result as Readonly<Record<string, unknown>>;
+    return record.status === "success" && isOperationId(record.operation_ref)
+      ? [record.operation_ref]
+      : [];
+  });
+  if (successfulRefs.length !== 1) {
+    throw new AgentError(
+      "CONFIG_INVALID",
+      "Fixture {{OPERATION_REF}} requires exactly one successful tool result",
+      { successfulOperationRefs: successfulRefs.length },
+    );
+  }
+  return successfulRefs[0]!;
 }
