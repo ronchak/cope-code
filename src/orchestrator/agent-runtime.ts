@@ -1484,6 +1484,15 @@ export class AgentRuntime {
             },
           });
           await this.persist();
+          throw new AgentError(
+            "RECOVERY_REQUIRED",
+            errorMessage(error),
+            {
+              automaticRecoveryDecisionAbandoned: true,
+              requestId,
+            },
+            { cause: error },
+          );
         }
         throw error;
       }
@@ -1594,13 +1603,27 @@ export class AgentRuntime {
       if (this.interruption !== undefined) {
         return { result: await this.finishInterruption() };
       }
+      const abandoned =
+        recoveryError instanceof AgentError &&
+        recoveryError.details.automaticRecoveryDecisionAbandoned === true;
       return {
         recovery: {
           raised: false,
-          reason:
-            `${reason} Automatic raise-and-continue could not obtain an ` +
-            `operator decision (${errorMessage(recoveryError)}). Resume this ` +
-            "session in an interactive terminal to retry the recovery decision.",
+          reason: abandoned
+            ? (
+                `${reason} Automatic raise-and-continue could not obtain an ` +
+                `operator decision (${errorMessage(recoveryError)}). The ` +
+                "current recovery request was durably denied fail-closed and " +
+                "cannot be retried. If Cope queued a budget notice, resume may " +
+                "continue on a new turn; otherwise start a new task from an " +
+                "interactive terminal."
+              )
+            : (
+                `${reason} Automatic raise-and-continue could not obtain an ` +
+                `operator decision (${errorMessage(recoveryError)}). Resume ` +
+                "this session in an interactive terminal to retry the " +
+                "recovery decision."
+              ),
         },
       };
     }

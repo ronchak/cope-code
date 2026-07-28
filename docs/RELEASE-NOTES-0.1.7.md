@@ -25,8 +25,9 @@ derive from or are checked against that value.
   new approval request on every subsequent turn or operation.
 - If the recovery approval prompt is unavailable, both data-plane and
   control-plane paths complete the synthetic request with an integrity-bound
-  default-deny decision, clear it from pending work, and pause for interactive
-  resume instead of failing or poisoning later completion.
+  default-deny decision, clear it from pending work, and pause instead of
+  failing or poisoning later completion. Operator guidance now states that the
+  durable deny cannot re-prompt under the same recovery request.
 - Startup reconciles the exact artifact/journal/session-state interruption
   windows around that default deny, including a missing first artifact write
   (which retries the operator prompt) and a completed journal whose pending
@@ -55,6 +56,8 @@ derive from or are checked against that value.
   the maximum listing size for every request.
 - Repository-wide patterns consistently include root for `**`, `./**`, and
   `**/*`; narrower patterns remain narrow, and deny precedence is covered.
+- Model operation identifiers reject Windows reserved device names before they
+  can become journal filenames.
 
 ## Capability safety
 

@@ -184,8 +184,10 @@ artifact before the grant changes, closing the crash window between consent
 and persistence. If the automatic recovery prompt itself cannot run (for
 example, no interactive terminal is attached), Cope durably abandons that
 synthetic request with an integrity-bound default-deny decision, clears it from
-pending work, preserves the already queued budget notice, and pauses for an
-interactive resume. The default-deny artifact makes the same-turn replay safe
+pending work, preserves any already queued budget notice, and pauses. That
+specific recovery request is durably denied and cannot re-prompt: resume may
+continue on a new model turn when a notice is queued; otherwise the operator
+must start a new task from an interactive terminal. The default-deny artifact makes the same-turn replay safe
 if interruption occurs before the notice replaces the source response. A
 caller interruption retains a still-available source response so the decision
 can be retried after resume; when a degraded result has already replaced that
@@ -205,6 +207,11 @@ update governing policy through the governed configuration process and start a
 new session, because resume intentionally rejects changed organization or
 repository policy hashes. The exhausted session remains paused for inspection
 rather than transitioning to `failed`.
+
+An unreadable or hash-mismatched recovery-decision artifact always pauses
+fail-closed for operator reconciliation; repeated resume does not guess,
+replace, or discard the decision. Use the explicit abort/reconciliation
+workflow rather than repeatedly resuming unchanged corrupt evidence.
 
 The session also persists a consecutive budget-pause streak. A successfully
 returned data result or an effective budget raise clears it. A second budget

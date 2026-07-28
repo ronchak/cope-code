@@ -70,6 +70,11 @@ test("parser, journal, and shared cba/1 validator enforce the same operation-ID 
     { id: "op/1", accepted: false, label: "forward separator" },
     { id: "op\\1", accepted: false, label: "back separator" },
     { id: "_op", accepted: false, label: "non-alphanumeric prefix" },
+    { id: "CON", accepted: false, label: "Windows console device" },
+    { id: "nul", accepted: false, label: "Windows null device" },
+    { id: "COM1", accepted: false, label: "Windows serial device" },
+    { id: "lpt9", accepted: false, label: "Windows printer device" },
+    { id: "CONSOLE", accepted: true, label: "reserved-name prefix only" },
   ];
 
   for (const entry of cases) {

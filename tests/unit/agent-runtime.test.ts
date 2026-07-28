@@ -1456,7 +1456,8 @@ test("budget recovery prompt failure pauses instead of escaping the runtime", as
   assert.equal(result.status, "paused", result.reason);
   assert.equal(localState.failure, undefined);
   assert.match(result.reason ?? "", /could not obtain an operator decision/iu);
-  assert.match(result.reason ?? "", /interactive terminal/iu);
+  assert.match(result.reason ?? "", /durably denied fail-closed/iu);
+  assert.match(result.reason ?? "", /cannot be retried/iu);
   assert.equal(localState.queuedOutbound?.disclosure?.kind, "decision");
   assert.deepEqual(localState.pendingOperations, []);
   const recoveryRequestId =
@@ -1582,6 +1583,7 @@ test("tool-result budget recovery prompt failure pauses and resumes without pend
   assert.equal(paused.status, "paused", paused.reason);
   assert.equal(localState.failure, undefined);
   assert.match(paused.reason ?? "", /could not obtain an operator decision/iu);
+  assert.match(paused.reason ?? "", /durably denied fail-closed/iu);
   assert.deepEqual(localState.pendingOperations, []);
   assert.equal(localState.queuedOutbound?.disclosure?.kind, "decision");
 
@@ -1916,6 +1918,7 @@ test("abandoned recovery decision replays safely when emergency notice queueing 
     user,
   }).run();
   assert.equal(paused.status, "paused", paused.reason);
+  assert.match(paused.reason ?? "", /cannot be retried/iu);
   assert.equal(localState.queuedOutbound, undefined);
   assert.deepEqual(localState.pendingOperations, []);
   assert.equal(prompts, 1);

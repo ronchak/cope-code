@@ -388,6 +388,13 @@ function defaultPathKey(value: string): string {
 function ensureUniqueOperationIds(ids: readonly string[], seen: ReadonlySet<string> | undefined): void {
   const current = new Set<string>();
   for (const operationId of ids) {
+    if (!isOperationId(operationId)) {
+      throw new ProtocolParseError(
+        "SCHEMA_INVALID",
+        `Operation ID '${operationId}' is not safe for durable storage.`,
+        { operation_id: operationId },
+      );
+    }
     if (current.has(operationId) || seen?.has(operationId) === true) {
       throw new ProtocolParseError(
         "DUPLICATE_OPERATION_ID",
