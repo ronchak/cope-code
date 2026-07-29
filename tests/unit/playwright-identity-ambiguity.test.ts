@@ -771,6 +771,17 @@ test("Chromium protocol widgets distinguish safe data, repairable format, and ca
               </div>
             </div>
           </div>
+          <div data-testid="copilot-message-reply-div" id="duplicate-banner">
+            <div data-testid="markdown-reply">
+              <div class="scriptor-component-code-block">
+                <div data-testid="message-bar-body-info">cba-agent/1 isn’t fully supported. Syntax highlighting is based on Plain Text.</div>
+                <div data-testid="message-bar-body-info">cba-agent/1 isn’t fully supported. Syntax highlighting is based on Plain Text.</div>
+                <div role="textbox" aria-readonly="true" aria-label="Code editor">
+                  <div data-line-index="0">${modelIntent}</div>
+                </div>
+              </div>
+            </div>
+          </div>
         </main>
       `,
     });
@@ -806,6 +817,9 @@ test("Chromium protocol widgets distinguish safe data, repairable format, and ca
   assert.equal(evidence[10]?.reasonCode, "PROTOCOL_WIDGET_LINE_INDEX_INVALID");
   assert.equal(evidence[11]?.status, "protocol_widget_incomplete");
   assert.equal(evidence[11]?.reasonCode, "PROTOCOL_WIDGET_EDITOR_PENDING");
+  assert.equal(evidence[12]?.status, "protocol_widget_ambiguous");
+  assert.equal(evidence[12]?.reasonCode, "PROTOCOL_WIDGET_BANNER_COUNT");
+  assert.equal(evidence[12]?.protocolBlockCount, 1);
   const inlineFenceTurn = new CbaProtocolAdapter().parseModelTurn(
     observation.responses.elements[8]?.text ?? "",
     {

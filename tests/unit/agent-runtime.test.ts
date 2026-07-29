@@ -348,6 +348,30 @@ class UnownedFenceCaptureTransport extends QueueTransport {
   }
 }
 
+class CompletedCaptureEvidenceTransport extends QueueTransport {
+  public constructor(
+    private readonly content: string,
+    private readonly captureEvidence: Readonly<Record<string, unknown>>,
+  ) {
+    super([]);
+  }
+
+  public override async receive(request: ReceiveRequest): Promise<ReceiveResult> {
+    return {
+      contractVersion: MODEL_TRANSPORT_CONTRACT_VERSION,
+      taskId: request.taskId,
+      turnId: request.turnId,
+      submissionId: request.submissionId,
+      observedAt: "2026-01-01T00:00:00.000Z",
+      conversationId: "conversation_1",
+      status: "completed",
+      responseId: "response_capture_evidence",
+      content: this.content,
+      captureEvidence: this.captureEvidence,
+    };
+  }
+}
+
 class TerminalBlockedTransport extends QueueTransport {
   public override async receive(request: ReceiveRequest): Promise<ReceiveResult> {
     return {
@@ -3426,6 +3450,137 @@ test("runtime repairs an unowned quoted fence without parsing it as authority", 
   assert.doesNotMatch(transport.submittedContents[1] ?? "", /quoted but never executable/u);
 });
 
+for (const protocolErrorCode of [undefined, "NOT_A_REAL_CODE"] as const) {
+  test(`runtime rejects model-malformed capture evidence with ${
+    protocolErrorCode === undefined ? "no protocol code" : "an unknown protocol code"
+  }`, async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-invalid-capture-evidence-"));
+    const localState = state(root);
+    const store = new SessionStore(path.join(root, "state"));
+    await store.create(localState);
+    const executableCompletion = [
+      "```cba-agent/1",
+      stableJson({
+        kind: "agent_intent",
+        intent: "complete_task",
+        arguments: {
+          summary: "This must not execute.",
+          acceptance_criteria: [],
+          validation: [],
+          skipped_validation: [],
+          remaining_risks: [],
+          follow_up: [],
+        },
+        reason: "Capture evidence already rejected these bytes.",
+      }),
+      "```",
+    ].join("\n");
+    const transport = new CompletedCaptureEvidenceTransport(
+      executableCompletion,
+      {
+        contractVersion: "response-capture/v2",
+        status: "model_protocol_malformed",
+        reasonCode: "MODEL_PROTOCOL_INVALID_CAPTURE",
+        ...(protocolErrorCode === undefined ? {} : { protocolErrorCode }),
+        codeBlockCount: 1,
+        protocolBlockCount: 1,
+        editorCount: 1,
+        bannerCount: 1,
+        lineCount: 1,
+        contentBytes: Buffer.byteLength(executableCompletion),
+      },
+    );
+
+    const result = await runtimeForTest({
+      root,
+      state: localState,
+      store,
+      transport,
+      protocol: new CbaProtocolAdapter(),
+    }).run();
+
+    assert.equal(result.status, "failed");
+    assert.match(result.reason ?? "", /capture evidence failed strict validation/u);
+    assert.equal(localState.budgetUsage.protocolRepairs, 0);
+    assert.equal(transport.submittedContents.length, 1);
+  });
+}
+
+for (
+  const [captureStatus, reasonCode] of [
+    ["protocol_widget_incomplete", "PROTOCOL_WIDGET_LINES_PENDING"],
+    ["protocol_widget_ambiguous", "PROTOCOL_WIDGET_BANNER_COUNT"],
+    ["protocol_widget_capture_failed", "PROTOCOL_WIDGET_CAPTURE_FAILED"],
+    ["unsupported_capture_contract", "PROTOCOL_WIDGET_BANNER_CONTRACT_CHANGED"],
+  ] as const
+) {
+  test(`runtime never parses a completed response classified as ${captureStatus}`, async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-non-executable-capture-"));
+    const localState = state(root);
+    const store = new SessionStore(path.join(root, "state"));
+    await store.create(localState);
+    const executableCompletion = [
+      "```cba-agent/1",
+      stableJson({
+        kind: "agent_intent",
+        intent: "complete_task",
+        arguments: {
+          summary: "This must not execute.",
+          acceptance_criteria: [],
+          validation: [],
+          skipped_validation: [],
+          remaining_risks: [],
+          follow_up: [],
+        },
+        reason: "Capture classified these bytes as non-executable.",
+      }),
+      "```",
+    ].join("\n");
+    const transport = new CompletedCaptureEvidenceTransport(
+      executableCompletion,
+      {
+        contractVersion: "response-capture/v2",
+        status: captureStatus,
+        protocolVersion: "cba-agent/1",
+        reasonCode,
+        codeBlockCount: 1,
+        protocolBlockCount: 1,
+        editorCount: 1,
+        bannerCount: 1,
+        lineCount: 1,
+        contentBytes: Buffer.byteLength(executableCompletion),
+      },
+    );
+
+    const result = await runtimeForTest({
+      root,
+      state: localState,
+      store,
+      transport,
+      protocol: new CbaProtocolAdapter(),
+    }).run();
+
+    assert.equal(result.status, "paused");
+    assert.match(result.reason ?? "", new RegExp(reasonCode, "u"));
+    assert.match(result.reason ?? "", /session is preserved/u);
+    assert.equal(localState.budgetUsage.protocolRepairs, 0);
+    assert.equal(transport.submittedContents.length, 1);
+    const events = await AuditLog.verify(
+      path.join(root, "audit.jsonl"),
+      localState.sessionId,
+    );
+    const captureEvent = events.find((event) => event.type === "transport.state");
+    assert.equal(captureEvent?.data.diagnosticCode, reasonCode);
+    assert.equal(captureEvent?.data.stage, "browser_response_capture");
+    assert.equal(captureEvent?.data.repairable, false);
+    assert.equal(
+      (captureEvent?.data.actual as Readonly<Record<string, unknown>> | undefined)
+        ?.capture_status,
+      captureStatus,
+    );
+  });
+}
+
 test("runtime does not send or charge a repair after the protocol-repair budget is exhausted", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-repair-budget-"));
   const localState = state(root);
@@ -5287,6 +5442,147 @@ test("recovery preserves capture-classified model repair evidence across restart
     /rendered text that must never be reparsed/u,
   );
 });
+
+test("recovery preserves a non-executable capture classification without parsing content", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-capture-recovery-inert-"));
+  const localState = state(root);
+  localState.status = "paused";
+  localState.pauseReason = "process restarted";
+  localState.turnSequence = 1;
+  localState.submission = {
+    submissionId: "submission_1",
+    turnId: "turn_0001",
+    messageHash: "a".repeat(64),
+    marker: "marker",
+    state: "answered",
+    preparedAt: "2026-01-01T00:00:00.000Z",
+    submittedAt: "2026-01-01T00:00:01.000Z",
+    answeredAt: "2026-01-01T00:00:02.000Z",
+  };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(
+    path.join(store.sessionDirectory(localState.sessionId), "artifacts"),
+  );
+  await artifacts.put("response", "turn_0001", [
+    "```cba-agent/1",
+    stableJson({
+      kind: "agent_intent",
+      intent: "complete_task",
+      arguments: {
+        summary: "This recovered content must remain inert.",
+        acceptance_criteria: [],
+        validation: [],
+        skipped_validation: [],
+        remaining_risks: [],
+        follow_up: [],
+      },
+      reason: "Capture evidence rejected the response.",
+    }),
+    "```",
+  ].join("\n"));
+  await artifacts.put("response-capture", "turn_0001", stableJson({
+    contractVersion: "response-capture/v2",
+    status: "protocol_widget_ambiguous",
+    protocolVersion: "cba-agent/1",
+    reasonCode: "PROTOCOL_WIDGET_BANNER_COUNT",
+    codeBlockCount: 1,
+    protocolBlockCount: 1,
+    editorCount: 1,
+    bannerCount: 2,
+    lineCount: 1,
+    contentBytes: 64,
+  }));
+
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    artifacts,
+    transport: new QueueTransport([]),
+    protocol: new CbaProtocolAdapter(),
+  }).run();
+
+  assert.equal(result.status, "paused");
+  assert.match(result.reason ?? "", /PROTOCOL_WIDGET_BANNER_COUNT/u);
+  assert.equal(localState.budgetUsage.protocolRepairs, 0);
+  const events = await AuditLog.verify(
+    path.join(root, "audit.jsonl"),
+    localState.sessionId,
+  );
+  const captureEvent = events.find((event) => event.type === "transport.state");
+  assert.equal(captureEvent?.data.diagnosticCode, "PROTOCOL_WIDGET_BANNER_COUNT");
+  assert.equal(captureEvent?.data.repairable, false);
+});
+
+for (const protocolErrorCode of [undefined, "NOT_A_REAL_CODE"] as const) {
+  test(`recovery rejects model-malformed evidence with ${
+    protocolErrorCode === undefined ? "no protocol code" : "an unknown protocol code"
+  }`, async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-capture-recovery-invalid-"));
+    const localState = state(root);
+    localState.status = "paused";
+    localState.pauseReason = "process restarted";
+    localState.turnSequence = 1;
+    localState.submission = {
+      submissionId: "submission_1",
+      turnId: "turn_0001",
+      messageHash: "a".repeat(64),
+      marker: "marker",
+      state: "answered",
+      preparedAt: "2026-01-01T00:00:00.000Z",
+      submittedAt: "2026-01-01T00:00:01.000Z",
+      answeredAt: "2026-01-01T00:00:02.000Z",
+    };
+    const store = new SessionStore(path.join(root, "state"));
+    await store.create(localState);
+    const artifacts = new SessionArtifactStore(
+      path.join(store.sessionDirectory(localState.sessionId), "artifacts"),
+    );
+    await artifacts.put("response", "turn_0001", [
+      "```cba-agent/1",
+      stableJson({
+        kind: "agent_intent",
+        intent: "complete_task",
+        arguments: {
+          summary: "This recovered content must remain inert.",
+          acceptance_criteria: [],
+          validation: [],
+          skipped_validation: [],
+          remaining_risks: [],
+          follow_up: [],
+        },
+        reason: "Capture evidence rejected the response.",
+      }),
+      "```",
+    ].join("\n"));
+    await artifacts.put("response-capture", "turn_0001", stableJson({
+      contractVersion: "response-capture/v2",
+      status: "model_protocol_malformed",
+      reasonCode: "MODEL_PROTOCOL_INVALID_CAPTURE",
+      ...(protocolErrorCode === undefined ? {} : { protocolErrorCode }),
+      codeBlockCount: 1,
+      protocolBlockCount: 1,
+      editorCount: 1,
+      bannerCount: 1,
+      lineCount: 1,
+      contentBytes: 64,
+    }));
+
+    const result = await runtimeForTest({
+      root,
+      state: localState,
+      store,
+      artifacts,
+      transport: new QueueTransport([]),
+      protocol: new CbaProtocolAdapter(),
+    }).run();
+
+    assert.equal(result.status, "paused");
+    assert.match(result.reason ?? "", /failed strict validation/u);
+    assert.equal(localState.budgetUsage.protocolRepairs, 0);
+  });
+}
 
 test("recovery rejects well-formed capture evidence outside the strict allowlist", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-capture-recovery-tamper-"));

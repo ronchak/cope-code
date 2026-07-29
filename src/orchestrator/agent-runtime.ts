@@ -282,6 +282,16 @@ export class AgentRuntime {
         });
         if (this.interruption !== undefined) return await this.finishInterruption();
 
+        const captureIssue = completedResponseCaptureIssue(response);
+        if (captureIssue !== undefined) {
+          const terminal = await this.handleTransportResult(captureIssue);
+          if (terminal !== undefined) return terminal;
+          throw new AgentError(
+            "TRANSPORT_INDETERMINATE",
+            "A non-executable response-capture classification was not handled",
+          );
+        }
+
         let messages: readonly NormalizedModelMessage[];
         try {
           const captureProtocolError = modelProtocolCaptureError(
@@ -792,9 +802,19 @@ export class AgentRuntime {
     );
     this.assertTransportCorrelation(result, request, "receive result");
     if (result.status === "completed") {
+      const captureEvidence = sanitizedCaptureEvidence(result.captureEvidence);
+      if (result.captureEvidence !== undefined && captureEvidence === undefined) {
+        throw new AgentError(
+          "PROTOCOL_INVALID",
+          "Completed response capture evidence failed strict validation",
+          {
+            stage: "model_response_capture",
+            protocol_code: "INVALID_MESSAGE",
+          },
+        );
+      }
       this.bindConversation(result);
       await this.dependencies.artifacts?.put("response", turnId, result.content);
-      const captureEvidence = sanitizedCaptureEvidence(result.captureEvidence);
       if (captureEvidence === undefined) {
         await this.dependencies.artifacts?.remove("response-capture", turnId);
       } else {
@@ -3501,18 +3521,20 @@ function modelProtocolCaptureError(
   evidence: Readonly<Record<string, unknown>> | undefined,
 ): ProtocolParseError | undefined {
   const capture = sanitizedCaptureEvidence(evidence);
-  if (capture?.status !== "model_protocol_malformed") return undefined;
-  const code = capture.protocolErrorCode;
-  if (
-    code !== "MISSING_ENVELOPE" &&
-    code !== "MULTIPLE_ENVELOPES" &&
-    code !== "UNSUPPORTED_VERSION" &&
-    code !== "EMPTY_ENVELOPE" &&
-    code !== "INVALID_JSON" &&
-    code !== "SCHEMA_INVALID"
-  ) {
-    return undefined;
+  if (capture === undefined) {
+    if (evidence === undefined) return undefined;
+    return new ProtocolParseError(
+      "INVALID_MESSAGE",
+      "Response capture evidence failed strict validation.",
+      {
+        stage: "model_response_capture",
+        capture_evidence_invalid: true,
+      },
+      false,
+    );
   }
+  if (capture.status !== "model_protocol_malformed") return undefined;
+  const code = capture.protocolErrorCode;
   const messages = {
     MISSING_ENVELOPE: "The model response quoted a protocol fence outside an owned protocol widget.",
     MULTIPLE_ENVELOPES: "The captured model response contains more than one protocol envelope.",
@@ -3521,9 +3543,10 @@ function modelProtocolCaptureError(
     INVALID_JSON: "The captured model response does not contain complete, valid JSON.",
     SCHEMA_INVALID: "The captured model response body does not match its declared protocol dialect.",
   } as const;
+  if (typeof code !== "string" || !Object.hasOwn(messages, code)) return undefined;
   return new ProtocolParseError(
-    code,
-    messages[code],
+    code as keyof typeof messages,
+    messages[code as keyof typeof messages],
     {
       stage: "model_response_capture",
       capture_evidence: capture,
@@ -3566,6 +3589,19 @@ function sanitizedCaptureEvidence(
       capture[key] = value;
     }
   }
+  if (
+    evidence.status === "model_protocol_malformed" &&
+    (
+      capture.protocolErrorCode !== "MISSING_ENVELOPE" &&
+      capture.protocolErrorCode !== "MULTIPLE_ENVELOPES" &&
+      capture.protocolErrorCode !== "UNSUPPORTED_VERSION" &&
+      capture.protocolErrorCode !== "EMPTY_ENVELOPE" &&
+      capture.protocolErrorCode !== "INVALID_JSON" &&
+      capture.protocolErrorCode !== "SCHEMA_INVALID"
+    )
+  ) {
+    return undefined;
+  }
   for (
     const key of [
       "codeBlockCount",
@@ -3588,6 +3624,62 @@ function sanitizedCaptureEvidence(
     capture[key] = value;
   }
   return capture;
+}
+
+function completedResponseCaptureIssue(
+  result: CompletedReceiveResult,
+): Exclude<ReceiveResult, { status: "completed" }> | undefined {
+  const evidence = sanitizedCaptureEvidence(result.captureEvidence);
+  const status = evidence?.status;
+  if (
+    evidence === undefined ||
+    typeof status !== "string" ||
+    status === "rendered_text" ||
+    status === "protocol_reconstructed" ||
+    status === "model_protocol_malformed"
+  ) {
+    return undefined;
+  }
+  const diagnosticCode = typeof evidence.reasonCode === "string"
+    ? evidence.reasonCode
+    : status.toUpperCase();
+  return {
+    contractVersion: result.contractVersion,
+    taskId: result.taskId,
+    turnId: result.turnId,
+    submissionId: result.submissionId,
+    observedAt: result.observedAt,
+    ...(result.conversationId === undefined
+      ? {}
+      : { conversationId: result.conversationId }),
+    status: "indeterminate",
+    diagnosticCode,
+    diagnostic: {
+      stage: "browser_response_capture",
+      summary:
+        "Cope could not safely read the protocol widget at browser_response_capture. " +
+        "Retrying the same model turn cannot repair this capture condition; the session is preserved.",
+      repairable: false,
+      suggestedAction: "preserve_session_and_inspect_browser_transcript",
+      expected: {
+        capture_contract_version: evidence.contractVersion,
+        protocol_block_count: 1,
+        editor_count: 1,
+        banner_count: 1,
+      },
+      actual: {
+        capture_status: status,
+        protocol_version: evidence.protocolVersion ?? "unrecognized",
+        reason_code: diagnosticCode,
+        code_block_count: evidence.codeBlockCount,
+        protocol_block_count: evidence.protocolBlockCount,
+        editor_count: evidence.editorCount,
+        banner_count: evidence.bannerCount,
+        line_count: evidence.lineCount,
+        content_bytes: evidence.contentBytes,
+      },
+    },
+  };
 }
 
 function parseCaptureEvidenceArtifact(raw: string): Readonly<Record<string, unknown>> {

@@ -896,45 +896,44 @@ export class PlaywrightSemanticPage implements SemanticPage {
                         .filter((value) => value !== undefined);
                       if (ownedProtocolBanners.length === 0) continue;
                       for (const editor of editors) protocolOwnedEditors.add(editor);
-                      for (const banner of ownedProtocolBanners) {
-                        const editor = editors[0];
-                        const lines = editor === undefined
-                          ? []
-                          : Array.from(
-                              editor.querySelectorAll<HTMLElement>("[data-line-index]"),
-                            );
-                        const indexedLines = lines.map((line) => ({
-                          index: Number(line.getAttribute("data-line-index")),
-                          text: line.textContent ?? "",
-                        }));
-                        const sortedLines = [...indexedLines].sort(
-                          (left, right) => left.index - right.index,
-                        );
-                        const firstLineIndex = sortedLines[0]?.index;
-                        const lineIndicesValid =
-                          lines.length > 0 &&
-                          firstLineIndex !== undefined &&
-                          Number.isSafeInteger(firstLineIndex) &&
-                          (firstLineIndex === 0 || firstLineIndex === 1) &&
-                          sortedLines.every((line, lineOffset) =>
-                            Number.isSafeInteger(line.index) &&
-                            line.index === firstLineIndex + lineOffset
+                      const banner = ownedProtocolBanners[0]!;
+                      const editor = editors[0];
+                      const lines = editor === undefined
+                        ? []
+                        : Array.from(
+                            editor.querySelectorAll<HTMLElement>("[data-line-index]"),
                           );
-                        const rawCode = sortedLines.map((line) => line.text).join("\n");
-                        const contentBytes = new TextEncoder().encode(rawCode).byteLength;
-                        protocolBlocks.push({
-                          version: banner.version,
-                          bannerContract: banner.bannerContract,
-                          code: contentBytes <= input.maximumProtocolBytes ? rawCode : "",
-                          editorCount: editors.length,
-                          bannerCount: ownedProtocolBanners.length,
-                          lineCount: lines.length,
-                          lineIndicesValid,
-                          contentBytes,
-                          contentBoundExceeded:
-                            contentBytes > input.maximumProtocolBytes,
-                        });
-                      }
+                      const indexedLines = lines.map((line) => ({
+                        index: Number(line.getAttribute("data-line-index")),
+                        text: line.textContent ?? "",
+                      }));
+                      const sortedLines = [...indexedLines].sort(
+                        (left, right) => left.index - right.index,
+                      );
+                      const firstLineIndex = sortedLines[0]?.index;
+                      const lineIndicesValid =
+                        lines.length > 0 &&
+                        firstLineIndex !== undefined &&
+                        Number.isSafeInteger(firstLineIndex) &&
+                        (firstLineIndex === 0 || firstLineIndex === 1) &&
+                        sortedLines.every((line, lineOffset) =>
+                          Number.isSafeInteger(line.index) &&
+                          line.index === firstLineIndex + lineOffset
+                        );
+                      const rawCode = sortedLines.map((line) => line.text).join("\n");
+                      const contentBytes = new TextEncoder().encode(rawCode).byteLength;
+                      protocolBlocks.push({
+                        version: banner.version,
+                        bannerContract: banner.bannerContract,
+                        code: contentBytes <= input.maximumProtocolBytes ? rawCode : "",
+                        editorCount: editors.length,
+                        bannerCount: ownedProtocolBanners.length,
+                        lineCount: lines.length,
+                        lineIndicesValid,
+                        contentBytes,
+                        contentBoundExceeded:
+                          contentBytes > input.maximumProtocolBytes,
+                      });
                     }
                     const renderedProtocolFenceCount = input.renderedText
                       .split(/\r\n|\n/u)
@@ -1395,6 +1394,24 @@ function normalizeResponseCapture(capture: PageResponseCapture): NormalizedRespo
           : "PROTOCOL_WIDGET_LINES_PENDING",
         lineCount: incompleteBlock.lineCount,
         contentBytes: incompleteBlock.contentBytes,
+      },
+    };
+  }
+
+  const ambiguousBannerBlock = capture.protocolBlocks.find((block) =>
+    block.bannerCount !== 1
+  );
+  if (ambiguousBannerBlock !== undefined) {
+    return {
+      text: capture.renderedText,
+      correlationText,
+      evidence: {
+        ...sharedEvidence,
+        status: "protocol_widget_ambiguous",
+        protocolVersion: ambiguousBannerBlock.version,
+        reasonCode: "PROTOCOL_WIDGET_BANNER_COUNT",
+        lineCount: ambiguousBannerBlock.lineCount,
+        contentBytes: ambiguousBannerBlock.contentBytes,
       },
     };
   }
