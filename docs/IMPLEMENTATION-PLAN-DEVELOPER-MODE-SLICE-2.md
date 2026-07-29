@@ -71,8 +71,10 @@ compatibility decision. Presence of session-start branch/HEAD facts cannot be th
 discriminator because every current session records them.
 
 Slice 2 keeps `createDefaultSessionGrant` unchanged, so ordinary/default sessions
-seed `frozen`. `observed` is reachable only through explicit test/manual
-terminal-capable grants until Slice 3 adds the product grant path.
+seed `frozen`. `observed` is reachable only through fixtures/manual composition that
+supply a hand-built terminal-capable `SessionGrant` and organization/repository
+policy documents that allow `terminal_exec` at every upper layer. Slice 3 owns the
+product path that creates this layered authorization.
 
 ### 2. Add a durable launch receipt, but do not invent resume-time attribution
 
@@ -90,7 +92,7 @@ Recovery truth is:
 | partial, corrupt, or manifest-mismatched launch receipt | `RECOVERY_REQUIRED`; never treat corrupt evidence as absence |
 | launch receipt, no exit receipt | pause indeterminate, never rerun |
 | exit receipt, no complete result | mark/persist an indeterminate journal record with a source-free reconciliation summary, never rerun |
-| journal completed/failed, session operation pending, no result artifact, and exact source-free metadata proves `spawn_failed`/no launch | reconcile as no-effect, refund once, consume the pending key, and mark the failure unreturned |
+| journal completed/failed, session operation pending, no launch/exit/result evidence, and exact source-free metadata proves `spawn_failed`/no launch | reconcile as no-effect, refund once, consume the pending key, and mark the failure unreturned |
 | journal completed/failed, session operation pending, no result artifact, and no exact no-launch proof | pause indeterminate or require recovery; never infer no effect |
 | complete matching result, no applied effects | promote the journal, apply effects exactly once, and replay |
 | complete result and applied effects | replay only; no effect or budget changes |
@@ -194,10 +196,12 @@ be captured or the complete serialized observation still exceeds its bound.
 Post-launch overflow likewise produces an explicit non-clean observation while
 preserving process truth.
 
-Freeze a measured pre/post observation deadline and record observation duration in
-source-free diagnostics. The single race retry is a complete re-observation and must
-remain inside the documented total bound; no unbounded Git/control-state walk may
-silently extend terminal latency.
+Freeze a 20-second deadline per complete observation attempt and a 40-second total
+deadline per pre/post phase, including the single full race retry. Record observation
+duration in source-free diagnostics. Pre-observation deadline expiry refuses launch
+and refunds; post-observation expiry yields explicit non-clean `unknown` while
+preserving process truth. A required large-repository timing fixture must stay under
+the bound. No unbounded Git/control-state walk may silently extend terminal latency.
 
 ### 6. Session diff is part of Slice 2
 
@@ -303,8 +307,9 @@ Binary paths are counted separately and excluded from line counts. Do not read a
 later worktree to recompute a persisted terminal result.
 
 An identical complete pre/post fingerprint yields `none`. HEAD, normal refs,
-`packed-refs`, and index deltas are normal attributable Git transitions and yield
-`observed` when the rest of the observation is trustworthy. Hooks, `config`,
+`packed-refs`, index, and `common/shallow` deltas are normal attributable Git
+transitions and yield `observed` when the rest of the observation is trustworthy.
+Hooks, `config`,
 `config.worktree`, `info/attributes`, `info/exclude`, policy-hidden entries,
 protected patterns, or nested-repository ambiguity yield
 `protected_or_hidden_changed`. Post-observation failure or insufficient evidence
@@ -397,7 +402,8 @@ atomic session persist performs:
 - the one-time `commands` refund when verified evidence proves no process launched;
 - pending terminal effect ID removal when one exists;
 - removal from `pendingOperations`;
-- insertion into the unreturned-result set; and
+- insertion into `completedOperationIds` and the unreturned-result set using the
+  existing `markOperationAwaitingReturn` invariant; and
 - durable pause facts for any budget overrun.
 
 Implementation ordering is mandatory:
@@ -406,7 +412,7 @@ Implementation ordering is mandatory:
    session state;
 2. deep-snapshot every in-place field the transaction will mutate, including budget
    usage, mutations, sequence, pending effect IDs, pending operations, and
-   unreturned IDs;
+   completed/unreturned IDs;
 3. apply mutation, sequence, budgets, marker cleanup, pending removal, and
    unreturned insertion in place so the existing `BudgetMeter` and composition
    closures retain the same state object;
@@ -438,10 +444,12 @@ return. It never enters the result-backed effect applicator.
 
 Startup also handles a journal record already `completed` or `failed` while its
 session operation remains pending and no terminal result artifact exists. Only exact
-source-free journal metadata proving `spawn_failed`/no launch permits the same
+source-free journal metadata proving `spawn_failed`/no launch together with validated
+absence of launch receipt, exit receipt, and result artifact permits the same
 no-effect transaction: refund once, consume the pending key, and mark the failure
-unreturned. Any other no-result completed/failed shape pauses indeterminate or
-requires recovery; it never infers no effect.
+unreturned. A complete launch receipt always takes precedence and pauses. Any other
+no-result completed/failed shape pauses indeterminate or requires recovery; it never
+infers no effect.
 
 ### Post-hoc budgets
 
@@ -494,6 +502,14 @@ healthy path diffs. Integrity violations remain whole-diff
 healthy patch or terminal baseline. This degradation applies only to terminal
 baselines; a missing typed-patch checkpoint entry retains the current whole-diff
 `CHECKPOINT_CORRUPT` behavior.
+
+Apply the same bounded degradation before the current session-diff file-count and
+aggregate-input limits fire. Preserve all patch-sourced paths within the existing
+patch contract; deterministically retain terminal-sourced paths that fit the
+remaining bound, return a bounded sample of terminal `unavailable` markers, and
+report exact omitted terminal path/count totals. If patch paths alone exceed the
+existing bound, retain the current whole-diff failure. Healthy in-bound paths are
+never discarded merely because additional terminal paths were omitted.
 
 The final handoff separately reports:
 
@@ -548,10 +564,10 @@ command ID.
 
 Observed authority does not relax the existing `outOfScopePaths` completion gate.
 Terminal-attributed visible paths must still fall within the effective grant's write
-scope for completion. Slice 2 fixtures use an explicit test/manual grant covering
-their effect paths; Slice 3 must create a Developer grant whose intended project
-write scope supports the advertised workflows without weakening protected/hidden
-boundaries.
+scope for completion. Slice 2 fixtures use a hand-built session grant covering their
+effect paths plus organization/repository policies that allow `terminal_exec`; Slice
+3 must create a Developer grant whose intended project write scope supports the
+advertised workflows without weakening protected/hidden boundaries.
 
 No separate branch/HEAD/index fields are needed in `TerminalMutationRecord` for
 completion. The unchanged `GitInspector.status().snapshotSha256` already binds
@@ -615,13 +631,15 @@ All tracks branch from the exact reviewed `S2-C0` SHA.
 | Track | Exclusive production ownership | Focused tests |
 | --- | --- | --- |
 | A — repository observation | `workspace-observer.ts`; observation-only additions to `git.ts`, `context.ts`, repository exports | observer and Git fixtures |
-| B — persistence/evidence | `terminal-artifacts.ts`, `artifact-store.ts`, shared session directory-sync helper, observation/session validators | artifact binding, compatibility, durability |
+| B — persistence/evidence | `terminal-artifacts.ts`, `artifact-store.ts`, shared session directory-sync helper, artifact/observation validators | artifact binding, compatibility, durability |
 | C — session diff | `snapshot-diff.ts` and narrow terminal resolver | mixed patch/terminal diff |
-| P — primary serialized integration | `terminal-executor.ts`, `tool-host.ts`, `agent-runtime.ts`, `budgets.ts`, `completion.ts`, `runtime-composition.ts`, `cli/commands.ts`, handoff/review package | executor, runtime, accounting, completion, end-to-end, reliability |
+| P — primary serialized integration | `session/types.ts`, `session/store.ts`, `terminal-executor.ts`, `tool-host.ts`, `agent-runtime.ts`, `budgets.ts`, `completion.ts`, `runtime-composition.ts`, `cli/commands.ts`, handoff/review package | session compatibility, executor, runtime, accounting, completion, end-to-end, reliability |
 
 No two worktrees edit an integration file concurrently. The primary owns all
 contract changes after `S2-C0`, all conflict resolution, every push, and every merge.
 Executor and runtime integration are deliberately serialized.
+After `S2-C0`, only the primary edits `session/types.ts` or `session/store.ts`;
+specialists return any newly discovered contract need instead of changing them.
 
 ## Pull request and integration sequence
 
@@ -633,7 +651,8 @@ Use five reviewable PRs:
    with the strict artifact owner.
 3. **S2-C — session diff.** Land mixed patch/terminal baselines against the reviewed
    observation reader. Exact Opus review `R2-1` runs on the integrated A+B+C head so
-   silent diff omission is reviewed before executor integration.
+   silent diff omission is reviewed with fixtures before executor integration;
+   `R2-2` repeats it through real runtime-created terminal records.
 4. **S2-P1+P2 — executor and effects.** Replace placeholders, add the launch
    receipt, preserve process ordering, implement startup/live/replay effect
    application and post-hoc accounting. Exact Opus review `R2-2`.
@@ -666,6 +685,8 @@ primary pushes and merges.
 - failure to capture identity-only evidence or the bounded observation refuses
   launch;
 - one concurrent-churn retry, then explicit unknown;
+- pre-observation deadline expiry refuses/refunds, post-observation expiry becomes
+  non-clean `unknown`, and a large-repository fixture completes within 40 seconds;
 - HEAD/ref/index transitions classify as observed while hook/config/info/protected
   changes classify as non-clean;
 - over-bound effect paths preserve exact totals/digest and explicit truncation under
@@ -698,6 +719,7 @@ Inject crashes:
 
 - after request;
 - after pre-observation;
+- between launch-receipt content and manifest renames;
 - after launch receipt;
 - after the child side effect;
 - after exit receipt;
@@ -756,10 +778,12 @@ and zero partial accounting.
 - earliest pre-existing user bytes remain the baseline;
 - rename endpoints, per-path unavailable baseline behavior, and whole-diff integrity
   failure;
+- terminal paths beyond session-diff file/input bounds retain healthy paths plus a
+  bounded unavailable sample and exact omitted totals;
 - no terminal-mutated path is silently omitted;
 - observed authority is read only from the persisted field;
-- default Slice 2 session creation seeds frozen while an explicit
-  terminal-capable test/manual grant seeds observed;
+- default Slice 2 session creation seeds frozen while a hand-built terminal-capable
+  grant plus allowing organization/repository fixtures seed observed;
 - old `auto`, config v1, old grants, and absent-field sessions stay frozen;
 - frozen branch/HEAD drift still rejects;
 - non-clean terminal records reject under frozen and observed authority and never
@@ -839,7 +863,8 @@ Slice 2 is mergeable only on one immutable exact head where:
     frozen sessions retain their current restrictions;
 11. external drift after the last recorded effect or validation rejects completion;
 12. session diff contains terminal baselines or per-path unavailable evidence
-    without discarding healthy paths;
+    without discarding healthy paths, including exact omitted counts above diff
+    bounds;
 13. handoff separates user work, terminal effects, process outcomes, validation, and
     limitations;
 14. Windows and macOS hosted behavior is green without unexpected skips;
