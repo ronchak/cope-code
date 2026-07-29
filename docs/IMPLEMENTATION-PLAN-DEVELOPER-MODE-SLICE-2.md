@@ -1,0 +1,647 @@
+# Developer Mode Slice 2 implementation plan
+
+Status: executable implementation plan
+
+Implementation base: `7f2118fb74051b12a1e21bf349cf615d6764cba2`
+
+Target: workspace effects and completion freshness only
+
+## Outcome
+
+Slice 2 replaces Slice 1's placeholder terminal observations with bounded,
+operation-scoped repository observations. Every terminal process outcome is reported
+independently from the project effects observed during its execution window.
+
+After this slice:
+
+- success, nonzero exit, timeout, cancellation, and OS spawn failure all retain
+  truthful process facts;
+- every launched operation has a full pre-observation and either a full
+  post-observation or an explicit non-clean observation;
+- created, updated, deleted, conservatively renamed, binary, staged, unstaged,
+  index, HEAD, and branch effects are attributed to the operation window;
+- session-start user work remains separately identified;
+- terminal mutations, validation staleness, and changed-file/line budgets are
+  applied exactly once;
+- unknown, protected, hidden, nested-repository, or post-result drift blocks
+  completion;
+- terminal-capable sessions can complete after attributed local Git transitions;
+- old sessions and sessions without terminal authority retain the current frozen
+  branch/HEAD behavior;
+- terminal-mutated paths appear in session diffs or produce an explicit unavailable
+  evidence result; and
+- catalog-backed `run_command` remains unchanged and remains the only named
+  validation mechanism.
+
+Slice 2 does not enable terminal authority for normal users. Config v2, product
+posture, onboarding, grants, and release documentation remain Slice 3 work.
+
+## Planning decisions
+
+This plan resolves the independent Codex and Fable plans using an exact-base Claude
+Opus comparison. The following decisions are frozen before implementation.
+
+### 1. Completion authority is persisted and capability-seeded
+
+Add an optional session field:
+
+```ts
+completionAuthority?: "frozen" | "observed";
+```
+
+Rules:
+
+- absent means `frozen`;
+- a new session is seeded from the hash-pinned effective grant:
+  `terminal_exec` present means `observed`, otherwise `frozen`;
+- mode names are never used as a proxy;
+- resume never recomputes the field from current policy, config, preference, or
+  mode;
+- an existing session may move from `frozen` to `observed` only in the same durable
+  transaction that expands its effective grant to add `terminal_exec`;
+- the field never downgrades during a session; and
+- old config, grants, sessions, fixtures, and recovery records therefore remain
+  frozen.
+
+This combines capability as the source of truth with a creation-time durable
+compatibility decision. Presence of session-start branch/HEAD facts cannot be the
+discriminator because every current session records them.
+
+### 2. Add a durable launch receipt, but do not invent resume-time attribution
+
+Slice 2 makes the interval between request persistence and process launch materially
+larger by inserting Git inspection and bounded before-image capture. Add a
+`terminal-launch-receipt` artifact after the full pre-observation succeeds and
+immediately before the OS spawn attempt.
+
+Recovery truth is:
+
+| Durable evidence | Recovery action |
+| --- | --- |
+| request/pre-observation, no launch receipt | complete as a deterministic prelaunch failure, refund the command reservation, never claim a process ran |
+| launch receipt, no exit receipt | pause indeterminate, never rerun |
+| exit receipt, no complete result | pause indeterminate, never rerun; expose a source-free reconciliation summary from durable evidence |
+| complete matching result, no applied effects | promote the journal, apply effects exactly once, and replay |
+| complete result and applied effects | replay only; no effect or budget changes |
+
+Do not take a resume-time post-observation and call it operation-scoped. Unrelated
+editor or user activity may have happened during the gap, and a later cleanup could
+even erase the command's effects. Such an observation cannot prove either `none` or
+`observed`.
+
+The receipt is trusted for ordinary hard-process-crash recovery only after the
+artifact store has completed its atomic write. Add a parent-directory durability
+step after rename on POSIX/macOS. Preserve Windows support using the strongest
+available file-flush plus atomic-replace semantics and cover ordinary process-crash
+visibility in hosted tests. Do not claim sudden-power-loss durability on hosts where
+Node cannot provide it; power-loss recovery is outside this MVP's guarantee.
+
+### 3. Preserve the repository fingerprint definition
+
+`repositoryFingerprint` remains exactly
+`GitInspector.status().snapshotSha256`. The workspace observer must obtain this value
+through the existing inspector rather than define a parallel digest.
+
+Expose component fingerprints additively for index, policy-hidden state, protected
+worktree state, normal Git transitions, and non-transition Git control state.
+Existing `snapshotSha256`, `excludedStateSha256`, validation records, session-start
+facts, and completion comparisons remain byte-compatible.
+
+### 4. Record only meaningful or non-clean terminal mutations
+
+- `observed` with nonempty changes: append one terminal mutation and increment
+  `mutationSequence`.
+- `unknown` or `protected_or_hidden_changed`: append one explicit non-clean terminal
+  mutation without an invented repository fingerprint and increment
+  `mutationSequence`.
+- verified `none`: append no mutation and do not increment `mutationSequence`.
+
+Every case clears the interim pending effect ID only in the same atomic session
+update that records the final attribution/accounting state. A non-clean record still
+blocks completion explicitly. A verified no-op must not make an informational
+`kind: "answer"` completion impossible merely because a mutation record exists.
+
+### 5. Keep observation bounded without rejecting large clean repositories
+
+Do not persist a complete index manifest and do not persist post-images.
+
+For before-state reconstruction:
+
+- untracked paths retain bounded bytes, unless their blob already exists in the
+  object database;
+- tracked paths whose worktree differs from the index retain bounded bytes or an
+  existing blob identity;
+- staged and dirty porcelain-v2 entries retain their HEAD/index blob identities;
+- a clean tracked path absent from pre-status is reconstructed from the persisted
+  pre-observation HEAD;
+- persist an index identity hash, not the full clean inventory; and
+- missing or ambiguous evidence yields `unknown`, never an invented baseline.
+
+Initial bounds:
+
+- at most 200 retained source-image entries;
+- at most 1 MiB per retained image;
+- at most 3 MiB raw retained source bytes;
+- at most 2 MiB index-identity input;
+- at most 1 MiB porcelain-status input; and
+- at most 6 MiB serialized observation artifact bytes after base64 expansion.
+
+Exceeding required prelaunch evidence refuses launch with a bounded recovery action.
+Post-launch overflow produces an explicit `unknown` observation while preserving
+process truth.
+
+### 6. Session diff is part of Slice 2
+
+The current composition silently drops terminal mutations when building session
+diffs. Slice 2 must widen the diff record to a patch/terminal union and use a narrow,
+reference-verifying terminal before-image resolver. A terminal-mutated path is
+included using the earliest trustworthy session baseline or produces explicit
+unavailable evidence. It is never silently omitted.
+
+### 7. Do not extend strict journal result metadata
+
+Keep `terminal-journal-result/1` byte-compatible. Its validator is exact-keyed and
+existing Slice 1 records must keep replaying. Full effect facts remain in the
+integrity-bound terminal result and observation artifacts, which effect, diff, and
+handoff consumers load through one validating persistence owner.
+
+## Architecture
+
+### Workspace observer
+
+Add `src/repository/workspace-observer.ts`, exported by the repository package and
+constructed by `RepositoryContext`.
+
+The repository layer owns:
+
+```ts
+interface WorkspaceObserver {
+  capturePre(signal?: AbortSignal): Promise<WorkspaceObservation>;
+  capturePost(pre: WorkspaceObservation): Promise<WorkspaceObservation>;
+  compare(
+    pre: WorkspaceObservation,
+    post: WorkspaceObservation,
+    sessionBaseline: SessionPreExistingBaseline,
+  ): Promise<WorkspaceEffect>;
+}
+```
+
+The implementation has no browser, model, session-store, or runtime imports. It uses
+direct Git argv, NUL-delimited porcelain v2, the existing repository boundary and
+path identity, and bounded reads. It never invokes hooks, filters, aliases, a pager,
+or a shell.
+
+`capturePost` owns a short observation deadline. It must not reuse an already-aborted
+process signal after timeout or cancellation. It starts only after process-tree
+termination has returned.
+
+Each observation is race-checked:
+
+1. capture status, branch, HEAD, index identity, and component fingerprints;
+2. retain the required bounded before-images;
+3. recapture the cheap boundary facts;
+4. accept only if both boundary samples match;
+5. retry the complete observation once for ordinary concurrent churn; and
+6. reject prelaunch or return an explicit non-clean post-state after the retry.
+
+### Observation artifact
+
+Keep the current placeholder codec as a byte-exact legacy branch. Add a strict union
+member such as `terminal-workspace-observation/1` with:
+
+- `phase: "pre" | "post"`;
+- observation timestamp;
+- the unchanged repository fingerprint;
+- branch and HEAD facts;
+- index identity;
+- bounded porcelain-v2 entries with rename origins and HEAD/index blob identities;
+- state fingerprints for visible paths;
+- policy-hidden, protected, Git-transition, and Git-control component fingerprints;
+- bounded pre-worktree image records with existence, mode, size, binary status,
+  SHA-256, and either retained bytes or a reconstructible blob identity;
+- bounded ignored summary with count, aggregate, and truncation flag;
+- nested-repository result;
+- `complete`, `protected_or_hidden_changed`, or `unknown` state; and
+- bounded, source-free limitation codes.
+
+The existing artifact envelope binds kind, operation ID, request hash, phase, body
+hash, and reference. Do not add a third phase such as `post_recovered`.
+
+### Effect comparison
+
+Compare the exact persisted pre/post observations. Effects describe what was
+observed during the operation window, not proven child causation.
+
+Produce the existing frozen terminal result fields:
+
+- created, updated, deleted, and conservatively verified renamed paths;
+- pre-existing-touched paths, defined against the session-start
+  `preExistingChanges` baseline;
+- changed file and line counts;
+- binary and bounded ignored summaries;
+- mutation outcome; and
+- final repository fingerprint only when state is known.
+
+Rename classification requires a usable Git rename origin plus matching pre-state
+identity. Ambiguous or unverifiable cases degrade to create/delete. Use
+`RepositoryBoundary.pathKey` for identity and preserve display spelling, including
+case-only renames.
+
+Changed lines use deterministic before/post content while the post-state is current.
+Binary paths are counted separately and excluded from line counts. Do not read a
+later worktree to recompute a persisted terminal result.
+
+An identical complete pre/post fingerprint yields `none`.
+Protected/hidden/Git-control/nested-repository drift yields
+`protected_or_hidden_changed`. Post-observation failure or insufficient evidence
+yields `unknown`.
+
+An OS spawn failure is still post-observed. If pre and post are identical, its
+mutation is `none`; if they differ, use `unknown`, because a process that never
+launched cannot truthfully be credited with concurrent changes.
+
+### Terminal executor ordering
+
+Preserve Slice 1's process, output, and artifact machinery. Replace placeholders in
+this order:
+
+1. prepare authorized cwd, environment, and normalized launch facts;
+2. persist request evidence;
+3. capture and persist the full pre-observation;
+4. on insufficient pre-evidence, persist a typed prelaunch failure and refund
+   `commands`;
+5. persist the launch receipt;
+6. spawn and supervise, retaining current output and cancellation behavior;
+7. persist the source-free exit receipt;
+8. wait for process-tree termination after timeout/cancellation;
+9. capture and persist the full post-observation using its own deadline;
+10. compare observations;
+11. scan and bound output;
+12. persist the complete result with independent process and mutation facts; and
+13. return to `AgentRuntime`.
+
+Post-observation trouble after launch does not erase a definite process result.
+Artifact/result persistence failure retains Slice 1's conservative
+`persistence_failed`/indeterminate behavior.
+
+### Exactly-once effect transaction
+
+Create one idempotent effect applicator keyed by operation ID and sourced only from a
+verified terminal result artifact. Invoke it from:
+
+1. live journal completion;
+2. replay of a pending/unreturned completed result; and
+3. startup promotion of an executing journal record with a verified result.
+
+The current startup promotion path must not stop after journal promotion; it must
+apply effects before continuing.
+
+One in-memory state update followed by one atomic session persist performs:
+
+- terminal mutation insertion when required;
+- `mutationSequence` increment when required;
+- changed-file/line post-hoc accounting;
+- pending terminal effect ID removal;
+- completed/unreturned bookkeeping needed by the surrounding transaction; and
+- durable pause facts for any budget overrun.
+
+If the session persist fails, the durable old state retains the pending ID and replay
+retries the same idempotent application. If a matching operation record already
+exists, verify its source-free facts and perform only idempotent cleanup. A mismatch
+is `RECOVERY_REQUIRED`.
+
+### Post-hoc budgets
+
+Add a non-throwing terminal/post-hoc budget API. It:
+
+- validates bounded nonnegative input;
+- applies safe, saturating arithmetic without throwing before state is updated;
+- records the actual known changed-file/line usage once;
+- returns all exceeded dimensions and effective one-time/persisted limits; and
+- allows the runtime to persist truth before entering the existing budget-recovery
+  pause.
+
+`commands` remains charged once at the launch boundary and refunded only when no
+process launched. `commandOutputBytes` remains charged once from the durable result.
+Recovery and replay never charge any counter twice.
+
+### Terminal mutation and compatibility
+
+Use the existing terminal mutation shape. Add only source-free facts that completion
+or handoff cannot otherwise obtain cheaply, at most an optional `processOutcome`.
+Do not duplicate full result facts in session state.
+
+Update strict validators additively:
+
+- legacy six-key patch records remain valid;
+- optional `kind: "patch"` records remain valid;
+- current Slice 1 terminal records and sessions remain readable;
+- new terminal records require exact operation/result/observation binding;
+- terminal records never receive a patch checkpoint ID or update
+  `lastCheckpointId`; and
+- non-clean records contain no invented fingerprint.
+
+Legacy placeholder results replay exact process/output truth, retain or restore their
+pending effect ID, and block completion with an actionable reconcile/new-session
+message. They are never retroactively attributed from the current worktree.
+
+### Session diff and handoff
+
+Widen `SessionMutationDiffRecord` to a patch/terminal union. The diff engine receives
+a narrow callback returning verified checkpoint-snapshot-shaped before facts; it
+does not import the terminal artifact store.
+
+For each task-mutated path, choose the earliest verified baseline across typed patch
+checkpoints and terminal pre-observations. Include both rename endpoints. Missing,
+corrupt, placeholder, bounded-out, or unknown terminal evidence returns an explicit
+unknown/recovery-required diff.
+
+The final handoff separately reports:
+
+- session-start pre-existing work;
+- pre-existing paths touched during terminal windows;
+- task-attributed patch and terminal paths;
+- terminal process outcomes;
+- non-clean observation limitations;
+- named validation outcomes; and
+- skipped checks.
+
+The review package stays source-free. Cleanup must not erase the source-free
+reconciliation summary for blocked, aborted, or failed terminal sessions.
+
+### Completion
+
+`frozen` authority preserves current behavior verbatim.
+
+`observed` authority:
+
+1. rejects unresolved journal operations;
+2. rejects legacy pending terminal effect IDs;
+3. rejects terminal records with `unknown` or
+   `protected_or_hidden_changed`;
+4. selects expected branch, HEAD, index, component, and repository facts from the
+   latest recorded effect;
+5. allows a later catalog validation to become authoritative only at the current
+   `mutationSequence` and exact current repository fingerprint;
+6. requires the live completion snapshot to equal the selected facts;
+7. rejects post-result editor/process drift; and
+8. requires every configured named `run_command` validation to succeed after the
+   latest mutation.
+
+`terminal_exec` never creates a `ValidationRecord` and never satisfies a required
+command ID.
+
+## Shared contract gate
+
+Land `S2-C0` as one exact-reviewed primary commit before specialist implementation.
+It contains types, validators, compile-only seams, and compatibility tests, not live
+attribution.
+
+Required contract decisions:
+
+1. unchanged `GitInspector.status().snapshotSha256` identity;
+2. persisted, capability-seeded, monotonic `completionAuthority`;
+3. launch-receipt artifact and its host durability guarantee;
+4. non-throwing post-hoc budget API;
+5. strict legacy/full observation union with only pre/post phases;
+6. no journal metadata key additions;
+7. bounded before-images without a full index manifest or post-images; and
+8. mixed patch/terminal session-diff resolver interface.
+
+Expected contract files:
+
+- `src/repository/workspace-observer.ts`;
+- additive types in `src/repository/git.ts`;
+- `src/session/terminal-artifacts.ts`;
+- `src/session/artifact-store.ts`;
+- `src/session/types.ts`;
+- `src/session/store.ts`;
+- `src/session/budgets.ts`;
+- `src/repository/snapshot-diff.ts`; and
+- compile-only completion/runtime wiring.
+
+The contract gate must include byte-compatible Slice 1 artifact, journal, session,
+patch-record, validation, and config-v1 fixtures.
+
+## Worktree ownership
+
+All tracks branch from the exact reviewed `S2-C0` SHA.
+
+| Track | Exclusive production ownership | Focused tests |
+| --- | --- | --- |
+| A — repository observation | `workspace-observer.ts`; observation-only additions to `git.ts`, `context.ts`, repository exports | observer and Git fixtures |
+| B — persistence/evidence | `terminal-artifacts.ts`, `artifact-store.ts`, observation/session validators | artifact binding, compatibility, durability |
+| C — session diff | `snapshot-diff.ts` and narrow terminal resolver | mixed patch/terminal diff |
+| P — primary serialized integration | `terminal-executor.ts`, `tool-host.ts`, `agent-runtime.ts`, `budgets.ts`, `completion.ts`, `runtime-composition.ts`, handoff/review package | executor, runtime, accounting, completion, end-to-end, reliability |
+
+No two worktrees edit an integration file concurrently. The primary owns all
+contract changes after `S2-C0`, all conflict resolution, every push, and every merge.
+Executor and runtime integration are deliberately serialized.
+
+## Pull request and integration sequence
+
+Use five reviewable PRs:
+
+1. **S2-C0 — shared contracts.** Types, codecs, validators, compatibility fixtures,
+   compile-only seams. Exact Opus review `R2-0`.
+2. **S2-A+B — observer and bound persistence.** Integrate observer capture/compare
+   with the strict artifact owner. Exact Opus review `R2-1`.
+3. **S2-C — session diff.** Land mixed patch/terminal baselines against the reviewed
+   observation reader.
+4. **S2-P1+P2 — executor and effects.** Replace placeholders, add the launch
+   receipt, preserve process ordering, implement startup/live/replay effect
+   application and post-hoc accounting. Exact Opus review `R2-2`.
+5. **S2-P3 — completion and acceptance.** Persist/consume completion authority,
+   integrate freshness, handoff/review facts, cross-layer tests, and hosted evidence.
+   Exact final-head Opus review `R2-3`.
+
+Every pushed commit receives the standing exact-SHA Codex review. Each PR rebases or
+merges onto the exact previous integration head before its final review. Only the
+primary pushes and merges.
+
+## Test matrix
+
+### Observer
+
+- clean no-op;
+- create, update, delete;
+- staged-only, unstaged-only, and mixed state;
+- command cleans a previously dirty path;
+- command edits a previously untracked path;
+- conservative rename, ambiguous rename degradation, and case-only rename;
+- empty file, executable-bit-only, LF/CRLF-only, and binary effects;
+- commit, branch creation/switch, detached HEAD, and index-only effects;
+- ignored summary without an exhaustive claim;
+- hidden/protected path, hook/config/control drift, and nested repository;
+- unreadable or over-bound post-state;
+- required pre-image overrun refuses launch;
+- one concurrent-churn retry, then explicit unknown;
+- spaces, Unicode, leading dash, and host-specific path spelling; and
+- observer fingerprint equals an independent
+  `GitInspector.status().snapshotSha256`.
+
+### Executor and artifacts
+
+- full observation and result reference binding;
+- legacy placeholder branch remains byte-compatible;
+- post-observation after success, nonzero, timeout, cancellation, and OS spawn
+  failure;
+- post-observation starts after tree termination and ignores the caller's aborted
+  signal;
+- prelaunch refusal launches nothing and refunds;
+- post-observation failure persists process truth with mutation `unknown`;
+- output scanning denial preserves mutation truth;
+- artifact/result persistence failure stays indeterminate; and
+- cleanup preserves source-free reconcile facts.
+
+### Crash and recovery
+
+Inject crashes:
+
+- after request;
+- after pre-observation;
+- after launch receipt;
+- after the child side effect;
+- after exit receipt;
+- after post-observation;
+- after full result;
+- after journal completion;
+- after effect application;
+- after budget persistence;
+- after pending-ID clearing; and
+- after outbox queueing.
+
+Every row proves zero duplicate launches. No receipt is retry-safe for ordinary
+process crash. Receipt without exit pauses. Exit without result pauses with an
+advisory report. Complete result promotes and applies effects once.
+
+### Accounting and session state
+
+- observed nonempty effect records once, increments once, charges once, and clears
+  pending once;
+- verified none records no mutation and no sequence increment;
+- unknown/protected records a non-clean effect, increments the sequence, clears the
+  interim marker, and still blocks completion;
+- nonzero, timeout, and cancellation use identical effect accounting;
+- live, replay, startup promotion, and repeated recovery remain idempotent;
+- mismatched duplicate facts require recovery;
+- files-only, lines-only, and combined overruns persist actual usage before pausing;
+- approved, denied, and unavailable budget raises;
+- command and output counters remain exactly once; and
+- old validation becomes stale after a terminal mutation.
+
+### Diff, completion, and compatibility
+
+- terminal-only, patch-then-terminal, terminal-then-patch, and repeated touches;
+- earliest pre-existing user bytes remain the baseline;
+- rename endpoints and missing/corrupt/placeholder baseline behavior;
+- no terminal-mutated path is silently omitted;
+- observed authority is read only from the persisted field;
+- old `auto`, config v1, old grants, and absent-field sessions stay frozen;
+- frozen branch/HEAD drift still rejects;
+- an attributed branch/HEAD/index transition completes only after fresh named
+  validation;
+- unknown/protected effects reject even after passing validation;
+- post-result drift rejects;
+- a no-op terminal command still permits informational completion;
+- `run_command` remains the only named-validation satisfier;
+- patch-only diffs and handoffs remain byte-compatible; and
+- source-free review packages contain no commands, output, roots, or path names.
+
+### Host behavior
+
+Windows:
+
+- direct Git argv and NUL-delimited parsing;
+- case-insensitive `pathKey` identity with preserved display spelling;
+- case-only rename and CRLF fixtures;
+- `.cmd` shell-mode effects;
+- `taskkill /T /F` completes before post-observation; and
+- launch-receipt visibility across an ordinary hard process crash.
+
+macOS:
+
+- actual boundary case sensitivity, not an APFS assumption;
+- executable-bit and UTF-8 filename effects;
+- POSIX exit/signal and descendant cleanup truth;
+- `/bin/sh` effects and cancellation followed by observation; and
+- parent-directory sync after receipt rename.
+
+Neither host claims child-process containment or exhaustive out-of-project effects.
+
+## Review checkpoints
+
+- **R2-0 — exact S2-C0 SHA:** fingerprint identity, authority persistence,
+  receipt durability, observation union, bounds, non-throwing post-hoc accounting,
+  strict compatibility, and specialist seam sufficiency.
+- **R2-1 — exact S2-A+B SHA:** operation-scoped classification, before-image
+  sufficiency, rename conservatism, base64 bound enforcement, protected/hidden
+  taxonomy, and Windows path identity.
+- **R2-2 — exact S2-P1+P2 SHA:** every crash window, process/effect independence,
+  startup promotion, exactly-once mutation/sequence/budgets, and pause-after-persist
+  ordering.
+- **R2-3 — exact final Slice 2 SHA:** session-start work preservation, mixed session
+  diff, non-widening resume behavior, validation freshness, handoff truth, host
+  evidence, and full compatibility.
+
+Duplicate execution, user-work loss, false completion, missing mutation after a
+failed command, silent diff omission, unsupported-host breakage, or double
+accounting is a merge blocker.
+
+## Final acceptance
+
+Slice 2 is mergeable only on one immutable exact head where:
+
+1. every launched operation has a full pre-observation and full or explicit
+   non-clean post-observation;
+2. failed, timed-out, and cancelled commands preserve both process and effect truth;
+3. all required project and Git effect classes have operation-scoped tests;
+4. session-start user work remains separately identified and recoverable;
+5. each result applies at most one mutation, sequence increment, and budget charge;
+6. post-hoc overrun truth is durable before later work pauses;
+7. pending effect IDs clear only after final effect/accounting persistence;
+8. unknown/protected effects cannot be masked by validation;
+9. validation freshness matches the latest sequence and exact fingerprint;
+10. observed sessions can complete after attributed Git transitions while old and
+    frozen sessions retain their current restrictions;
+11. external drift after the last recorded effect or validation rejects completion;
+12. session diff contains terminal baselines or explicit unavailable evidence;
+13. handoff separates user work, terminal effects, process outcomes, validation, and
+    limitations;
+14. Windows and macOS hosted behavior is green without unexpected skips; and
+15. existing terminal replay, process cleanup, browser/protocol, typed-patch,
+    catalog command, old session/config, and offline fixture tests remain green.
+
+Run on the exact final SHA:
+
+```text
+npm run build
+npm run test:unit
+npm run test:e2e
+npm run test:reliability
+npm run check
+```
+
+Then run hosted Windows x64 standard-user and macOS arm64/x64 terminal observation
+smokes before merge.
+
+## Deferred work
+
+Do not include:
+
+- Slice 3 config v2, terminal grants, onboarding, product presentation, kill-switch
+  UX, or release notes;
+- PTY, stdin, interactive prompts, persistent/background processes, or watch mode;
+- arbitrary-command rollback;
+- filesystem watchers or kernel audit integration;
+- worktree/container/VM/OS sandbox claims;
+- exhaustive ignored, out-of-project, remote, network, or service-side attribution;
+- multi-root workspaces;
+- model-supplied environment variables;
+- typed Git publication/push/release tools;
+- paged observation artifacts;
+- mode-enum renames; or
+- enterprise tamper-resistance or new policy layers.
+
+These are not Slice 2 blockers unless a concrete supported workflow would otherwise
+duplicate execution, lose user work, or permit false completion.
