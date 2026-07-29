@@ -417,12 +417,17 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
         immutableTransition.post,
         signal,
       );
+      const preMode = canonicalWorktreeMode(
+        preState,
+        preEntries.get(this.boundary.pathKey(from)),
+      );
+      const postMode = canonicalWorktreeMode(postState, entry);
       if (
         preState.exists &&
         postState.exists &&
         preState.sha256 !== undefined &&
         preState.sha256 === postState.sha256 &&
-        preState.mode === postState.mode
+        preMode === postMode
       ) {
         renamed.push({ from, to });
         consumed.add(this.boundary.pathKey(from));
@@ -2232,6 +2237,22 @@ function pathStateFromSample(sample: WorktreeSample): PathState {
     ...(sample.binary === undefined ? {} : { binary: sample.binary }),
     ...(sample.bytes === undefined ? {} : { bytes: sample.bytes }),
   };
+}
+
+/**
+ * Git tree identities use canonical Git modes, while Node's Windows stat mode
+ * commonly includes writable bits (for example 100666 for a 100644 blob).
+ * Porcelain v2's worktree mode keeps rename comparison in Git's mode domain
+ * without weakening the required byte match or explicit rename origin.
+ */
+function canonicalWorktreeMode(
+  state: PathState,
+  entry: GitObservationEntry | undefined,
+): number | undefined {
+  const worktreeMode = entry?.worktreeMode;
+  return worktreeMode !== undefined && /^[0-7]{6}$/u.test(worktreeMode)
+    ? Number.parseInt(worktreeMode, 8)
+    : state.mode;
 }
 
 function gitRawPathState(

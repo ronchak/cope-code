@@ -1,7 +1,19 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash, createHmac } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { cp, lstat, mkdir, mkdtemp, open, opendir, readlink, realpath, rm, writeFile } from "node:fs/promises";
+import {
+  cp,
+  lstat,
+  mkdir,
+  mkdtemp,
+  open,
+  opendir,
+  readlink,
+  realpath,
+  rm,
+  writeFile,
+  type FileHandle,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -1452,6 +1464,21 @@ export async function createIsolatedGitView(
     } catch (error) {
       if (!isMissingFileSystemError(error)) throw error;
     }
+    const sharedChecksum = await splitIndexChecksum(
+      isolatedIndexPath,
+      objectFormat,
+      signal,
+    );
+    if (sharedChecksum !== undefined) {
+      const fileName = `sharedindex.${sharedChecksum}`;
+      await copySharedIndex(
+        path.join(path.dirname(indexPath), fileName),
+        path.join(shadow, fileName),
+        sharedChecksum,
+        objectFormat,
+        signal,
+      );
+    }
     return {
       branch: branch ?? null,
       head: head ?? null,
@@ -1466,6 +1493,392 @@ export async function createIsolatedGitView(
   } catch (error) {
     await rm(shadow, { recursive: true, force: true });
     throw error;
+  }
+}
+
+async function splitIndexChecksum(
+  indexPath: string,
+  objectFormat: "sha1" | "sha256",
+  signal?: AbortSignal,
+): Promise<string | undefined> {
+  const hashBytes = objectFormat === "sha256" ? 32 : 20;
+  let handle;
+  try {
+    handle = await open(
+      indexPath,
+      fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
+    );
+  } catch (error) {
+    if (isMissingFileSystemError(error)) return undefined;
+    throw error;
+  }
+  try {
+    const state = await handle.stat({ bigint: true });
+    if (
+      !state.isFile() ||
+      state.nlink !== 1n ||
+      state.size > BigInt(Number.MAX_SAFE_INTEGER) ||
+      state.size < BigInt(12 + hashBytes)
+    ) {
+      throw malformedIndex("Git index is not a safely parseable regular file");
+    }
+    const size = Number(state.size);
+    const contentEnd = size - hashBytes;
+    const digest = createHash(objectFormat);
+    for await (const chunk of handle.createReadStream({
+      autoClose: false,
+      start: 0,
+      end: contentEnd - 1,
+    })) {
+      throwIfSharedIndexCopyCancelled(signal);
+      digest.update(Buffer.from(chunk));
+    }
+    const trailingChecksum = await readIndexBytes(
+      handle,
+      contentEnd,
+      hashBytes,
+    );
+    if (!digest.digest().equals(trailingChecksum)) {
+      throw malformedIndex("Git index checksum is invalid");
+    }
+    const header = await readIndexBytes(handle, 0, 12);
+    if (!header.subarray(0, 4).equals(Buffer.from("DIRC", "ascii"))) {
+      throw malformedIndex("Git index signature is invalid");
+    }
+    const version = header.readUInt32BE(4);
+    if (![2, 3, 4].includes(version)) {
+      throw malformedIndex("Git index version is unsupported");
+    }
+    const entryCount = header.readUInt32BE(8);
+    const fixedEntryBytes = 42 + hashBytes;
+    if (
+      entryCount >
+      Math.floor(Math.max(0, contentEnd - 12) / fixedEntryBytes)
+    ) {
+      throw malformedIndex("Git index entry count exceeds its byte length");
+    }
+    let offset = 12;
+    for (let index = 0; index < entryCount; index += 1) {
+      throwIfSharedIndexCopyCancelled(signal);
+      const entryStart = offset;
+      const fixed = await readIndexBytes(
+        handle,
+        offset,
+        fixedEntryBytes,
+        contentEnd,
+      );
+      const flags = fixed.readUInt16BE(40 + hashBytes);
+      offset += fixedEntryBytes;
+      if ((flags & 0x4000) !== 0) {
+        if (version < 3) {
+          throw malformedIndex(
+            "Git index v2 entry unexpectedly has extended flags",
+          );
+        }
+        await readIndexBytes(handle, offset, 2, contentEnd);
+        offset += 2;
+      }
+      if (version === 4) {
+        let variableBytes = 0;
+        while (true) {
+          const encoded = await readIndexBytes(handle, offset, 1, contentEnd);
+          offset += 1;
+          variableBytes += 1;
+          if (variableBytes > 10) {
+            throw malformedIndex(
+              "Git index v4 path prefix encoding is malformed",
+            );
+          }
+          if (((encoded[0] ?? 0) & 0x80) === 0) break;
+        }
+        offset = await indexNulEnd(handle, offset, contentEnd, signal);
+        continue;
+      }
+      const encodedNameLength = flags & 0x0fff;
+      const pathLength =
+        encodedNameLength === 0x0fff
+          ? (await indexNulEnd(handle, offset, contentEnd, signal)) - offset - 1
+          : encodedNameLength;
+      if (encodedNameLength !== 0x0fff) {
+        const terminator = await readIndexBytes(
+          handle,
+          offset + pathLength,
+          1,
+          contentEnd,
+        );
+        if (terminator[0] !== 0) {
+          throw malformedIndex("Git index entry path is not NUL-terminated");
+        }
+      }
+      const entryWithoutPadding =
+        offset + pathLength - entryStart;
+      const padding = 8 - (entryWithoutPadding % 8);
+      const paddingBytes = await readIndexBytes(
+        handle,
+        offset + pathLength,
+        padding,
+        contentEnd,
+      );
+      if (paddingBytes.some((value) => value !== 0)) {
+        throw malformedIndex("Git index entry padding is malformed");
+      }
+      offset += pathLength + padding;
+    }
+
+    let linkChecksum: string | undefined;
+    let sawLink = false;
+    while (offset < contentEnd) {
+      const extensionHeader = await readIndexBytes(
+        handle,
+        offset,
+        8,
+        contentEnd,
+      );
+      const signature = extensionHeader.subarray(0, 4).toString("ascii");
+      const extensionBytes = extensionHeader.readUInt32BE(4);
+      offset += 8;
+      if (extensionBytes > contentEnd - offset) {
+        throw malformedIndex("Git index extension exceeds its byte length");
+      }
+      if (signature === "link") {
+        if (sawLink || extensionBytes < hashBytes) {
+          throw malformedIndex("Git split-index link extension is malformed");
+        }
+        sawLink = true;
+        const checksum = await readIndexBytes(
+          handle,
+          offset,
+          hashBytes,
+          contentEnd,
+        );
+        if (!checksum.equals(Buffer.alloc(hashBytes))) {
+          linkChecksum = checksum.toString("hex");
+        }
+      }
+      offset += extensionBytes;
+    }
+    if (offset !== contentEnd) {
+      throw malformedIndex("Git index extensions are misaligned");
+    }
+    return linkChecksum;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function indexNulEnd(
+  handle: FileHandle,
+  start: number,
+  contentEnd: number,
+  signal?: AbortSignal,
+): Promise<number> {
+  let offset = start;
+  while (offset < contentEnd) {
+    throwIfSharedIndexCopyCancelled(signal);
+    const bytes = await readIndexBytes(
+      handle,
+      offset,
+      Math.min(4 * 1024, contentEnd - offset),
+      contentEnd,
+    );
+    const nul = bytes.indexOf(0);
+    if (nul >= 0) return offset + nul + 1;
+    offset += bytes.length;
+  }
+  throw malformedIndex("Git index entry path is not NUL-terminated");
+}
+
+async function readIndexBytes(
+  handle: FileHandle,
+  position: number,
+  length: number,
+  contentEnd = Number.MAX_SAFE_INTEGER,
+): Promise<Buffer> {
+  if (
+    !Number.isSafeInteger(position) ||
+    !Number.isSafeInteger(length) ||
+    position < 0 ||
+    length < 0 ||
+    position + length > contentEnd
+  ) {
+    throw malformedIndex("Git index structure exceeds its byte length");
+  }
+  const result = Buffer.alloc(length);
+  let read = 0;
+  while (read < length) {
+    const chunk = await handle.read(
+      result,
+      read,
+      length - read,
+      position + read,
+    );
+    if (chunk.bytesRead < 1) {
+      throw malformedIndex("Git index ended before its declared structure");
+    }
+    read += chunk.bytesRead;
+  }
+  return result;
+}
+
+function malformedIndex(message: string): AgentError {
+  return new AgentError("RECOVERY_REQUIRED", message);
+}
+
+async function copySharedIndex(
+  sourcePath: string,
+  destinationPath: string,
+  expectedChecksum: string,
+  objectFormat: "sha1" | "sha256",
+  signal?: AbortSignal,
+): Promise<void> {
+  const checksumBytes = objectFormat === "sha256" ? 32 : 20;
+  const expected = Buffer.from(expectedChecksum, "hex");
+  let source;
+  let destination;
+  let completed = false;
+  try {
+    throwIfSharedIndexCopyCancelled(signal);
+    const initialPath = await lstat(sourcePath, { bigint: true });
+    if (
+      !initialPath.isFile() ||
+      initialPath.isSymbolicLink() ||
+      initialPath.nlink !== 1n
+    ) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Git split-index backing is not a bounded regular file",
+      );
+    }
+    source = await open(
+      sourcePath,
+      fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
+    );
+    const before = await source.stat({ bigint: true });
+    const beforePath = await lstat(sourcePath, { bigint: true });
+    if (
+      !before.isFile() ||
+      beforePath.isSymbolicLink() ||
+      before.nlink !== 1n ||
+      before.dev !== beforePath.dev ||
+      before.ino !== beforePath.ino ||
+      before.size !== beforePath.size ||
+      initialPath.dev !== before.dev ||
+      initialPath.ino !== before.ino ||
+      initialPath.size !== before.size ||
+      initialPath.mtimeNs !== before.mtimeNs ||
+      initialPath.ctimeNs !== before.ctimeNs ||
+      before.size < BigInt(checksumBytes) ||
+      before.size > BigInt(MAX_GIT_CONTROL_BYTES)
+    ) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Git split-index backing is not a bounded regular file",
+      );
+    }
+    destination = await open(
+      destinationPath,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL,
+      0o600,
+    );
+    const digest = createHash(objectFormat);
+    let checksumTail = Buffer.alloc(0);
+    let copiedBytes = 0;
+    for await (const chunk of source.createReadStream({ autoClose: false })) {
+      throwIfSharedIndexCopyCancelled(signal);
+      const data = Buffer.from(chunk);
+      copiedBytes += data.length;
+      if (copiedBytes > MAX_GIT_CONTROL_BYTES) {
+        throw new AgentError(
+          "BUDGET_EXCEEDED",
+          "Git split-index backing exceeds its copy bound",
+          { maxBytes: MAX_GIT_CONTROL_BYTES },
+        );
+      }
+      const withTail = Buffer.concat([checksumTail, data]);
+      if (withTail.length > checksumBytes) {
+        const digestLength = withTail.length - checksumBytes;
+        digest.update(withTail.subarray(0, digestLength));
+        checksumTail = Buffer.from(withTail.subarray(digestLength));
+      } else {
+        checksumTail = withTail;
+      }
+      let written = 0;
+      while (written < data.length) {
+        const result = await destination.write(
+          data,
+          written,
+          data.length - written,
+          null,
+        );
+        if (result.bytesWritten < 1) {
+          throw new AgentError(
+            "COMMAND_FAILED",
+            "Git split-index backing copy made no progress",
+          );
+        }
+        written += result.bytesWritten;
+      }
+    }
+    const calculated = digest.digest();
+    if (
+      checksumTail.length !== checksumBytes ||
+      !checksumTail.equals(expected) ||
+      !calculated.equals(expected)
+    ) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Git split-index backing checksum does not match its link identity",
+      );
+    }
+    const after = await source.stat({ bigint: true });
+    const afterPath = await lstat(sourcePath, { bigint: true });
+    if (
+      !after.isFile() ||
+      afterPath.isSymbolicLink() ||
+      after.nlink !== 1n ||
+      before.dev !== after.dev ||
+      before.ino !== after.ino ||
+      before.size !== after.size ||
+      before.mtimeNs !== after.mtimeNs ||
+      before.ctimeNs !== after.ctimeNs ||
+      after.dev !== afterPath.dev ||
+      after.ino !== afterPath.ino ||
+      after.size !== afterPath.size
+    ) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Git split-index backing changed while it was copied",
+      );
+    }
+    await destination.sync();
+    completed = true;
+  } catch (error) {
+    if (isMissingFileSystemError(error)) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Git split-index backing is missing",
+        {},
+        { cause: error },
+      );
+    }
+    throw error;
+  } finally {
+    await Promise.all([
+      source?.close().catch(() => undefined),
+      destination?.close().catch(() => undefined),
+    ]);
+    if (!completed) {
+      await rm(destinationPath, { force: true }).catch(() => undefined);
+    }
+  }
+}
+
+function throwIfSharedIndexCopyCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted === true) {
+    throw new AgentError(
+      "COMMAND_CANCELLED",
+      "Git split-index backing copy was cancelled",
+    );
   }
 }
 

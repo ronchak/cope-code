@@ -1,9 +1,20 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { access, chmod, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  chmod,
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import { promisify } from "node:util";
 
 import { AgentError } from "../../src/shared/errors.js";
@@ -166,6 +177,14 @@ test("Git inspector uses fixed read-only operations and returns bounded structur
     git.diff({ paths: ["../outside"] }),
     (error: unknown) => error instanceof AgentError && error.code === "PATH_OUTSIDE_REPOSITORY",
   );
+});
+
+test("Git inspector isolates a SHA-1 split index without rewriting real index files", async (context) => {
+  await exerciseSplitIndex(context, "sha1");
+});
+
+test("Git inspector isolates a SHA-256 split index when supported by host Git", async (context) => {
+  await exerciseSplitIndex(context, "sha256");
 });
 
 test("Git status fingerprint binds dirty bytes, branch, HEAD, and non-disclosing state markers", async (context) => {
@@ -471,3 +490,179 @@ test("a non-readable directory is not emitted but traversal can reach an allowed
     true,
   );
 });
+
+async function exerciseSplitIndex(
+  context: TestContext,
+  objectFormat: "sha1" | "sha256",
+): Promise<void> {
+  const root = await mkdtemp(path.join(os.tmpdir(), `cba-split-${objectFormat}-`));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  try {
+    await execFileAsync(DEFAULT_GIT_EXECUTABLE, [
+      "init",
+      "--quiet",
+      ...(objectFormat === "sha256" ? ["--object-format=sha256"] : []),
+      root,
+    ]);
+  } catch (error) {
+    if (
+      objectFormat === "sha256" &&
+      unsupportedGitFeature(error, /(?:sha-?256|object-format).*(?:unsupported|not supported|unknown)|unknown option.*object-format/iu)
+    ) {
+      context.skip("Installed Git does not support SHA-256 repositories");
+      return;
+    }
+    throw error;
+  }
+  await execFileAsync(DEFAULT_GIT_EXECUTABLE, [
+    "-C",
+    root,
+    "config",
+    "user.name",
+    "CBA Test",
+  ]);
+  await execFileAsync(DEFAULT_GIT_EXECUTABLE, [
+    "-C",
+    root,
+    "config",
+    "user.email",
+    "cba@example.invalid",
+  ]);
+  await writeFile(path.join(root, "tracked.txt"), "before\n");
+  await execFileAsync(DEFAULT_GIT_EXECUTABLE, [
+    "-C",
+    root,
+    "add",
+    "--",
+    "tracked.txt",
+  ]);
+  await execFileAsync(DEFAULT_GIT_EXECUTABLE, [
+    "-C",
+    root,
+    "commit",
+    "--quiet",
+    "-m",
+    "initial",
+  ]);
+  try {
+    await execFileAsync(DEFAULT_GIT_EXECUTABLE, [
+      "-C",
+      root,
+      "update-index",
+      "--split-index",
+    ]);
+  } catch (error) {
+    if (
+      objectFormat === "sha256" &&
+      unsupportedGitFeature(error, /split index.*(?:unsupported|not supported)/iu)
+    ) {
+      context.skip("Installed Git does not support split indexes in SHA-256 repositories");
+      return;
+    }
+    throw error;
+  }
+  const sharedResult = await execFileAsync(DEFAULT_GIT_EXECUTABLE, [
+    "-C",
+    root,
+    "rev-parse",
+    "--shared-index-path",
+  ]);
+  const sharedIndexPathRaw = String(sharedResult.stdout).trim();
+  const sharedIndexPath = path.isAbsolute(sharedIndexPathRaw)
+    ? sharedIndexPathRaw
+    : path.resolve(root, sharedIndexPathRaw);
+  assert.match(
+    path.basename(sharedIndexPath),
+    objectFormat === "sha256"
+      ? /^sharedindex\.[a-f0-9]{64}$/u
+      : /^sharedindex\.[a-f0-9]{40}$/u,
+  );
+  const indexPath = path.join(root, ".git", "index");
+  const indexBefore = await readFile(indexPath);
+  const sharedBefore = await readFile(sharedIndexPath);
+  const viewsBefore = await isolatedViewDirectories();
+  const inspector = new GitInspector(await RepositoryBoundary.create(root));
+  await writeFile(path.join(root, "tracked.txt"), "after\n");
+  const status = await inspector.status();
+  assert.equal(
+    status.entries.some((entry) => entry.path === "tracked.txt"),
+    true,
+  );
+  const diff = await inspector.diff({
+    baseline: "worktree",
+    paths: ["tracked.txt"],
+  });
+  assert.equal(diff.diff.includes("+after"), true);
+  assert.deepEqual(await readFile(indexPath), indexBefore);
+  assert.deepEqual(await readFile(sharedIndexPath), sharedBefore);
+  assert.deepEqual(await isolatedViewDirectories(), viewsBefore);
+
+  const missingPath = `${sharedIndexPath}.temporarily-missing`;
+  await rename(sharedIndexPath, missingPath);
+  try {
+    await assert.rejects(
+      inspector.status(),
+      (error: unknown) =>
+        error instanceof AgentError &&
+        ["COMMAND_FAILED", "RECOVERY_REQUIRED"].includes(error.code),
+    );
+    assert.deepEqual(await isolatedViewDirectories(), viewsBefore);
+  } finally {
+    await rename(missingPath, sharedIndexPath);
+  }
+
+  if (process.platform !== "win32") {
+    const symlinkTarget = `${sharedIndexPath}.symlink-target`;
+    await rename(sharedIndexPath, symlinkTarget);
+    await symlink(path.basename(symlinkTarget), sharedIndexPath);
+    try {
+      await assert.rejects(
+        inspector.status(),
+        /split-index backing is not a bounded regular file/iu,
+      );
+      assert.deepEqual(await isolatedViewDirectories(), viewsBefore);
+    } finally {
+      await rm(sharedIndexPath);
+      await rename(symlinkTarget, sharedIndexPath);
+    }
+  }
+
+  const corrupted = Buffer.from(sharedBefore);
+  corrupted[0] = (corrupted[0] ?? 0) ^ 0xff;
+  await writeFile(sharedIndexPath, corrupted);
+  try {
+    await assert.rejects(
+      inspector.status(),
+      /split-index backing checksum/iu,
+    );
+    assert.deepEqual(await isolatedViewDirectories(), viewsBefore);
+  } finally {
+    await writeFile(sharedIndexPath, sharedBefore);
+  }
+  const recovered = await inspector.status();
+  assert.equal(
+    recovered.entries.some((entry) => entry.path === "tracked.txt"),
+    true,
+  );
+  assert.deepEqual(await readFile(indexPath), indexBefore);
+}
+
+async function isolatedViewDirectories(): Promise<readonly string[]> {
+  return (await readdir(os.tmpdir()))
+    .filter((entry) => entry.startsWith("cba-git-view-"))
+    .sort();
+}
+
+function unsupportedGitFeature(
+  error: unknown,
+  pattern: RegExp,
+): boolean {
+  if (error === null || typeof error !== "object") return false;
+  const details = error as {
+    readonly message?: unknown;
+    readonly stderr?: unknown;
+  };
+  return pattern.test(
+    `${String(details.message ?? "")}\n${String(details.stderr ?? "")}`,
+  );
+}

@@ -30,6 +30,7 @@ import {
   GitInspector,
   type IsolatedGitReadResult,
   type IsolatedGitNulReadResult,
+  type GitObservationEntry,
   type GitStatusResult,
 } from "../../src/repository/git.js";
 import { sha256, stableJson } from "../../src/shared/crypto.js";
@@ -716,13 +717,62 @@ test("live observer conservatively verifies a staged rename", async (context) =>
   const pre = await fixture.observer.capturePre(baseline);
   await git(fixture.root, ["mv", "--", "README.md", "Renamed.md"]);
   const post = await fixture.observer.capturePost(pre);
-  const effect = await fixture.observer.compare(pre, post, baseline);
+  const liveEffect = await fixture.observer.compare(pre, post, baseline);
+  assert.deepEqual(liveEffect.paths.renamed, [
+    { from: "README.md", to: "Renamed.md" },
+  ]);
+  const comparisonBoundary = await RepositoryBoundary.create(fixture.root);
+  const comparisonObserver = new LiveWorkspaceObserver(
+    comparisonBoundary,
+    new GitInspector(comparisonBoundary),
+  );
+  const effect = await comparisonObserver.compare(
+    pre,
+    withWindowsWorktreeMode(post),
+    baseline,
+  );
   assert.equal(effect.outcome, "observed");
   assert.deepEqual(effect.paths.renamed, [
     { from: "README.md", to: "Renamed.md" },
   ]);
   assert.equal(effect.paths.createdTotal, 0);
   assert.equal(effect.paths.deletedTotal, 0);
+
+  const contentMismatch = withRenamedEntry(post, (entry) =>
+    entry.worktreeIdentity === undefined
+      ? entry
+      : {
+          ...entry,
+          worktreeIdentity: {
+            ...entry.worktreeIdentity,
+            contentSha256: "f".repeat(64),
+            mode: 0o100666,
+          },
+        });
+  assert.deepEqual(
+    (
+      await comparisonObserver.compare(pre, contentMismatch, baseline)
+    ).paths.renamed,
+    [],
+  );
+
+  const modeMismatch = withRenamedEntry(post, (entry) =>
+    entry.worktreeIdentity === undefined
+      ? entry
+      : {
+          ...entry,
+          worktreeMode: "100755",
+          worktreeIdentity: {
+            ...entry.worktreeIdentity,
+            mode: 0o100777,
+          },
+        });
+  assert.deepEqual(
+    (
+      await comparisonObserver.compare(pre, modeMismatch, baseline)
+    ).paths.renamed,
+    [],
+  );
 });
 
 test("live observer uses boundary path identity for a case-only rename", async (context) => {
@@ -741,7 +791,16 @@ test("live observer uses boundary path identity for a case-only rename", async (
   const pre = await observer.capturePre(emptyBaseline());
   await git(fixture.root, ["mv", "--", "README.md", "readme.md"]);
   const post = await observer.capturePost(pre);
-  const effect = await observer.compare(pre, post, emptyBaseline());
+  const liveEffect = await observer.compare(pre, post, emptyBaseline());
+  assert.deepEqual(liveEffect.paths.renamed, [
+    { from: "README.md", to: "readme.md" },
+  ]);
+  const comparisonObserver = new LiveWorkspaceObserver(boundary, inspector);
+  const effect = await comparisonObserver.compare(
+    pre,
+    withWindowsWorktreeMode(post),
+    emptyBaseline(),
+  );
   assert.deepEqual(effect.paths.renamed, [
     { from: "README.md", to: "readme.md" },
   ]);
@@ -1004,6 +1063,33 @@ export function observation(
     return { ...facts, state, repositoryFingerprint: HASH };
   }
   return { ...facts, state };
+}
+
+function withWindowsWorktreeMode(
+  observation: WorkspaceObservation,
+): WorkspaceObservation {
+  return withRenamedEntry(observation, (entry) =>
+    entry.worktreeIdentity === undefined
+      ? entry
+      : {
+          ...entry,
+          worktreeIdentity: {
+            ...entry.worktreeIdentity,
+            mode: 0o100666,
+          },
+        });
+}
+
+function withRenamedEntry(
+  observation: WorkspaceObservation,
+  update: (entry: GitObservationEntry) => GitObservationEntry,
+): WorkspaceObservation {
+  if (observation.state === "unknown") return observation;
+  return {
+    ...observation,
+    entries: observation.entries.map((entry) =>
+      entry.kind === "renamed" ? update(entry) : entry),
+  };
 }
 
 async function createRepositoryFixture(
