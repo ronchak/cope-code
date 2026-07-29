@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { verifyCompletion, type CompletionClaim } from "../../src/orchestrator/completion.js";
+import {
+  effectiveCompletionAuthority,
+  verifyCompletion,
+  type CompletionClaim,
+} from "../../src/orchestrator/completion.js";
 import {
   DEFAULT_BUDGET_LIMITS,
   SESSION_SCHEMA_VERSION,
@@ -61,6 +65,14 @@ function state(): SessionState {
     protocolRepairStreak: 0,
   };
 }
+
+test("completion authority defaults legacy sessions to frozen", () => {
+  assert.equal(effectiveCompletionAuthority({}), "frozen");
+  assert.equal(
+    effectiveCompletionAuthority({ completionAuthority: "observed" }),
+    "observed",
+  );
+});
 
 test("completion verifier accepts known, in-scope, freshly validated state", () => {
   const result = verifyCompletion(

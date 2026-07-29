@@ -1,8 +1,17 @@
 import {
   TERMINAL_EXEC_CONTRACT,
   TERMINAL_EXEC_RESULT_CONTRACT,
+  TERMINAL_STREAM_ARTIFACT_KINDS,
   type TerminalExecResult,
 } from "../protocol/terminal-exec.js";
+import {
+  WORKSPACE_OBSERVATION_CONTRACT,
+  TERMINAL_RESULT_MAX_PATH_BYTES,
+  TERMINAL_RESULT_MAX_PATH_ENDPOINTS,
+  isWorkspaceObservation,
+  type WorkspaceObservation,
+  type WorkspacePostObservationControl,
+} from "../repository/workspace-observer.js";
 import { sha256, stableJson } from "../shared/crypto.js";
 import { AgentError } from "../shared/errors.js";
 import { isJournalOperationId } from "../shared/operation-id.js";
@@ -15,6 +24,10 @@ import {
 export const TERMINAL_REQUEST_ARTIFACT_CONTRACT = "terminal-request-artifact/1" as const;
 export const TERMINAL_OBSERVATION_ARTIFACT_CONTRACT =
   "terminal-observation-placeholder/1" as const;
+export const TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT =
+  WORKSPACE_OBSERVATION_CONTRACT;
+export const TERMINAL_LAUNCH_RECEIPT_ARTIFACT_CONTRACT =
+  "terminal-launch-receipt/1" as const;
 export const TERMINAL_EXIT_RECEIPT_ARTIFACT_CONTRACT =
   "terminal-exit-receipt/1" as const;
 export const TERMINAL_RESULT_ARTIFACT_CONTRACT = "terminal-result-artifact/1" as const;
@@ -48,13 +61,34 @@ export interface TerminalRequestArtifact {
   readonly execution: TerminalExecutionFacts;
 }
 
-export interface TerminalObservationArtifact {
+export interface LegacyTerminalObservationArtifact {
   readonly contract: typeof TERMINAL_OBSERVATION_ARTIFACT_CONTRACT;
   readonly operation_id: string;
   readonly request_hash: string;
   readonly phase: "pre" | "post";
   readonly observed_at: string;
   readonly state: "placeholder";
+}
+
+export interface TerminalWorkspaceObservationArtifact {
+  readonly contract: typeof TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT;
+  readonly operation_id: string;
+  readonly request_hash: string;
+  readonly phase: "pre" | "post";
+  readonly observation: WorkspaceObservation;
+}
+
+export type TerminalObservationArtifact =
+  | LegacyTerminalObservationArtifact
+  | TerminalWorkspaceObservationArtifact;
+
+export interface TerminalLaunchReceiptArtifact {
+  readonly contract: typeof TERMINAL_LAUNCH_RECEIPT_ARTIFACT_CONTRACT;
+  readonly operation_id: string;
+  readonly request_hash: string;
+  readonly request: ArtifactReference;
+  readonly pre_observation: ArtifactReference;
+  readonly recorded_at: string;
 }
 
 export interface TerminalExitReceiptArtifact {
@@ -79,7 +113,7 @@ export interface TerminalExitReceiptArtifact {
   readonly stderr_bytes: number;
 }
 
-export interface TerminalResultArtifact {
+export interface LegacyTerminalResultArtifact {
   readonly contract: typeof TERMINAL_RESULT_ARTIFACT_CONTRACT;
   readonly operation_id: string;
   readonly request_hash: string;
@@ -89,6 +123,78 @@ export interface TerminalResultArtifact {
   readonly post_observation: ArtifactReference;
   readonly result: TerminalExecResult;
 }
+
+interface FullTerminalResultArtifactBase {
+  readonly contract: typeof TERMINAL_RESULT_ARTIFACT_CONTRACT;
+  readonly operation_id: string;
+  readonly request_hash: string;
+  readonly request: ArtifactReference;
+  readonly pre_observation: ArtifactReference;
+  readonly launch_receipt: ArtifactReference;
+  readonly exit_receipt: ArtifactReference;
+  readonly post_observation: ArtifactReference;
+  readonly result: TerminalExecResult;
+}
+
+export type FullTerminalResultArtifact = FullTerminalResultArtifactBase & (
+  | {
+      readonly post_observation_control: WorkspacePostObservationControl;
+    }
+  | {
+      readonly post_observation_control?: never;
+    }
+);
+
+export type TerminalResultArtifact =
+  | LegacyTerminalResultArtifact
+  | FullTerminalResultArtifact;
+
+export interface TerminalPrelaunchFailureMetadata {
+  readonly reasonCode: string;
+  readonly outcome: "spawn_failed";
+  readonly mutation_outcome: "none";
+  readonly runtimeBudgetLimits?: Readonly<Record<string, number>>;
+  readonly plannedDisclosureBytes?: number;
+}
+
+export type TerminalRecoveryContext =
+  | "ordinary_process_crash"
+  | "known_power_or_storage_loss";
+
+export type IncompleteTerminalEvidence =
+  | { readonly state: "none"; readonly recoveryContext: TerminalRecoveryContext }
+  | {
+      readonly state: "request_without_launch";
+      readonly recoveryContext: TerminalRecoveryContext;
+      readonly hasPreObservation: boolean;
+    }
+  | {
+      readonly state: "launch_without_exit";
+      readonly recoveryContext: TerminalRecoveryContext;
+      readonly launchReceipt: TerminalLaunchReceiptArtifact;
+    }
+  | {
+      readonly state: "exit_without_result";
+      readonly recoveryContext: TerminalRecoveryContext;
+      readonly advisory: {
+        readonly outcome: TerminalExitReceiptArtifact["outcome"];
+        readonly exitCode: number | null;
+        readonly signal: NodeJS.Signals | null;
+        readonly completedAt: string;
+        readonly durationMs: number;
+        readonly stdoutBytes: number;
+        readonly stderrBytes: number;
+      };
+    }
+  | {
+      readonly state: "completed_prelaunch_failure";
+      readonly recoveryContext: TerminalRecoveryContext;
+      readonly metadata: TerminalPrelaunchFailureMetadata;
+    }
+  | {
+      readonly state: "completed_unproven_without_result";
+      readonly recoveryContext: TerminalRecoveryContext;
+    };
 
 /**
  * The only terminal data intended for OperationRecord.safeResult. It contains
@@ -145,9 +251,9 @@ export class TerminalArtifactPersistence {
   }
 
   public async persistObservation(
-    input: Omit<TerminalObservationArtifact, "contract" | "state">,
+    input: Omit<LegacyTerminalObservationArtifact, "contract" | "state">,
   ): Promise<ArtifactReference> {
-    const artifact: TerminalObservationArtifact = {
+    const artifact: LegacyTerminalObservationArtifact = {
       contract: TERMINAL_OBSERVATION_ARTIFACT_CONTRACT,
       operation_id: input.operation_id,
       request_hash: input.request_hash,
@@ -162,6 +268,71 @@ export class TerminalArtifactPersistence {
         : "terminal-post-observation",
       artifact.operation_id,
       stableJson(artifact),
+    );
+  }
+
+  public async persistWorkspaceObservation(input: {
+    readonly operationId: string;
+    readonly requestHash: string;
+    readonly observation: WorkspaceObservation;
+  }): Promise<ArtifactReference> {
+    const artifact: TerminalWorkspaceObservationArtifact = {
+      contract: TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT,
+      operation_id: input.operationId,
+      request_hash: input.requestHash,
+      phase: input.observation.phase,
+      observation: input.observation,
+    };
+    assertTerminalObservationArtifact(artifact, "INTERNAL_ERROR");
+    return this.artifacts.putReferenced(
+      artifact.phase === "pre"
+        ? "terminal-pre-observation"
+        : "terminal-post-observation",
+      artifact.operation_id,
+      stableJson(artifact),
+    );
+  }
+
+  public async persistLaunchReceipt(input: {
+    readonly operationId: string;
+    readonly requestHash: string;
+    readonly request: ArtifactReference;
+    readonly preObservation: ArtifactReference;
+    readonly recordedAt: string;
+  }): Promise<ArtifactReference> {
+    const request = await this.readRequestReference(input.request);
+    const preObservation = await this.readObservationReference(
+      input.preObservation,
+      "pre",
+    );
+    if (
+      preObservation.contract !==
+      TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT ||
+      request.operation_id !== input.operationId ||
+      request.request_hash !== input.requestHash ||
+      preObservation.operation_id !== input.operationId ||
+      preObservation.request_hash !== input.requestHash
+    ) {
+      throw new AgentError(
+        "INTERNAL_ERROR",
+        "Terminal launch receipt evidence does not bind",
+      );
+    }
+    assertLaunchablePreObservation(preObservation, "INTERNAL_ERROR");
+    const artifact: TerminalLaunchReceiptArtifact = {
+      contract: TERMINAL_LAUNCH_RECEIPT_ARTIFACT_CONTRACT,
+      operation_id: input.operationId,
+      request_hash: input.requestHash,
+      request: input.request,
+      pre_observation: input.preObservation,
+      recorded_at: input.recordedAt,
+    };
+    assertTerminalLaunchReceiptArtifact(artifact, "INTERNAL_ERROR");
+    return this.artifacts.putReferencedDurable(
+      "terminal-launch-receipt",
+      artifact.operation_id,
+      stableJson(artifact),
+      { syncDirectories: true },
     );
   }
 
@@ -202,6 +373,17 @@ export class TerminalArtifactPersistence {
       input.postObservation,
       "post",
     );
+    if (
+      preObservation.contract ===
+        TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT ||
+      postObservation.contract ===
+        TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT
+    ) {
+      throw new AgentError(
+        "INTERNAL_ERROR",
+        "Legacy terminal results require legacy placeholder observations",
+      );
+    }
     assertEvidenceBinding(
       input.operationId,
       input.requestHash,
@@ -234,6 +416,246 @@ export class TerminalArtifactPersistence {
         reference,
         input.result,
       ),
+    };
+  }
+
+  public async persistFullResult(input: {
+    readonly operationId: string;
+    readonly requestHash: string;
+    readonly request: ArtifactReference;
+    readonly preObservation: ArtifactReference;
+    readonly launchReceipt: ArtifactReference;
+    readonly exitReceipt: ArtifactReference;
+    readonly postObservation: ArtifactReference;
+    readonly result: TerminalExecResult;
+    readonly postObservationControl?: WorkspacePostObservationControl;
+  }): Promise<{
+    readonly reference: ArtifactReference;
+    readonly safeMetadata: TerminalJournalResultMetadata;
+  }> {
+    const request = await this.readRequestReference(input.request);
+    const preObservation = await this.readObservationReference(
+      input.preObservation,
+      "pre",
+    );
+    const launchReceipt = await this.readLaunchReceiptReference(
+      input.launchReceipt,
+    );
+    const exitReceipt = await this.readExitReceiptReference(input.exitReceipt);
+    const postObservation = await this.readObservationReference(
+      input.postObservation,
+      "post",
+    );
+    if (
+      preObservation.contract !==
+        TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT ||
+      postObservation.contract !==
+        TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT
+    ) {
+      throw new AgentError(
+        "INTERNAL_ERROR",
+        "A full terminal result requires full workspace observations",
+      );
+    }
+    assertLaunchablePreObservation(preObservation, "INTERNAL_ERROR");
+    assertEvidenceBinding(
+      input.operationId,
+      input.requestHash,
+      request,
+      preObservation,
+      exitReceipt,
+      postObservation,
+      input.result,
+    );
+    assertLaunchReceiptBinding(
+      launchReceipt,
+      input.operationId,
+      input.requestHash,
+      input.request,
+      input.preObservation,
+    );
+    assertPostObservationControl(
+      input.result.mutation.outcome,
+      input.postObservationControl,
+      preObservation,
+      postObservation,
+      input.result,
+      "INTERNAL_ERROR",
+    );
+    const artifact: FullTerminalResultArtifact = {
+      contract: TERMINAL_RESULT_ARTIFACT_CONTRACT,
+      operation_id: input.operationId,
+      request_hash: input.requestHash,
+      request: input.request,
+      pre_observation: input.preObservation,
+      launch_receipt: input.launchReceipt,
+      exit_receipt: input.exitReceipt,
+      post_observation: input.postObservation,
+      result: input.result,
+      ...(input.postObservationControl === undefined
+        ? {}
+        : { post_observation_control: input.postObservationControl }),
+    };
+    assertTerminalResultArtifact(artifact, "INTERNAL_ERROR");
+    const reference = await this.artifacts.putReferenced(
+      "terminal-result",
+      input.operationId,
+      stableJson(artifact),
+    );
+    return {
+      reference,
+      safeMetadata: terminalJournalResultMetadata(
+        input.requestHash,
+        reference,
+        input.result,
+      ),
+    };
+  }
+
+  public async inspectIncompleteEvidence(input: {
+    readonly operationId: string;
+    readonly requestHash: string;
+    readonly recoveryContext: TerminalRecoveryContext;
+    readonly journalStatus?: "accepted" | "executing" | "completed" | "failed";
+    readonly journalSafeResult?: unknown;
+  }): Promise<IncompleteTerminalEvidence> {
+    assertRecoveryIdentity(input.operationId, input.requestHash);
+    const [requestRaw, preRaw, launchRaw, exitRaw, postRaw, resultRaw] =
+      await Promise.all([
+        this.artifacts.getOptional("terminal-request", input.operationId),
+        this.artifacts.getOptional("terminal-pre-observation", input.operationId),
+        this.artifacts.getOptional("terminal-launch-receipt", input.operationId),
+        this.artifacts.getOptional("terminal-exit-receipt", input.operationId),
+        this.artifacts.getOptional("terminal-post-observation", input.operationId),
+        this.artifacts.getOptional("terminal-result", input.operationId),
+      ]);
+    if (resultRaw !== undefined) {
+      throw recoveryError(
+        "Complete terminal evidence is not an incomplete-evidence state",
+        input,
+      );
+    }
+    const request = requestRaw === undefined
+      ? undefined
+      : parseTerminalRequestArtifact(requestRaw);
+    const pre = preRaw === undefined
+      ? undefined
+      : parseTerminalObservationArtifact(preRaw);
+    const launch = launchRaw === undefined
+      ? undefined
+      : parseTerminalLaunchReceiptArtifact(launchRaw);
+    const exit = exitRaw === undefined
+      ? undefined
+      : parseTerminalExitReceiptArtifact(exitRaw);
+    const post = postRaw === undefined
+      ? undefined
+      : parseTerminalObservationArtifact(postRaw);
+    for (const evidence of [request, pre, launch, exit, post]) {
+      if (
+        evidence !== undefined &&
+        (evidence.operation_id !== input.operationId ||
+          evidence.request_hash !== input.requestHash)
+      ) {
+        throw recoveryError(
+          "Incomplete terminal evidence does not match the recovery request",
+          input,
+        );
+      }
+    }
+    if (pre !== undefined && (pre.phase !== "pre" || request === undefined)) {
+      throw recoveryError(
+        "Terminal pre-observation has an incomplete evidence chain",
+        input,
+      );
+    }
+    if (launch !== undefined) {
+      if (request === undefined || pre === undefined) {
+        throw recoveryError(
+          "Terminal launch receipt has an incomplete evidence chain",
+          input,
+        );
+      }
+      if (
+        pre.contract !== TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT
+      ) {
+        throw recoveryError(
+          "Terminal launch receipt does not bind a full pre-observation",
+          input,
+        );
+      }
+      assertLaunchablePreObservation(pre, "RECOVERY_REQUIRED");
+      assertLaunchReceiptBinding(
+        launch,
+        input.operationId,
+        input.requestHash,
+        referenceFor("terminal-request", requestRaw ?? "", input.operationId),
+        referenceFor(
+          "terminal-pre-observation",
+          preRaw ?? "",
+          input.operationId,
+        ),
+      );
+    }
+    if (post !== undefined && (post.phase !== "post" || exit === undefined)) {
+      throw recoveryError(
+        "Terminal post-observation has an incomplete evidence chain",
+        input,
+      );
+    }
+    if (
+      post?.contract === TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT &&
+      launch === undefined
+    ) {
+      throw recoveryError(
+        "A full terminal post-observation has no launch receipt",
+        input,
+      );
+    }
+    if (exit !== undefined) {
+      return {
+        state: "exit_without_result",
+        recoveryContext: input.recoveryContext,
+        advisory: {
+          outcome: exit.outcome,
+          exitCode: exit.exit_code,
+          signal: exit.signal,
+          completedAt: exit.completed_at,
+          durationMs: exit.duration_ms,
+          stdoutBytes: exit.stdout_bytes,
+          stderrBytes: exit.stderr_bytes,
+        },
+      };
+    }
+    if (launch !== undefined) {
+      return {
+        state: "launch_without_exit",
+        recoveryContext: input.recoveryContext,
+        launchReceipt: launch,
+      };
+    }
+    if (
+      input.journalStatus === "completed" ||
+      input.journalStatus === "failed"
+    ) {
+      if (isTerminalPrelaunchFailureMetadata(input.journalSafeResult)) {
+        return {
+          state: "completed_prelaunch_failure",
+          recoveryContext: input.recoveryContext,
+          metadata: input.journalSafeResult,
+        };
+      }
+      return {
+        state: "completed_unproven_without_result",
+        recoveryContext: input.recoveryContext,
+      };
+    }
+    if (request === undefined) {
+      return { state: "none", recoveryContext: input.recoveryContext };
+    }
+    return {
+      state: "request_without_launch",
+      recoveryContext: input.recoveryContext,
+      hasPreObservation: pre !== undefined,
     };
   }
 
@@ -285,6 +707,10 @@ export class TerminalArtifactPersistence {
         "terminal-pre-observation",
         input.operationId,
       );
+      const launchRaw = await this.artifacts.getOptional(
+        "terminal-launch-receipt",
+        input.operationId,
+      );
       const exitRaw = await this.artifacts.getOptional(
         "terminal-exit-receipt",
         input.operationId,
@@ -297,11 +723,13 @@ export class TerminalArtifactPersistence {
         requestRaw === undefined ? undefined : parseTerminalRequestArtifact(requestRaw);
       const pre =
         preRaw === undefined ? undefined : parseTerminalObservationArtifact(preRaw);
+      const launch =
+        launchRaw === undefined ? undefined : parseTerminalLaunchReceiptArtifact(launchRaw);
       const exit =
         exitRaw === undefined ? undefined : parseTerminalExitReceiptArtifact(exitRaw);
       const post =
         postRaw === undefined ? undefined : parseTerminalObservationArtifact(postRaw);
-      for (const evidence of [request, pre, exit, post]) {
+      for (const evidence of [request, pre, launch, exit, post]) {
         if (
           evidence !== undefined &&
           (evidence.operation_id !== input.operationId ||
@@ -316,8 +744,48 @@ export class TerminalArtifactPersistence {
       if (pre !== undefined && (pre.phase !== "pre" || request === undefined)) {
         throw recoveryError("Terminal pre-observation has an incomplete evidence chain", input);
       }
+      if (launch !== undefined && (request === undefined || pre === undefined)) {
+        throw recoveryError("Terminal launch receipt has an incomplete evidence chain", input);
+      }
+      if (launch !== undefined && requestRaw !== undefined && preRaw !== undefined) {
+        if (
+          pre?.contract !== TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT
+        ) {
+          throw recoveryError(
+            "Terminal launch receipt does not bind a full pre-observation",
+            input,
+          );
+        }
+        assertLaunchablePreObservation(pre, "RECOVERY_REQUIRED");
+        assertLaunchReceiptBinding(
+          launch,
+          input.operationId,
+          input.requestHash,
+          referenceFor("terminal-request", requestRaw, input.operationId),
+          referenceFor(
+            "terminal-pre-observation",
+            preRaw,
+            input.operationId,
+          ),
+        );
+      }
       if (post !== undefined && post.phase !== "post") {
         throw recoveryError("Terminal post-observation phase does not match", input);
+      }
+      if (post !== undefined && exit === undefined) {
+        throw recoveryError(
+          "Terminal post-observation has no exit receipt",
+          input,
+        );
+      }
+      if (
+        post?.contract === TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT &&
+        launch === undefined
+      ) {
+        throw recoveryError(
+          "A full terminal post-observation has no launch receipt",
+          input,
+        );
       }
       return undefined;
     }
@@ -333,6 +801,9 @@ export class TerminalArtifactPersistence {
       artifact.pre_observation,
       "pre",
     );
+    const launchReceipt = "launch_receipt" in artifact
+      ? await this.readLaunchReceiptReference(artifact.launch_receipt)
+      : undefined;
     const exitReceipt = await this.readExitReceiptReference(artifact.exit_receipt);
     const postObservation = await this.readObservationReference(
       artifact.post_observation,
@@ -347,6 +818,48 @@ export class TerminalArtifactPersistence {
       postObservation,
       artifact.result,
     );
+    if (launchReceipt !== undefined) {
+      assertLaunchReceiptBinding(
+        launchReceipt,
+        input.operationId,
+        input.requestHash,
+        artifact.request,
+        artifact.pre_observation,
+      );
+      if (
+        preObservation.contract !==
+          TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT ||
+        postObservation.contract !==
+          TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT
+      ) {
+        throw recoveryError(
+          "Full terminal result contains legacy observations",
+          input,
+        );
+      }
+      assertLaunchablePreObservation(
+        preObservation,
+        "RECOVERY_REQUIRED",
+      );
+      assertPostObservationControl(
+        artifact.result.mutation.outcome,
+        (artifact as FullTerminalResultArtifact).post_observation_control,
+        preObservation,
+        postObservation,
+        artifact.result,
+        "RECOVERY_REQUIRED",
+      );
+    } else if (
+      preObservation.contract ===
+        TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT ||
+      postObservation.contract ===
+        TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT
+    ) {
+      throw recoveryError(
+        "Legacy terminal result contains full observations without a launch receipt",
+        input,
+      );
+    }
     const reference: ArtifactReference = {
       kind: "terminal-result",
       id: input.operationId,
@@ -391,6 +904,35 @@ export class TerminalArtifactPersistence {
       });
     }
     return artifact;
+  }
+
+  public async readWorkspaceObservationReference(
+    reference: ArtifactReference,
+    phase: "pre" | "post",
+  ): Promise<TerminalWorkspaceObservationArtifact> {
+    const artifact = await this.readObservationReference(reference, phase);
+    if (
+      artifact.contract !==
+      TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT
+    ) {
+      throw recoveryError(
+        "Terminal observation is a legacy placeholder",
+        {
+          operationId: artifact.operation_id,
+          requestHash: artifact.request_hash,
+        },
+      );
+    }
+    return artifact;
+  }
+
+  private async readLaunchReceiptReference(
+    reference: ArtifactReference,
+  ): Promise<TerminalLaunchReceiptArtifact> {
+    assertExpectedReference(reference, "terminal-launch-receipt");
+    return parseTerminalLaunchReceiptArtifact(
+      await this.artifacts.getReferenced(reference),
+    );
   }
 
   private async readExitReceiptReference(
@@ -484,6 +1026,37 @@ export function isTerminalJournalResultMetadata(
   );
 }
 
+export function isTerminalPrelaunchFailureMetadata(
+  value: unknown,
+): value is TerminalPrelaunchFailureMetadata {
+  if (!hasExactKeys(value, [
+    "reasonCode",
+    "outcome",
+    "mutation_outcome",
+    "runtimeBudgetLimits",
+    "plannedDisclosureBytes",
+  ], true)) return false;
+  const item = value as Partial<TerminalPrelaunchFailureMetadata>;
+  const limits = item.runtimeBudgetLimits;
+  return (
+    validBoundedString(item.reasonCode, 256) &&
+    item.outcome === "spawn_failed" &&
+    item.mutation_outcome === "none" &&
+    (limits === undefined ||
+      (
+        limits !== null &&
+        typeof limits === "object" &&
+        !Array.isArray(limits) &&
+        Object.keys(limits).length <= 32 &&
+        Object.entries(limits).every(([key, amount]) =>
+          validBoundedString(key, 128) && validNonnegativeInteger(amount)
+        )
+      )) &&
+    (item.plannedDisclosureBytes === undefined ||
+      validNonnegativeInteger(item.plannedDisclosureBytes))
+  );
+}
+
 function parseTerminalRequestArtifact(raw: string): TerminalRequestArtifact {
   const value = parseJson(raw, "Terminal request artifact is invalid JSON");
   assertTerminalRequestArtifact(value, "RECOVERY_REQUIRED");
@@ -493,6 +1066,14 @@ function parseTerminalRequestArtifact(raw: string): TerminalRequestArtifact {
 function parseTerminalObservationArtifact(raw: string): TerminalObservationArtifact {
   const value = parseJson(raw, "Terminal observation artifact is invalid JSON");
   assertTerminalObservationArtifact(value, "RECOVERY_REQUIRED");
+  return value;
+}
+
+function parseTerminalLaunchReceiptArtifact(
+  raw: string,
+): TerminalLaunchReceiptArtifact {
+  const value = parseJson(raw, "Terminal launch receipt is invalid JSON");
+  assertTerminalLaunchReceiptArtifact(value, "RECOVERY_REQUIRED");
   return value;
 }
 
@@ -542,19 +1123,41 @@ function assertTerminalObservationArtifact(
   value: unknown,
   code: "INTERNAL_ERROR" | "RECOVERY_REQUIRED",
 ): asserts value is TerminalObservationArtifact {
-  if (
-    !hasExactKeys(value, [
+  if (hasExactKeys(value, [
+    "contract",
+    "operation_id",
+    "request_hash",
+    "phase",
+    "observation",
+  ])) {
+    const full = value as Partial<TerminalWorkspaceObservationArtifact>;
+    if (
+      full.contract !== TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT ||
+      !isJournalOperationId(full.operation_id) ||
+      typeof full.request_hash !== "string" ||
+      !HASH_PATTERN.test(full.request_hash) ||
+      (full.phase !== "pre" && full.phase !== "post") ||
+      !isWorkspaceObservation(full.observation) ||
+      full.observation.phase !== full.phase
+    ) {
+      throw new AgentError(
+        code,
+        "Terminal workspace observation has invalid durable facts",
+      );
+    }
+    return;
+  }
+  if (!hasExactKeys(value, [
       "contract",
       "operation_id",
       "request_hash",
       "phase",
       "observed_at",
       "state",
-    ])
-  ) {
+    ])) {
     throw new AgentError(code, "Terminal observation artifact has an invalid shape");
   }
-  const item = value as Partial<TerminalObservationArtifact>;
+  const item = value as Partial<LegacyTerminalObservationArtifact>;
   if (
     item.contract !== TERMINAL_OBSERVATION_ARTIFACT_CONTRACT ||
     !isJournalOperationId(item.operation_id) ||
@@ -565,6 +1168,39 @@ function assertTerminalObservationArtifact(
     item.state !== "placeholder"
   ) {
     throw new AgentError(code, "Terminal observation artifact has invalid durable facts");
+  }
+}
+
+function assertTerminalLaunchReceiptArtifact(
+  value: unknown,
+  code: "INTERNAL_ERROR" | "RECOVERY_REQUIRED",
+): asserts value is TerminalLaunchReceiptArtifact {
+  if (!hasExactKeys(value, [
+    "contract",
+    "operation_id",
+    "request_hash",
+    "request",
+    "pre_observation",
+    "recorded_at",
+  ])) {
+    throw new AgentError(code, "Terminal launch receipt has an invalid shape");
+  }
+  const item = value as Partial<TerminalLaunchReceiptArtifact>;
+  if (
+    item.contract !== TERMINAL_LAUNCH_RECEIPT_ARTIFACT_CONTRACT ||
+    !isJournalOperationId(item.operation_id) ||
+    typeof item.request_hash !== "string" ||
+    !HASH_PATTERN.test(item.request_hash) ||
+    !isExpectedReference(item.request, "terminal-request") ||
+    !isExpectedReference(item.pre_observation, "terminal-pre-observation") ||
+    item.request.id !== item.operation_id ||
+    item.pre_observation.id !== item.operation_id ||
+    !isIsoTimestamp(item.recorded_at)
+  ) {
+    throw new AgentError(
+      code,
+      "Terminal launch receipt has invalid durable bindings",
+    );
   }
 }
 
@@ -617,21 +1253,25 @@ function assertTerminalResultArtifact(
   value: unknown,
   code: "INTERNAL_ERROR" | "RECOVERY_REQUIRED",
 ): asserts value is TerminalResultArtifact {
-  if (
-    !hasExactKeys(value, [
-      "contract",
-      "operation_id",
-      "request_hash",
-      "request",
-      "pre_observation",
-      "exit_receipt",
-      "post_observation",
-      "result",
-    ])
-  ) {
+  const full = value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    "launch_receipt" in value;
+  const allowed = full
+    ? [
+        "contract", "operation_id", "request_hash", "request",
+        "pre_observation", "launch_receipt", "exit_receipt",
+        "post_observation", "result", "post_observation_control",
+      ]
+    : [
+        "contract", "operation_id", "request_hash", "request",
+        "pre_observation", "exit_receipt", "post_observation", "result",
+      ];
+  if (!hasExactKeys(value, allowed, full)) {
     throw new AgentError(code, "Terminal result artifact has an invalid shape");
   }
-  const item = value as Partial<TerminalResultArtifact>;
+  const item = value as Partial<FullTerminalResultArtifact> &
+    Partial<LegacyTerminalResultArtifact>;
   if (
     item.contract !== TERMINAL_RESULT_ARTIFACT_CONTRACT ||
     !isJournalOperationId(item.operation_id) ||
@@ -649,6 +1289,19 @@ function assertTerminalResultArtifact(
     throw new AgentError(code, "Terminal result artifact has invalid durable bindings");
   }
   assertTerminalExecResult(item.result, code);
+  if (!full) return;
+  if (
+    !isExpectedReference(item.launch_receipt, "terminal-launch-receipt") ||
+    item.launch_receipt.id !== item.operation_id ||
+    (item.result.mutation.outcome === "observed"
+      ? !isWorkspacePostObservationControl(item.post_observation_control)
+      : item.post_observation_control !== undefined)
+  ) {
+    throw new AgentError(
+      code,
+      "Full terminal result artifact has invalid durable bindings",
+    );
+  }
 }
 
 function assertTerminalExecResult(
@@ -740,6 +1393,150 @@ function assertEvidenceBinding(
       requestHash,
     });
   }
+}
+
+function assertLaunchReceiptBinding(
+  receipt: TerminalLaunchReceiptArtifact,
+  operationId: string,
+  requestHash: string,
+  request: ArtifactReference,
+  preObservation: ArtifactReference,
+): void {
+  if (
+    receipt.operation_id !== operationId ||
+    receipt.request_hash !== requestHash ||
+    stableJson(receipt.request) !== stableJson(request) ||
+    stableJson(receipt.pre_observation) !== stableJson(preObservation)
+  ) {
+    throw recoveryError(
+      "Terminal launch receipt does not bind to the exact prelaunch evidence",
+      { operationId, requestHash },
+    );
+  }
+}
+
+function assertPostObservationControl(
+  outcome: TerminalExecResult["mutation"]["outcome"],
+  control: WorkspacePostObservationControl | undefined,
+  preObservation: TerminalWorkspaceObservationArtifact,
+  postObservation: TerminalWorkspaceObservationArtifact,
+  result: TerminalExecResult,
+  code: "INTERNAL_ERROR" | "RECOVERY_REQUIRED",
+): void {
+  if (!hasFullTerminalPathSummary(result.mutation)) {
+    throw new AgentError(
+      code,
+      "A full terminal result requires bounded path-summary facts",
+    );
+  }
+  if (
+    preObservation.observation.state !== "complete" &&
+    outcome !== "unknown"
+  ) {
+    throw new AgentError(
+      code,
+      "A limited pre-observation can only produce unknown attribution",
+    );
+  }
+  if (outcome === "observed") {
+    if (
+      !isWorkspacePostObservationControl(control) ||
+      postObservation.observation.state !== "complete" ||
+      control.branch !== postObservation.observation.branch ||
+      control.head !== postObservation.observation.head ||
+      control.excludedStateFingerprint !==
+        postObservation.observation.components.excluded ||
+      result.mutation.repository_fingerprint !==
+        postObservation.observation.repositoryFingerprint
+    ) {
+      throw new AgentError(
+        code,
+        "Terminal control anchor does not match the post-observation",
+      );
+    }
+    return;
+  }
+  if (control !== undefined) {
+    throw new AgentError(
+      code,
+      "A non-observed terminal result cannot carry a control anchor",
+    );
+  }
+  if (outcome === "none") {
+    if (
+      preObservation.observation.state !== "complete" ||
+      postObservation.observation.state !== "complete" ||
+      preObservation.observation.repositoryFingerprint !==
+        postObservation.observation.repositoryFingerprint ||
+      preObservation.observation.branch !==
+        postObservation.observation.branch ||
+      preObservation.observation.head !==
+        postObservation.observation.head ||
+      stableJson(preObservation.observation.components) !==
+        stableJson(postObservation.observation.components) ||
+      preObservation.observation.nestedRepository !==
+        postObservation.observation.nestedRepository ||
+      result.mutation.repository_fingerprint !==
+        postObservation.observation.repositoryFingerprint
+    ) {
+      throw new AgentError(
+        code,
+        "A no-effect terminal result does not match its complete observations",
+      );
+    }
+    return;
+  }
+  if (result.mutation.repository_fingerprint !== undefined) {
+    throw new AgentError(
+      code,
+      "A non-clean terminal result cannot invent a repository fingerprint",
+    );
+  }
+}
+
+function assertLaunchablePreObservation(
+  preObservation: TerminalWorkspaceObservationArtifact,
+  code: "INTERNAL_ERROR" | "RECOVERY_REQUIRED",
+): void {
+  if (
+    preObservation.observation.state !== "complete" &&
+    preObservation.observation.state !== "metadata_limited"
+  ) {
+    throw new AgentError(
+      code,
+      "Terminal launch requires a complete or metadata-limited pre-observation",
+    );
+  }
+}
+
+function isWorkspacePostObservationControl(
+  value: unknown,
+): value is WorkspacePostObservationControl {
+  if (!hasExactKeys(value, [
+    "branch",
+    "head",
+    "excludedStateFingerprint",
+  ])) return false;
+  const item = value as Partial<WorkspacePostObservationControl>;
+  return (
+    (item.branch === null || typeof item.branch === "string") &&
+    (item.head === null || typeof item.head === "string") &&
+    typeof item.excludedStateFingerprint === "string" &&
+    HASH_PATTERN.test(item.excludedStateFingerprint)
+  );
+}
+
+function referenceFor(
+  kind: ArtifactReference["kind"],
+  raw: string,
+  id: string,
+): ArtifactReference {
+  return {
+    kind,
+    id,
+    bytes: Buffer.byteLength(raw),
+    sha256: sha256(raw),
+  };
 }
 
 function isTerminalInvocation(value: unknown): value is TerminalInvocation {
@@ -836,6 +1633,16 @@ function isTerminalMutationResult(
       "binary_files",
       "ignored_summary",
       "repository_fingerprint",
+      "created_total",
+      "updated_total",
+      "deleted_total",
+      "renamed_total",
+      "pre_existing_touched_total",
+      "path_endpoint_total",
+      "path_endpoint_omitted",
+      "path_facts_truncated",
+      "path_facts_sha256",
+      "unavailable_baseline_count",
     ], true)
   ) {
     return false;
@@ -861,15 +1668,103 @@ function isTerminalMutationResult(
     validBoundedString(item.ignored_summary, MAX_RESULT_STRING_BYTES, true) &&
     (item.repository_fingerprint === undefined ||
       (typeof item.repository_fingerprint === "string" &&
-        HASH_PATTERN.test(item.repository_fingerprint)))
+        HASH_PATTERN.test(item.repository_fingerprint))) &&
+    validOptionalTerminalPathSummary(item)
   );
 }
 
 function isTerminalArtifactReference(value: unknown): boolean {
   return (
     isArtifactReference(value) &&
-    value.kind.startsWith("terminal-")
+    (TERMINAL_STREAM_ARTIFACT_KINDS as readonly string[]).includes(value.kind)
   );
+}
+
+function validOptionalTerminalPathSummary(
+  item: Partial<TerminalExecResult["mutation"]>,
+): boolean {
+  const values = [
+    item.created_total,
+    item.updated_total,
+    item.deleted_total,
+    item.renamed_total,
+    item.pre_existing_touched_total,
+    item.path_endpoint_total,
+    item.path_endpoint_omitted,
+    item.path_facts_truncated,
+    item.path_facts_sha256,
+    item.unavailable_baseline_count,
+  ];
+  if (values.every((value) => value === undefined)) return true;
+  if (values.some((value) => value === undefined)) return false;
+  if (
+    !validNonnegativeInteger(item.created_total) ||
+    !validNonnegativeInteger(item.updated_total) ||
+    !validNonnegativeInteger(item.deleted_total) ||
+    !validNonnegativeInteger(item.renamed_total) ||
+    !validNonnegativeInteger(item.pre_existing_touched_total) ||
+    !validNonnegativeInteger(item.path_endpoint_total) ||
+    !validNonnegativeInteger(item.path_endpoint_omitted) ||
+    !validNonnegativeInteger(item.unavailable_baseline_count) ||
+    typeof item.path_facts_truncated !== "boolean" ||
+    typeof item.path_facts_sha256 !== "string" ||
+    !HASH_PATTERN.test(item.path_facts_sha256)
+  ) return false;
+  const retained =
+    (item.created?.length ?? 0) +
+    (item.updated?.length ?? 0) +
+    (item.deleted?.length ?? 0) +
+    (item.renamed?.length ?? 0) * 2 +
+    (item.pre_existing_touched?.length ?? 0);
+  const total =
+    item.created_total +
+    item.updated_total +
+    item.deleted_total +
+    item.renamed_total * 2 +
+    item.pre_existing_touched_total;
+  return item.created_total >= (item.created?.length ?? 0) &&
+    item.updated_total >= (item.updated?.length ?? 0) &&
+    item.deleted_total >= (item.deleted?.length ?? 0) &&
+    item.renamed_total >= (item.renamed?.length ?? 0) &&
+    item.pre_existing_touched_total >=
+      (item.pre_existing_touched?.length ?? 0) &&
+    item.path_endpoint_total === total &&
+    item.path_endpoint_omitted === total - retained &&
+    item.path_endpoint_omitted >= 0 &&
+    item.path_facts_truncated === (item.path_endpoint_omitted > 0);
+}
+
+function hasFullTerminalPathSummary(
+  item: TerminalExecResult["mutation"],
+): boolean {
+  if (
+    item.created_total === undefined ||
+    item.updated_total === undefined ||
+    item.deleted_total === undefined ||
+    item.renamed_total === undefined ||
+    item.pre_existing_touched_total === undefined ||
+    item.path_endpoint_total === undefined ||
+    item.path_endpoint_omitted === undefined ||
+    item.path_facts_truncated === undefined ||
+    item.path_facts_sha256 === undefined ||
+    item.unavailable_baseline_count === undefined ||
+    !validOptionalTerminalPathSummary(item)
+  ) return false;
+  const retainedEndpoints =
+    item.created.length +
+    item.updated.length +
+    item.deleted.length +
+    item.renamed.length * 2 +
+    item.pre_existing_touched.length;
+  const retainedBytes = [
+    ...item.created,
+    ...item.updated,
+    ...item.deleted,
+    ...item.renamed.flatMap((rename) => [rename.from, rename.to]),
+    ...item.pre_existing_touched,
+  ].reduce((total, path) => total + Buffer.byteLength(path), 0);
+  return retainedEndpoints <= TERMINAL_RESULT_MAX_PATH_ENDPOINTS &&
+    retainedBytes <= TERMINAL_RESULT_MAX_PATH_BYTES;
 }
 
 function assertExpectedReference(

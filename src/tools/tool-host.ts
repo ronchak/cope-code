@@ -16,6 +16,10 @@ import type {
 import type { ContentProcessor } from "../repository/types.js";
 import type { ProcessRunner } from "./process-runner.js";
 import type { TerminalExecutor } from "./terminal-executor.js";
+import type {
+  IncompleteTerminalEvidence,
+  TerminalRecoveryContext,
+} from "../session/terminal-artifacts.js";
 import { isLocalToolName, type LocalToolName } from "../protocol/types.js";
 import {
   GIT_STATUS_RESULT_BYTES,
@@ -162,6 +166,23 @@ export class ToolHost {
   }): Promise<ToolHostOutcome | undefined> {
     if (input.tool !== "terminal_exec") return undefined;
     return this.dependencies.terminalExecutor?.recoverCompleted(input);
+  }
+
+  public async inspectTerminalRecoveryEvidence(input: {
+    readonly operationId: string;
+    readonly requestHash: string;
+    readonly recoveryContext: TerminalRecoveryContext;
+    readonly journalStatus?: "accepted" | "executing" | "completed" | "failed";
+    readonly journalSafeResult?: unknown;
+  }): Promise<IncompleteTerminalEvidence> {
+    const executor = this.dependencies.terminalExecutor;
+    if (executor === undefined) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Terminal recovery evidence reader is unavailable",
+      );
+    }
+    return executor.inspectRecoveryEvidence(input);
   }
 
   public async dispatch(

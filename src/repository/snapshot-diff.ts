@@ -11,9 +11,46 @@ import { looksBinary, readRegularFile } from "./text-file.js";
 
 export const SNAPSHOT_DIFF_VERSION = "snapshot-diff.v1" as const;
 
-export interface SessionMutationDiffRecord {
+export interface PatchSessionMutationDiffRecord {
+  readonly kind?: "patch";
   readonly checkpointId: string;
   readonly changedPaths: readonly string[];
+}
+
+export interface TerminalSessionMutationDiffRecord {
+  readonly kind: "terminal";
+  readonly operationId: string;
+  readonly changedPaths: readonly string[];
+}
+
+export type SessionMutationDiffRecord =
+  | PatchSessionMutationDiffRecord
+  | TerminalSessionMutationDiffRecord;
+
+export type TerminalBeforeImageResolution =
+  | {
+      readonly available: true;
+      readonly baselineId: string;
+      readonly entry: CheckpointFileSnapshot;
+    }
+  | {
+      readonly available: false;
+      readonly reason:
+        | "legacy_placeholder"
+        | "missing_evidence"
+        | "bounded_out"
+        | "unknown_observation";
+    };
+
+export type TerminalBeforeImageResolver = (
+  mutation: TerminalSessionMutationDiffRecord,
+  repositoryRelativePath: string,
+  signal?: AbortSignal,
+) => Promise<TerminalBeforeImageResolution>;
+
+export interface TerminalUnavailableDiffFact {
+  readonly path: string;
+  readonly reason: Exclude<TerminalBeforeImageResolution, { readonly available: true }>["reason"];
 }
 
 export interface SnapshotDiffRequest {
@@ -35,6 +72,9 @@ export interface SnapshotDiffResult {
   readonly changedFileCount: number;
   /** Effective post-clamp output ceiling, used for a second disclosure bound. */
   readonly limitBytes: number;
+  readonly unavailableTerminalPaths?: readonly TerminalUnavailableDiffFact[];
+  readonly unavailableTerminalPathCount?: number;
+  readonly omittedTerminalPathCount?: number;
 }
 
 export interface SnapshotDiffInspectorOptions {
@@ -43,6 +83,7 @@ export interface SnapshotDiffInspectorOptions {
   readonly maxFiles?: number;
   readonly maxInputBytes?: number;
   readonly isPathAllowed?: (repositoryRelativePath: string) => boolean;
+  readonly resolveTerminalBeforeImage?: TerminalBeforeImageResolver;
 }
 
 interface BaselineCandidate {
@@ -61,6 +102,7 @@ export class SnapshotDiffInspector {
   private readonly maxFiles: number;
   private readonly maxInputBytes: number;
   private readonly isPathAllowed: (repositoryRelativePath: string) => boolean;
+  private readonly resolveTerminalBeforeImage: TerminalBeforeImageResolver | undefined;
 
   public constructor(
     private readonly boundary: RepositoryBoundary,
@@ -75,6 +117,7 @@ export class SnapshotDiffInspector {
       "maxInputBytes",
     );
     this.isPathAllowed = options.isPathAllowed ?? (() => true);
+    this.resolveTerminalBeforeImage = options.resolveTerminalBeforeImage;
   }
 
   public async diffCheckpoint(
@@ -107,6 +150,18 @@ export class SnapshotDiffInspector {
     const requested = await this.resolveRequestedPaths(request.paths ?? []);
     const earliest = new Map<string, { readonly path: string; readonly checkpointId: string }>();
     for (const mutation of mutations) {
+      if (mutation.kind === "terminal") {
+        if (this.resolveTerminalBeforeImage === undefined) {
+          throw new AgentError(
+            "RECOVERY_REQUIRED",
+            "Terminal session diff requires a verified before-image resolver",
+          );
+        }
+        throw new AgentError(
+          "RECOVERY_REQUIRED",
+          "Terminal session diff contract is not integrated yet",
+        );
+      }
       for (const untrustedPath of mutation.changedPaths) {
         const normalized = normalizeRepositoryPath(untrustedPath);
         const key = this.boundary.pathKey(normalized);

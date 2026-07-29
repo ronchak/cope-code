@@ -3,6 +3,10 @@ import type {
   BudgetMetric,
   LocalToolName,
 } from "../protocol/types.js";
+import type {
+  IncompleteTerminalEvidence,
+  TerminalRecoveryContext,
+} from "../session/terminal-artifacts.js";
 
 export type ToolName = LocalToolName;
 
@@ -193,6 +197,13 @@ export interface ToolExecutor {
    * request hash and operation identity and must never launch work here.
    */
   recoverCompleted?(input: RecoverCompletedToolCall): Promise<ToolOutcome | undefined>;
+  inspectTerminalRecoveryEvidence?(input: {
+    readonly operationId: string;
+    readonly requestHash: string;
+    readonly recoveryContext: TerminalRecoveryContext;
+    readonly journalStatus?: "accepted" | "executing" | "completed" | "failed";
+    readonly journalSafeResult?: unknown;
+  }): Promise<IncompleteTerminalEvidence>;
   inspectCompletionState(): Promise<RepositoryCompletionState>;
 }
 

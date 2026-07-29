@@ -1,7 +1,10 @@
-import { constants } from "node:fs";
 import { access, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { AgentError, errorMessage } from "../shared/errors.js";
+import {
+  TERMINAL_SESSION_MAX_PATH_BYTES,
+  TERMINAL_SESSION_MAX_PATH_ENDPOINTS,
+} from "../repository/workspace-observer.js";
 import { newId, stableJson } from "../shared/crypto.js";
 import {
   isJournalOperationId,
@@ -20,9 +23,10 @@ import {
   isCompletionHandoffReference,
 } from "./completion-handoff-store.js";
 import { sessionRetainsSourceArtifacts } from "./terminal-cleanup.js";
-import { CURRENT_HOST_PLATFORM } from "../platform/index.js";
+import { syncDirectory } from "./directory-sync.js";
 
-const MAX_SESSION_BYTES = 4 * 1024 * 1024;
+export const MAX_SESSION_BYTES = 4 * 1024 * 1024;
+export const TERMINAL_SESSION_HEADROOM_BYTES = 128 * 1024;
 const HASH_PATTERN = /^[a-f0-9]{64}$/u;
 const SESSION_KEYS = [
   "schemaVersion",
@@ -39,6 +43,7 @@ const SESSION_KEYS = [
   "objective",
   "acceptanceCriteria",
   "mode",
+  "completionAuthority",
   "status",
   "createdAt",
   "updatedAt",
@@ -149,7 +154,7 @@ export class SessionStore {
     const directory = this.sessionDirectory(state.sessionId);
     const destination = path.join(directory, "session.json");
     const temporary = path.join(directory, `session.${newId("write")}.tmp`);
-    const serialized = `${stableJson(state)}\n`;
+    const serialized = serializeSessionState(state);
     if (Buffer.byteLength(serialized) > MAX_SESSION_BYTES) {
       throw new AgentError("BUDGET_EXCEEDED", "Session state exceeds its durable storage bound");
     }
@@ -239,6 +244,33 @@ export class SessionStore {
   }
 }
 
+export interface SessionStateWritePreflight {
+  readonly fits: boolean;
+  readonly bytes: number;
+  readonly reserveBytes: number;
+  readonly maxBytes: number;
+}
+
+export function preflightSessionStateWrite(
+  state: SessionState,
+  reserveBytes = 0,
+): SessionStateWritePreflight {
+  if (!Number.isSafeInteger(reserveBytes) || reserveBytes < 0) {
+    throw new AgentError("INTERNAL_ERROR", "Session-state reserve is invalid");
+  }
+  const bytes = Buffer.byteLength(serializeSessionState(state));
+  return {
+    fits: bytes + reserveBytes <= MAX_SESSION_BYTES,
+    bytes,
+    reserveBytes,
+    maxBytes: MAX_SESSION_BYTES,
+  };
+}
+
+function serializeSessionState(state: SessionState): string {
+  return `${stableJson(state)}\n`;
+}
+
 export class WorkspaceLock {
   private released = false;
 
@@ -305,16 +337,6 @@ function assertSafeId(value: string): void {
   }
 }
 
-async function syncDirectory(directory: string): Promise<void> {
-  if (!CURRENT_HOST_PLATFORM.supportsDirectoryFsync) return;
-  const handle = await open(directory, constants.O_RDONLY);
-  try {
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-}
-
 export async function fileExists(filename: string): Promise<boolean> {
   try {
     await access(filename);
@@ -367,6 +389,8 @@ function assertValidSessionState(value: Partial<SessionState>): asserts value is
     typeof value.objective !== "string" || value.objective.length === 0 || value.objective.length > 1_000_000 ||
     !boundedStringArray(value.acceptanceCriteria, 1_024, 64 * 1024) ||
     !["inspect", "edit", "auto"].includes(value.mode ?? "" as never) ||
+    (value.completionAuthority !== undefined &&
+      !["frozen", "observed"].includes(value.completionAuthority)) ||
     !isSessionStatus(value.status) ||
     !isIsoTimestamp(value.createdAt) ||
     !isIsoTimestamp(value.updatedAt) ||
@@ -612,13 +636,137 @@ function isMutationRecord(value: unknown): value is SessionState["mutations"][nu
   }
   if (item.kind !== "terminal") return false;
   const terminal = item as Partial<Extract<SessionState["mutations"][number], { readonly kind: "terminal" }>>;
-  return hasExactKeys(terminal, [
+  if (
+    (terminal as { readonly recordContract?: unknown }).recordContract !==
+    "terminal-mutation/2"
+  ) {
+    return hasExactKeys(terminal, [
+      "kind", "operationId", "changedPaths", "changedLines", "createdPaths", "updatedPaths",
+      "deletedPaths", "renamedPaths", "preExistingTouchedPaths", "completedAt",
+      "observationOutcome", "preObservation", "postObservation", "terminalResult",
+      "repositoryFingerprint",
+    ], true) &&
+      validLegacyTerminalPaths(terminal) &&
+      ["none", "observed", "protected_or_hidden_changed", "unknown"].includes(
+        terminal.observationOutcome ?? "",
+      ) &&
+      (terminal.preObservation === undefined ||
+        isExpectedArtifactReference(terminal.preObservation, "terminal-pre-observation")) &&
+      (terminal.postObservation === undefined ||
+        isExpectedArtifactReference(terminal.postObservation, "terminal-post-observation")) &&
+      isExpectedArtifactReference(terminal.terminalResult, "terminal-result") &&
+      (terminal.repositoryFingerprint === undefined ||
+        HASH_PATTERN.test(terminal.repositoryFingerprint));
+  }
+  if (!hasExactKeys(terminal, [
     "kind", "operationId", "changedPaths", "changedLines", "createdPaths", "updatedPaths",
     "deletedPaths", "renamedPaths", "preExistingTouchedPaths", "completedAt",
     "observationOutcome", "preObservation", "postObservation", "terminalResult",
-    "repositoryFingerprint",
-  ], true) &&
-    boundedStringArray(terminal.createdPaths, 100_000, 32_768) &&
+    "repositoryFingerprint", "recordContract", "processOutcome", "createdTotal",
+    "updatedTotal", "deletedTotal", "renamedTotal", "preExistingTouchedTotal",
+    "changedPathCount", "pathEndpointTotal", "omittedPathEndpointTotal",
+    "pathFactsTruncated", "pathFactsSha256", "unavailableBaselineCount",
+    "postObservationControl",
+  ], true)) return false;
+  const full = terminal as Partial<Extract<
+    SessionState["mutations"][number],
+    { readonly recordContract: "terminal-mutation/2" }
+  >>;
+  if (
+    !boundedStringArray(
+      full.changedPaths,
+      TERMINAL_SESSION_MAX_PATH_ENDPOINTS,
+      32_768,
+    ) ||
+    !boundedStringArray(
+      full.createdPaths,
+      TERMINAL_SESSION_MAX_PATH_ENDPOINTS,
+      32_768,
+    ) ||
+    !boundedStringArray(
+      full.updatedPaths,
+      TERMINAL_SESSION_MAX_PATH_ENDPOINTS,
+      32_768,
+    ) ||
+    !boundedStringArray(
+      full.deletedPaths,
+      TERMINAL_SESSION_MAX_PATH_ENDPOINTS,
+      32_768,
+    ) ||
+    !boundedStringArray(
+      full.preExistingTouchedPaths,
+      TERMINAL_SESSION_MAX_PATH_ENDPOINTS,
+      32_768,
+    ) ||
+    !Array.isArray(full.renamedPaths) ||
+    full.renamedPaths.length >
+      Math.floor(TERMINAL_SESSION_MAX_PATH_ENDPOINTS / 2) ||
+    !full.renamedPaths.every((rename) =>
+      hasExactKeys(rename, ["from", "to"]) &&
+      typeof rename.from === "string" && Buffer.byteLength(rename.from) <= 32_768 &&
+      typeof rename.to === "string" && Buffer.byteLength(rename.to) <= 32_768
+    ) ||
+    terminalRetainedEndpointCount(full) >
+      TERMINAL_SESSION_MAX_PATH_ENDPOINTS ||
+    terminalPathFactBytes(full) > TERMINAL_SESSION_MAX_PATH_BYTES ||
+    !validNonnegativeInteger(full.changedPathCount) ||
+    !validNonnegativeInteger(full.createdTotal) ||
+    !validNonnegativeInteger(full.updatedTotal) ||
+    !validNonnegativeInteger(full.deletedTotal) ||
+    !validNonnegativeInteger(full.renamedTotal) ||
+    !validNonnegativeInteger(full.preExistingTouchedTotal) ||
+    !validNonnegativeInteger(full.pathEndpointTotal) ||
+    !validNonnegativeInteger(full.omittedPathEndpointTotal) ||
+    !validNonnegativeInteger(full.unavailableBaselineCount) ||
+    full.createdTotal < full.createdPaths.length ||
+    full.updatedTotal < full.updatedPaths.length ||
+    full.deletedTotal < full.deletedPaths.length ||
+    full.renamedTotal < full.renamedPaths.length ||
+    full.preExistingTouchedTotal < full.preExistingTouchedPaths.length ||
+    full.changedPathCount < full.changedPaths.length ||
+    full.pathEndpointTotal !==
+      full.createdTotal + full.updatedTotal + full.deletedTotal +
+      full.renamedTotal * 2 + full.preExistingTouchedTotal ||
+    full.omittedPathEndpointTotal !== full.pathEndpointTotal -
+      (full.createdPaths.length + full.updatedPaths.length + full.deletedPaths.length +
+        full.renamedPaths.length * 2 + full.preExistingTouchedPaths.length) ||
+    typeof full.pathFactsTruncated !== "boolean" ||
+    full.pathFactsTruncated !== (full.omittedPathEndpointTotal > 0) ||
+    typeof full.pathFactsSha256 !== "string" ||
+    !HASH_PATTERN.test(full.pathFactsSha256) ||
+    (full.processOutcome !== undefined &&
+      ![
+        "completed", "completed_nonzero", "spawn_failed", "timed_out",
+        "cancelled", "persistence_failed", "indeterminate",
+      ].includes(full.processOutcome)) ||
+    !isExpectedArtifactReference(full.preObservation, "terminal-pre-observation") ||
+    !isExpectedArtifactReference(full.postObservation, "terminal-post-observation") ||
+    !isExpectedArtifactReference(full.terminalResult, "terminal-result") ||
+    full.preObservation.id !== full.operationId ||
+    full.postObservation.id !== full.operationId ||
+    full.terminalResult.id !== full.operationId
+  ) return false;
+  if (full.observationOutcome === "observed") {
+    return typeof full.repositoryFingerprint === "string" &&
+      HASH_PATTERN.test(full.repositoryFingerprint) &&
+      isTerminalPostObservationControl(full.postObservationControl);
+  }
+  return (
+    ["protected_or_hidden_changed", "unknown"].includes(
+      full.observationOutcome ?? "",
+    ) &&
+    full.repositoryFingerprint === undefined &&
+    full.postObservationControl === undefined
+  );
+}
+
+function validLegacyTerminalPaths(
+  terminal: Partial<Extract<
+    SessionState["mutations"][number],
+    { readonly kind: "terminal" }
+  >>,
+): boolean {
+  return boundedStringArray(terminal.createdPaths, 100_000, 32_768) &&
     boundedStringArray(terminal.updatedPaths, 100_000, 32_768) &&
     boundedStringArray(terminal.deletedPaths, 100_000, 32_768) &&
     boundedStringArray(terminal.preExistingTouchedPaths, 100_000, 32_768) &&
@@ -628,20 +776,75 @@ function isMutationRecord(value: unknown): value is SessionState["mutations"][nu
       hasExactKeys(rename, ["from", "to"]) &&
       typeof rename.from === "string" && rename.from.length <= 32_768 &&
       typeof rename.to === "string" && rename.to.length <= 32_768
-    ) &&
-    ["none", "observed", "protected_or_hidden_changed", "unknown"].includes(
-      terminal.observationOutcome ?? "",
-    ) &&
-    (terminal.preObservation === undefined ||
-      (isArtifactReference(terminal.preObservation) &&
-        terminal.preObservation.kind === "terminal-pre-observation")) &&
-    (terminal.postObservation === undefined ||
-      (isArtifactReference(terminal.postObservation) &&
-        terminal.postObservation.kind === "terminal-post-observation")) &&
-    isArtifactReference(terminal.terminalResult) &&
-    terminal.terminalResult.kind === "terminal-result" &&
-    (terminal.repositoryFingerprint === undefined ||
-      HASH_PATTERN.test(terminal.repositoryFingerprint));
+    );
+}
+
+function terminalPathFactBytes(
+  terminal: {
+    readonly changedPaths?: readonly string[];
+    readonly createdPaths?: readonly string[];
+    readonly updatedPaths?: readonly string[];
+    readonly deletedPaths?: readonly string[];
+    readonly preExistingTouchedPaths?: readonly string[];
+    readonly renamedPaths?: readonly { readonly from: string; readonly to: string }[];
+  },
+): number {
+  return [
+    ...(terminal.changedPaths ?? []),
+    ...(terminal.createdPaths ?? []),
+    ...(terminal.updatedPaths ?? []),
+    ...(terminal.deletedPaths ?? []),
+    ...(terminal.preExistingTouchedPaths ?? []),
+    ...(terminal.renamedPaths ?? []).flatMap((rename) => [rename.from, rename.to]),
+  ].reduce((total, value) => total + Buffer.byteLength(value), 0);
+}
+
+function terminalRetainedEndpointCount(
+  terminal: {
+    readonly createdPaths?: readonly string[];
+    readonly updatedPaths?: readonly string[];
+    readonly deletedPaths?: readonly string[];
+    readonly preExistingTouchedPaths?: readonly string[];
+    readonly renamedPaths?: readonly { readonly from: string; readonly to: string }[];
+  },
+): number {
+  return (
+    (terminal.createdPaths?.length ?? 0) +
+    (terminal.updatedPaths?.length ?? 0) +
+    (terminal.deletedPaths?.length ?? 0) +
+    (terminal.preExistingTouchedPaths?.length ?? 0) +
+    (terminal.renamedPaths?.length ?? 0) * 2
+  );
+}
+
+function validNonnegativeInteger(value: unknown): value is number {
+  return typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0;
+}
+
+function isExpectedArtifactReference(
+  value: unknown,
+  kind: ArtifactReference["kind"],
+): value is ArtifactReference {
+  return isArtifactReference(value) && value.kind === kind;
+}
+
+function isTerminalPostObservationControl(value: unknown): boolean {
+  if (!hasExactKeys(value, ["branch", "head", "excludedStateFingerprint"])) {
+    return false;
+  }
+  const control = value as {
+    readonly branch?: unknown;
+    readonly head?: unknown;
+    readonly excludedStateFingerprint?: unknown;
+  };
+  return (
+    (control.branch === null || typeof control.branch === "string") &&
+    (control.head === null || typeof control.head === "string") &&
+    typeof control.excludedStateFingerprint === "string" &&
+    HASH_PATTERN.test(control.excludedStateFingerprint)
+  );
 }
 
 function isArtifactReference(value: unknown): value is ArtifactReference {

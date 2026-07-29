@@ -13,6 +13,31 @@ const counterToLimit: Readonly<Record<BudgetCounter, keyof BudgetLimits>> = {
   protocolRepairs: "maxProtocolRepairs",
 };
 
+export type PostHocBudgetCounter =
+  | "changedFiles"
+  | "changedLines"
+  | "commandOutputBytes";
+
+export interface PostHocBudgetCharge {
+  readonly changedFiles?: number;
+  readonly changedLines?: number;
+  readonly commandOutputBytes?: number;
+}
+
+export interface PostHocBudgetExceeded {
+  readonly counter: PostHocBudgetCounter;
+  readonly previous: number;
+  readonly charged: number;
+  readonly actual: number;
+  readonly persistedLimit: number;
+  readonly effectiveLimit: number;
+}
+
+export interface PostHocBudgetResult {
+  readonly usage: Pick<BudgetUsage, PostHocBudgetCounter>;
+  readonly exceeded: readonly PostHocBudgetExceeded[];
+}
+
 export class BudgetMeter {
   public constructor(private readonly state: SessionState) {}
 
@@ -86,8 +111,77 @@ export class BudgetMeter {
     } satisfies BudgetUsage;
   }
 
+  /**
+   * Records facts discovered only after a terminal operation. Budget overruns
+   * are returned after all actual usage is applied; they never throw before
+   * truth can be persisted.
+   */
+  public applyPostHoc(
+    charge: PostHocBudgetCharge,
+    oneTimeLimits: Partial<Record<PostHocBudgetCounter, number>> = {},
+  ): PostHocBudgetResult {
+    const counters: readonly PostHocBudgetCounter[] = [
+      "changedFiles",
+      "changedLines",
+      "commandOutputBytes",
+    ];
+    const next = { ...this.state.budgetUsage };
+    const exceeded: PostHocBudgetExceeded[] = [];
+    for (const counter of counters) {
+      const amount = charge[counter] ?? 0;
+      if (!Number.isSafeInteger(amount) || amount < 0) {
+        throw new AgentError(
+          "INTERNAL_ERROR",
+          `Invalid post-hoc budget amount for ${counter}`,
+          { amount },
+        );
+      }
+      const limitKey = counterToLimit[counter];
+      const persistedLimit = this.state.budgetLimits[limitKey];
+      const oneTimeLimit = oneTimeLimits[counter];
+      if (
+        oneTimeLimit !== undefined &&
+        (!Number.isSafeInteger(oneTimeLimit) || oneTimeLimit < persistedLimit)
+      ) {
+        throw new AgentError(
+          "INTERNAL_ERROR",
+          `Invalid one-time post-hoc budget limit for ${counter}`,
+          { oneTimeLimit, persistedLimit },
+        );
+      }
+      const previous = next[counter];
+      const actual = saturatingAdd(previous, amount);
+      next[counter] = actual;
+      const effectiveLimit = oneTimeLimit ?? persistedLimit;
+      if (actual > effectiveLimit) {
+        exceeded.push({
+          counter,
+          previous,
+          charged: amount,
+          actual,
+          persistedLimit,
+          effectiveLimit,
+        });
+      }
+    }
+    this.state.budgetUsage = next;
+    return {
+      usage: {
+        changedFiles: next.changedFiles,
+        changedLines: next.changedLines,
+        commandOutputBytes: next.commandOutputBytes,
+      },
+      exceeded,
+    };
+  }
+
   public remaining(counter: BudgetCounter): number {
     const limitKey = counterToLimit[counter];
     return this.state.budgetLimits[limitKey] - this.state.budgetUsage[counter];
   }
+}
+
+function saturatingAdd(left: number, right: number): number {
+  const total = left + right;
+  return Number.isSafeInteger(total) ? total : Number.MAX_SAFE_INTEGER;
 }

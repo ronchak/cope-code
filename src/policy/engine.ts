@@ -167,6 +167,7 @@ export class PolicyEngine {
   private evaluateMode(operation: PolicyOperation, checks: PolicyCheck[]): void {
     if (this.session.mode === "inspect") {
       if (
+        operation.tool === "terminal_exec" ||
         toolRequiresContext(operation.tool, "change") ||
         operation.paths?.some((path) => path.access !== "read") === true
       ) {

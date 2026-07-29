@@ -43,6 +43,36 @@ export interface GitStatusResult {
   readonly snapshotSha256: string;
 }
 
+export interface GitIndexIdentity {
+  readonly sha256: string;
+  readonly bytes: number;
+}
+
+export interface GitComponentFingerprints {
+  readonly visibleStateSha256: string;
+  readonly excludedStateSha256: string;
+  readonly protectedWorktreeSha256: string;
+  readonly normalTransitionsSha256: string;
+  readonly gitControlsSha256: string;
+}
+
+export interface GitObservationEntry extends GitStatusEntry {
+  readonly headMode?: string;
+  readonly indexMode?: string;
+  readonly worktreeMode?: string;
+  readonly headObject?: string;
+  readonly indexObject?: string;
+  readonly worktreeIdentity?: {
+    readonly mode: number;
+    readonly size: number;
+    readonly mtimeNs?: string;
+    readonly ctimeNs?: string;
+    readonly device?: string;
+    readonly fileId?: string;
+    readonly contentSha256?: string;
+  };
+}
+
 /**
  * Local-only command boundary evidence. The ignored-worktree component is
  * deliberately never returned to Copilot because it may encode excluded path
@@ -143,6 +173,13 @@ export class GitInspector {
     const stateEntries: GitStatusEntry[] = [];
     // Keep descriptor use bounded even for unusually large dirty worktrees.
     for (const entry of parsed.entries) {
+      // Ignored entry content hashes do not participate in any returned status
+      // digest or summary. Skipping them is byte-compatible and avoids making
+      // ignored build churn break ordinary status inspection.
+      if (entry.kind === "ignored") {
+        stateEntries.push(entry);
+        continue;
+      }
       stateEntries.push({
         ...entry,
         stateSha256: this.digest(stableJson({
@@ -898,7 +935,7 @@ function shouldSkipIntegrityDirectory(repositoryRelativePath: string): boolean {
     name === "vendor";
 }
 
-interface IsolatedGitView {
+export interface IsolatedGitView {
   readonly branch: string | null;
   readonly head: string | null;
   readonly environment: NodeJS.ProcessEnv;
@@ -912,7 +949,7 @@ interface IsolatedGitView {
  * config, hooks, info attributes, or refs. Repository .gitattributes may name
  * a filter, but without its local command definition Git treats it as inert.
  */
-async function createIsolatedGitView(
+export async function createIsolatedGitView(
   gitExecutable: string,
   repositoryRoot: string,
   signal?: AbortSignal,

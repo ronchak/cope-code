@@ -32,9 +32,18 @@ export type TerminalExecMutationOutcome =
 export type TerminalArtifactKind =
   | "terminal-request"
   | "terminal-pre-observation"
+  | "terminal-launch-receipt"
   | "terminal-exit-receipt"
   | "terminal-post-observation"
   | "terminal-result";
+
+/**
+ * Slice 2 does not define a separate stdout/stderr artifact kind. Keep this
+ * explicit so adding evidence kinds cannot silently widen stream references.
+ */
+export const TERMINAL_STREAM_ARTIFACT_KINDS = [] as const;
+export type TerminalStreamArtifactKind =
+  (typeof TERMINAL_STREAM_ARTIFACT_KINDS)[number];
 
 export interface TerminalArtifactReference {
   readonly kind: TerminalArtifactKind;
@@ -43,12 +52,17 @@ export interface TerminalArtifactReference {
   readonly sha256: string;
 }
 
+export interface TerminalStreamArtifactReference
+  extends Omit<TerminalArtifactReference, "kind"> {
+  readonly kind: TerminalStreamArtifactKind;
+}
+
 export interface TerminalExecStreamResult {
   readonly bytes: number;
   readonly head: string;
   readonly tail: string;
   readonly truncated: boolean;
-  readonly artifact?: TerminalArtifactReference;
+  readonly artifact?: TerminalStreamArtifactReference;
 }
 
 export interface TerminalExecRename {
@@ -68,6 +82,16 @@ export interface TerminalExecMutationResult {
   readonly binary_files: number;
   readonly ignored_summary: string;
   readonly repository_fingerprint?: string;
+  readonly created_total?: number;
+  readonly updated_total?: number;
+  readonly deleted_total?: number;
+  readonly renamed_total?: number;
+  readonly pre_existing_touched_total?: number;
+  readonly path_endpoint_total?: number;
+  readonly path_endpoint_omitted?: number;
+  readonly path_facts_truncated?: boolean;
+  readonly path_facts_sha256?: string;
+  readonly unavailable_baseline_count?: number;
 }
 
 export interface TerminalExecResult {

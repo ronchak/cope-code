@@ -131,3 +131,33 @@ test("session diff uses the earliest checkpoint for each agent-mutated path", as
   assert.equal(onlyA.comparedFileCount, 1);
   assert.equal(onlyA.diff.includes("b.txt"), false);
 });
+
+test("terminal session diff remains a fail-closed compile seam until its resolver is integrated", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-terminal-diff-seam-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(
+    boundary,
+    path.join(temporary, "checkpoints"),
+  );
+  const mutation = {
+    kind: "terminal" as const,
+    operationId: "op_terminal_1",
+    changedPaths: ["generated.txt"],
+  };
+  await assert.rejects(
+    () => new SnapshotDiffInspector(boundary, checkpoints).diffSession([mutation]),
+    /verified before-image resolver/u,
+  );
+  await assert.rejects(
+    () => new SnapshotDiffInspector(boundary, checkpoints, {
+      resolveTerminalBeforeImage: async () => ({
+        available: false,
+        reason: "missing_evidence",
+      }),
+    }).diffSession([mutation]),
+    /contract is not integrated yet/u,
+  );
+});
