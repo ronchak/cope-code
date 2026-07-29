@@ -103,22 +103,38 @@ export class WindowsHostPlatform implements HostPlatform {
     return { standardUserVerified: true, guiSessionVerified: options.liveBrowser };
   }
 
-  public async terminateProcessTree(child: ChildProcess): Promise<void> {
+  public async terminateProcessTree(child: ChildProcess, graceMs = 1_000): Promise<void> {
     const pid = child.pid;
-    if (pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
+    if (pid === undefined) return;
     await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadline);
+        resolve();
+      };
       const killer = this.spawnProcess("taskkill.exe", ["/pid", String(pid), "/T", "/F"], {
         shell: false,
         windowsHide: true,
         stdio: "ignore",
         env: this.probeEnvironment(process.env),
       });
-      killer.once("error", () => { try { child.kill("SIGKILL"); } catch { /* exited */ } resolve(); });
+      const deadline = setTimeout(() => {
+        try { killer.kill("SIGKILL"); } catch { /* already exited */ }
+        try { child.kill("SIGKILL"); } catch { /* already exited */ }
+        finish();
+      }, Math.max(1, graceMs));
+      deadline.unref();
+      killer.once("error", () => {
+        try { child.kill("SIGKILL"); } catch { /* exited */ }
+        finish();
+      });
       killer.once("close", (code) => {
         if (code !== 0 && child.exitCode === null && child.signalCode === null) {
           try { child.kill("SIGKILL"); } catch { /* exited */ }
         }
-        resolve();
+        finish();
       });
     });
   }
