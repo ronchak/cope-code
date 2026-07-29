@@ -1,29 +1,56 @@
 # Architecture
 
-## Host portability boundary
+## Product intent
 
-One host adapter is selected at startup and injected through preflight, state/path resolution, onboarding, runtime composition, and process execution. Windows retains its `%LOCALAPPDATA%`, integrity-label, frozen Edge discovery order, Git discovery, and `taskkill.exe` behavior while adding deterministic Chrome Stable candidates. Darwin adds exact-tuple preview eligibility, Aqua verification, private Application Support storage, deterministic Edge/Chrome candidates, actual-volume case/Unicode identity, and a parent-death POSIX process-group supervisor. The browser adapter, `ModelTransport`, protocol, agent loop, policy meanings, and visible/headful/manual-authentication constraints are shared and unchanged. See [MACOS-TARGET.md](MACOS-TARGET.md); this boundary is implementation evidence, not live certification.
+Cope turns Microsoft 365 Copilot Chat into a local coding agent through a visible supported browser. Copilot supplies software-engineering judgment. The local CLI supplies repository access, terminal execution, file editing, process control, Git operations, recovery, and verification.
 
-## Governing invariant
+The target user experience is intentionally close to Claude Code: open a project, describe a task, watch the agent inspect and modify the codebase, run the tools it needs, answer only genuinely necessary questions, and receive a grounded completion report.
 
-Microsoft 365 Copilot Chat is the only reasoning engine. The harness is a deterministic control plane: it moves explicit state, validates a versioned protocol, evaluates facts against policy, executes a requested typed operation, and reports observed outcomes. It must never infer a different tool call from malformed prose, invent repository facts, choose an implementation, reinterpret a failed command as success, or accept Copilot's completion claim on trust.
+Developer usefulness is the primary product objective. Security controls exist to preserve informed user authority, reduce accidental cross-workspace effects, protect Cope's browser transport and local records from ordinary tool access, and make observed local effects truthful and recoverable. They are not intended to reduce the agent to a fixed validation-command catalog or to imply that arbitrary host commands are sandboxed.
 
-That boundary makes the browser replaceable and keeps the local runtime testable without Edge.
+## Status
+
+This document describes the target architecture. Cope 0.1.9 implements the browser transport, state machine, strict protocol, repository tools, atomic patching, command catalog, recovery, and completion foundations, but it does not yet implement the full developer-mode terminal surface described here.
+
+The current implementation gap is summarized in [LIMITATIONS.md](LIMITATIONS.md). The minimum viable developer-mode target is defined in [DEVELOPER-MODE-TARGET.md](DEVELOPER-MODE-TARGET.md).
+
+## Governing model
+
+Microsoft 365 Copilot Chat is the reasoning engine. Cope is the local agent runtime.
+
+Copilot may inspect evidence, choose an implementation, request tools, react to results, and decide when the task appears complete. Cope owns transport correlation, user authority, operation identity, local execution, durable state, observed outcomes, recovery, and final verification.
+
+The harness must never fabricate a tool result, silently reinterpret malformed prose as an action, treat an uncertain browser submission as safely retryable, or accept a completion claim without checking local state. It may expose broad developer capabilities once the user has granted them. Deterministic execution is a correctness boundary, not a reason to make the tool weak.
+
+## Design priorities
+
+The architecture is ordered around these priorities:
+
+1. A genuinely useful coding-agent workflow.
+2. Low-friction autonomy for normal work in the selected project.
+3. Accurate observation and attribution of local effects.
+4. Truthful recovery after interruption or uncertain mutation.
+5. Clear escalation for materially new or consequential authority.
+6. Optional hardened deployment controls without making them the default product.
+
+When a stronger security guarantee conflicts with the developer-mode experience, the product must state the residual risk honestly instead of pretending that application-level checks provide an operating-system sandbox.
 
 ## Component boundaries
 
 | Component | Owns | Must not own |
 | --- | --- | --- |
-| CLI (`src/cli`) | argument parsing, grant presentation, operator input, persisted status, pause/abort control, rollback, audit verification, review-package export, fresh terminal handoff | policy decisions, DOM details, repository mutation logic |
-| Orchestrator (`src/orchestrator`) | state-machine progression, turn correlation, budgets, pending operations, recovery routing, completion checks | software-engineering judgment, direct filesystem or DOM access |
-| Protocol (`src/protocol`) | model-facing `cba-agent/1` intents/answers, deterministic normalization into internal `cba/1`, strict fence extraction, correlation and semantic validation, bootstrap and result serialization | tool execution, policy, browser interaction |
-| Policy (`src/policy`) | organization/repository/session precedence, allow/ask/deny, budget and capability decisions | executing a denied action, modifying its own inputs |
-| Repository/security/tools (`src/repository`, `src/security`, `src/tools`) | path boundary, bounded reads/search, Git inspection, content controls, atomic changes, checkpoints, command catalog/process limits | browser selectors, model reasoning, arbitrary shell |
-| Transport (`src/transport`) | submit/resolve/receive correlation and exactly-once status contract; offline fixture/replay implementations | repository or policy knowledge |
-| Browser adapter (`src/browser`) | Edge/Chrome product model, deterministic discovery and identity evidence, visible lifecycle, product-specific dedicated profile, host/account/protection assertions, semantic locators, submission/response association, page-state classification | local tools, policy decisions, source mutation |
-| Session/audit (`src/session`, `src/audit`) | durable local truth, workspace lock, operation journal, artifacts, integrity records | treating the chat transcript as authoritative state |
+| CLI (`src/cli`) | project selection, task entry, grant presentation, live progress, user decisions, pause/abort/resume, final handoff | model reasoning, DOM selectors, hidden policy changes |
+| Orchestrator (`src/orchestrator`) | agent-loop progression, turn correlation, operation scheduling, budgets, recovery routing, completion checks | software-engineering judgment, browser DOM logic |
+| Protocol (`src/protocol`) | model-facing intents and results, tool schemas, deterministic identity, semantic validation, compact bootstrap and repairs | tool execution, policy decisions, browser interaction |
+| Policy (`src/policy`) | modes, typed-tool workspace roots, allow/ask/deny decisions, capability expansion, high-consequence escalation | executing actions, inventing local facts, claiming OS containment |
+| Repository (`src/repository`) | project discovery, bounded reads/search, file identity, diffs, checkpoints, patch transactions, observed change inventory | browser assumptions, model reasoning |
+| Terminal and process services (`src/tools`) | direct argv and shell execution, live output, cancellation, environment and working-directory handling, later PTY/process handles | deciding what command solves the task |
+| Git services (`src/repository`, `src/tools`) | status, diff, branch facts, local Git operations, attribution of command-generated changes | remote publication without applicable authority |
+| Transport (`src/transport`) | submit/resolve/receive correlation and exactly-once delivery classification | repository or policy knowledge |
+| Browser adapter (`src/browser`) | visible supported-browser lifecycle, dedicated profile, host/account checks, semantic locators, response association | local tools, source mutation, generic web automation |
+| Session and audit (`src/session`, `src/audit`) | durable local truth, workspace lock, operation journal, artifacts, mutation records, integrity evidence | treating the chat transcript as authoritative state |
 
-Dependency direction is inward through contracts:
+Dependency direction remains inward through contracts:
 
 ```text
 CLI
@@ -31,142 +58,219 @@ CLI
  v
 AgentRuntime --> ProtocolAdapter
  |      |-----> RuntimePolicy --> PolicyEngine
- |      |-----> ToolExecutor --> repository/security/process services
+ |      |-----> ToolExecutor --> repository / terminal / process / Git services
  |      |-----> ModelTransport <---- fixture | replay | browser adapter
  |      `-----> SessionStore / OperationJournal / AuditLog
  `------------> UserInteraction
 ```
 
-The tool layer cannot import Copilot DOM assumptions. The browser adapter cannot read or modify a repository. Selecting Edge or Chrome changes local launch/configuration state only; it does not change the model-transport contract, policy, tools, correlation, classifier, or agent loop.
+The browser remains a replaceable transport. Terminal and repository services must not import Copilot DOM assumptions. The browser adapter must not read or modify project files.
 
-## Authoritative control flow
+## Runtime modes
 
-1. The CLI resolves the canonical Git repository, rejects index gitlinks and descendant Git boundaries, loads versioned configuration, records policy-visible pre-existing changes plus a keyed aggregate of hidden state, performs host preflight, and acquires the per-workspace lock.
-2. The user approves one task-scoped session grant. No repository content is sent before the applicable disclosure capability exists.
-3. The runtime serializes the objective, acceptance criteria, active tools, scope, and budgets into the `cba-agent/1` model-facing bootstrap contract. Task, turn, message, and operation identity remain harness-owned.
-4. The disclosure guard scans the final serialized outbound message.
-5. The transport submits it to the correlated conversation and returns a delivery status: `submitted`, `not-submitted`, or `indeterminate`.
-6. The model response is accepted only when transport correlation and completion signals succeed.
-7. The protocol adapter extracts exactly one `cba-agent/1` intent, answer, blocked state, or progress object; generates deterministic internal `cba/1` correlation; and validates the resulting wire message. Historical model-authored `cba/1` remains a migration path. Live marker-proven legacy turns may rebind stale task/turn correlation with an audit event, but cached recovery replay never does.
-8. The runtime evaluates each requested operation against organization policy, repository policy, and the session grant.
-9. The tool host revalidates local facts, executes the operation, records actual results, and places source-bearing output through the disclosure guard. For `run_command`, explicitly granted `sideEffects: true` validation may run in `edit`/`auto` and may create ordinary Git-ignored artifacts. Every command is bracketed by nested-Git plus Git-visible/nonignored, keyed policy-hidden protected, and Git-control integrity checks; `sideEffects: false` additionally binds a bounded ordinary-ignored-file inventory. Disallowed or unverifiable drift becomes recovery-required and cannot be trusted as validation. Intentional source-mutating commands remain outside v1 until a versioned write-scope/checkpoint contract exists.
-10. Results return through the same transport. The loop continues without per-step approval while every operation remains in the existing grant and budget.
-11. `complete_task` triggers local verification. A failed check becomes a structured result for Copilot to act on; only a successful local check makes the session `completed`.
+### Inspect
 
-## State machine
+Inspect mode is read-only. It permits repository inspection, safe diagnostics, and informational answers. It is the narrow mode for review or orientation.
 
-The persisted state uses schema version `1` and protocol version `cba/1`. Terminal states are `completed`, `rolled_back`, `blocked`, `aborted`, and `failed`. `rolled_back` means an explicit checkpoint restoration succeeded and any prior completion is no longer authoritative.
+### Developer
+
+Developer mode is the target default. One initial task grant authorizes ordinary work in the selected project, including reading and editing files, running shell or direct commands, using installed developer tools, creating generated artifacts, using the network, and performing local Git operations.
+
+Developer mode should interrupt only when Cope can identify a material expansion or high-consequence action, such as selecting another typed-tool root, requesting elevation, explicitly targeting Cope's private state or browser profile, or performing a destructive remote or publishing action.
+
+A shell command still runs with the current user's operating-system authority. The selected project is the intended scope and default working directory, not a kernel-enforced boundary around the child process.
+
+### Hardened
+
+Hardened mode is optional. It retains reviewed command catalogs, stricter path rules, declared network hosts, narrower mutation mechanisms, and organization-controlled ceilings. It is appropriate for managed deployments, not the baseline personal-developer experience.
+
+The current `edit` and `auto` modes may be migrated or aliased during implementation, but the resulting user-facing distinction must be simple: read-only inspection, normal developer autonomy, or an explicitly managed hardened profile.
+
+## Authority and grants
+
+The user approves one visible task-scoped grant before repository content is sent to Copilot. In developer mode, that grant should be compact and understandable:
+
+- selected project and any additional typed-tool roots;
+- permission to read and modify project files;
+- permission to run local developer commands as the current user;
+- whether network and local Git operations are available;
+- known actions that still require confirmation;
+- an explicit statement that general commands are not sandboxed to the project.
+
+The model should not be prompted for permissions it already has. A denied operation should explain the actual boundary and whether a capability request can expand it. Session approvals should persist for the session and survive resume.
+
+No mode grants operating-system elevation. Cope runs with the user's existing authority and does not bypass platform security controls.
+
+## Target tool surface
+
+The model-facing tool surface should remain typed, but it must be broad enough to support normal development.
+
+### Repository observation
+
+- list files and directories;
+- search text;
+- read bounded file ranges;
+- inspect Git status and diffs;
+- inspect file metadata and project configuration.
+
+### Repository mutation
+
+- exact text edits;
+- atomic create, update, delete, and multi-file patches;
+- move or rename files;
+- record observed command-generated changes in session history.
+
+### Terminal and process control
+
+- execute a one-shot command through direct argv or an explicit shell;
+- select a repository-relative default working directory;
+- stream stdout and stderr locally while bounding model-visible output;
+- cancel process trees on pause or abort;
+- later start, inspect, write to, and stop long-running or interactive processes.
+
+### Git
+
+- inspect status, diff, branch, and history needed for the task;
+- stage or restore selected paths;
+- create local commits when granted;
+- keep known push, force-push, merge, release, deployment, and publication actions separately authorizable where practical.
+
+### Interaction and lifecycle
+
+- request missing user input;
+- request a bounded capability expansion;
+- report progress;
+- claim completion for independent local verification.
+
+## Terminal execution model
+
+Terminal execution is a first-class capability, not a disguised validation command.
+
+A one-shot execution request should support either:
 
 ```text
-created -> preflight -> grant_pending -> transport_starting
-                                            |
-                                            v
-                                    initializing_model
-                                            |
-                                            v
-                                      awaiting_model
-                                       /    |     \
-                                      v     v      v
-                              executing  awaiting  validating
-                                tools      user    completion
-                                  |         |         |
-                                  v         |         +--> completed
-                              returning <---+         |
-                               results <--------------+
-                                  |
-                                  `------> awaiting_model
-
-active states --> paused --> recovering --> safe resumable state
-active states -----------------------------> blocked | aborted | failed
-inactive lifecycle state -- explicit verified rollback --> rolled_back
+executable + argv
 ```
 
-Transitions are enumerated in code. Redundant or unlisted transitions are internal errors. Each mutation and browser exchange has persistent intent before its consequential action.
+or:
 
-Operator control is also explicit. `Ctrl+C`/`SIGTERM` request a resumable pause. A separate CLI first attempts the workspace lock; when the owner is active, it writes one versioned, session-bound pause/abort request for the owner's 250 ms monitor. Pause cancels the active runtime/transport and persists `paused`; abort persists terminal `aborted`. Abort has priority over a later pause request.
+```text
+shell + command text
+```
 
-## Exactly-once and crash ordering
+Direct argv remains preferable when the model does not need shell syntax. Shell mode is necessary for ordinary developer workflows involving pipes, redirects, command chaining, environment setup, globs, and platform-native scripts.
 
-### Browser submissions
+Commands run as the current user with an explicit working directory. The runtime records the exact request, start and end state, exit status, duration, bounded output, cancellation state, and observed project effects. The CLI may show live output while Copilot receives only bounded excerpts or durable page references.
 
-Before submission, the runtime stores the complete outbox artifact, hashes it, and persists a `prepared` submission intent. The adapter appends a task/turn/submission marker, rechecks host, identity, protection, conversation, and actionable composer state immediately before activating send. It then classifies the outcome:
+The runtime must not describe this as sandboxed unless an actual platform sandbox is present. Application-level process supervision, timeouts, output limits, and post-run inspection improve usability and recovery but do not contain a malicious executable.
 
-- `submitted`: page evidence proves the marker is associated with the conversation;
-- `not-submitted`: evidence proves activation did not happen, so retry is permitted;
-- `indeterminate`: delivery cannot be proven either way, so blind retry is prohibited.
+PTY-backed and persistent processes are a later capability. They are not required to deliver the first useful developer-mode release.
 
-On recovery, the runtime asks `resolveSubmission` first. It reuses the same submission ID and original bytes only when non-submission is known. The opaque hashed conversation identity is persisted and required on subsequent turns.
+## Command-generated mutations
 
-### Local operations
+Commands are allowed to modify project files in developer mode. Treating every tracked change from a formatter, codemod, package manager, generator, migration, or build tool as a recovery incident would defeat the product.
 
-The operation journal stores request integrity and lifecycle state. Completed operations return the recorded outcome rather than executing again. Read-only operations can be retried after bounded uncertainty. An interrupted mutation is marked indeterminate and requires reconciliation or rollback; it is never blindly replayed.
+The minimum viable flow is:
 
-### Atomic source changes
+1. Record the pre-command Git and workspace state.
+2. Persist the exact terminal request under a mutating operation identity.
+3. Run the command.
+4. Inspect the resulting project state.
+5. Attribute observed in-project creates, updates, deletes, and renames to the command operation.
+6. Preserve pre-existing user changes as a separate category.
+7. Persist the bounded command result before marking the operation complete.
+8. Add the observed changes to session mutation history.
+9. Return the actual change summary and command result to Copilot.
+10. Require relevant validation after the latest mutation before completion when configured.
 
-`edit_text` performs a literal old-to-new replacement in one file after checking its exact current-byte SHA-256 and non-overlapping occurrence count. `apply_patch` remains the create/delete and whole-file/multi-file transaction. Both converge on the same patch engine: a checkpoint is created outside the repository, changes are staged as flat identity-bound artifacts, and authenticated reserved-leaf probes verify hard-link capability for every participating directory before any target is parked. Each transaction also records the exact identity of a private mode-`0700` quarantine directory before mutation. Destructive cleanup first moves the shared-namespace name to a deterministic leaf inside that directory, validates the moved inode/content/mode, and only then unlinks it; an interrupted move is reconciled from the journal rather than guessed. Consequential leaf operations run relative to an identity-checked target directory before the post-change inventory is verified. Artifact plans and identities, pre-link installation intent, quarantine identity, plus rollback direction and progress are integrity-bound in the checkpoint so a reopened process can authenticate or safely refuse deterministic transaction leaves. An unacknowledged install whose target is now absent is ambiguous and preserves that absence for explicit recovery instead of recreating older content. Successful rollback retains an authenticated terminal marker, including the original force decision, making retries and audit convergence idempotent until CLI state has caught up. Failure invokes restoration. If restoration itself cannot be proven, the session stops in recovery-required state.
+Command outcome and mutation outcome are separate facts. A failed, timed-out, or cancelled command may still have changed files.
 
-The filesystem transaction is fail-closed application logic, not a kernel sandbox or a portable pathname compare-and-swap primitive. Descriptor reads, no-follow opens, no-overwrite hard links, pre/post identity checks, private quarantine, and authenticated recovery close observable ancestor, leaf-replacement, same-inode, and process-loss races. Portable Node APIs cannot exclude a hostile same-user writer acting inside the private namespace or in the final kernel boundary between the last pathname check and `rename`/`link`; endpoint isolation remains required against that threat.
+Unexpected effects outside the intended project should stop the task when Cope can observe them. Cope cannot guarantee detection of every external effect from an unrestricted host process. Developer mode accepts that residual risk and communicates it plainly.
 
-Checkpoint-backed diffs remain inside the same repository boundary. `checkpoint` scope compares current bytes with one verified before-image; `session` scope receives a narrow mutation/checkpoint inventory from authoritative session state and selects the earliest before-image for each agent-mutated path. The repository diff inspector owns byte comparison, bounds, and concrete-path filtering. Tool orchestration supplies scope only; transports and the browser adapter have no checkpoint or filesystem knowledge.
+The existing patch engine retains strong checkpoint and rollback guarantees for predeclared file operations. The first terminal MVP should promise truthful attribution and reconciliation, not automatic rollback for arbitrary commands whose target paths were unknown before launch.
 
-## Trust boundaries
+A later hardened implementation may run commands in an isolated worktree, container, VM, or operating-system sandbox and import the resulting patch into the real workspace.
 
-1. User to CLI/session grant.
-2. Organization/repository configuration to effective policy.
-3. Repository/process output to disclosure guard.
-4. Copilot output to strict protocol parser.
-5. Harness to child process.
-6. Harness to visible selected-browser automation.
-7. Product-specific dedicated browser profile to authentication state.
-8. Selected Edge or Chrome process to the approved Microsoft 365 host.
-9. Session process to local audit and recovery storage.
+## Filesystem scope
 
-Every value crossing these boundaries is untrusted until the receiving layer validates it. Source comments, documentation, test fixtures, filenames, diffs, and command output cannot alter protocol or authority.
+The selected project is the default workspace and command working directory. Typed repository tools use project-relative paths. Developer mode may add explicit roots for monorepos, sibling packages, generated SDKs, or user-selected files.
 
-## Local truth and storage
+Cope's private state, operation journal, checkpoints, dedicated browser profiles, authentication material, and machine configuration are never ordinary typed-tool roots. The terminal contract does not authorize targeting them, but an unrestricted child process may technically reach any location available to the current user. Stronger prevention requires operating-system isolation.
 
-On Windows, the default state root is `%LOCALAPPDATA%\CopilotBrowserAgent`. Sessions, checkpoints, workspace locks, policy hashes, operation records, audit events, disclosure metadata, and temporary recovery artifacts live outside the repository. `.cba\repository.json` is repository configuration, not runtime state.
+Symlink and cross-device behavior should be based on the actual host and configured typed-tool workspace, not rejected universally for portability. The MVP may remain conservative where repository-tool recovery is not yet reliable, but those constraints are implementation gaps rather than permanent product principles.
 
-Operational records are separated by sensitivity and recovery purpose:
+## Network and credentials
 
-- `artifacts` stores exact outbox, response, and user-decision/capability-decision bytes with integrity manifests. Free-form decisions can contain repository-sensitive text. Paused and otherwise nonterminal sessions retain it for recovery. Every terminal lifecycle commit durably records whether source artifacts must be removed or retained; when removal is required, later terminal loads retry the idempotent cleanup after transient failure.
-- checkpoints store source-bearing before-images and remain after completion until the approved checkpoint retention process removes them.
-- `fingerprint.key` is a per-session 256-bit HMAC key used to make secret fingerprints non-dictionary-guessable. It is created during initial composition, never sent to Copilot or included in review export, and remains sensitive local state. Once the session has a durable repository baseline, a missing or malformed key fails recovery closed instead of being silently replaced.
-- the completion handoff is a bounded, secret-redacted, integrity-protected durable model claim plus verifier facts. It can still contain task prose and repository paths, is retained separately from transient artifacts, and is not a source-free review package. Hosts that support directory fsync store it as a separately flushed file before committing its session-state reference. Windows stores the record inline with that reference so completion has one atomic state commit instead of an unflushable cross-file ordering.
-- `review-package.json` is an optional source-free derivative containing hashes, counts, timestamps, budgets, validation/mutation metadata, and redaction findings. Its SHA-256 body digest detects change relative to the package; it is not a signature, trusted timestamp, or external attestation.
+Developer mode permits normal network use by developer commands. Package installation, documentation retrieval, source control, schema generation, and cloud-development tools are legitimate work.
 
-Dedicated Edge and Chrome profile storage remains outside both repository and agent-state roots and is credential-equivalent. The products never share a profile. All of these records require explicit ACL, encryption, retention, backup, incident-preservation, and deletion decisions; POSIX-style creation modes do not provision Windows ACLs.
+Cope should not claim host-level egress enforcement unless it actually installs or integrates one. Network policy in application configuration is authorization and reporting without an OS firewall or sandbox.
 
-The audit and disclosure ledgers are SHA-256 hash chains. This detects modification or truncation relative to the available chain; it is not a signature, trusted timestamp, or substitute for approved host storage and access controls.
+The browser adapter never extracts or replays Microsoft credentials, cookies, or tokens. Local commands inherit the environment chosen by the terminal runtime. Secret detection and redaction remain useful before sending source or command output to Copilot, but they are not presented as perfect data-loss prevention.
+
+## Browser transport boundary
+
+The visible browser remains the main architectural constraint. Cope uses the supported Microsoft 365 Copilot UI, manual authentication, a dedicated product-specific profile, and correlated task conversations.
+
+The adapter must retain:
+
+- explicit approved hosts;
+- manual sign-in, MFA, consent, and bot-control handling;
+- submission markers and conversation binding;
+- `submitted`, `not-submitted`, and `indeterminate` delivery states;
+- resolve-before-retry behavior;
+- response association and completion detection;
+- no generic browser-control tool exposed to the model.
+
+These controls prevent duplicate or misdirected browser actions without restricting local developer capability.
+
+## Protocol and context efficiency
+
+The model-facing contract should consume as little chat context as practical.
+
+The first turn sends a compact capability manifest and active tool schemas. Stable operating rules are not repeated on every successful turn. Later turns carry only the relevant result, changed capability, or concise repair reminder. Policy details that cannot affect the next model decision remain local.
+
+The first terminal milestone should add a separately versioned `terminal_exec` tool under the established `cba-agent/1` envelope. The current `run_command` meaning remains catalog-only. An envelope-wide protocol successor is reserved for incompatible changes to top-level message, correlation, authority, or batching semantics.
+
+The protocol may batch independent observations and later add deterministic command sequences that do not require model interpretation between steps. Dependent decisions still require a result round trip.
+
+## State, recovery, and exactly-once behavior
+
+The persisted state machine, operation journal, browser outbox, and recovery model remain core architecture.
+
+Before a consequential action, Cope records durable intent. Completed operations return recorded outcomes instead of executing twice. Read-only work may be retried after bounded uncertainty. A terminal, mutation, or remote action with an unknown outcome requires reconciliation rather than blind replay.
+
+The complete bounded terminal result or stable artifact reference must be persisted before journal completion so recovery can return the same outcome without rerunning the command.
+
+Pause and abort cancel active transport and process work. Resume reconstructs the session from local state, not from assumptions about the chat transcript.
 
 ## Completion boundary
 
-The completion verifier checks deterministic facts:
+Copilot's completion claim is advisory. Cope verifies deterministic local facts:
 
-- repository state is currently known;
-- no changed path is outside the effective scope;
-- no operation remains pending;
+- the current workspace state is known;
+- no operation remains unresolved;
 - no browser submission is indeterminate;
-- every required command has a latest successful record;
-- required validation occurred after the last mutation when configured;
-- the completion summary is nonempty; and
-- configured acceptance criteria are addressed.
+- observed project changes are attributed or explicitly reported;
+- configured required validation has a latest successful result after the relevant mutation;
+- the completion report addresses the task and acceptance criteria.
 
-The final report distinguishes all working-tree changes, agent-recorded changed paths, and pre-existing user paths. After the session reaches `completed`, the active `run`/`resume` command takes a consistency-checked fresh Git status/diff and requires its fingerprint to match the verifier's completion snapshot. If that fresh handoff cannot be established, the command fails even though persisted state records the earlier verified completion. The standalone `status` command reports persisted facts and deliberately does not recompute repository state. The runtime does not commit, push, merge, deploy, publish, or release.
+Completion verification does not prove semantic correctness. The final handoff must distinguish model claims, command results, observed diffs, pre-existing changes, skipped validation, and remaining risk.
 
-## Design rules for extension
+## Extension rules
 
-- Introduce a new model surface by implementing `ModelTransport`; do not add surface-specific conditionals to the runtime.
-- Introduce a new tool by versioning its schema and protocol contract, implementing deterministic authorization facts, adding bounded output and audit behavior, and extending offline/adversarial tests.
-- Never add a raw shell, arbitrary path, generic browser-control, credential, or policy-modification tool to `cba/1`.
-- A wire semantic change requires a new protocol version; a compatible UI selector update requires a new certified UI contract suffix.
-- Configuration must fail closed on unknown schema versions and fields at every validated nesting level, including command, browser-host, UI-contract, signal-group, locator, and text-pattern objects.
-- Keep tests capable of executing the complete loop without network, an installed browser, or Copilot.
+- Add a new model surface by implementing `ModelTransport`.
+- Add a new local capability through a typed tool with an explicit contract version.
+- Preserve the meaning of existing tools such as catalog-backed `run_command`.
+- Prefer broad useful tools with clear observed effects over many narrowly predeclared commands.
+- Keep browser automation transport-specific and local execution browser-agnostic.
+- Never claim containment, egress control, rollback, or transactional guarantees that the host implementation does not provide.
+- Preserve offline fixture and replay coverage for the full loop.
+- Keep hardened policy as an optional profile rather than the only architecture.
 
-## Browser product boundary
+## Current implementation gap
 
-`BrowserProduct` is exactly `edge | chrome`. A browser launch configuration records the product, canonical verified executable, version/hash identity evidence, product-specific profile directory, independent browser/UI contract version, approved entry point, and host/UI checks. Existing strict `cba-browser-config/1` Edge documents are interpreted as Edge in memory; they are not silently rewritten, switched to Chrome, or detached from their authenticated Edge profile. New browser-aware documents use `cba-browser-config/2`.
+Cope 0.1.9 already provides a strong base: browser correlation, durable sessions, typed model intents, policy evaluation, bounded repository inspection, atomic patching, one-shot process execution, cancellation, checkpoints, audit records, and independent completion verification.
 
-Discovery is bounded to deterministic platform candidates and an explicit advanced path. Identity verification then fails closed unless platform metadata proves the requested product: bundle identifier, signing team and code-signature validity on macOS; product/company/original-filename metadata and Authenticode signer on Windows. The verified file version, canonical path, stat identity, and SHA-256 are pinned and rechecked at launch. This proves that the selected file matched the expected signed browser product at those checks. It does not certify a tenant, Conditional Access flow, Copilot UI contract, future browser update, endpoint integrity, or release tuple.
+It remains materially short of the target because commands are catalog-only, shells are prohibited, standard setup discovers only a few npm validation scripts, command-generated source changes are rejected, network access is denied by default, output is buffered rather than presented as a developer terminal stream, process interaction is non-PTY, terminal results are not durable replay artifacts, and local Git writes are unavailable through typed tools.
 
-Playwright launches only that verified executable in a visible persistent context, with downloads disabled and no channel fallback or browser download. Edge and Chrome share the Copilot-page adapter because no product-specific page behavior has been demonstrated. Chrome remains a preview candidate until its independent live gates pass.
+The pivot is substantial but evolutionary. It does not require replacing the browser transport or agent loop. It requires broadening local execution, adding post-command mutation attribution and durable terminal results, adjusting recovery and completion accounting, and changing the trust posture from maximum application-level containment to explicit developer authority with observable effects.

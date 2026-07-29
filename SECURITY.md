@@ -2,31 +2,95 @@
 
 ## Reporting
 
-Report suspected vulnerabilities, unsafe browser behavior, data disclosure, credential/profile exposure, repository-boundary escape, command injection, audit corruption, or duplicate mutation/submission through the organization's approved private security channel.
+Report suspected vulnerabilities or unsafe behavior through the project's approved private security channel when possible.
 
-Do not open a public issue containing repository names, tenant URLs, identities, source, prompts/responses, session state, checkpoints, browser profiles, screenshots, traces, cookies, tokens, or exploit details. This source tree does not name a public response mailbox; deployments must configure an accountable product owner, security contact, privacy contact, and Edge/Copilot adapter owner before pilot use.
+Relevant reports include:
 
-For an active incident, stop the agent, disable live transport if needed, isolate the endpoint according to organizational procedure, preserve approved evidence, and follow [Recovery, checkpoints, and audit](docs/RECOVERY-AND-AUDIT.md).
+- a browser submission sent to the wrong host, account, tenant, or conversation;
+- automated credential, MFA, consent, cookie, token, or profile handling;
+- a mutation or external action being replayed after an uncertain outcome;
+- model or repository text becoming executable without a valid top-level tool request;
+- Cope reporting a command, mutation, validation, or completion as successful without local evidence;
+- unintended privilege elevation;
+- corruption or exposure of Cope's private state, operation records, checkpoints, or dedicated browser profile;
+- loss or overwrite of pre-existing user work;
+- a documented developer-mode or hardened-mode boundary being bypassed.
 
-## Candidate security baseline
+Do not open a public issue containing repository names, tenant URLs, identities, source, prompts or responses, session state, checkpoints, browser profiles, screenshots, traces, cookies, tokens, or exploit details.
 
-This source tree does not certify a supported live compatibility tuple. The primary candidate inventory reports Windows 11 Enterprise build 22631, Edge 149.0.4022.98, Node 24.17.0, npm 11.13.0, and Git 2.55.0.windows.3, but it contains conflicting Git executable discovery and incomplete host/security probes. The two exact Mac candidates are experimental home-test preview lanes only and have offline implementation evidence, not live approval; see [the macOS target record](docs/MACOS-TARGET.md). A deployment may claim support only for exact executable paths/hashes, configuration revisions, tenant/UI contract, endpoint posture, and machine tuple that pass the live-pilot gates. A source checkout or passing offline tests is not that certification.
+For an active incident, stop or pause the agent, preserve relevant local state, reconcile the repository before resuming, and follow [Recovery, checkpoints, and audit](docs/RECOVERY-AND-AUDIT.md).
 
-The following are mandatory for real-repository use:
+## Product security posture
 
-- written browser-automation and data-owner authorization;
-- exact tenant URL, work identity, and protection-indicator certification;
-- a protected dedicated Edge profile with manual authentication;
-- non-elevated execution and approved endpoint/network controls;
-- reviewed organization/repository/session policy;
-- reviewed catalog executables and transitive scripts, truthful side-effect/network metadata, explicit policy/grant approval, and endpoint containment; side-effecting validation may create ordinary Git-ignored artifacts, but intentional source-mutating commands remain unsupported until a versioned checkpointable write-scope contract is approved and implemented;
-- approved storage ACL, encryption, retention, and deletion procedures;
-- dependency provenance, vulnerability review, SBOM, signing, and distribution controls;
-- offline/adversarial tests and target-machine live acceptance; and
-- tested kill switch, rollback, incident response, and manual fallback.
+Cope's primary target is a powerful local developer agent used by one developer. Developer mode intentionally accepts the ordinary risks of running local development commands with the current user's authority.
 
-## Security boundaries
+The selected project is the intended workspace and default working directory. It is not a kernel-enforced sandbox around arbitrary child processes. A shell command may read files available to the user, use the network, start descendants, consume resources, and modify state outside the project. Cope must state that residual risk honestly rather than claim portable containment it does not provide.
 
-The harness provides application-level policy, path, command, content, idempotency, checkpoint, and audit controls. It is not a VM/container, kernel filesystem/network/resource sandbox, data-loss-prevention product, anti-malware system, network firewall, credential vault, or cryptographically signed audit/review service. Approved executables and transitive scripts are trusted computing base, and the harness cannot comprehensively prevent or observe their external writes. Review-package body hashes are integrity metadata, not signatures, and POSIX-style file modes do not establish Windows ACLs. These containment gaps remain live-pilot/release gates even when offline tests pass. See the [threat model](docs/THREAT-MODEL.md) and [limitations](docs/LIMITATIONS.md) for residual risk.
+Users who require stronger containment should use hardened mode or run Cope inside a restricted account, disposable worktree, container, VM, operating-system sandbox, or managed endpoint with real filesystem, network, and resource controls.
 
-No mode authorizes credential automation, arbitrary shell, unrestricted filesystem/Git/browser control, policy modification, elevation, hidden browser operation, push, deploy, publish, or release.
+The governing product and implementation guidance is in [AGENTS.md](AGENTS.md), [Architecture](docs/ARCHITECTURE.md), and [Developer mode target](docs/DEVELOPER-MODE-TARGET.md).
+
+## Security floor retained in developer mode
+
+Developer mode retains controls that protect user authority and execution truth:
+
+- visible supported-browser operation and manual authentication;
+- approved Copilot host, identity, conversation, and response correlation;
+- no generic browser-control tool exposed to the model;
+- durable browser outbox and resolve-before-retry handling;
+- harness-owned operation identity and durable operation records;
+- no blind replay of uncertain mutations or consequential external actions;
+- truthful tool outcomes and independent completion verification;
+- no administrator, root, UAC, or other privilege elevation;
+- no typed repository access to Cope private state or dedicated browser profiles;
+- bounded model-visible output, cancellation, and process-tree cleanup;
+- explicit preservation and reporting of pre-existing work;
+- outbound secret scanning and redaction where applicable.
+
+These controls do not make a launched executable trustworthy or contained.
+
+## Developer mode
+
+The target developer mode authorizes, after one concise grant:
+
+- project file reads and mutations;
+- direct argv and shell execution;
+- command-generated source changes;
+- normal network-dependent development tools;
+- local Git reads and writes;
+- installed developer tools and ordinary user environment access.
+
+General terminal authority will be introduced through a separately versioned tool contract. Existing catalog-backed `run_command` semantics remain unchanged for hardened mode and named validation.
+
+Known destructive remote, deployment, publication, or release actions should remain separately visible or authorizable where Cope can identify them. Arbitrary scripts can conceal external effects, so application policy is not complete service-level enforcement.
+
+## Hardened mode
+
+Hardened mode may retain reviewed command catalogs, direct argv only, narrow path grants, declared network hosts, lower budgets, no command-generated source mutation, and isolated execution.
+
+Those restrictions are optional deployment controls. They do not define the default product architecture.
+
+## Current release status
+
+Cope 0.1.9 is a hardened precursor. It does not currently expose arbitrary shell execution, normal command-generated tracked-file mutation, or broad network-dependent developer commands.
+
+That is a current implementation limitation, not a permanent security requirement. Do not use the 0.1.9 restriction set to reject or redesign the documented developer-mode target.
+
+Current operational instructions remain in [Operator guide](docs/OPERATOR-GUIDE.md). They should describe what the released code can actually do until developer mode ships.
+
+## Boundaries and non-guarantees
+
+Cope provides application-level authorization, browser correlation, operation identity, recovery records, repository observation, and completion verification.
+
+It is not inherently:
+
+- a VM, container, or kernel sandbox;
+- an anti-malware system;
+- a network firewall or enforceable egress controller;
+- a credential vault;
+- perfect data-loss prevention;
+- a secure-delete system;
+- a cryptographically anchored audit service;
+- a guarantee that passing tests or model reasoning are correct.
+
+Security work should prioritize concrete failures that can break the core agent loop, execute unintended content, lose user work, duplicate consequential actions, expose authentication state, or produce false results. Speculative enterprise hardening should not block useful developer functionality unless the maintainer explicitly makes it a release requirement.

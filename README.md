@@ -1,27 +1,62 @@
 # Cope
 
-Cope turns Microsoft 365 Copilot Chat into a local coding agent through a visible Microsoft Edge Stable or Google Chrome Stable session. Edge remains the established compatibility target. Chrome is a **preview candidate / offline evidence only** until its separate live acceptance gates pass. The normal interface is intentionally small: install it once, run `cope setup`, then run `cope`, choose a project, and describe the task in plain English.
+Cope turns Microsoft 365 Copilot Chat into a local coding agent through a visible Microsoft Edge Stable or Google Chrome Stable session.
 
-The deterministic harness remains responsible for repository boundaries, permissions, local tools, checkpoints, validation, recovery, and audit records. Copilot supplies the coding judgment through its normal browser UI. Cope does not use private Copilot endpoints, token extraction, network interception, or automated sign-in.
+The target product is a Claude Code-like developer experience: run `cope` in a project, describe a task, and let Copilot inspect files, edit code, operate the terminal, use development tools, validate the result, and report what actually changed.
 
-## Current release
+Cope's local runtime owns repository access, terminal and process execution, user authority, checkpoints, recovery, browser correlation, and completion verification. Copilot supplies software-engineering judgment through its normal browser UI. Cope does not use private Copilot endpoints, token extraction, network interception, or automated sign-in.
 
-The current package version is **0.1.9**. See the
-[Cope 0.1.9 release notes](docs/RELEASE-NOTES-0.1.9.md) for reliable
-`cba-agent/1` browser ingestion, fail-closed capture diagnostics, and exact
-protocol-repair reporting.
+## Current release and target
+
+The current package version is **0.1.9**.
+
+Version 0.1.9 implements the visible-browser transport, typed
+`cba-agent/1` intent protocol, repository inspection and patching, catalog
+command execution, durable recovery, and completion foundations. It also fixes
+the live response-ingestion failure by reconstructing only response-owned
+protocol widgets, carrying source-free capture evidence through recovery, and
+preserving exact protocol diagnostics. It is still a hardened precursor rather
+than the full developer-mode product: it does not expose a general shell or
+permit commands to intentionally modify tracked project files.
+
+Microsoft Edge Stable remains the established live compatibility target.
+Google Chrome Stable remains a **Chrome preview candidate / offline evidence
+only** status backed by offline and installed-Chrome evidence until its
+separate live acceptance gates pass.
+
+The architecture pivot is documented in:
+
+- [Architecture](docs/ARCHITECTURE.md)
+- [Developer mode target](docs/DEVELOPER-MODE-TARGET.md)
+- [Limitations and compatibility](docs/LIMITATIONS.md)
+- [Threat model](docs/THREAT-MODEL.md)
+- [Protocol](docs/PROTOCOL.md)
+- [Policy and configuration](docs/POLICY-AND-CONFIGURATION.md)
+- [Requirements traceability](docs/REQUIREMENTS-TRACEABILITY.md)
+
+Current release behavior is documented in the
+[Cope 0.1.9 release notes](docs/RELEASE-NOTES-0.1.9.md) and the [0.1.9 protocol-ingestion
+PRD](docs/PRD-0.1.9-PROTOCOL-INGESTION.md). Earlier behavior remains in the
+[0.1.8 release notes](docs/RELEASE-NOTES-0.1.8.md).
+
+## Product direction
+
+Developer mode will become the recommended default. One concise project-scoped grant will authorize ordinary repository and terminal work, including shell and argv execution, command-generated project changes, normal network-dependent development tools, and local Git operations.
+
+Inspect mode will remain read-only. The existing fixed command-catalog model will remain available as an optional hardened profile for managed environments.
+
+The target documents describe where Cope is going. They do not claim the 0.1.9
+code already implements developer mode.
 
 ## Install on Windows
 
-Extract the release zip, then double-click:
+Extract the release zip and double-click:
 
 ```text
 install.cmd
 ```
 
-The installer performs a locked dependency install, builds the TypeScript release, creates a packed npm artifact, installs the global `cope` command, and offers to run guided browser setup. It is browser-neutral: it neither chooses nor downloads a browser. The packed install is deliberate. Moving or deleting the extracted release folder later will not break the global command.
-
-The installer also remembers the extracted source folder for local updates. From that checkout, pull or apply the changes you want, then run `cope update` to rebuild and reinstall Cope. Moving or deleting the source folder does not break the installed command, but you must rerun `install.cmd` from the folder's new location before using `cope update` again.
+The installer performs a locked dependency install, builds the TypeScript release, creates a packed npm artifact, installs the global `cope` command, and offers guided browser setup. It does not choose or download a browser.
 
 Open a new PowerShell window after installation and run:
 
@@ -29,23 +64,33 @@ Open a new PowerShell window after installation and run:
 cope
 ```
 
-Requirements are Node.js 24 or newer, npm, Git, Windows 11, and Microsoft Edge Stable or Google Chrome Stable. Cope refuses elevated execution for live sessions.
+Current requirements are Node.js 24 or newer, npm 11 or newer, Git, Windows 11, and Microsoft Edge Stable or Google Chrome Stable. Cope refuses elevated execution for live sessions.
 
-## Install on macOS (experimental preview candidate)
+The installer remembers the extracted source folder for local updates. Pull or apply changes in that checkout, then run:
 
-macOS operation is an uncertified, exact-tuple home-test preview—not production parity or a generic support claim. From a reviewed checkout, with Node 24+, npm 11+, Git, and Edge Stable or Chrome Stable already installed:
+```powershell
+cope update
+```
+
+Moving or deleting the extracted folder does not break the installed command, but `cope update` requires the remembered checkout to remain available or to be registered again by rerunning `install.cmd`.
+
+## Install on macOS
+
+macOS remains an experimental exact-tuple preview candidate rather than a general support claim.
+
+From a reviewed checkout with Node 24 or newer, npm 11 or newer, Git, and Edge Stable or Chrome Stable already installed:
 
 ```sh
 ./scripts/install-macos.sh --skip-setup
 ```
 
-The installer verifies the installed command and, when using the default `~/.local` prefix, safely adds it to `~/.zprofile` if it is not already on `PATH`. Open a new Terminal window, then run:
+Open a new Terminal window and run:
 
 ```sh
 cope setup
 ```
 
-The installer is user-level, validates `${COPE_INSTALL_PREFIX:-$HOME/.local}`, packs a durable artifact instead of linking to the checkout, uses no `sudo`, and downloads no browser. Use `--no-path-update` if shell startup files must remain untouched. Browser choice, the dedicated profile, sign-in, MFA, and consent belong to `cope setup`; authentication remains manual. A live browser additionally requires a logged-in Aqua session; root and logged-out/headless operation fail closed. See [the exact candidate tuples and gates](docs/MACOS-TARGET.md).
+The installer is user-level, does not use `sudo`, and does not download a browser. The selected browser, dedicated profile, sign-in, MFA, and consent remain part of visible manual setup. See [MACOS-TARGET.md](docs/MACOS-TARGET.md) for the exact preview tuples and evidence gates.
 
 ## Everyday use
 
@@ -55,13 +100,13 @@ Open Cope in the current Git project:
 cope
 ```
 
-Open a project from anywhere:
+Open another project:
 
 ```powershell
 cope C:\work\my-project
 ```
 
-Run a task directly from inside a project:
+Run a task directly:
 
 ```powershell
 cope "fix the failing tests"
@@ -85,39 +130,43 @@ Continue the newest resumable session:
 cope -c
 ```
 
+The current 0.1.9 release starts in its existing edit-capable policy model. The future developer mode described in the architecture docs is not yet available merely because the documentation names it.
+
 ## Standalone files
 
-Cope operates inside Git repositories because checkpoints, diffs, safe recovery, and completion verification depend on Git. A standalone HTML file is now a supported onboarding path rather than a dead end.
+Cope currently operates inside Git repositories because checkpoints, diffs, recovery, and completion verification depend on a repository baseline.
+
+A standalone HTML file can be opened directly:
 
 ```powershell
-cope "C:\Users\V0X8\Downloads\Fork-item_prep_1st_shift_dashboard_v.12.9.04.html"
+cope "C:\Users\V0X8\Downloads\dashboard.html"
 ```
 
-Cope offers a recommended clean-project copy beside the file, creates a baseline commit, works in that copy, and asks before copying a verified result back. If the original changed in the meantime, Cope refuses to overwrite it and preserves both versions.
+Cope offers to create a clean project copy beside the file, establishes a baseline commit, works in the copy, and asks before copying a verified result back. It refuses to overwrite the original if it changed in the meantime.
 
 ## Interactive interface
 
 Running `cope` opens the guided terminal interface. It remembers the last project and mode, avoids silently turning a home folder into a repository, detects missing configuration, and guides first-time setup.
 
-Preview the terminal interface on any development machine without browser setup:
+Preview the interface without browser setup:
 
 ```text
 cope demo
 ```
 
-From a source checkout where `cope` is not globally installed:
+From a source checkout:
 
 ```text
 npm run dev -- demo
 ```
 
-Demo mode is intentionally side-effect free. It does not create configuration, inspect or modify project files, launch a browser, contact Microsoft 365, or create sessions. Sample task prompts show the live handoff point and then return to the demo prompt.
+Demo mode is side-effect free. It does not create configuration, inspect or modify project files, launch a browser, contact Microsoft 365, or create sessions.
 
-Describe a task directly at the prompt. The small in-session command set is:
+The in-session command set is:
 
 ```text
 /help       Show interactive help
-/mode       Switch inspect, edit, or auto
+/mode       Switch the current supported mode
 /resume     Resume interrupted work
 /sessions   Show recent work
 /repo PATH  Open another project or file
@@ -128,27 +177,33 @@ Describe a task directly at the prompt. The small in-session command set is:
 /exit       Close Cope
 ```
 
-The legacy operational commands still exist for recovery and automation, but they are no longer the front door:
+Legacy operational commands remain available under:
 
 ```powershell
 cope help advanced
 ```
 
-## First-run onboarding
+## Setup
 
-`cope setup` detects installed Edge Stable and Chrome Stable copies, verifies their product identity, and guides the choice only when a meaningful choice exists. One detected browser is preselected; two produce an arrow-key selector that defaults to an existing choice or otherwise Edge; none produces retry and manual-installation actions. Existing valid configurations remain selected and are not silently changed. Plain terminals receive a numbered fallback.
+`cope setup` detects installed Edge Stable and Chrome Stable copies, verifies product identity, creates machine policy and browser configuration, prepares a product-specific dedicated profile, and visibly launches the browser for manual Microsoft 365 sign-in readiness.
 
-Setup creates local machine policy, browser configuration, and a product-specific dedicated profile, then visibly launches the selected browser for manual sign-in readiness. It asks for the account name or email visibly shown in Microsoft 365 Copilot and uses `https://m365.cloud.microsoft/chat` by default. Credentials, MFA, CAPTCHA, consent, and ordinary-profile import are never automated. For managed automation only, `cope setup --browser edge|chrome` and `--browser-executable <path>` are available; normal users do not need them.
+Credentials, MFA, CAPTCHA, consent, and ordinary-profile import are never automated.
 
-Before setup discovers or launches a browser, Cope checks unfinished live-browser sessions against their pinned runtime and browser configuration. Live session state and its runtime pin are published under the same configuration lock used by setup, so concurrent startup cannot leave setup observing a half-created session. `cope sessions --all` marks a session with `*` when it can be resumed and `!` when recovery is blocked, then prints the exact `resume`, `abort`, or reconciliation action. Setup never silently discards a session or repeats the browser flow while unresolved recovery evidence exists.
+Per-project setup creates `.cba\repository.json`. The current release detects selected npm validation scripts such as `test`, `check`, `build`, `typecheck`, and `lint`. Those catalog commands remain useful, but they are not the target terminal architecture.
 
-Per-project setup is guided automatically. Cope detects useful package scripts such as `test`, `check`, `build`, `typecheck`, and `lint`, then creates `.cba\repository.json`. Inspect mode starts read-only. Edit mode allows project changes subject to the layered policy and task grant.
-
-Run the environment checker at any time:
+Run diagnostics at any time:
 
 ```powershell
 cope doctor
 ```
+
+## Current browser boundary
+
+The browser adapter verifies the selected executable's product identity and pinned evidence, the dedicated profile, approved host, visible identity, optional protection indicator, actionable composer, conversation, and UI contract before sending project content.
+
+Edge and Chrome never share a dedicated profile. Cope rejects overlap with ordinary browser profiles. UI changes may require a browser-contract update. An uncertain send is resolved before retry rather than blindly duplicated.
+
+Generic browser control is not part of the coding-agent target.
 
 ## Development and verification
 
@@ -161,9 +216,11 @@ npm test
 
 The suite builds the project and runs deterministic tests serially. Browser classifier tests use synthetic page states, and agent-loop tests use local fixtures. They do not contact Copilot.
 
-The two previous Windows preflight failures were caused by tests invoking bare `git` while production already used the Windows Git resolver. Version 0.1.1 makes the tests use the same resolver and includes spawn diagnostics if Git genuinely fails.
+A developer-mode implementation must preserve offline full-loop testing while adding shell execution, command-generated mutation handling, and process recovery coverage.
 
 ## Configuration locations
+
+On Windows:
 
 ```text
 Machine policy   %LOCALAPPDATA%\CopilotBrowserAgent\config\organization-policy.json
@@ -174,33 +231,20 @@ Project config   <project>\.cba\repository.json
 Session state    %LOCALAPPDATA%\CopilotBrowserAgent
 ```
 
-The browser adapter verifies the selected executable's Edge/Chrome identity and recorded hash, dedicated-profile product marker, approved host, conversation, visible identity, optional protection indicator, composer, and UI contract before submitting a prompt. Edge and Chrome never share a dedicated profile, and Cope rejects overlap with either ordinary browser profile. UI changes can still require browser-contract adjustments. Cope fails closed with diagnostics rather than sending content from an unverified page.
-
-## Technical documentation
-
-Architecture and controls remain documented under `docs`:
-
-- `docs/ARCHITECTURE.md`
-- `docs/POLICY-AND-CONFIGURATION.md`
-- `docs/PROTOCOL.md`
-- `docs/RECOVERY-AND-AUDIT.md`
-- `docs/LIMITATIONS.md`
-- `docs/OPERATOR-GUIDE.md`
-- `docs/WINDOWS-TARGET.md`
-- `docs/MACOS-TARGET.md`
-- `docs/LIVE-PILOT-ACCEPTANCE.md`
-- `docs/PRD-0.1.9-PROTOCOL-INGESTION.md`
-- `docs/RELEASE-NOTES-0.1.9.md`
-- `docs/RELEASE-NOTES-0.1.8.md`
-- `docs/RELEASE-NOTES-0.1.7.md`
-- `docs/RELEASE-NOTES-0.1.6.md`
+Cope private state and browser profiles remain outside project workspaces and are not normal coding-tool roots.
 
 ## Uninstall
 
-Double-click `uninstall.cmd`, or run:
+On Windows, double-click `uninstall.cmd` or run:
 
 ```powershell
 npm uninstall --global @local/copilot-browser-agent
 ```
 
-For the macOS preview candidate, `./scripts/uninstall-macos.sh` retains state/profile by default; the destructive `--remove-state` and `--remove-profile` flags are explicit.
+On macOS, run:
+
+```sh
+./scripts/uninstall-macos.sh
+```
+
+The macOS uninstaller retains state and the dedicated profile by default. Destructive removal requires explicit flags.

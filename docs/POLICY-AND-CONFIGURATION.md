@@ -1,290 +1,241 @@
 # Policy and configuration
 
-## Fail-closed loading
+## Purpose
 
-Live sessions require three explicit inputs: an organization policy, a repository configuration with embedded repository policy, and a browser/UI configuration. Each JSON object has a version discriminator and rejects unknown fields, including nested command, browser-host, UI-contract, signal-group, locator, and text-pattern fields. Configuration bytes are bounded, UTF-8 BOMs are refused, schemas are validated, policy patterns are safety-checked, duplicate rules are rejected, and file hashes are persisted with the session.
+Policy exists to communicate and enforce the authority the user actually intends to grant. It should not turn normal developer work into a stream of avoidable prompts or imply stronger containment than the host provides.
 
-Changing a policy file does not silently expand a running session. Resume requires the persisted organization/repository/browser hashes and grant hash to match; a change is refused and requires a new session/grant.
+Cope's target has two practical policy profiles:
 
-Default Windows locations:
+- developer mode, optimized for broad local capability and low friction;
+- hardened mode, optimized for managed restrictions and reviewed command surfaces.
 
-```text
-%LOCALAPPDATA%\CopilotBrowserAgent\config\organization-policy.json
-%LOCALAPPDATA%\CopilotBrowserAgent\config\browser.json
-<canonical repository root>\.cba\repository.json
-```
+Inspect mode remains a read-only option.
 
-Experimental macOS preview candidate locations (same schemas and policy meanings):
+Cope 0.1.9 implements the current layered organization, repository, and session policy system. The developer-mode defaults described here are a target and require code and schema changes.
 
-```text
-~/Library/Application Support/CopilotBrowserAgent/config/organization-policy.json
-~/Library/Application Support/CopilotBrowserAgent/config/browser.json
-<canonical repository root>/.cba/repository.json
-~/Library/Application Support/CopilotBrowserAgentEdgeProfile
-~/Library/Application Support/CopilotBrowserAgentChromeProfile
-```
+## Policy precedence
 
-The macOS state tree and Cope-owned profile files are ownership/mode verified on every startup; wrong or unverifiable storage fails closed. Location parity does not imply a certified live tuple.
+Organization, repository, and session rules may still combine using the most restrictive applicable decision. That model is useful for managed deployments.
 
-The files in `config/examples` are nondeployable review templates. The policies contain placeholder IDs/revisions, and the browser file uses reserved `.invalid` hosts plus identity/profile placeholders. Copying them is neither authorization nor certification.
+For the personal-developer default, the generated organization and repository policies should not contain broad denials that make the initial developer grant ineffective. A strict higher layer should be deliberate and visible rather than silently inherited from a hardened template.
 
-## Three policy layers
+Changing a persisted policy during an active session must not silently expand authority. Resume should either use the durable approved grant or require the user to begin a new session when the policy meaning changed.
 
-Each operation is evaluated independently against:
+## Runtime modes
 
-1. `organization`: enterprise-wide, non-overridable constraints;
-2. `repository`: data-owner scope, protected content, catalog, and task limits; and
-3. `session`: one user's approval for one task, repository, branch, mode, paths, commands, disclosure classes, and budgets.
+### Inspect
 
-The effective result is the most restrictive: `deny > ask > allow`. An allow in a lower layer cannot weaken a higher-layer ask or deny. Effective numeric budgets are the minimum values supplied by the three layers. Missing rules resolve to that layer's `default_decision`; production policies should use explicit rules and a deny default.
+Inspect mode authorizes project-local reads and safe diagnostics. It denies file mutation and terminal execution that may have side effects.
 
-Policy decisions are:
+### Developer
 
-- `allow`: execute and audit without another prompt;
-- `ask`: pause for one specific capability expansion;
-- `deny`: do not execute; return a structured reason to Copilot.
+Developer mode should be the recommended default. Its initial session grant authorizes:
 
-High-confidence secret or credential disclosure is a non-overridable v1 denial.
+- read, create, update, delete, move, and rename through typed repository tools inside the selected workspace;
+- direct argv and shell execution as the current user;
+- the selected project as the default working directory;
+- ordinary command-generated project changes;
+- normal network-dependent developer commands;
+- local Git reads and writes;
+- bounded command output, diffs, and mutation records;
+- all normal repository and lifecycle tools.
 
-## Autonomy modes
+The grant should be task-scoped and presented once in a concise human-readable summary. It must state that general child processes are not sandboxed to the selected project.
 
-| Mode | Read/search/Git | Source mutation | Commands |
-| --- | --- | --- | --- |
-| `inspect` | within grant | denied | granted, genuinely side-effect-free commands only |
-| `edit` | within grant | within writable/create/delete grant | explicitly granted catalog commands; `sideEffects: true` validation is allowed within the integrity boundary |
-| `auto` | within grant | within full approved envelope | same command integrity boundary; mode does not broaden the catalog or grant |
+### Hardened
 
-The mode is an additional restriction, not a replacement for policy. `auto` does not grant a path, command, network, disclosure, or change class by itself.
+Hardened mode retains explicit command catalogs, path allowlists, network host declarations, lower budgets, and stricter mutation mechanisms. It may deny shell execution, command-generated source mutation, remote actions, or additional roots.
 
-## `cba-policy/1`
+Hardened mode is opt-in unless an organization policy requires it.
 
-A policy document has `policy_id`, `revision`, `layer`, `default_decision`, and `capabilities`. `policy_id` identifies one governed policy lineage; increment/change `revision` whenever its meaning changes, and persist the installed-file hash with approval evidence. The strict schema intentionally has no `owner` or free-form approval field. Record accountable owner, approvers, evidence, validity, policy ID/revision, and hash in the external governance system rather than adding an unknown JSON key.
+## Non-negotiable floors
 
-### Tools
+Even developer mode does not permit Cope itself to:
 
-`tools` is a rule set over the ten exact `cba/1` tool names. Unknown tools are always denied. Removing a tool from repository policy removes it from effective use without changing the semantics of remaining tools.
+- request or automate administrator, root, UAC, or other privilege elevation;
+- automate Microsoft credentials, MFA, CAPTCHA, consent, cookie extraction, or token replay;
+- expose Cope's private state, checkpoints, machine configuration, or dedicated browser profiles as typed repository roots;
+- silently add another typed-tool filesystem root;
+- blindly replay an operation whose outcome is unknown;
+- treat a model assertion as a local result.
 
-### Paths
+These are application-authority rules. They do not make an arbitrary shell process technically unable to reach files or services available to the current user. Stronger prevention requires an operating-system sandbox, restricted account, container, VM, firewall, or comparable external control.
 
-`paths.read`, `write`, `create`, and `delete` are repository-relative glob rule sets. `excluded` paths cannot be read, disclosed, or changed. `protected` paths may be readable only if another rule permits, but cannot be mutated.
+## Ask boundaries
 
-Patterns must be relative, bounded, and safe. Resolution also canonicalizes filesystem state and rejects absolute paths, drive/UNC paths, `..`, alternate streams, links, devices, and other escapes. A glob allow is never the only path control.
+Developer mode should ask only for materially new or high-consequence authority that Cope can identify. Typical ask boundaries are:
 
-The CLI runtime has mandatory floors in addition to configured policy. Repository discovery/read/search always applies conservative non-negatable exclusions for Git/agent control data, dependency/vendor/build/coverage trees, lock/minified/binary/archive/database/media content, environment files, and key/certificate material. Mutation always applies built-in protection for `.git`, `.cba`, `.copilot-agent`, environment/key material, and CI workflow controls. The live composition API does not expose the library's default-exclusion override. Organization/repository `excluded` and `protected` lists add restrictions; they cannot remove these runtime floors.
+- access to an additional typed-tool filesystem root;
+- an explicit operation outside the selected project grant;
+- known remote destructive or publishing actions;
+- production deployment or release activation;
+- known destructive cloud or database operations;
+- a resource, output, or time limit substantially above the active grant;
+- a hardened-policy exception.
 
-Onboarded policy should still list the applicable mandatory patterns explicitly so owners can review the intended boundary, and it must add repository-specific credentials, generated output, deployment, code-owner, signing, release, and other sensitive controls. Index mode-`160000` gitlinks and every descendant `.git` file/directory are rejected as unsupported repository boundaries irrespective of glob policy; the invariant runs in preflight/composition and is rechecked during path access and completion.
+The model should not be asked again for permission already included in the active grant. Session approvals should survive resume and should be represented compactly in later model turns.
 
-### Commands
+An arbitrary command or script may conceal external effects. Developer mode cannot promise complete intent detection for remote or out-of-workspace actions executed inside general shell code.
 
-Policy can constrain command `ids`, `categories`, `risks`, `side_effects`, and `max_timeout_ms`. All constraints apply to metadata resolved from the local catalog, not to model prose.
+## Filesystem configuration
 
-### Disclosure
+The selected project root is the default typed-tool workspace and terminal working directory. Repository tools use project-relative paths. Developer mode may add named roots for sibling packages, generated clients, shared configuration, or user-selected standalone files.
 
-`disclosure.classifications` governs content labels. `secrets` must be `deny`. Per-operation byte/file limits are applied before browser submission, and total disclosed bytes consume the session budget. The final serialized outbound message is scanned after tool output is inserted.
-
-Classification is an onboarding assertion, not automatic data-loss-prevention certification. The repository data owner must choose it and decide whether Copilot Chat is an approved destination.
-
-`list_files` is a bounded, read-only operation with explicit truncation. Its
-omitted default and any larger requested `max_results` are deterministically
-clamped downward to the most restrictive effective file ceiling before both
-authorization and execution. The result includes `applied_max_results`; it
-never treats a request as authority to exceed policy. Other operations that
-cannot safely express truncation continue to deny oversized requests with
-structured limit and retry details.
-
-### Network
-
-`network.access` and optional host rules evaluate catalog metadata. A command marked `networkRequired: true` must name its target hosts and obtain all applicable policy permission.
-
-This is an application authorization control, not technical egress containment. The process runner does not provide a Windows filtering platform rule, container, or VM. A binary marked `networkRequired: false` could still open a socket if it is malicious or miscataloged. Catalog only trusted executables and use managed OS/network controls when isolation is required.
-
-### Changes
-
-Policy separately controls file creation, deletion, dependency-manifest changes, local commits, files per operation, changed lines per operation, and limit behavior. V1 has no model-callable Git commit tool; a `local_commits` rule does not create that capability.
-
-### Budgets
-
-Supported metrics are:
-
-| JSON metric | Meaning |
-| --- | --- |
-| `elapsed_ms` | wall-clock session duration |
-| `turns` | model exchanges |
-| `operations` | accepted tool operations |
-| `read_files` | disclosed file reads |
-| `changed_files` | distinct/charged mutations |
-| `changed_lines` | deterministic changed-line estimate |
-| `disclosed_bytes` | bytes sent through the disclosure boundary |
-| `commands` | catalog command executions |
-| `command_output_bytes` | retained command output |
-| `protocol_repairs` | malformed-model-response repairs |
-
-`budget_exceeded` is `ask` or `deny`. A permitted session expansion remains bounded by organization and repository maximums.
-Budget expansion is strictly monotonic against live state: the requested limit
-must be greater than both the effective current limit and current usage. Equal,
-lower, or already-consumed values are rejected and never persisted. Denials
-report `current_limit`, `current_usage`, and `minimum_acceptable`.
-
-The shipped defaults distinguish the initial session working grant from its
-higher-layer approval ceiling. Sessions start with the conservative
-`DEFAULT_POLICY_BUDGETS`. Organization and repository defaults provide four
-times that working grant only for elapsed time, turns, operations, and
-disclosed bytes. Read-file, mutation, command, command-output, and
-protocol-repair ceilings retain their original absolute values. Cope therefore
-cannot silently enlarge a security-sensitive activity ceiling; the shipped
-configuration provides bounded recovery headroom only where session longevity
-or disclosure delivery requires it.
-
-Raise-and-continue requires strict headroom between the live session limit and
-the most restrictive organization/repository ceiling. The bootstrap operating
-envelope reports this availability for every budget metric. If the current
-limit or usage already reaches that ceiling, expansion is structurally
-unavailable: Cope returns `BUDGET_EXPANSION_UNAVAILABLE`, identifies the
-blocking layer and ceiling, does not prompt for an ineffective approval, and
-pauses with an explicit explanation that the policy-pinned session cannot
-continue. The operator must update the governing policy through the governed
-configuration process and start a new session; resume intentionally rejects
-changed organization or repository policy hashes.
-
-The runtime reserves 64 KiB of the cumulative disclosure limit for its
-source-free control plane, including an 8 KiB emergency slice that ordinary
-decisions and repairs cannot consume. Data-bearing tool results cannot consume
-the 64 KiB window. If any ordinary outbound message reaches its applicable
-ceiling, Cope emits a byte-capped `cba/1` notice from the emergency slice and
-pauses rather than failing. Session startup rejects a disclosure budget that
-cannot hold the rendered bootstrap in addition to the 64 KiB reserve, so this
-condition is reported as invalid configuration before browser work begins.
-
-For cumulative data-result exhaustion as well as turn, operation,
-elapsed-time, and other recoverable session-budget exhaustion, Cope first
-offers a local raise-and-continue approval when the higher policy layers leave
-headroom. The approval targets the effective higher-layer ceiling rather than
-the next single unit, so the operator is not prompted again on every following
-turn or operation. The requested absolute limit remains visible and requires
-an explicit allow-for-session decision. A result that exceeds its
-already-authorized per-operation
-reservation instead receives a narrower-request hint; raising a cumulative
-ceiling cannot make that operation safe. Only `allow_session` is effective, and
-the requested floor is derived from live usage. The exact operator decision is
-journaled, hashed, and stored as a recovery artifact before an expanded grant
-is persisted. Higher-layer ceilings remain non-overridable. Resume keeps the
-same journal, checkpoints,
-completed-operation evidence, and queued outbound, so work is neither
-discarded nor replayed.
-
-## `cba-repository-config/1`
-
-The repository document contains:
-
-- `classification`: the repository's approved disclosure label;
-- `policy`: a complete `cba-policy/1` with layer `repository`;
-- `grant_defaults`: readable/writable patterns and disclosure labels proposed at session creation;
-- `commands`: the only model-selectable local command definitions;
-- `completion.required_command_ids`: validations that must have succeeded;
-- `completion.require_validation_after_last_mutation`: rejects stale validation;
-- bounded file/read/search/diff/checkpoint/patch byte limits; `max_file_bytes`
-  cannot exceed the pinned mutation protocol's 16 MiB per-file ceiling
-  (`max_checkpoint_bytes` is a total checkpoint budget and may be larger); and
-- transient recovery-artifact retention preference.
-
-Every required completion command must exist in the catalog.
-
-The `git_diff` tool implements bounded `working_tree`, `staged`, `checkpoint`, and `session` scopes. Checkpoint scope compares against one integrity-verified before-image. Session scope uses the earliest checkpoint before-image for each agent-mutated path. Both reapply exact current read policy and report only an excluded count for denied paths.
-
-### Command catalog
-
-Each definition makes security-relevant facts explicit:
+A future configuration shape may distinguish:
 
 ```json
 {
-  "id": "npm.test",
-  "category": "test",
-  "risk": "low",
-  "sideEffects": true,
-  "networkRequired": false,
-  "executable": "C:\\Program Files\\nodejs\\node.exe",
-  "fixedArguments": [
-    "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js",
-    "run",
-    "test"
-  ],
-  "workingDirectory": ".",
-  "timeoutMs": 300000,
-  "maxTimeoutMs": 600000,
-  "maxOutputBytes": 524288,
-  "successExitCodes": [0]
+  "workspace_roots": [
+    { "id": "project", "path": ".", "access": "read-write" },
+    { "id": "shared-types", "path": "../shared-types", "access": "read-write" }
+  ]
 }
 ```
 
-The target machine exposes npm primarily through `.ps1`/`.cmd` shims. Do not catalog those. Shells and `.cmd`, `.bat`, or `.ps1` executable paths are rejected. Invoke `node.exe` directly with the installed `npm-cli.js` as a fixed argument.
+The exact schema is not implemented in 0.1.9. Additional roots must be canonicalized, shown to the user, and bound to the session grant.
 
-Optional parameters are typed as string, repository path, enum, integer, boolean flag, or bounded string list. Each has a name and may have a fixed flag, regex, enumeration, size/range, existence requirement, and leading-dash rule. Unknown parameters fail. Arguments are passed with `shell: false`; no joined command string is constructed.
+Cope state and browser profile roots are always excluded from typed workspace configuration. A general terminal process still has the current user's operating-system access unless external isolation is present.
 
-Mark `sideEffects` truthfully. Build/test tools that create `dist`, coverage, caches, snapshots, or generated files are side-effecting even when they are not intended to edit source. In `edit`/`auto`, an explicitly granted `sideEffects: true` command may run and may create ordinary Git-ignored artifacts; those artifacts are excluded from the completion source fingerprint. The `npm.test` and `npm.build` definitions in the example repository file are therefore potential validation commands after repository-specific review and grant approval, although the example file remains nondeployable while its placeholders and repository facts are unresolved.
+## Terminal policy
 
-Every command is treated as untrusted and bracketed by nested-Git plus Git-visible/nonignored, keyed policy-hidden protected-path, and Git-control integrity checks. A command declared `sideEffects: false` additionally inventories ordinary Git-ignored files under explicit entry and byte bounds. Tracked/nonignored, protected, control, or nested-boundary drift—or an unverifiable inventory—becomes `RECOVERY_REQUIRED` (`COMMAND_UNDECLARED_REPOSITORY_MUTATION` where applicable) rather than an accepted command result. Catalog a command as side-effect-free only when the repository owner has established that it writes neither ordinary ignored output nor source/control data. Intentional command-driven source mutation remains unsupported until a future versioned write-scope/checkpoint contract; direct source changes use `edit_text` for small literal edits to existing text files or `apply_patch` for creates, deletes, whole-file replacements, and multi-file transactions. Mark `networkRequired` truthfully and list `networkHosts` whenever true.
+The current command catalog remains valid for hardened commands and deterministic required validation.
 
-The process receives a minimal allowlisted environment plus definition-specific fixed values, a repository-contained working directory, timeout, combined-output cap, cancellation, and process-tree termination. Do not put secrets in a command definition's environment: repository configuration is source-controlled and may be disclosed. These application controls are not an OS filesystem, network, or resource sandbox. Approved executables and transitive scripts are trusted computing base, and writes outside the repository cannot be comprehensively prevented or observed; live use requires approved endpoint, egress, resource, and command-review controls.
+Developer mode requires a separate `terminal_exec` capability with a required tool contract such as `terminal-exec/1`. It should be additive to the established model-facing envelope and should not widen `run_command`.
 
-## `cba-session-grant/1`
+Terminal policy authorizes:
 
-The runtime creates a grant bound to one `grant_id`, `task_id`, canonical `repository_root`, optional branch, and mode. It includes the same capability dimensions plus `approved_capabilities` with timestamps.
+- direct argv execution;
+- explicit shell execution;
+- a default project working directory and bounded requested cwd;
+- environment inheritance rules;
+- network use;
+- maximum runtime and model-visible output;
+- local output streaming;
+- later persistent process creation;
+- known high-consequence classes that still require confirmation.
 
-Before transport startup, the built-in approval prompt emits the complete versioned `cba-effective-grant/1` operating envelope. It includes repository/branch/mode; read, write, create, and delete scope; mandatory and layer-added exclusions/protections; the rules and precedence by layer; granted command IDs/categories plus their resolved definitions and per-layer constraints; disclosure, network, and change constraints by layer; effective budgets; checkpoint/rollback and escalation semantics; and organization, repository, and grant hashes. `--approve-grant` is appropriate only when this exact computed envelope has already been reviewed and recorded through a controlled procedure; it suppresses the interactive question but does not broaden authority.
+The policy should authorize the capability class rather than requiring every exact command to be predeclared. The runtime still records each exact command and result.
 
-After creation, `status` reloads the exact persisted grant and reports its full capability object plus current stored budget limits/usage and mode. It is a persisted snapshot and does not recompute the working tree. Approval is once per session and does not authorize later changes to policy files.
+Shell mode may carry a higher risk label than direct argv mode, but it should not require a prompt for every invocation after the user has approved developer mode.
 
-An exact operation that evaluates to `ask` can use `allow_once` only for that already-waiting operation. The decision is stored in an integrity-checked decision artifact for crash-safe replay but does not mutate `grant.json` or authorize a later call. A standalone model `request_capability` has no exact operation to bind, so choosing `allow_once` is reported as ineffective and Copilot must request the concrete operation.
+## Command-generated mutations
 
-`allow_session` can mutate the task grant only after:
+Developer policy must permit terminal commands to create, update, delete, and rename project files.
 
-1. organization and repository rules permit the expansion;
-2. the CLI explains target, operation, and risk;
-3. the user chooses allow for this session; and
-4. the decision and updated grant hash are persisted and audited.
+Authorization occurs against the active terminal capability before launch. The exact mutation set is observed after execution and added to session state. A command is not denied merely because its future changed paths cannot be enumerated perfectly in advance.
 
-The expansion appends a canonical capability key/timestamp to `approved_capabilities`. A higher-layer deny remains absolute; a higher-layer ask is satisfied only by the explicit, scoped session approval and never by inference or a broader lower-layer allow. User-input and capability-decision artifacts can contain sensitive free-form text; they share the transient recovery-artifact retention policy and must be protected accordingly.
+Changed-file and changed-line budgets for `terminal_exec` should be metered from observed post-command effects. They cannot be exact preconditions for launching an arbitrary command. If actual usage exceeds a configured developer-mode limit, Cope records the effects truthfully and pauses or blocks later work rather than pretending the command did not run.
 
-## Browser configuration (`cba-browser-config/1` and `/2`)
+The runtime should stop or ask when it observes an effect outside the intended project or against protected Cope state. It must acknowledge that an unrestricted host process can produce external effects that application-level inspection cannot detect.
 
-Browser configuration is machine/tenant specific and must remain outside repositories. Required facts:
+Hardened mode may require declared write scopes, isolated worktrees, or no command-generated source mutation.
 
-- exact product (`edge` or `chrome`) in version 2;
-- independent browser contract version (`cope-visible-browser/v1`);
-- exact HTTPS `entry_url`;
-- exact `approved_hosts`, with subdomains permitted only deliberately;
-- optional manual authentication redirect hosts;
-- expected work-account display signal (never a credential);
-- whether a protection indicator is mandatory;
-- absolute, dedicated local profile directory outside repository and agent-state roots, with no UNC/device/shared path form;
-- canonical verified browser executable, observed version, and SHA-256;
-- response/message bounds and state-based waits; and
-- a versioned semantic UI contract.
+## Network policy
 
-The adapter supports role, label, placeholder, test-id, text, and bounded CSS fallback locators. XPath and arbitrary page scripts are not supported. Every signal group names its expected signal, candidate strategies, minimum candidate quorum, maximum element count, and capture type.
+Developer mode should permit normal network use by local developer commands after the initial grant.
 
-Signals cover shell, conversation, composer, send control, assistant responses, user messages, streaming, identity, protection, signed-out, MFA, consent, throttling, service error, and modal state. The adapter refuses unknown/ambiguous states.
+Application-level network metadata is authorization and reporting, not enforceable egress isolation. Exact host allowlists are suitable only when the command's behavior is actually predictable or when an external network control enforces them.
 
-Version 1 is the exact legacy Edge-only schema with `edge_executable`. The strict compatibility parser treats it as `product: "edge"` and `cope-visible-browser/v1` in memory. A valid legacy document is not rewritten merely because setup runs, so its bytes, established Edge profile, authentication state, approved hosts, and optional UI settings remain intact. It cannot represent Chrome. Unknown, mixed v1/v2, corrupt, or ambiguous documents fail closed.
+Hardened deployments may deny network, permit selected hosts, or run commands in an environment with real egress controls.
 
-Version 2 replaces `edge_executable` with `product`, `browser_contract_version`, `browser_executable`, `browser_version`, and `browser_executable_sha256`. Changing products requires explicit confirmation and selects/creates the other product's dedicated profile. Setup serializes changes under a lock and compare-and-swap check, refuses live resumable browser sessions, launches the proposed browser for manual readiness before persistence, and does not silently switch an existing user.
+## Environment policy
 
-`cope setup` is the primary interface. Detection is deterministic and bounded; one browser is preselected, two produce a keyboard choice (existing product first, otherwise Edge), and none produces Retry plus an advanced manual path. `cope setup --browser edge|chrome` and `--browser-executable` exist for managed automation. `COPE_BROWSER_EXECUTABLE` is the neutral override; `COPE_EDGE_EXECUTABLE` is retained only as an Edge compatibility alias. Every candidate and override undergoes the same identity verification. Installers remain browser-neutral and download no browser.
+The current minimal inherited environment is suitable for hardened validation but insufficient for a normal developer terminal.
 
-macOS evidence includes the exact Stable bundle identifier, expected signing team, valid code signature, reported version, canonical path/stat identity, and SHA-256. Windows evidence combines an exact approved machine-wide/user-local Stable executable location (derived from `Program Files`/`LOCALAPPDATA`, never an override or lookalike suffix) with exact product/company/original-filename metadata, Authenticode signer, version, canonical path/stat identity, and SHA-256. This rejects known Beta/Dev/Canary/SxS locations, portable/lookalike paths, product mismatch, and unsupported Chromium derivatives. It proves a vendor-signed requested product occupied the approved Stable location at check time; it does not defeat a privileged replacement with another vendor-signed binary or independently attest the release channel. Exact binary/channel approval remains part of tuple certification, along with Copilot UI behavior, account/tenant eligibility, Conditional Access, future browser updates, and endpoint integrity.
+Developer mode should begin from the current user's ordinary process environment and remove only Cope-internal control variables or values that are specifically unsafe to forward. The exact inherited variable names should be visible in diagnostics without exposing secret values.
 
-The shipped Edge and Chrome uncertified templates contain baselines, not tenant or browser certification. Their Copilot and authentication hosts are reserved `.invalid` names. Replace hosts, identity, profile, executable/version/hash placeholders and certify every locator against the exact managed Copilot surface. The profile path is canonicalized before launch; a prospective path is evaluated through its deepest existing parent so a symlink/junction cannot redirect it into the repository, `%LOCALAPPDATA%\CopilotBrowserAgent` state root, either ordinary browser profile, or the other product's Cope profile. If the tenant redirects to a different host, add only the precise approved host after governance review; do not set a wildcard or broad Microsoft parent domain.
+Secret environment values may be consumed by child processes. They must not be copied into browser messages unless the outbound content scanner explicitly permits the resulting text.
 
-## Review checklist
+## Git and remote actions
 
-- External approval records name policy owners/repository data owner and bind them to exact installed-file hashes.
-- Placeholder policy IDs/revisions are replaced, and revisions change whenever meaning changes.
-- Defaults are deny and every allow is necessary.
-- Exclusions and protected paths cover credentials, Git internals, agent state, CI/deployment, and repository-specific sensitive areas.
-- Writable scope excludes pre-existing user work that should not be touched.
-- Command metadata reflects actual side effects, network, risk, output, and timeout.
-- Required validation commands exist, are truthfully classified, and can run within the integrity boundary; no required command intentionally mutates tracked/nonignored source or control state.
-- Approved executables/transitive scripts and target endpoint, egress, filesystem, and resource containment have live-pilot owner approval.
-- Browser URL, identity, protection, profile, and locators have recorded evidence.
-- Retention settings and external procedures separately cover transient decision/outbox/response artifacts, checkpoints, fingerprint keys, completion handoffs, review packages, audit/disclosure metadata, and each product-specific dedicated browser profile.
-- Fixture/replay and adversarial tests pass after the change.
+Local Git operations should be part of developer mode. The runtime may expose them through terminal execution initially and typed tools later.
+
+Remote Git and publication actions should be separately visible where Cope can classify them. Suggested target classes are:
+
+- local Git mutation;
+- normal remote write;
+- destructive remote write;
+- deployment;
+- publication or release.
+
+The MVP may ask before known remote writes. It must not claim complete detection when arbitrary scripts can hide remote effects.
+
+## Budgets
+
+Budgets protect responsiveness and context, not authority for its own sake.
+
+Developer-mode defaults should be high enough for real tasks and recoverable through a single session approval. Read, command, output, changed-file, and changed-line ceilings should not become hard organization limits in the default personal configuration.
+
+Useful metrics include:
+
+- elapsed time;
+- browser turns;
+- model-visible bytes;
+- repository reads;
+- terminal commands;
+- terminal output bytes;
+- changed files and lines;
+- active processes;
+- protocol repairs.
+
+Per-operation model-visible output and file-size bounds remain useful. Large results should be streamed locally, paged, or summarized rather than rejected without a recovery path.
+
+## Disclosure and secrets
+
+Cope should continue scanning final outbound source and command output for likely credentials and sensitive material. Typed repository tools keep private roots excluded.
+
+Secret detection is not perfect DLP. Developer-mode documentation and grant presentation should state that project content is being sent to Microsoft 365 Copilot Chat under the user's account and tenant configuration.
+
+The model-facing bootstrap receives the active disclosure capability, not the complete local scanning configuration.
+
+## Compact model projection
+
+Policy is enforced locally. Copilot needs only the subset that changes what it can request.
+
+The bootstrap policy projection should fit in a compact manifest such as:
+
+```json
+{
+  "mode": "developer",
+  "roots": [{ "id": "project", "access": "read-write" }],
+  "terminal": {
+    "contract": "terminal-exec/1",
+    "shell": true,
+    "argv": true,
+    "network": true,
+    "sandboxed": false
+  },
+  "git": { "local": true, "known_remote": "ask" },
+  "protected_typed_roots": ["cope-state", "browser-profile"]
+}
+```
+
+The exact format is versioned tool-contract work. Stable implementation details, long pattern lists, and policy checks that cannot affect the next action should remain local and out of the chat context.
+
+## Current configuration compatibility
+
+Cope 0.1.9 repository configuration includes:
+
+- repository classification;
+- embedded repository policy;
+- default readable and writable paths;
+- catalog command definitions;
+- required completion commands;
+- repository and patch limits;
+- retention settings.
+
+Those files remain valid for the released implementation. A developer-mode schema should either migrate them explicitly or introduce a new version. Existing documents must not be silently widened to grant shell access.
+
+The current quick setup can continue producing a hardened-compatible catalog for known validation commands after developer mode is added. Those commands remain useful as named completion checks.
+
+For the minimum pivot, the existing internal `auto` session mode may be presented as developer mode for newly created sessions while old persisted sessions retain their current meaning. A later schema migration can rename the internal mode without blocking terminal capability.
+
+## Configuration principles
+
+- Choose useful developer defaults for personal installations.
+- Make hardened behavior explicit.
+- Present grants in user language rather than schema language.
+- Do not repeat prompts for authority already granted.
+- Do not claim OS enforcement where only application checks exist.
+- Version new terminal authority at the tool contract and preserve existing `run_command` semantics.
+- Keep the current release and historical session behavior recoverable.
