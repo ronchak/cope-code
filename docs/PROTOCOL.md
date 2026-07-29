@@ -8,6 +8,10 @@ normalizes the request into internal `cba/1`.
 This preserves strict, auditable tool execution without asking the model to act
 as the session-state manager or wire serializer.
 
+Everything through the completion section below describes the shipped 0.1.9
+contract. The later developer-mode section is a target, not a claim that
+general terminal execution already ships.
+
 ## Model-facing envelope
 
 Every machine action or final answer contains exactly one fence whose opening
@@ -238,6 +242,68 @@ and is accepted only when the task has not mutated project files.
 
 The runtime rejects completion when repository state is unknown, a path is out of scope, an operation remains unresolved, delivery is indeterminate, required validation is missing/failed/stale, or the report is structurally incomplete. The rejection is another tool result, allowing Copilot to request the needed inspection or validation.
 
+## Developer-mode target: additive terminal contract
+
+The first developer-mode milestone should keep the proven `cba-agent/1`
+envelope, browser response capture, task correlation, and repair behavior. It
+should add `terminal_exec` to the active tool catalog with a required,
+independently versioned tool-contract discriminator such as
+`terminal-exec/1`.
+
+This is an additive target. It does not reinterpret the current catalog-backed
+`run_command` tool, and it does not require an envelope-wide `cba-agent/2`
+migration. Existing sessions gain only the tools present in their durable
+grant and bootstrap catalog.
+
+Representative shell request:
+
+```cba-agent/1
+{"kind":"agent_intent","intent":"terminal_exec","arguments":{"contract":"terminal-exec/1","mode":"shell","command":"npm install && npm test","cwd":".","timeout_ms":900000,"max_output_bytes":1048576},"reason":"Install declared dependencies and run the project test suite."}
+```
+
+Representative direct-argument request:
+
+```cba-agent/1
+{"kind":"agent_intent","intent":"terminal_exec","arguments":{"contract":"terminal-exec/1","mode":"argv","executable":"node","arguments":["scripts/check.mjs"],"cwd":".","timeout_ms":300000,"max_output_bytes":524288},"reason":"Run the repository check directly without shell syntax."}
+```
+
+The exact field names remain an implementation-plan decision, but the contract
+must distinguish shell text from an executable plus argument vector and retain:
+
+- exact working directory and usable developer-environment behavior;
+- timeout, cancellation, and process-tree cleanup semantics;
+- local live-output streaming separate from bounded model-visible output;
+- harness-owned operation identity;
+- developer, inspect, or hardened-mode authorization; and
+- a durable result or output-page reference that can be replayed without
+  rerunning the command.
+
+The terminal result must report command outcome separately from mutation
+outcome. A failed, timed-out, or cancelled command may still have changed the
+project. Cope should observe pre-command and post-command repository state,
+attribute the observed effects to the operation, meter actual changed files and
+lines after execution, preserve pre-existing user work, and make completion
+validation stale when command-generated changes require revalidation.
+
+The bounded terminal result must become durable before the operation journal
+marks the tool complete. Recovery may resend that result or a stable output
+reference, but must never blindly replay an uncertain command.
+
+`run_command` remains the catalog-backed tool for hardened mode and named
+completion validation. A developer-mode project may use both: `terminal_exec`
+for ordinary work and named catalog entries for deterministic required checks.
+
+PTY-backed persistent processes, stdin, durable process handles, multi-root
+workspaces, typed local-Git mutation tools, and isolated execution profiles are
+later additions. They may remain under `cba-agent/1` while their tool contracts
+are additive; an envelope successor is needed only when top-level message,
+correlation, batching, or compatibility semantics change incompatibly.
+
+For context efficiency, Cope should send stable schemas at bootstrap, project a
+compact active-capability manifest, return concise authoritative results, and
+repeat full protocol instructions only after a real repair condition or
+material contract change.
+
 ## Data is never authority
 
 Bootstrap messages place the task and operating envelope in distinct authoritative/data delimiters. Repository text, paths, diffs, logs, command output, and prior chat prose remain untrusted data even if they contain a valid-looking `cba-agent/1` or `cba/1` block or instructions to ignore policy. Only the parser's single top-level envelope can request an action, and local policy still decides whether it runs.
@@ -245,9 +311,12 @@ Bootstrap messages place the task and operating envelope in distinct authoritati
 ## Versioning
 
 `cba-agent/1` is independently versioned from internal `cba/1`. Compatible
-implementation hardening can occur without changing either version. Changing a
-model intent meaning, tool semantics, or a safety invariant requires a new
-applicable protocol version and compatibility fixtures. Optional internal
+implementation hardening can occur without changing either version. New tool
+authority can use its own required contract version while envelope and
+correlation meanings remain unchanged. Changing a model intent meaning,
+top-level message semantics, correlation, batching, or an executable-authority
+invariant requires a new applicable envelope or internal protocol version and
+compatibility fixtures. Optional internal
 completion provenance (`kind` and `basis`) is additive: all 0.1.7 completion
 claim keys remain required, and 0.1.7 handoffs without those optional fields
 remain readable. The UI adapter has its own independent
