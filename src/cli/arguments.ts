@@ -1,6 +1,7 @@
 import { AgentError } from "../shared/errors.js";
 import type { AutonomyMode } from "../session/types.js";
 import type { BrowserProduct } from "../browser/product.js";
+import type { TerminalRecoveryContext } from "../session/terminal-artifacts.js";
 
 export type TransportSelection = "edge" | "fixture" | "replay";
 
@@ -58,6 +59,7 @@ export type CliCommand =
       readonly transcript?: string;
       readonly fixture?: string;
       readonly approveGrant: boolean;
+      readonly recoveryContext?: TerminalRecoveryContext;
     } & CommonOptions)
   | ({ readonly command: "status"; readonly sessionId: string } & CommonOptions)
   | ({ readonly command: "pause"; readonly sessionId: string; readonly reason?: string } & CommonOptions)
@@ -224,12 +226,16 @@ export function parseCliArguments(argv: readonly string[]): CliCommand {
       const transcript = takeOption(args, "--transcript");
       const fixture = takeOption(args, "--fixture");
       const approveGrant = takeFlagAny(args, ["--approve-grant", "--yes", "-y"]);
+      const recoveryContext = parseRecoveryContext(
+        takeOption(args, "--recovery-context") ?? "ordinary-process-crash",
+      );
       validateResumeTransport(transport, transcript, fixture);
       assertNoUnknown(args);
       return {
         command,
         sessionId,
         approveGrant,
+        recoveryContext,
         ...common,
         ...(transport === undefined ? {} : { transport }),
         ...(transcript === undefined ? {} : { transcript }),
@@ -439,6 +445,15 @@ function parseBrowserProduct(value: string): BrowserProduct {
     throw new AgentError("CONFIG_INVALID", `Invalid browser '${value}'; choose edge or chrome`);
   }
   return value;
+}
+
+function parseRecoveryContext(value: string): TerminalRecoveryContext {
+  if (value === "ordinary-process-crash") return "ordinary_process_crash";
+  if (value === "power-storage-loss") return "known_power_or_storage_loss";
+  throw new AgentError(
+    "CONFIG_INVALID",
+    `Invalid recovery context '${value}'`,
+  );
 }
 
 function requirePositional(args: string[], message: string): string {

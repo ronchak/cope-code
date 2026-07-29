@@ -72,6 +72,28 @@ test("CLI parses pause and pins explicit resume transport sources", () => {
   assert.equal(resume.transport, "fixture");
   assert.equal(resume.fixture, "model.json");
   assert.equal(resume.approveGrant, true);
+  assert.equal(resume.recoveryContext, "ordinary_process_crash");
+});
+
+test("CLI accepts only explicit terminal recovery contexts", () => {
+  const resume = parseCliArguments([
+    "resume",
+    "session_12345678",
+    "--recovery-context",
+    "power-storage-loss",
+  ]);
+  assert.equal(resume.command, "resume");
+  if (resume.command !== "resume") return;
+  assert.equal(resume.recoveryContext, "known_power_or_storage_loss");
+  assert.throws(
+    () => parseCliArguments([
+      "resume",
+      "session_12345678",
+      "--recovery-context",
+      "guess",
+    ]),
+    /recovery context/iu,
+  );
 });
 
 test("CLI rejects transport source flags without matching transport", () => {

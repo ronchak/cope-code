@@ -9,10 +9,15 @@ import {
   TERMINAL_EXEC_RESULT_CONTRACT,
   type TerminalExecResult,
 } from "../../src/protocol/terminal-exec.js";
+import {
+  WORKSPACE_OBSERVATION_CONTRACT,
+  type WorkspaceObservation,
+} from "../../src/repository/workspace-observer.js";
 import { SessionArtifactStore } from "../../src/session/artifact-store.js";
 import {
   TerminalArtifactPersistence,
   isTerminalJournalResultMetadata,
+  isTerminalPrelaunchFailureMetadata,
 } from "../../src/session/terminal-artifacts.js";
 import { sha256, stableJson } from "../../src/shared/crypto.js";
 
@@ -160,6 +165,397 @@ test("terminal recovery returns undefined for valid incomplete evidence", async 
   );
 });
 
+test("full terminal evidence binds launch, observations, result, and hidden control facts", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "cope-terminal-full-"));
+  const artifacts = new SessionArtifactStore(path.join(directory, "artifacts"));
+  const persistence = new TerminalArtifactPersistence(artifacts);
+  const request = await persistRequest(persistence);
+  const pre = await persistence.persistWorkspaceObservation({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    observation: workspaceObservation("pre", "a".repeat(64)),
+  });
+  const launch = await persistence.persistLaunchReceipt({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    request,
+    preObservation: pre,
+    recordedAt: "2026-07-29T00:00:00.500Z",
+  });
+  assert.equal(
+    (await persistence.inspectIncompleteEvidence({
+      operationId: OPERATION_ID,
+      requestHash: REQUEST_HASH,
+      recoveryContext: "ordinary_process_crash",
+      journalStatus: "executing",
+    })).state,
+    "launch_without_exit",
+  );
+
+  const exit = await persistence.persistExitReceipt(exitReceipt());
+  assert.equal(
+    (await persistence.inspectIncompleteEvidence({
+      operationId: OPERATION_ID,
+      requestHash: REQUEST_HASH,
+      recoveryContext: "ordinary_process_crash",
+      journalStatus: "executing",
+    })).state,
+    "exit_without_result",
+  );
+  const repositoryFingerprint = "9".repeat(64);
+  const post = await persistence.persistWorkspaceObservation({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    observation: workspaceObservation("post", repositoryFingerprint),
+  });
+  const result: TerminalExecResult = {
+    ...terminalResult(),
+    mutation: {
+      outcome: "observed",
+      created: ["src/generated.ts"],
+      updated: [],
+      deleted: [],
+      renamed: [],
+      pre_existing_touched: [],
+      changed_files: 1,
+      changed_lines: 12,
+      binary_files: 0,
+      ignored_summary: "",
+      repository_fingerprint: repositoryFingerprint,
+      created_total: 1,
+      updated_total: 0,
+      deleted_total: 0,
+      renamed_total: 0,
+      pre_existing_touched_total: 0,
+      path_endpoint_total: 1,
+      path_endpoint_omitted: 0,
+      path_facts_truncated: false,
+      path_facts_sha256: "e".repeat(64),
+      unavailable_baseline_count: 0,
+    },
+  };
+  const control = {
+    branch: "main",
+    head: "b".repeat(40),
+    excludedStateFingerprint: "3".repeat(64),
+  } as const;
+  await assert.rejects(
+    () => persistence.persistResult({
+      operationId: OPERATION_ID,
+      requestHash: REQUEST_HASH,
+      request,
+      preObservation: pre,
+      exitReceipt: exit,
+      postObservation: post,
+      result,
+    }),
+    /legacy placeholder observations/u,
+  );
+  await assert.rejects(
+    () => persistence.persistFullResult({
+      operationId: OPERATION_ID,
+      requestHash: REQUEST_HASH,
+      request,
+      preObservation: pre,
+      launchReceipt: launch,
+      exitReceipt: exit,
+      postObservation: post,
+      result,
+      postObservationControl: {
+        ...control,
+        excludedStateFingerprint: "4".repeat(64),
+      },
+    }),
+    /control anchor/u,
+  );
+  await assert.rejects(
+    () => persistence.persistFullResult({
+      operationId: OPERATION_ID,
+      requestHash: REQUEST_HASH,
+      request,
+      preObservation: pre,
+      launchReceipt: launch,
+      exitReceipt: exit,
+      postObservation: post,
+      result: {
+        ...result,
+        mutation: {
+          ...result.mutation,
+          created_total: 0,
+          updated_total: 1,
+        },
+      },
+      postObservationControl: control,
+    }),
+    /bounded path-summary facts/u,
+  );
+  const persisted = await persistence.persistFullResult({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    request,
+    preObservation: pre,
+    launchReceipt: launch,
+    exitReceipt: exit,
+    postObservation: post,
+    result,
+    postObservationControl: control,
+  });
+  const recovered = await persistence.recoverCompletedEvidence({
+    operationId: OPERATION_ID,
+    tool: "terminal_exec",
+    requestHash: REQUEST_HASH,
+  });
+  assert.equal(recovered?.result.replayed, true);
+  assert.deepEqual(recovered?.safeMetadata, persisted.safeMetadata);
+  assert.doesNotMatch(
+    stableJson(recovered?.result),
+    /excludedStateFingerprint|post_observation_control/u,
+  );
+  assert.doesNotMatch(
+    stableJson(recovered?.safeMetadata),
+    /excludedStateFingerprint|post_observation_control/u,
+  );
+});
+
+test("incomplete terminal reader recognizes only exact prelaunch failure metadata", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "cope-terminal-prelaunch-"));
+  const persistence = new TerminalArtifactPersistence(
+    new SessionArtifactStore(path.join(directory, "artifacts")),
+  );
+  const metadata = {
+    reasonCode: "PRE_OBSERVATION_UNAVAILABLE",
+    outcome: "spawn_failed",
+    mutation_outcome: "none",
+    plannedDisclosureBytes: 4096,
+  } as const;
+  assert.equal(isTerminalPrelaunchFailureMetadata(metadata), true);
+  assert.equal(
+    (await persistence.inspectIncompleteEvidence({
+      operationId: OPERATION_ID,
+      requestHash: REQUEST_HASH,
+      recoveryContext: "ordinary_process_crash",
+      journalStatus: "failed",
+      journalSafeResult: metadata,
+    })).state,
+    "completed_prelaunch_failure",
+  );
+  assert.equal(isTerminalPrelaunchFailureMetadata({
+    ...metadata,
+    extra: true,
+  }), false);
+  assert.equal(
+    (await persistence.inspectIncompleteEvidence({
+      operationId: OPERATION_ID,
+      requestHash: REQUEST_HASH,
+      recoveryContext: "known_power_or_storage_loss",
+      journalStatus: "failed",
+      journalSafeResult: { ...metadata, extra: true },
+    })).state,
+    "completed_unproven_without_result",
+  );
+});
+
+test("a full no-effect result binds every canonical Git component", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "cope-terminal-none-"));
+  const persistence = new TerminalArtifactPersistence(
+    new SessionArtifactStore(path.join(directory, "artifacts")),
+  );
+  const request = await persistRequest(persistence);
+  const fingerprint = "a".repeat(64);
+  const preObservation = workspaceObservation("pre", fingerprint);
+  if (preObservation.state !== "complete") {
+    throw new Error("expected complete fixture observation");
+  }
+  const pre = await persistence.persistWorkspaceObservation({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    observation: preObservation,
+  });
+  const launch = await persistence.persistLaunchReceipt({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    request,
+    preObservation: pre,
+    recordedAt: "2026-07-29T00:00:00.500Z",
+  });
+  const exit = await persistence.persistExitReceipt(exitReceipt());
+  const changedPost = await persistence.persistWorkspaceObservation({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    observation: {
+      ...workspaceObservation("post", fingerprint),
+      components: {
+        ...preObservation.components,
+        gitTransitions: "f".repeat(64),
+      },
+    },
+  });
+  const result: TerminalExecResult = {
+    ...terminalResult(),
+    mutation: {
+      outcome: "none",
+      created: [],
+      updated: [],
+      deleted: [],
+      renamed: [],
+      pre_existing_touched: [],
+      changed_files: 0,
+      changed_lines: 0,
+      binary_files: 0,
+      ignored_summary: "",
+      repository_fingerprint: fingerprint,
+      created_total: 0,
+      updated_total: 0,
+      deleted_total: 0,
+      renamed_total: 0,
+      pre_existing_touched_total: 0,
+      path_endpoint_total: 0,
+      path_endpoint_omitted: 0,
+      path_facts_truncated: false,
+      path_facts_sha256: "e".repeat(64),
+      unavailable_baseline_count: 0,
+    },
+  };
+  await assert.rejects(
+    () => persistence.persistFullResult({
+      operationId: OPERATION_ID,
+      requestHash: REQUEST_HASH,
+      request,
+      preObservation: pre,
+      launchReceipt: launch,
+      exitReceipt: exit,
+      postObservation: changedPost,
+      result,
+    }),
+    /no-effect terminal result/u,
+  );
+  const unchangedPost = await persistence.persistWorkspaceObservation({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    observation: {
+      ...preObservation,
+      phase: "post",
+      observedAt: "2026-07-29T00:00:02.000Z",
+    },
+  });
+  await persistence.persistFullResult({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    request,
+    preObservation: pre,
+    launchReceipt: launch,
+    exitReceipt: exit,
+    postObservation: unchangedPost,
+    result,
+  });
+});
+
+test("launch and attribution refuse insufficient pre-observation evidence", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "cope-terminal-limited-"));
+  const persistence = new TerminalArtifactPersistence(
+    new SessionArtifactStore(path.join(directory, "artifacts")),
+  );
+  const request = await persistRequest(persistence);
+  const unknown = await persistence.persistWorkspaceObservation({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    observation: {
+      contract: WORKSPACE_OBSERVATION_CONTRACT,
+      phase: "pre",
+      observedAt: "2026-07-29T00:00:00.000Z",
+      durationMs: 20_000,
+      state: "unknown",
+      limitationCodes: ["PRE_OBSERVATION_TIMEOUT"],
+    },
+  });
+  await assert.rejects(
+    () => persistence.persistLaunchReceipt({
+      operationId: OPERATION_ID,
+      requestHash: REQUEST_HASH,
+      request,
+      preObservation: unknown,
+      recordedAt: "2026-07-29T00:00:00.500Z",
+    }),
+    /complete or metadata-limited/u,
+  );
+
+  const completePre = workspaceObservation("pre", "a".repeat(64));
+  if (completePre.state !== "complete") {
+    throw new Error("expected complete fixture observation");
+  }
+  const {
+    repositoryFingerprint: _repositoryFingerprint,
+    ...preFacts
+  } = completePre;
+  const limited = await persistence.persistWorkspaceObservation({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    observation: {
+      ...preFacts,
+      state: "metadata_limited",
+      limitationCodes: ["VISIBLE_STATE_BOUND_EXCEEDED"],
+    },
+  });
+  const launch = await persistence.persistLaunchReceipt({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    request,
+    preObservation: limited,
+    recordedAt: "2026-07-29T00:00:00.500Z",
+  });
+  const exit = await persistence.persistExitReceipt(exitReceipt());
+  const postFingerprint = "9".repeat(64);
+  const post = await persistence.persistWorkspaceObservation({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    observation: workspaceObservation("post", postFingerprint),
+  });
+  const result: TerminalExecResult = {
+    ...terminalResult(),
+    mutation: {
+      outcome: "observed",
+      created: [],
+      updated: [],
+      deleted: [],
+      renamed: [],
+      pre_existing_touched: [],
+      changed_files: 0,
+      changed_lines: 0,
+      binary_files: 0,
+      ignored_summary: "",
+      repository_fingerprint: postFingerprint,
+      created_total: 0,
+      updated_total: 0,
+      deleted_total: 0,
+      renamed_total: 0,
+      pre_existing_touched_total: 0,
+      path_endpoint_total: 0,
+      path_endpoint_omitted: 0,
+      path_facts_truncated: false,
+      path_facts_sha256: "e".repeat(64),
+      unavailable_baseline_count: 0,
+    },
+  };
+  await assert.rejects(
+    () => persistence.persistFullResult({
+      operationId: OPERATION_ID,
+      requestHash: REQUEST_HASH,
+      request,
+      preObservation: limited,
+      launchReceipt: launch,
+      exitReceipt: exit,
+      postObservation: post,
+      result,
+      postObservationControl: {
+        branch: "main",
+        head: "b".repeat(40),
+        excludedStateFingerprint: "3".repeat(64),
+      },
+    }),
+    /only produce unknown attribution/u,
+  );
+});
+
 async function createCompleteFixture(): Promise<{
   readonly root: string;
   readonly artifacts: SessionArtifactStore;
@@ -210,7 +606,20 @@ async function persistRequestAndPre(
     ReturnType<TerminalArtifactPersistence["persistObservation"]>
   >;
 }> {
-  const request = await persistence.persistRequest({
+  const request = await persistRequest(persistence);
+  const pre = await persistence.persistObservation({
+    operation_id: OPERATION_ID,
+    request_hash: REQUEST_HASH,
+    phase: "pre",
+    observed_at: "2026-07-29T00:00:00.000Z",
+  });
+  return { request, pre };
+}
+
+async function persistRequest(
+  persistence: TerminalArtifactPersistence,
+): Promise<Awaited<ReturnType<TerminalArtifactPersistence["persistRequest"]>>> {
+  return persistence.persistRequest({
     operation_id: OPERATION_ID,
     request_hash: REQUEST_HASH,
     invocation: invocation(),
@@ -225,13 +634,6 @@ async function persistRequestAndPre(
       environment_keys_hash: "a".repeat(64),
     },
   });
-  const pre = await persistence.persistObservation({
-    operation_id: OPERATION_ID,
-    request_hash: REQUEST_HASH,
-    phase: "pre",
-    observed_at: "2026-07-29T00:00:00.000Z",
-  });
-  return { request, pre };
 }
 
 function invocation(): TerminalExecResult["invocation"] {
@@ -302,5 +704,46 @@ function terminalResult(): TerminalExecResult {
       ignored_summary: "",
     },
     replayed: false,
+  };
+}
+
+function workspaceObservation(
+  phase: WorkspaceObservation["phase"],
+  repositoryFingerprint: string,
+): WorkspaceObservation {
+  return {
+    contract: WORKSPACE_OBSERVATION_CONTRACT,
+    phase,
+    observedAt:
+      phase === "pre"
+        ? "2026-07-29T00:00:00.000Z"
+        : "2026-07-29T00:00:02.000Z",
+    durationMs: 20,
+    state: "complete",
+    branch: "main",
+    head: "b".repeat(40),
+    repositoryFingerprint,
+    components: {
+      index: "1".repeat(64),
+      visible: "2".repeat(64),
+      excluded: "3".repeat(64),
+      protectedWorktree: "4".repeat(64),
+      gitTransitions: "5".repeat(64),
+      gitControls: "6".repeat(64),
+    },
+    entries: [],
+    beforeImages: [],
+    transitionPaths: {
+      paths: [],
+      total: 0,
+      omitted: 0,
+      truncated: false,
+      completeFactsSha256: "7".repeat(64),
+    },
+    ignoredCount: 0,
+    ignoredSummarySha256: "8".repeat(64),
+    ignoredSummaryTruncated: false,
+    nestedRepository: "none",
+    limitationCodes: [],
   };
 }

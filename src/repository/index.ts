@@ -8,3 +8,4 @@ export * from "./repository-tools.js";
 export * from "./snapshot-diff.js";
 export * from "./text-file.js";
 export * from "./types.js";
+export * from "./workspace-observer.js";

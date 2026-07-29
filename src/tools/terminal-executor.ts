@@ -1,4 +1,8 @@
 import type { RepositoryBoundary } from "../repository/boundary.js";
+import type {
+  SessionPreExistingBaseline,
+  WorkspaceObserver,
+} from "../repository/workspace-observer.js";
 import type { ContentProcessor } from "../repository/types.js";
 import {
   TERMINAL_EXEC_CONTRACT,
@@ -21,6 +25,9 @@ import { errorMessage } from "../shared/errors.js";
 import {
   TerminalArtifactPersistence,
   type RecoverTerminalResultInput,
+  type IncompleteTerminalEvidence,
+  type TerminalRecoveryContext,
+  type TerminalPrelaunchFailureMetadata,
 } from "../session/terminal-artifacts.js";
 import type {
   TerminalOutputSink,
@@ -42,6 +49,7 @@ export interface TerminalExecutorContext {
   readonly timeoutMs: number;
   readonly maxOutputBytes: number;
   readonly requestHash: string;
+  readonly preExistingBaseline?: SessionPreExistingBaseline;
 }
 
 export interface TerminalExecutorOutcome {
@@ -73,6 +81,7 @@ export interface TerminalExecutorDependencies {
   readonly environment?: NodeJS.ProcessEnv;
   readonly onTerminalOutput?: TerminalLiveOutput;
   readonly maxLiveOutputBytes?: number;
+  readonly observer?: WorkspaceObserver;
 }
 
 /**
@@ -253,6 +262,16 @@ export class TerminalExecutor {
       data: { ...evidence.result },
       safeMetadata: { ...evidence.safeMetadata },
     };
+  }
+
+  public async inspectRecoveryEvidence(input: {
+    readonly operationId: string;
+    readonly requestHash: string;
+    readonly recoveryContext: TerminalRecoveryContext;
+    readonly journalStatus?: "accepted" | "executing" | "completed" | "failed";
+    readonly journalSafeResult?: unknown;
+  }): Promise<IncompleteTerminalEvidence> {
+    return this.dependencies.persistence.inspectIncompleteEvidence(input);
   }
 
   private async prepare(
@@ -616,6 +635,11 @@ function prelaunchFailure(
   reasonCode: string,
   message: string,
 ): TerminalExecutorOutcome {
+  const safeMetadata = {
+    reasonCode,
+    outcome: "spawn_failed",
+    mutation_outcome: "none",
+  } satisfies TerminalPrelaunchFailureMetadata;
   return {
     operationId,
     tool: "terminal_exec",
@@ -625,11 +649,7 @@ function prelaunchFailure(
       message,
       outcome: "spawn_failed",
     },
-    safeMetadata: {
-      reasonCode,
-      outcome: "spawn_failed",
-      mutation_outcome: "none",
-    },
+    safeMetadata,
   };
 }
 

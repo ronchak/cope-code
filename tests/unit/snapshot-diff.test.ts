@@ -131,3 +131,112 @@ test("session diff uses the earliest checkpoint for each agent-mutated path", as
   assert.equal(onlyA.comparedFileCount, 1);
   assert.equal(onlyA.diff.includes("b.txt"), false);
 });
+
+test("terminal session diff resolves healthy baselines and reports unavailable evidence", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-terminal-diff-resolver-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  await writeFile(path.join(root, "patch.txt"), "patch before\n");
+  await writeFile(path.join(root, "generated.txt"), "generated after\n");
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(
+    boundary,
+    path.join(temporary, "checkpoints"),
+  );
+  const checkpoint = await checkpoints.createCheckpoint(["patch.txt"]);
+  await writeFile(path.join(root, "patch.txt"), "patch after\n");
+  const mutation = {
+    kind: "terminal" as const,
+    operationId: "op_terminal_1",
+    changedPaths: ["generated.txt", "missing.txt"],
+  };
+  await assert.rejects(
+    () => new SnapshotDiffInspector(boundary, checkpoints).diffSession([mutation]),
+    /verified before-image resolver/u,
+  );
+
+  const resolvedPaths: string[] = [];
+  const result = await new SnapshotDiffInspector(boundary, checkpoints, {
+    resolveTerminalBeforeImage: async (_terminal, repositoryRelativePath) => {
+      resolvedPaths.push(repositoryRelativePath);
+      if (repositoryRelativePath === "missing.txt") {
+        return {
+          available: false,
+          reason: "missing_evidence",
+        };
+      }
+      return {
+        available: true,
+        baselineId: "terminal:op_terminal_1",
+        entry: {
+          path: repositoryRelativePath,
+          existed: false,
+          bytes: null,
+          mode: null,
+          sha256: null,
+        },
+      };
+    },
+  }).diffSession([
+    {
+      checkpointId: checkpoint.id,
+      changedPaths: ["patch.txt"],
+    },
+    mutation,
+  ]);
+
+  assert.deepEqual(resolvedPaths, ["generated.txt", "missing.txt"]);
+  assert.equal(result.comparedFileCount, 2);
+  assert.equal(result.changedFileCount, 2);
+  assert.match(result.diff, /patch\.txt/u);
+  assert.match(result.diff, /-patch before/u);
+  assert.match(result.diff, /\+patch after/u);
+  assert.match(result.diff, /generated\.txt/u);
+  assert.deepEqual(result.unavailableTerminalPaths, [{
+    path: "missing.txt",
+    reason: "missing_evidence",
+  }]);
+  assert.equal(result.unavailableTerminalPathCount, 1);
+  assert.equal(result.omittedTerminalPathCount, 0);
+});
+
+test("terminal session diff preserves patch paths before omitting bounded terminal paths", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-terminal-diff-bound-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  await writeFile(path.join(root, "patch.txt"), "before\n");
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(
+    boundary,
+    path.join(temporary, "checkpoints"),
+  );
+  const checkpoint = await checkpoints.createCheckpoint(["patch.txt"]);
+  await writeFile(path.join(root, "patch.txt"), "after\n");
+  let resolverCalled = false;
+  const result = await new SnapshotDiffInspector(boundary, checkpoints, {
+    maxFiles: 1,
+    resolveTerminalBeforeImage: async () => {
+      resolverCalled = true;
+      return {
+        available: false,
+        reason: "bounded_out",
+      };
+    },
+  }).diffSession([
+    { checkpointId: checkpoint.id, changedPaths: ["patch.txt"] },
+    {
+      kind: "terminal",
+      operationId: "op_terminal_2",
+      changedPaths: ["terminal.txt"],
+    },
+  ]);
+
+  assert.equal(resolverCalled, false);
+  assert.equal(result.comparedFileCount, 1);
+  assert.match(result.diff, /patch\.txt/u);
+  assert.deepEqual(result.unavailableTerminalPaths, []);
+  assert.equal(result.unavailableTerminalPathCount, 0);
+  assert.equal(result.omittedTerminalPathCount, 1);
+});

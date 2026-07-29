@@ -3,6 +3,7 @@ import type { ArtifactReference } from "./artifact-store.js";
 export const SESSION_SCHEMA_VERSION = 1 as const;
 
 export type AutonomyMode = "inspect" | "edit" | "auto";
+export type CompletionAuthority = "frozen" | "observed";
 
 export type SessionStatus =
   | "created"
@@ -94,7 +95,7 @@ export interface PatchMutationRecord {
   readonly repositoryFingerprint: string;
 }
 
-export interface TerminalMutationRecord {
+export interface LegacyTerminalMutationRecord {
   readonly kind: "terminal";
   readonly operationId: string;
   readonly checkpointId?: never;
@@ -119,6 +120,71 @@ export interface TerminalMutationRecord {
   readonly terminalResult: ArtifactReference;
   readonly repositoryFingerprint?: string;
 }
+
+export interface TerminalPostObservationControl {
+  readonly branch: string | null;
+  readonly head: string | null;
+  readonly excludedStateFingerprint: string;
+}
+
+interface FullTerminalMutationRecordBase {
+  readonly kind: "terminal";
+  readonly recordContract: "terminal-mutation/2";
+  readonly operationId: string;
+  readonly checkpointId?: never;
+  readonly changedPaths: readonly string[];
+  readonly changedLines: number;
+  readonly createdPaths: readonly string[];
+  readonly updatedPaths: readonly string[];
+  readonly deletedPaths: readonly string[];
+  readonly renamedPaths: readonly {
+    readonly from: string;
+    readonly to: string;
+  }[];
+  readonly preExistingTouchedPaths: readonly string[];
+  readonly processOutcome?:
+    | "completed"
+    | "completed_nonzero"
+    | "spawn_failed"
+    | "timed_out"
+    | "cancelled"
+    | "persistence_failed"
+    | "indeterminate";
+  readonly createdTotal: number;
+  readonly updatedTotal: number;
+  readonly deletedTotal: number;
+  readonly renamedTotal: number;
+  readonly preExistingTouchedTotal: number;
+  readonly changedPathCount: number;
+  readonly pathEndpointTotal: number;
+  readonly omittedPathEndpointTotal: number;
+  readonly pathFactsTruncated: boolean;
+  readonly pathFactsSha256: string;
+  readonly unavailableBaselineCount: number;
+  readonly completedAt: string;
+  readonly preObservation: ArtifactReference;
+  readonly postObservation: ArtifactReference;
+  readonly terminalResult: ArtifactReference;
+}
+
+export type FullTerminalMutationRecord = FullTerminalMutationRecordBase & (
+  | {
+      readonly observationOutcome: "observed";
+      readonly repositoryFingerprint: string;
+      readonly postObservationControl: TerminalPostObservationControl;
+    }
+  | {
+      readonly observationOutcome:
+        | "protected_or_hidden_changed"
+        | "unknown";
+      readonly repositoryFingerprint?: never;
+      readonly postObservationControl?: never;
+    }
+);
+
+export type TerminalMutationRecord =
+  | LegacyTerminalMutationRecord
+  | FullTerminalMutationRecord;
 
 export type MutationRecord = PatchMutationRecord | TerminalMutationRecord;
 
@@ -149,6 +215,11 @@ export interface SessionState {
   readonly objective: string;
   readonly acceptanceCriteria: readonly string[];
   readonly mode: AutonomyMode;
+  /**
+   * Creation-time completion semantics. Absent is byte-compatible and means
+   * frozen for legacy sessions.
+   */
+  readonly completionAuthority?: CompletionAuthority;
   status: SessionStatus;
   readonly createdAt: string;
   updatedAt: string;

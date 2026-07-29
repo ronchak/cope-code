@@ -2,6 +2,7 @@ import { access, mkdir, open, readFile, rename, rm, unlink } from "node:fs/promi
 import path from "node:path";
 import { newId, sha256, stableJson } from "../shared/crypto.js";
 import { AgentError } from "../shared/errors.js";
+import { syncDirectory } from "./directory-sync.js";
 
 export const ARTIFACT_KINDS = [
   "outbox",
@@ -10,6 +11,7 @@ export const ARTIFACT_KINDS = [
   "decision",
   "terminal-request",
   "terminal-pre-observation",
+  "terminal-launch-receipt",
   "terminal-exit-receipt",
   "terminal-post-observation",
   "terminal-result",
@@ -17,7 +19,7 @@ export const ARTIFACT_KINDS = [
 
 export type ArtifactKind = (typeof ARTIFACT_KINDS)[number];
 
-const MAX_ARTIFACT_BYTES = 8 * 1024 * 1024;
+export const MAX_ARTIFACT_BYTES = 8 * 1024 * 1024;
 const MAX_MANIFEST_BYTES = 64 * 1024;
 
 export interface ArtifactReference {
@@ -25,6 +27,20 @@ export interface ArtifactReference {
   readonly id: string;
   readonly bytes: number;
   readonly sha256: string;
+}
+
+export interface ArtifactWritePreflight {
+  readonly fits: boolean;
+  readonly bytes: number;
+  readonly maxBytes: number;
+}
+
+export interface DurableArtifactWriteOptions {
+  readonly syncDirectories?: boolean;
+}
+
+export interface SessionArtifactStoreOptions {
+  readonly syncDirectory?: (directory: string) => Promise<void>;
 }
 
 interface ArtifactManifest extends ArtifactReference {
@@ -37,7 +53,14 @@ interface ArtifactManifest extends ArtifactReference {
  * unless a separately approved retention policy requires otherwise.
  */
 export class SessionArtifactStore {
-  public constructor(private readonly root: string) {}
+  private readonly syncDirectory: (directory: string) => Promise<void>;
+
+  public constructor(
+    private readonly root: string,
+    options: SessionArtifactStoreOptions = {},
+  ) {
+    this.syncDirectory = options.syncDirectory ?? syncDirectory;
+  }
 
   public async put(kind: ArtifactKind, id: string, content: string): Promise<void> {
     assertSafeArtifactId(id);
@@ -78,6 +101,71 @@ export class SessionArtifactStore {
       id,
       bytes: Buffer.byteLength(content),
       sha256: sha256(content),
+    };
+  }
+
+  public preflightWrite(content: string): ArtifactWritePreflight {
+    const bytes = Buffer.byteLength(content);
+    return {
+      fits: bytes <= MAX_ARTIFACT_BYTES,
+      bytes,
+      maxBytes: MAX_ARTIFACT_BYTES,
+    };
+  }
+
+  /**
+   * Publishes an artifact with the directory ordering required immediately
+   * before an external process launch. The host capability gate lives in the
+   * shared helper; this method does not claim power-loss proof.
+   */
+  public async putReferencedDurable(
+    kind: ArtifactKind,
+    id: string,
+    content: string,
+    options: DurableArtifactWriteOptions = {},
+  ): Promise<ArtifactReference> {
+    assertSafeArtifactId(id);
+    const preflight = this.preflightWrite(content);
+    if (!preflight.fits) {
+      throw new AgentError(
+        "BUDGET_EXCEEDED",
+        "Source-bearing recovery artifact exceeds its storage bound",
+        { kind, id, maxBytes: preflight.maxBytes },
+      );
+    }
+    const directory = path.join(this.root, kind);
+    const rootExisted = await exists(this.root);
+    const directoryExisted = await exists(directory);
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    if (options.syncDirectories === true && !directoryExisted) {
+      if (!rootExisted) await this.syncDirectory(path.dirname(this.root));
+      await this.syncDirectory(this.root);
+    }
+    const manifest: ArtifactManifest = {
+      schemaVersion: 1,
+      kind,
+      id,
+      bytes: preflight.bytes,
+      sha256: sha256(content),
+    };
+    await atomicWrite(this.contentPath(kind, id), content);
+    if (options.syncDirectories === true) {
+      await this.syncDirectory(directory);
+    }
+    try {
+      await atomicWrite(this.manifestPath(kind, id), `${stableJson(manifest)}\n`);
+      if (options.syncDirectories === true) {
+        await this.syncDirectory(directory);
+      }
+    } catch (error) {
+      await unlink(this.contentPath(kind, id)).catch(() => undefined);
+      throw error;
+    }
+    return {
+      kind,
+      id,
+      bytes: preflight.bytes,
+      sha256: manifest.sha256,
     };
   }
 
@@ -233,6 +321,15 @@ function assertArtifactReference(value: unknown): asserts value is ArtifactRefer
 
 function ignoreMissing(error: unknown): void {
   if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+}
+
+async function exists(filename: string): Promise<boolean> {
+  try {
+    await access(filename);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function hasExactKeys(value: unknown, keys: readonly string[]): boolean {

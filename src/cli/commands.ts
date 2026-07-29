@@ -61,6 +61,7 @@ import {
 } from "../session/terminal-cleanup.js";
 import {
   SESSION_SCHEMA_VERSION,
+  type CompletionAuthority,
   type SessionState,
   type SessionStatus,
   zeroBudgetUsage,
@@ -314,6 +315,7 @@ async function runNewSession(
       objective: command.objective,
       acceptanceCriteria: command.acceptanceCriteria,
       mode: command.mode,
+      completionAuthority: completionAuthorityForEffectivePolicy(engine),
       status: "created",
       createdAt: now,
       updatedAt: now,
@@ -1343,6 +1345,17 @@ function emptyPolicyUsage() {
     command_output_bytes: 0,
     protocol_repairs: 0,
   } as const;
+}
+
+export function completionAuthorityForEffectivePolicy(
+  engine: PolicyEngine,
+): CompletionAuthority {
+  const policy = engine.evaluate({
+    tool: "terminal_exec",
+    projected_usage: emptyPolicyUsage(),
+    planned_disclosure_bytes: 0,
+  });
+  return policy.decision === "allow" ? "observed" : "frozen";
 }
 
 function policyProtectedPatterns(

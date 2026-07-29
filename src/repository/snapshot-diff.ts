@@ -11,9 +11,46 @@ import { looksBinary, readRegularFile } from "./text-file.js";
 
 export const SNAPSHOT_DIFF_VERSION = "snapshot-diff.v1" as const;
 
-export interface SessionMutationDiffRecord {
+export interface PatchSessionMutationDiffRecord {
+  readonly kind?: "patch";
   readonly checkpointId: string;
   readonly changedPaths: readonly string[];
+}
+
+export interface TerminalSessionMutationDiffRecord {
+  readonly kind: "terminal";
+  readonly operationId: string;
+  readonly changedPaths: readonly string[];
+}
+
+export type SessionMutationDiffRecord =
+  | PatchSessionMutationDiffRecord
+  | TerminalSessionMutationDiffRecord;
+
+export type TerminalBeforeImageResolution =
+  | {
+      readonly available: true;
+      readonly baselineId: string;
+      readonly entry: CheckpointFileSnapshot;
+    }
+  | {
+      readonly available: false;
+      readonly reason:
+        | "legacy_placeholder"
+        | "missing_evidence"
+        | "bounded_out"
+        | "unknown_observation";
+    };
+
+export type TerminalBeforeImageResolver = (
+  mutation: TerminalSessionMutationDiffRecord,
+  repositoryRelativePath: string,
+  signal?: AbortSignal,
+) => Promise<TerminalBeforeImageResolution>;
+
+export interface TerminalUnavailableDiffFact {
+  readonly path: string;
+  readonly reason: Exclude<TerminalBeforeImageResolution, { readonly available: true }>["reason"];
 }
 
 export interface SnapshotDiffRequest {
@@ -35,6 +72,9 @@ export interface SnapshotDiffResult {
   readonly changedFileCount: number;
   /** Effective post-clamp output ceiling, used for a second disclosure bound. */
   readonly limitBytes: number;
+  readonly unavailableTerminalPaths?: readonly TerminalUnavailableDiffFact[];
+  readonly unavailableTerminalPathCount?: number;
+  readonly omittedTerminalPathCount?: number;
 }
 
 export interface SnapshotDiffInspectorOptions {
@@ -43,6 +83,7 @@ export interface SnapshotDiffInspectorOptions {
   readonly maxFiles?: number;
   readonly maxInputBytes?: number;
   readonly isPathAllowed?: (repositoryRelativePath: string) => boolean;
+  readonly resolveTerminalBeforeImage?: TerminalBeforeImageResolver;
 }
 
 interface BaselineCandidate {
@@ -50,6 +91,20 @@ interface BaselineCandidate {
   readonly checkpointId: string;
   readonly entry: CheckpointFileSnapshot;
 }
+
+type SessionBaselineSource =
+  | {
+      readonly kind: "patch";
+      readonly path: string;
+      readonly checkpointId: string;
+    }
+  | {
+      readonly kind: "terminal";
+      readonly path: string;
+      readonly mutation: TerminalSessionMutationDiffRecord;
+    };
+
+const MAX_UNAVAILABLE_TERMINAL_PATH_SAMPLE = 256;
 
 /**
  * Compares integrity-verified checkpoint before-images with current worktree
@@ -61,6 +116,7 @@ export class SnapshotDiffInspector {
   private readonly maxFiles: number;
   private readonly maxInputBytes: number;
   private readonly isPathAllowed: (repositoryRelativePath: string) => boolean;
+  private readonly resolveTerminalBeforeImage: TerminalBeforeImageResolver | undefined;
 
   public constructor(
     private readonly boundary: RepositoryBoundary,
@@ -75,6 +131,7 @@ export class SnapshotDiffInspector {
       "maxInputBytes",
     );
     this.isPathAllowed = options.isPathAllowed ?? (() => true);
+    this.resolveTerminalBeforeImage = options.resolveTerminalBeforeImage;
   }
 
   public async diffCheckpoint(
@@ -105,16 +162,31 @@ export class SnapshotDiffInspector {
   ): Promise<SnapshotDiffResult> {
     throwIfAborted(signal);
     const requested = await this.resolveRequestedPaths(request.paths ?? []);
-    const earliest = new Map<string, { readonly path: string; readonly checkpointId: string }>();
+    const earliest = new Map<string, SessionBaselineSource>();
+    let hasTerminalMutation = false;
     for (const mutation of mutations) {
+      if (mutation.kind === "terminal") hasTerminalMutation = true;
       for (const untrustedPath of mutation.changedPaths) {
         const normalized = normalizeRepositoryPath(untrustedPath);
         const key = this.boundary.pathKey(normalized);
-        if (!earliest.has(key)) earliest.set(key, { path: normalized, checkpointId: mutation.checkpointId });
+        if (earliest.has(key)) continue;
+        earliest.set(
+          key,
+          mutation.kind === "terminal"
+            ? { kind: "terminal", path: normalized, mutation }
+            : {
+                kind: "patch",
+                path: normalized,
+                checkpointId: mutation.checkpointId,
+              },
+        );
       }
     }
 
-    const allowed: Array<{ readonly path: string; readonly checkpointId: string }> = [];
+    const allowedPatch: Array<Extract<SessionBaselineSource, { readonly kind: "patch" }>> = [];
+    const allowedTerminal: Array<
+      Extract<SessionBaselineSource, { readonly kind: "terminal" }>
+    > = [];
     let excludedCount = 0;
     for (const candidate of earliest.values()) {
       if (!matchesRequestedPath(candidate.path, requested, this.boundary)) continue;
@@ -122,13 +194,17 @@ export class SnapshotDiffInspector {
         excludedCount += 1;
         continue;
       }
-      allowed.push(candidate);
+      if (candidate.kind === "patch") allowedPatch.push(candidate);
+      else allowedTerminal.push(candidate);
     }
-    allowed.sort((left, right) => left.path.localeCompare(right.path));
-    this.assertFileCount(allowed.length);
+    allowedPatch.sort(compareSessionBaselineSources);
+    allowedTerminal.sort(compareSessionBaselineSources);
+    this.assertFileCount(allowedPatch.length);
+    const retainedTerminal = allowedTerminal.slice(0, this.maxFiles - allowedPatch.length);
+    const omittedTerminalPathCount = allowedTerminal.length - retainedTerminal.length;
 
-    const byCheckpoint = new Map<string, typeof allowed>();
-    for (const candidate of allowed) {
+    const byCheckpoint = new Map<string, typeof allowedPatch>();
+    for (const candidate of allowedPatch) {
       const group = byCheckpoint.get(candidate.checkpointId) ?? [];
       group.push(candidate);
       byCheckpoint.set(candidate.checkpointId, group);
@@ -152,14 +228,36 @@ export class SnapshotDiffInspector {
       }
     }
 
-    const selected = allowed.map((candidate) => {
+    const selected: BaselineCandidate[] = allowedPatch.map((candidate) => {
       const baseline = baselineByPath.get(this.boundary.pathKey(candidate.path));
       if (baseline === undefined) {
         throw new AgentError("CHECKPOINT_CORRUPT", "Session checkpoint inventory is incomplete");
       }
       return baseline;
     });
-    return this.render(
+    const unavailableTerminalPaths: TerminalUnavailableDiffFact[] = [];
+    let unavailableTerminalPathCount = 0;
+    for (const candidate of retainedTerminal) {
+      throwIfAborted(signal);
+      const resolution = await this.resolveTerminalBaseline(candidate, signal);
+      if (!resolution.available) {
+        unavailableTerminalPathCount += 1;
+        if (unavailableTerminalPaths.length < MAX_UNAVAILABLE_TERMINAL_PATH_SAMPLE) {
+          unavailableTerminalPaths.push({
+            path: candidate.path,
+            reason: resolution.reason,
+          });
+        }
+        continue;
+      }
+      selected.push({
+        path: candidate.path,
+        checkpointId: resolution.baselineId,
+        entry: resolution.entry,
+      });
+    }
+
+    const result = await this.render(
       "session",
       "earliest-agent-checkpoint",
       selected,
@@ -167,6 +265,74 @@ export class SnapshotDiffInspector {
       request.maxBytes,
       signal,
     );
+    if (!hasTerminalMutation) return result;
+    return {
+      ...result,
+      unavailableTerminalPaths,
+      unavailableTerminalPathCount,
+      omittedTerminalPathCount,
+    };
+  }
+
+  private async resolveTerminalBaseline(
+    candidate: Extract<SessionBaselineSource, { readonly kind: "terminal" }>,
+    signal: AbortSignal | undefined,
+  ): Promise<TerminalBeforeImageResolution> {
+    if (this.resolveTerminalBeforeImage === undefined) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Terminal session diff requires a verified before-image resolver",
+      );
+    }
+    let resolution: TerminalBeforeImageResolution;
+    try {
+      resolution = await this.resolveTerminalBeforeImage(
+        candidate.mutation,
+        candidate.path,
+        signal,
+      );
+    } catch (error) {
+      throwIfAborted(signal);
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Terminal before-image integrity validation failed",
+        {
+          operationId: candidate.mutation.operationId,
+          repositoryRelativePath: candidate.path,
+        },
+        { cause: error },
+      );
+    }
+    throwIfAborted(signal);
+    if (!resolution.available) return resolution;
+    let resolvedEntryPath: string;
+    try {
+      resolvedEntryPath = normalizeRepositoryPath(resolution.entry.path);
+    } catch (error) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Terminal before-image resolver returned an invalid path",
+        {
+          operationId: candidate.mutation.operationId,
+          repositoryRelativePath: candidate.path,
+        },
+        { cause: error },
+      );
+    }
+    if (
+      resolution.baselineId.length === 0 ||
+      this.boundary.pathKey(resolvedEntryPath) !== this.boundary.pathKey(candidate.path)
+    ) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Terminal before-image resolver returned mismatched evidence",
+        {
+          operationId: candidate.mutation.operationId,
+          repositoryRelativePath: candidate.path,
+        },
+      );
+    }
+    return resolution;
   }
 
   private async render(
@@ -259,6 +425,13 @@ export class SnapshotDiffInspector {
       });
     }
   }
+}
+
+function compareSessionBaselineSources(
+  left: SessionBaselineSource,
+  right: SessionBaselineSource,
+): number {
+  return left.path.localeCompare(right.path);
 }
 
 class BoundedTextWriter {

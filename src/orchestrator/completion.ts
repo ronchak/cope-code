@@ -1,4 +1,5 @@
 import type { SessionState, ValidationRecord } from "../session/types.js";
+import type { CompletionAuthority } from "../session/types.js";
 
 export interface CompletionClaim {
   readonly kind?: "work" | "answer";
@@ -56,6 +57,12 @@ export interface CompletionVerification {
     readonly gitStatusSummary: string;
     readonly repositoryFingerprint: string;
   };
+}
+
+export function effectiveCompletionAuthority(
+  state: Pick<SessionState, "completionAuthority">,
+): CompletionAuthority {
+  return state.completionAuthority ?? "frozen";
 }
 
 export function verifyCompletion(

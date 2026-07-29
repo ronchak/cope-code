@@ -4,6 +4,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { TOOL_NAMES, TOOL_REGISTRY } from "../../src/protocol/index.js";
+import { completionAuthorityForEffectivePolicy } from "../../src/cli/commands.js";
 import { DEFAULT_MAX_CHECKPOINT_FILES } from "../../src/repository/checkpoint.js";
 import {
   DEFAULT_ORGANIZATION_POLICY,
@@ -64,6 +65,71 @@ test("all default policy projections explicitly deny terminal execution", () => 
   const result = engine(defaultSession).evaluate(operation({ tool: "terminal_exec" }));
   assert.equal(result.decision, "deny");
   assert.ok(result.reasons.some((reason) => reason.reason_code === "TOOL_NOT_GRANTED"));
+});
+
+test("inspect mode denies terminal execution even under otherwise permissive layers", () => {
+  const allowTerminalTools = { allow: [...TOOL_NAMES] };
+  const organization: PolicyDocument = {
+    ...DEFAULT_ORGANIZATION_POLICY,
+    capabilities: {
+      ...DEFAULT_ORGANIZATION_POLICY.capabilities,
+      tools: allowTerminalTools,
+    },
+  };
+  const repository: PolicyDocument = {
+    ...DEFAULT_REPOSITORY_POLICY,
+    capabilities: {
+      ...DEFAULT_REPOSITORY_POLICY.capabilities,
+      tools: allowTerminalTools,
+    },
+  };
+  const inspectBase = session("inspect");
+  const inspectGrant: SessionGrant = {
+    ...inspectBase,
+    capabilities: {
+      ...inspectBase.capabilities,
+      tools: allowTerminalTools,
+    },
+  };
+  const autoBase = session("auto");
+  const autoGrant: SessionGrant = {
+    ...autoBase,
+    capabilities: {
+      ...autoBase.capabilities,
+      tools: allowTerminalTools,
+    },
+  };
+  const terminal = operation({
+    tool: "terminal_exec",
+    planned_disclosure_bytes: 0,
+  });
+  assert.equal(
+    engine(autoGrant, organization, repository).evaluate(terminal).decision,
+    "allow",
+  );
+  assert.equal(
+    completionAuthorityForEffectivePolicy(
+      engine(autoGrant, organization, repository),
+    ),
+    "observed",
+  );
+  const denied = engine(
+    inspectGrant,
+    organization,
+    repository,
+  ).evaluate(terminal);
+  assert.equal(denied.decision, "deny");
+  assert.equal(
+    completionAuthorityForEffectivePolicy(
+      engine(inspectGrant, organization, repository),
+    ),
+    "frozen",
+  );
+  assert.ok(
+    denied.reasons.some(
+      (reason) => reason.reason_code === "MODE_INSPECT_WRITE_DENIED",
+    ),
+  );
 });
 
 test("session deny cannot be erased by capability expansion under legacy upper policies", () => {

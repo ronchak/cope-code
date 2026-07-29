@@ -4,13 +4,19 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { SecretScanner } from "../../src/security/secrets.js";
+import { stableJson } from "../../src/shared/crypto.js";
 import { BudgetMeter } from "../../src/session/budgets.js";
 import { SessionArtifactStore } from "../../src/session/artifact-store.js";
 import {
   CompletionHandoffStore,
   isCompletionHandoffRecord,
 } from "../../src/session/completion-handoff-store.js";
-import { SessionStore } from "../../src/session/store.js";
+import {
+  MAX_SESSION_BYTES,
+  TERMINAL_SESSION_HEADROOM_BYTES,
+  SessionStore,
+  preflightSessionStateWrite,
+} from "../../src/session/store.js";
 import { allowedTransitions, isTerminal, transitionSession } from "../../src/session/state-machine.js";
 import {
   DEFAULT_BUDGET_LIMITS,
@@ -83,6 +89,64 @@ test("budget meter performs check-before-consume and never overdraws", () => {
   assert.equal(state.budgetUsage.turns, 0);
 });
 
+test("post-hoc budget accounting persists all actual usage before reporting overruns", () => {
+  const state = makeState({
+    budgetLimits: {
+      ...DEFAULT_BUDGET_LIMITS,
+      maxChangedFiles: 2,
+      maxChangedLines: 10,
+      maxCommandOutputBytes: 4,
+    },
+  });
+  state.budgetUsage = {
+    ...state.budgetUsage,
+    changedFiles: 1,
+    changedLines: 8,
+    commandOutputBytes: 1,
+  };
+  const result = new BudgetMeter(state).applyPostHoc({
+    changedFiles: 2,
+    changedLines: 5,
+    commandOutputBytes: 9,
+  });
+  assert.deepEqual(result.usage, {
+    changedFiles: 3,
+    changedLines: 13,
+    commandOutputBytes: 10,
+  });
+  assert.deepEqual(
+    result.exceeded.map((entry) => entry.counter),
+    ["changedFiles", "changedLines", "commandOutputBytes"],
+  );
+  assert.deepEqual(
+    {
+      changedFiles: state.budgetUsage.changedFiles,
+      changedLines: state.budgetUsage.changedLines,
+      commandOutputBytes: state.budgetUsage.commandOutputBytes,
+    },
+    result.usage,
+  );
+});
+
+test("session-state preflight uses the durable serializer and reserves terminal headroom", () => {
+  const state = makeState();
+  const preflight = preflightSessionStateWrite(
+    state,
+    TERMINAL_SESSION_HEADROOM_BYTES,
+  );
+  assert.equal(preflight.fits, true);
+  assert.equal(preflight.reserveBytes, TERMINAL_SESSION_HEADROOM_BYTES);
+  assert.equal(preflight.maxBytes, MAX_SESSION_BYTES);
+  assert.equal(
+    preflight.bytes,
+    Buffer.byteLength(`${stableJson(state)}\n`),
+  );
+  assert.throws(
+    () => preflightSessionStateWrite(state, -1),
+    /reserve is invalid/u,
+  );
+});
+
 test("session store writes atomically and rejects mismatched identity", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-session-"));
   const store = new SessionStore(root);
@@ -95,6 +159,93 @@ test("session store writes atomically and rejects mismatched identity", async ()
   parsed.sessionId = "session_tampered";
   await writeFile(filename, `${JSON.stringify(parsed)}\n`, "utf8");
   await assert.rejects(() => store.read(state.sessionId), /does not match/);
+});
+
+test("session store preserves optional completion authority and rejects unknown values", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-session-authority-"));
+  const store = new SessionStore(root);
+  const state = makeState({ completionAuthority: "observed" });
+  await store.create(state);
+  assert.equal((await store.read(state.sessionId)).completionAuthority, "observed");
+
+  const malformed = {
+    ...state,
+    completionAuthority: "developer",
+  } as unknown as SessionState;
+  await assert.rejects(
+    () => store.write(malformed),
+    /structural validation/u,
+  );
+});
+
+test("session store validates full bounded terminal mutation records and control anchors", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-session-full-terminal-"));
+  const store = new SessionStore(root);
+  const reference = (kind: "terminal-pre-observation" | "terminal-post-observation" | "terminal-result") => ({
+    kind,
+    id: "op_terminal_full_1",
+    bytes: 128,
+    sha256: "f".repeat(64),
+  });
+  const record = {
+    kind: "terminal" as const,
+    recordContract: "terminal-mutation/2" as const,
+    operationId: "op_terminal_full_1",
+    changedPaths: ["src/generated.ts"],
+    changedLines: 12,
+    createdPaths: ["src/generated.ts"],
+    updatedPaths: [],
+    deletedPaths: [],
+    renamedPaths: [],
+    preExistingTouchedPaths: [],
+    processOutcome: "completed" as const,
+    createdTotal: 1,
+    updatedTotal: 0,
+    deletedTotal: 0,
+    renamedTotal: 0,
+    preExistingTouchedTotal: 0,
+    changedPathCount: 1,
+    pathEndpointTotal: 1,
+    omittedPathEndpointTotal: 0,
+    pathFactsTruncated: false,
+    pathFactsSha256: "e".repeat(64),
+    unavailableBaselineCount: 0,
+    completedAt: "2026-01-01T00:00:02.000Z",
+    observationOutcome: "observed" as const,
+    preObservation: reference("terminal-pre-observation"),
+    postObservation: reference("terminal-post-observation"),
+    terminalResult: reference("terminal-result"),
+    repositoryFingerprint: "a".repeat(64),
+    postObservationControl: {
+      branch: "main",
+      head: "b".repeat(40),
+      excludedStateFingerprint: "c".repeat(64),
+    },
+  };
+  const state = makeState({ mutations: [record] });
+  await store.create(state);
+  assert.deepEqual((await store.read(state.sessionId)).mutations, [record]);
+
+  state.mutations = [{
+    ...record,
+    observationOutcome: "unknown",
+  } as never];
+  await assert.rejects(
+    () => store.write(state),
+    /malformed durable records/u,
+  );
+
+  state.mutations = [{
+    ...record,
+    terminalResult: {
+      ...record.terminalResult,
+      id: "op_terminal_other_2",
+    },
+  }];
+  await assert.rejects(
+    () => store.write(state),
+    /malformed durable records/u,
+  );
 });
 
 test("session store accepts legacy patch records and bounded terminal attribution state", async () => {

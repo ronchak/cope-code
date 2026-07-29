@@ -3,7 +3,11 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { SessionArtifactStore } from "../../src/session/artifact-store.js";
+import {
+  MAX_ARTIFACT_BYTES,
+  SessionArtifactStore,
+  isArtifactReference,
+} from "../../src/session/artifact-store.js";
 
 test("source-bearing recovery artifacts are isolated and integrity checked", async () => {
   const session = await mkdtemp(path.join(tmpdir(), "cba-artifact-"));
@@ -54,4 +58,63 @@ test("source-bearing recovery artifacts reject oversized writes and partial mani
     "utf8",
   );
   await assert.rejects(() => store.get("decision", "decision_1"), /unreadable/u);
+});
+
+test("artifact preflight and references recognize the launch-receipt contract", async () => {
+  const session = await mkdtemp(path.join(tmpdir(), "cba-launch-artifact-"));
+  const root = path.join(session, "artifacts");
+  const synchronized: string[] = [];
+  const store = new SessionArtifactStore(root, {
+    syncDirectory: async (directory) => {
+      synchronized.push(directory);
+    },
+  });
+  assert.deepEqual(store.preflightWrite("abc"), {
+    fits: true,
+    bytes: 3,
+    maxBytes: MAX_ARTIFACT_BYTES,
+  });
+  assert.equal(store.preflightWrite("x".repeat(MAX_ARTIFACT_BYTES + 1)).fits, false);
+
+  const reference = await store.putReferencedDurable(
+    "terminal-launch-receipt",
+    "terminal_operation_1",
+    "{}",
+    { syncDirectories: true },
+  );
+  assert.equal(isArtifactReference(reference), true);
+  assert.equal(reference.kind, "terminal-launch-receipt");
+  assert.equal(await store.getReferenced(reference), "{}");
+  assert.deepEqual(synchronized, [
+    session,
+    root,
+    path.join(root, "terminal-launch-receipt"),
+    path.join(root, "terminal-launch-receipt"),
+  ]);
+});
+
+test("a directory-sync failure refuses durable launch-receipt publication", async () => {
+  const session = await mkdtemp(path.join(tmpdir(), "cba-launch-sync-failure-"));
+  const root = path.join(session, "artifacts");
+  const store = new SessionArtifactStore(root, {
+    syncDirectory: async () => {
+      throw new Error("injected directory sync failure");
+    },
+  });
+  await assert.rejects(
+    () => store.putReferencedDurable(
+      "terminal-launch-receipt",
+      "terminal_operation_1",
+      "{}",
+      { syncDirectories: true },
+    ),
+    /injected directory sync failure/u,
+  );
+  assert.equal(
+    await store.getOptional(
+      "terminal-launch-receipt",
+      "terminal_operation_1",
+    ),
+    undefined,
+  );
 });
