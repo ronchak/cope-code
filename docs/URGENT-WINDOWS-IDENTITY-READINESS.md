@@ -217,6 +217,12 @@ two distinct identity strings belong to one person.
   exact `cba/1` unsupported-language information banner, and the editor contains
   syntactically valid JSON declaring `protocol: "cba/1"`. `json`, unlabeled,
   ambiguous, and ordinary content retain the rendered-text fallback.
+- Cope 0.1.9 generalizes that boundary to the exact `cba-agent/1` and legacy
+  `cba/1` banners through a versioned, source-free capture result. Page code
+  reports bounded widget facts; host code validates ownership, multiplicity,
+  numeric contiguous line indices, byte bounds, and fence safety before it
+  constructs and re-verifies the wrapper. Capture ambiguity is a non-repairable
+  transport failure and does not spend the model protocol-repair budget.
 - Retain per-envelope response digests locally. Accept one rolling-window shift
   only when every retained envelope matches the prior suffix exactly and there
   is exactly one new final envelope. Durable restart recovery remains

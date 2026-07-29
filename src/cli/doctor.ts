@@ -22,6 +22,7 @@ import {
   browserProductPresentation,
   isCompatibleBrowserExecutableUpgrade,
   otherDedicatedBrowserProfileRoots,
+  probeResponseCaptureNormalizer,
   resolveSafeBrowserProfileDirectory,
   verifyDedicatedProfileMarker,
   verifyManualBrowserExecutable,
@@ -107,6 +108,29 @@ export async function executeDoctorCommand(
     detail: git.exitCode === 0 ? git.stdout.trim() : git.stderr.trim() || gitExecutable,
     required: true,
   });
+
+  try {
+    const evidence = probeResponseCaptureNormalizer();
+    checks.push({
+      name: "Protocol capture",
+      ok: true,
+      detail:
+        `${evidence.contractVersion}; ${evidence.protocolVersion ?? "unknown protocol"} ` +
+        "host reconstruction verified with a synthetic source-free fixture",
+      summary:
+        `${evidence.contractVersion}; ${evidence.protocolVersion ?? "unknown protocol"} ` +
+        "host reconstruction verified",
+      evidence,
+      required: true,
+    });
+  } catch (error) {
+    checks.push({
+      name: "Protocol capture",
+      ok: false,
+      detail: errorMessage(error),
+      required: true,
+    });
+  }
 
   const paths = configurationPaths(command.stateHome, host);
   try {

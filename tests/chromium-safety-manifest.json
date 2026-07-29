@@ -3,5 +3,5 @@
     "tests/unit/playwright-identity-ambiguity.test.ts",
     "tests/unit/playwright-native-dialog-race.test.ts"
   ],
-  "expectedTestCount": 15
+  "expectedTestCount": 16
 }

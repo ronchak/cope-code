@@ -1,6 +1,7 @@
 # PRD: Cope 0.1.9 protocol-ingestion reliability
 
-Status: proposed for implementation
+Status: implementation complete in the PR; independent review and Windows live
+acceptance pending
 
 Target: Cope 0.1.9
 
@@ -16,6 +17,22 @@ prove the complete M365-shaped DOM-to-normalized-action path in real Chromium.
 The release must not replace the exact protocol-label provenance check with
 JSON-shape guessing. A fence-free transport would change the authority and
 prompt-injection threat model and is explicitly deferred to a separate design.
+
+## Implementation status
+
+The 0.1.9 candidate implements a versioned `response-capture/v2` contract,
+two-dialect host reconstruction, exact fence/body parity, 0.1.8 baseline
+compatibility, capture-aware repair routing, crash-safe source-free evidence,
+and installed-Chromium seam tests. Incomplete streaming widgets use the normal
+stability quorum; ambiguous ownership and capture failures preserve the
+session without spending model-repair budget; model-authored JSON, version,
+multiplicity, and dialect errors remain bounded repairs.
+
+`cope doctor` also runs a fixed, source-free fixture through the same
+host-side normalizer. It never opens, reads, or mutates a live conversation.
+The remaining release evidence is a fresh authenticated Windows positive task
+and quoted-protocol negative task. Those gates block a release tag, not review
+of the candidate implementation.
 
 ## Incident evidence and confidence
 
@@ -248,9 +265,10 @@ through:
 
 Cope must distinguish at least:
 
-- `model_protocol_missing`;
+- rendered text with no owned protocol widget (parser-level model omission);
 - `model_protocol_malformed`;
-- `protocol_widget_reconstructed`;
+- `protocol_reconstructed`;
+- `protocol_widget_incomplete`;
 - `protocol_widget_ambiguous`;
 - `protocol_widget_capture_failed`;
 - `response_selection_ambiguous`; and
@@ -397,8 +415,8 @@ Do not infer or rewrite a materially different intent on the model's behalf.
    separation between correlation identity and normalized content.
 2. Update `docs/URGENT-WINDOWS-IDENTITY-READINESS.md`, whose current
    reconstruction requirement is legacy-only.
-3. Add Cope 0.1.9 release notes and synchronize release-version surfaces only
-   after the implementation and live gates pass.
+3. Add Cope 0.1.9 release notes and synchronize candidate version surfaces in
+   the PR. Do not tag or publish the release until the live gates pass.
 4. Run the complete offline, coverage, and zero-skip Chromium suites.
 5. Run fresh authenticated Windows acceptance with an inspect-only task and
    zero protocol repairs.
@@ -459,25 +477,25 @@ Do not infer or rewrite a materially different intent on the model's behalf.
 
 ## Acceptance checklist
 
-- [ ] `cba-agent/1` M365 widget reaches `parseModelTurn()` and normalizes.
-- [ ] Valid legacy `cba/1` widget reaches `parseModelTurn()`.
-- [ ] Fence version and body dialect cannot disagree.
-- [ ] Inert JSON/plain/unlabeled/quoted blocks never execute.
-- [ ] Ownership, multiplicity, line-index, size, and delimiter ambiguity fail
+- [x] `cba-agent/1` M365 widget reaches `parseModelTurn()` and normalizes.
+- [x] Valid legacy `cba/1` widget reaches `parseModelTurn()`.
+- [x] Fence version and body dialect cannot disagree.
+- [x] Inert JSON/plain/unlabeled/quoted blocks never execute.
+- [x] Ownership, multiplicity, line-index, size, and delimiter ambiguity fail
       closed.
-- [ ] Page output is re-verified by the host before it becomes executable.
-- [ ] Response correlation identity does not silently change because the
+- [x] Page output is re-verified by the host before it becomes executable.
+- [x] Response correlation identity does not silently change because the
       display representation was normalized.
-- [ ] Capture diagnostics are typed, source-free, and actionable.
-- [ ] Actual parser codes survive end to end.
-- [ ] Capture faults consume zero model-repair budget.
-- [ ] Model-formatting faults retain bounded repair behavior.
-- [ ] Repair exhaustion retains the last underlying failure.
-- [ ] Transcript replay covers the production-shaped failure.
-- [ ] All new Chromium tests are in the zero-skip manifest and execute.
+- [x] Capture diagnostics are typed, source-free, persisted, and actionable.
+- [x] Actual parser codes survive end to end.
+- [x] Capture faults consume zero model-repair budget.
+- [x] Model-formatting faults retain bounded repair behavior.
+- [x] Repair exhaustion retains the last underlying failure.
+- [x] Transcript replay preserves production-shaped capture evidence.
+- [x] All new Chromium tests are in the zero-skip manifest and execute.
 - [ ] Fresh Windows live acceptance completes with zero protocol repairs.
 - [ ] Negative quoted-protocol live acceptance remains inert.
-- [ ] Protocol, incident, and release documentation are synchronized.
+- [x] Protocol, incident, and release documentation are synchronized.
 
 ## Risks and mitigations
 
@@ -521,12 +539,29 @@ changes to the initial plan:
 - make response-baseline compatibility an explicit release requirement; and
 - defer fence-free ingestion as a separate security-contract change.
 
+The first implementation checkpoint was then reviewed again by
+`claude-opus-5` at extra-high effort and published on PR #37. Its
+`CHANGES REQUIRED` findings drove these additional candidate changes:
+
+- reject protocol fences quoted in ordinary editors or rendered prose before
+  parser entry;
+- treat partial widgets as pending until the normal streaming/stability quorum;
+- detect changed and unsupported protocol-family banners structurally;
+- carry source-free evidence through completed transport, audit, artifacts,
+  crash recovery, and transcript replay;
+- route model-authored version, multiplicity, JSON, and dialect errors through
+  bounded repair without parsing rendered widget text;
+- retry transient capture failures and fail closed only after the bounded
+  response window;
+- reproduce exact v0.1.8 legacy correlation trim/order semantics;
+- accept contiguous zero- or one-based editor line indices; and
+- add a read-only fixture probe to `cope doctor`.
+
 ## Immediate next steps
 
-1. Land this PRD and root-cause record for review.
-2. Open the implementation change from the failing real-Chromium tests.
-3. Implement the versioned capture result and two-dialect registry.
-4. Propagate exact capture/parser codes and correct repair classification.
-5. Complete offline and zero-skip Chromium verification.
-6. Run Windows live positive and negative acceptance.
-7. Only then bump release surfaces and tag Cope 0.1.9.
+1. Complete full offline, coverage, release, and installed-browser verification.
+2. Obtain explicit green reviews from Claude Opus 5 and the GitHub Codex
+   reviewer on the immutable PR head.
+3. Run Windows live positive and negative acceptance.
+4. Merge the reviewed candidate only after both reviewer greens.
+5. Tag or publish Cope 0.1.9 only after the Windows evidence is attached.

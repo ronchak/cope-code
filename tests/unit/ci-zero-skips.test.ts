@@ -41,7 +41,7 @@ test("zero-skip runner accepts passing tests and rejects skipped or TODO safety 
   assert.match(todoResult.stderr, /marked TODO/u);
 });
 
-test("Chromium safety command covers the current 15-test inventory", async () => {
+test("Chromium safety command covers the current 16-test inventory", async () => {
   const manifest = JSON.parse(await readFile(path.resolve("package.json"), "utf8")) as {
     scripts?: Record<string, string>;
   };
@@ -60,7 +60,7 @@ test("Chromium safety command covers the current 15-test inventory", async () =>
     "tests/unit/playwright-identity-ambiguity.test.ts",
     "tests/unit/playwright-native-dialog-race.test.ts",
   ]);
-  assert.equal(safetyManifest.expectedTestCount, 15);
+  assert.equal(safetyManifest.expectedTestCount, 16);
 
   const validator = path.resolve("scripts/validate-chromium-safety-inventory.mjs");
   const validation = spawnSync(

@@ -240,7 +240,21 @@ test("transcript replay verifies strict event order, digest, and correlation", a
           observedAt: "2026-07-17T12:00:01.000Z",
           status: "completed",
           responseId: "response-replay",
-          content: "recorded response",
+          content:
+            "```cba-agent/1\n" +
+            '{"kind":"agent_progress","phase":"discovering","summary":"recorded response"}' +
+            "\n```",
+          captureEvidence: {
+            contractVersion: "response-capture/v2",
+            status: "protocol_reconstructed",
+            protocolVersion: "cba-agent/1",
+            codeBlockCount: 1,
+            protocolBlockCount: 1,
+            editorCount: 1,
+            bannerCount: 1,
+            lineCount: 1,
+            contentBytes: 82,
+          },
         },
       },
     ],
@@ -250,6 +264,10 @@ test("transcript replay verifies strict event order, digest, and correlation", a
   assert.equal((await replay.resolveSubmission(request)).status, "submitted");
   const result = await replay.receive(request);
   assert.equal(result.status, "completed");
+  if (result.status === "completed") {
+    assert.equal(result.captureEvidence?.status, "protocol_reconstructed");
+    assert.equal(result.captureEvidence?.protocolVersion, "cba-agent/1");
+  }
   assert.equal(replay.remainingEvents, 0);
 });
 

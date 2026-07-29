@@ -6,7 +6,10 @@ import test from "node:test";
 import { AuditLog } from "../../src/audit/audit-log.js";
 import { LOCAL_TOOL_NAMES, TOOL_REGISTRY } from "../../src/protocol/index.js";
 import { sha256, stableJson } from "../../src/shared/crypto.js";
-import { AgentRuntime } from "../../src/orchestrator/agent-runtime.js";
+import {
+  AgentRuntime,
+  type AgentRuntimeDependencies,
+} from "../../src/orchestrator/agent-runtime.js";
 import {
   CONTROL_PLANE_RESERVE_BYTES,
   EMERGENCY_NOTICE_RESERVE_BYTES,
@@ -235,6 +238,76 @@ class UntrustedConversationResultTransport extends QueueTransport {
       conversationId: "conversation_untrusted",
       status: "indeterminate",
       diagnosticCode: "CONVERSATION_CHANGED_DURING_RESPONSE",
+    };
+  }
+}
+
+class CaptureFailureTransport extends QueueTransport {
+  public constructor() {
+    super([]);
+  }
+
+  public override async receive(request: ReceiveRequest): Promise<ReceiveResult> {
+    return {
+      contractVersion: MODEL_TRANSPORT_CONTRACT_VERSION,
+      taskId: request.taskId,
+      turnId: request.turnId,
+      submissionId: request.submissionId,
+      observedAt: "2026-01-01T00:00:00.000Z",
+      conversationId: "conversation_1",
+      status: "indeterminate",
+      diagnosticCode: "PROTOCOL_WIDGET_LINE_INDEX_INVALID",
+      diagnostic: {
+        stage: "browser_response_capture",
+        summary:
+          "Cope could not safely read the protocol widget at browser_response_capture. " +
+          "Retrying the same model turn cannot repair this capture condition; the session is preserved.",
+        repairable: false,
+        suggestedAction: "preserve_session_and_inspect_browser_transcript",
+        expected: { protocol_block_count: 1 },
+        actual: {
+          capture_status: "protocol_widget_ambiguous",
+          protocol_block_count: 1,
+          line_count: 2,
+        },
+      },
+    };
+  }
+}
+
+class MalformedCaptureTransport extends QueueTransport {
+  private receiveCalls = 0;
+
+  public constructor(validResponse: string) {
+    super([validResponse]);
+  }
+
+  public override async receive(request: ReceiveRequest): Promise<ReceiveResult> {
+    this.receiveCalls += 1;
+    if (this.receiveCalls > 1) return super.receive(request);
+    return {
+      contractVersion: MODEL_TRANSPORT_CONTRACT_VERSION,
+      taskId: request.taskId,
+      turnId: request.turnId,
+      submissionId: request.submissionId,
+      observedAt: "2026-01-01T00:00:00.000Z",
+      conversationId: "conversation_1",
+      status: "completed",
+      responseId: "response_malformed_capture",
+      content: "rendered model output without an executable wrapper",
+      captureEvidence: {
+        contractVersion: "response-capture/v2",
+        status: "model_protocol_malformed",
+        protocolVersion: "cba-agent/2",
+        reasonCode: "MODEL_PROTOCOL_UNSUPPORTED_VERSION",
+        protocolErrorCode: "UNSUPPORTED_VERSION",
+        codeBlockCount: 1,
+        protocolBlockCount: 1,
+        editorCount: 1,
+        bannerCount: 1,
+        lineCount: 1,
+        contentBytes: 64,
+      },
     };
   }
 }
@@ -527,6 +600,7 @@ function runtimeForTest(input: {
   readonly user?: UserInteraction;
   readonly idFactory?: (prefix: string) => string;
   readonly signal?: AbortSignal;
+  readonly onProgress?: AgentRuntimeDependencies["onProgress"];
 }): AgentRuntime {
   return new AgentRuntime({
     state: input.state,
@@ -568,6 +642,7 @@ function runtimeForTest(input: {
     ...(input.signal === undefined ? {} : { signal: input.signal }),
     ...(input.artifacts === undefined ? {} : { artifacts: input.artifacts }),
     ...(input.completionHandoffs === undefined ? {} : { completionHandoffs: input.completionHandoffs }),
+    ...(input.onProgress === undefined ? {} : { onProgress: input.onProgress }),
   });
 }
 
@@ -3160,6 +3235,123 @@ test("runtime sends protocol repair feedback and continues", async () => {
   );
 });
 
+test("runtime preserves MISSING_ENVELOPE through repair, progress, and audit diagnostics", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-missing-envelope-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const validCompletion = [
+    "```cba-agent/1",
+    stableJson({
+      kind: "agent_intent",
+      intent: "complete_task",
+      arguments: {
+        summary: "Finished after a protocol repair.",
+        acceptance_criteria: [],
+        validation: [],
+        skipped_validation: [],
+        remaining_risks: [],
+        follow_up: [],
+      },
+      reason: "Submit the final completion report.",
+    }),
+    "```",
+  ].join("\n");
+  const transport = new QueueTransport([
+    "This response has no protocol fence.",
+    validCompletion,
+  ]);
+  const progress: import("../../src/orchestrator/agent-runtime.js").RuntimeProgressEvent[] = [];
+  const runtime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    protocol: new CbaProtocolAdapter(),
+    onProgress: (event) => { progress.push(event); },
+  });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "completed", result.reason);
+  assert.match(transport.submittedContents[1] ?? "", /"code":"MISSING_ENVELOPE"/u);
+  assert.match(transport.submittedContents[1] ?? "", /"source_code":"MISSING_ENVELOPE"/u);
+  assert.equal(
+    progress.some((event) =>
+      event.kind === "model" &&
+      event.detail.actionType === "protocol_repair" &&
+      event.detail.protocolCode === "MISSING_ENVELOPE"),
+    true,
+  );
+  const events = await AuditLog.verify(
+    path.join(root, "audit.jsonl"),
+    localState.sessionId,
+  );
+  const protocolError = events.find((event) => event.type === "protocol.error");
+  assert.equal(protocolError?.data.protocolCode, "MISSING_ENVELOPE");
+  assert.equal(
+    (protocolError?.data.details as Readonly<Record<string, unknown>> | undefined)
+      ?.protocol_code,
+    "MISSING_ENVELOPE",
+  );
+});
+
+test("runtime repairs a model-format capture error without parsing rendered widget text", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-capture-repair-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(
+    path.join(store.sessionDirectory(localState.sessionId), "artifacts"),
+  );
+  const validCompletion = [
+    "```cba-agent/1",
+    stableJson({
+      kind: "agent_intent",
+      intent: "complete_task",
+      arguments: {
+        summary: "Finished after a capture-classified repair.",
+        acceptance_criteria: [],
+        validation: [],
+        skipped_validation: [],
+        remaining_risks: [],
+        follow_up: [],
+      },
+      reason: "Submit the final completion report.",
+    }),
+    "```",
+  ].join("\n");
+  const transport = new MalformedCaptureTransport(validCompletion);
+  const runtime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    artifacts,
+    transport,
+    protocol: new CbaProtocolAdapter(),
+  });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "completed", result.reason);
+  assert.equal(localState.budgetUsage.protocolRepairs, 1);
+  assert.match(transport.submittedContents[1] ?? "", /"code":"UNSUPPORTED_VERSION"/u);
+  assert.doesNotMatch(transport.submittedContents[1] ?? "", /rendered model output/u);
+  const events = await AuditLog.verify(
+    path.join(root, "audit.jsonl"),
+    localState.sessionId,
+  );
+  const error = events.find((event) => event.type === "protocol.error");
+  assert.equal(error?.data.protocolCode, "UNSUPPORTED_VERSION");
+  assert.equal(
+    (error?.data.captureEvidence as Readonly<Record<string, unknown>> | undefined)
+      ?.status,
+    "model_protocol_malformed",
+  );
+  assert.equal(
+    await artifacts.getOptional("response-capture", "turn_0001"),
+    undefined,
+  );
+});
+
 test("runtime does not send or charge a repair after the protocol-repair budget is exhausted", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-repair-budget-"));
   const localState = state(root);
@@ -3167,14 +3359,58 @@ test("runtime does not send or charge a repair after the protocol-repair budget 
   const store = new SessionStore(path.join(root, "state"));
   await store.create(localState);
   const transport = new QueueTransport(["first-invalid-response", "second-invalid-response"]);
-  const runtime = runtimeForTest({ root, state: localState, store, transport });
+  const runtime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    protocol: new CbaProtocolAdapter(),
+  });
 
   const result = await runtime.run();
   assert.equal(result.status, "failed");
   assert.match(result.reason ?? "", /exhausted the protocol-repair budget/u);
+  assert.match(result.reason ?? "", /MISSING_ENVELOPE/u);
   assert.equal(transport.submittedContents.length, 2, "only bootstrap and one repair may be submitted");
   assert.equal(localState.budgetUsage.protocolRepairs, 1);
   assert.equal(localState.protocolRepairStreak, 1);
+});
+
+test("runtime pauses and audits a capture failure without spending protocol repair budget", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-capture-failure-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const transport = new CaptureFailureTransport();
+  const runtime = runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    protocol: new CbaProtocolAdapter(),
+  });
+
+  const result = await runtime.run();
+  assert.equal(result.status, "paused");
+  assert.match(result.reason ?? "", /PROTOCOL_WIDGET_LINE_INDEX_INVALID/u);
+  assert.match(result.reason ?? "", /browser_response_capture/u);
+  assert.match(result.reason ?? "", /Retrying the same model turn cannot repair/u);
+  assert.equal(localState.budgetUsage.protocolRepairs, 0);
+  assert.equal(localState.protocolRepairStreak, 0);
+  assert.equal(transport.submittedContents.length, 1, "only the bootstrap may be submitted");
+  const events = await AuditLog.verify(
+    path.join(root, "audit.jsonl"),
+    localState.sessionId,
+  );
+  const captureEvent = events.find((event) => event.type === "transport.state");
+  assert.equal(captureEvent?.data.diagnosticCode, "PROTOCOL_WIDGET_LINE_INDEX_INVALID");
+  assert.equal(captureEvent?.data.stage, "browser_response_capture");
+  assert.equal(captureEvent?.data.repairable, false);
+  assert.deepEqual(captureEvent?.data.actual, {
+    capture_status: "protocol_widget_ambiguous",
+    protocol_block_count: 1,
+    line_count: 2,
+  });
 });
 
 test("runtime fails closed without retrying a non-repairable protocol violation", async () => {
@@ -4900,6 +5136,82 @@ test("runtime resumes from an integrity-checked cached model response without re
   assert.equal(result.modelSummary, "Recovered and complete.");
   assert.equal(localState.turnSequence, 1);
   await assert.rejects(() => artifacts.get("response", "turn_0001"));
+});
+
+test("recovery preserves capture-classified model repair evidence across restart", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-capture-recovery-"));
+  const localState = state(root);
+  localState.status = "paused";
+  localState.pauseReason = "process restarted";
+  localState.turnSequence = 1;
+  localState.submission = {
+    submissionId: "submission_1",
+    turnId: "turn_0001",
+    messageHash: "a".repeat(64),
+    marker: "marker",
+    state: "answered",
+    preparedAt: "2026-01-01T00:00:00.000Z",
+    submittedAt: "2026-01-01T00:00:01.000Z",
+    answeredAt: "2026-01-01T00:00:02.000Z",
+  };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(
+    path.join(store.sessionDirectory(localState.sessionId), "artifacts"),
+  );
+  await artifacts.put(
+    "response",
+    "turn_0001",
+    "rendered text that must never be reparsed after recovery",
+  );
+  await artifacts.put("response-capture", "turn_0001", stableJson({
+    contractVersion: "response-capture/v2",
+    status: "model_protocol_malformed",
+    protocolVersion: "cba/1",
+    reasonCode: "MODEL_PROTOCOL_DIALECT_MISMATCH",
+    protocolErrorCode: "SCHEMA_INVALID",
+    codeBlockCount: 1,
+    protocolBlockCount: 1,
+    editorCount: 1,
+    bannerCount: 1,
+    lineCount: 1,
+    contentBytes: 50,
+  }));
+  const completion = [
+    "```cba-agent/1",
+    stableJson({
+      kind: "agent_intent",
+      intent: "complete_task",
+      arguments: {
+        summary: "Recovered capture evidence and completed after repair.",
+        acceptance_criteria: [],
+        validation: [],
+        skipped_validation: [],
+        remaining_risks: [],
+        follow_up: [],
+      },
+      reason: "Submit the corrected completion report.",
+    }),
+    "```",
+  ].join("\n");
+  const transport = new QueueTransport([completion]);
+
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    artifacts,
+    transport,
+    protocol: new CbaProtocolAdapter(),
+  }).run();
+
+  assert.equal(result.status, "completed", result.reason);
+  assert.equal(localState.budgetUsage.protocolRepairs, 1);
+  assert.match(transport.submittedContents[0] ?? "", /"code":"SCHEMA_INVALID"/u);
+  assert.doesNotMatch(
+    transport.submittedContents[0] ?? "",
+    /rendered text that must never be reparsed/u,
+  );
 });
 
 test("runtime pauses instead of replaying an indeterminate mutation", async () => {

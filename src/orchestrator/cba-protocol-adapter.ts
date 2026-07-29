@@ -90,6 +90,7 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
       readonly taskId: string;
       readonly turnId: string;
       readonly recoveryReplay?: boolean;
+      readonly captureEvidence?: Readonly<Record<string, unknown>>;
     },
   ): ParsedModelTurn {
     const actualBytes = Buffer.byteLength(raw, "utf8");

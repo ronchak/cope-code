@@ -64,8 +64,41 @@ export interface ElementSnapshot {
   readonly visible: boolean;
   readonly enabled: boolean;
   readonly text: string;
+  /**
+   * Stable rendered identity used only for assistant-envelope correlation.
+   * Protocol normalization may change `text`, but must not silently change a
+   * baseline captured by an earlier release.
+   */
+  readonly correlationText?: string;
+  /** Source-free facts about response-widget normalization. */
+  readonly responseCapture?: ResponseCaptureEvidence;
   readonly value: string;
   readonly accessibleLabel: string;
+}
+
+export const RESPONSE_CAPTURE_CONTRACT_VERSION = "response-capture/v2" as const;
+
+export type ResponseCaptureStatus =
+  | "rendered_text"
+  | "protocol_reconstructed"
+  | "model_protocol_malformed"
+  | "protocol_widget_incomplete"
+  | "protocol_widget_ambiguous"
+  | "protocol_widget_capture_failed"
+  | "unsupported_capture_contract";
+
+export interface ResponseCaptureEvidence {
+  readonly contractVersion: typeof RESPONSE_CAPTURE_CONTRACT_VERSION;
+  readonly status: ResponseCaptureStatus;
+  readonly protocolVersion?: string;
+  readonly reasonCode?: string;
+  readonly protocolErrorCode?: string;
+  readonly codeBlockCount: number;
+  readonly protocolBlockCount: number;
+  readonly editorCount: number;
+  readonly bannerCount: number;
+  readonly lineCount: number;
+  readonly contentBytes: number;
 }
 
 export interface GroupSnapshot {

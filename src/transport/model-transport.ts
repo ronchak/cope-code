@@ -80,6 +80,8 @@ export interface CompletedReceiveResult extends ReceiveResultBase {
   readonly status: "completed";
   readonly responseId: string;
   readonly content: string;
+  /** Source-free evidence retained across response normalization and recovery. */
+  readonly captureEvidence?: Readonly<Record<string, unknown>>;
 }
 
 export interface BlockedReceiveResult extends ReceiveResultBase {

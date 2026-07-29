@@ -93,6 +93,10 @@ test("doctor reports Chrome preview identity and privacy concisely while JSON in
     stderr: { write: () => undefined },
   }, host, { browserIdentityVerifier: identityVerifier });
   const report = JSON.parse(json) as { checks: Array<{ name: string; evidence?: Record<string, unknown> }> };
+  const capture = report.checks.find((check) => check.name === "Protocol capture");
+  assert.equal(capture?.evidence?.contractVersion, "response-capture/v2");
+  assert.equal(capture?.evidence?.status, "protocol_reconstructed");
+  assert.equal(capture?.evidence?.protocolVersion, "cba-agent/1");
   const browser = report.checks.find((check) => check.name === "Selected browser");
   assert.equal(browser?.evidence?.product, "chrome");
   assert.equal(browser?.evidence?.executable_path, executablePath);

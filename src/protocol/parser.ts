@@ -38,7 +38,12 @@ export class ProtocolParseError extends AgentError {
     public readonly repairable = true,
     options?: ErrorOptions,
   ) {
-    super(protocolCode === "DUPLICATE_OPERATION_ID" ? "DUPLICATE_OPERATION" : "PROTOCOL_INVALID", message, details, options);
+    super(
+      protocolCode === "DUPLICATE_OPERATION_ID" ? "DUPLICATE_OPERATION" : "PROTOCOL_INVALID",
+      message,
+      { ...details, protocol_code: protocolCode },
+      options,
+    );
     this.name = "ProtocolParseError";
   }
 }

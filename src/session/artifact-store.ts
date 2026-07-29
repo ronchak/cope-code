@@ -3,7 +3,7 @@ import path from "node:path";
 import { newId, sha256, stableJson } from "../shared/crypto.js";
 import { AgentError } from "../shared/errors.js";
 
-export type ArtifactKind = "outbox" | "response" | "decision";
+export type ArtifactKind = "outbox" | "response" | "response-capture" | "decision";
 
 const MAX_ARTIFACT_BYTES = 8 * 1024 * 1024;
 const MAX_MANIFEST_BYTES = 64 * 1024;

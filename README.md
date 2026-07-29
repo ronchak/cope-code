@@ -6,9 +6,10 @@ The deterministic harness remains responsible for repository boundaries, permiss
 
 ## Current release
 
-The current package version is **0.1.8**. See the
-[Cope 0.1.8 release notes](docs/RELEASE-NOTES-0.1.8.md) for the model-facing
-intent protocol, browser-correlation hardening, and clearer task diagnostics.
+The current package version is **0.1.9**. See the
+[Cope 0.1.9 release notes](docs/RELEASE-NOTES-0.1.9.md) for reliable
+`cba-agent/1` browser ingestion, fail-closed capture diagnostics, and exact
+protocol-repair reporting.
 
 ## Install on Windows
 
@@ -189,6 +190,7 @@ Architecture and controls remain documented under `docs`:
 - `docs/MACOS-TARGET.md`
 - `docs/LIVE-PILOT-ACCEPTANCE.md`
 - `docs/PRD-0.1.9-PROTOCOL-INGESTION.md`
+- `docs/RELEASE-NOTES-0.1.9.md`
 - `docs/RELEASE-NOTES-0.1.8.md`
 - `docs/RELEASE-NOTES-0.1.7.md`
 - `docs/RELEASE-NOTES-0.1.6.md`
