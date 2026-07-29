@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { OperationJournal } from "../../src/session/operation-journal.js";
+import type { TerminalJournalResultMetadata } from "../../src/session/terminal-artifacts.js";
 import { sha256, stableJson } from "../../src/shared/crypto.js";
 
 test("operation journal safely replays completed operations", async () => {
@@ -78,3 +79,95 @@ test("operation journal rejects unknown fields even with a recomputed digest", a
   await writeFile(filename, `${stableJson(parsed)}\n`, "utf8");
   await assert.rejects(() => journal.read("op_123"), /invalid schema/u);
 });
+
+test("operation journal promotes only an exactly bound executing terminal result", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-terminal-op-"));
+  const journal = new OperationJournal(root, "session_12345678");
+  const request = { contract: "terminal-exec/1", mode: "shell", command: "exit 7" };
+  const requestHash = sha256(stableJson(request));
+  const registered = await journal.register(
+    "op_terminal_123",
+    "terminal_exec",
+    true,
+    request,
+    "2026-07-29T00:00:00.000Z",
+  );
+  await journal.markExecuting(
+    registered.record,
+    "2026-07-29T00:00:01.000Z",
+  );
+  const metadata = terminalMetadata(requestHash);
+  const completed = await journal.resolveTerminalCompleted(
+    "op_terminal_123",
+    requestHash,
+    "2026-07-29T00:00:02.000Z",
+    metadata,
+  );
+  assert.equal(completed.status, "completed");
+  assert.equal(completed.outcome, "failure");
+  assert.deepEqual(completed.safeResult, metadata);
+
+  const replay = await journal.register(
+    "op_terminal_123",
+    "terminal_exec",
+    true,
+    request,
+    "2026-07-29T00:00:03.000Z",
+  );
+  assert.equal(replay.kind, "replay_completed");
+});
+
+test("operation journal refuses mismatched terminal recovery promotion", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-terminal-op-"));
+  const journal = new OperationJournal(root, "session_12345678");
+  const request = { contract: "terminal-exec/1", mode: "shell", command: "true" };
+  const requestHash = sha256(stableJson(request));
+  const registered = await journal.register(
+    "op_terminal_123",
+    "terminal_exec",
+    true,
+    request,
+    "2026-07-29T00:00:00.000Z",
+  );
+  await journal.markExecuting(
+    registered.record,
+    "2026-07-29T00:00:01.000Z",
+  );
+  await assert.rejects(
+    () =>
+      journal.resolveTerminalCompleted(
+        "op_terminal_123",
+        "f".repeat(64),
+        "2026-07-29T00:00:02.000Z",
+        terminalMetadata(requestHash),
+      ),
+    /does not match/u,
+  );
+  assert.equal((await journal.read("op_terminal_123")).status, "executing");
+});
+
+function terminalMetadata(requestHash: string): TerminalJournalResultMetadata {
+  return {
+    contract: "terminal-journal-result/1",
+    operation_id: "op_terminal_123",
+    request_hash: requestHash,
+    terminal_result: {
+      kind: "terminal-result",
+      id: "op_terminal_123",
+      bytes: 1,
+      sha256: "a".repeat(64),
+    },
+    outcome: "completed_nonzero",
+    exit_code: 7,
+    signal: null,
+    completed_at: "2026-07-29T00:00:01.000Z",
+    duration_ms: 1_000,
+    stdout_bytes: 0,
+    stderr_bytes: 0,
+    redaction_count: 0,
+    disclosure: "complete",
+    mutation_outcome: "unknown",
+    changed_files: 0,
+    changed_lines: 0,
+  };
+}

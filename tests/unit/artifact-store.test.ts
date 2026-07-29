@@ -33,6 +33,10 @@ test("terminal artifacts return integrity-bound references", async () => {
     await store.get(reference.kind, reference.id),
     "{\"contract\":\"terminal-exec-result/1\"}",
   );
+  await assert.rejects(
+    () => store.getReferenced({ ...reference, bytes: reference.bytes + 1 }),
+    /does not match its durable reference/u,
+  );
 });
 
 test("source-bearing recovery artifacts reject oversized writes and partial manifests", async () => {

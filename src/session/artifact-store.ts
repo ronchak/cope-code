@@ -146,6 +146,27 @@ export class SessionArtifactStore {
     return this.get(kind, id);
   }
 
+  /**
+   * Reads an artifact through a previously persisted reference. The manifest
+   * protects the artifact on disk; this additional comparison protects the
+   * caller's durable binding to the exact artifact bytes it selected.
+   */
+  public async getReferenced(reference: ArtifactReference): Promise<string> {
+    assertArtifactReference(reference);
+    const content = await this.get(reference.kind, reference.id);
+    if (
+      reference.bytes !== Buffer.byteLength(content) ||
+      reference.sha256 !== sha256(content)
+    ) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Source-bearing recovery artifact does not match its durable reference",
+        { kind: reference.kind, id: reference.id },
+      );
+    }
+    return content;
+  }
+
   public async remove(kind: ArtifactKind, id: string): Promise<void> {
     assertSafeArtifactId(id);
     await Promise.all([
@@ -185,6 +206,28 @@ async function atomicWrite(filename: string, content: string): Promise<void> {
 function assertSafeArtifactId(id: string): void {
   if (!/^[A-Za-z0-9._-]{3,160}$/u.test(id)) {
     throw new AgentError("INTERNAL_ERROR", "Unsafe recovery artifact identifier");
+  }
+}
+
+export function isArtifactReference(value: unknown): value is ArtifactReference {
+  if (!hasExactKeys(value, ["kind", "id", "bytes", "sha256"])) return false;
+  const reference = value as Partial<ArtifactReference>;
+  return (
+    typeof reference.kind === "string" &&
+    (ARTIFACT_KINDS as readonly string[]).includes(reference.kind) &&
+    typeof reference.id === "string" &&
+    /^[A-Za-z0-9._-]{3,160}$/u.test(reference.id) &&
+    Number.isSafeInteger(reference.bytes) &&
+    (reference.bytes ?? -1) >= 0 &&
+    (reference.bytes ?? MAX_ARTIFACT_BYTES + 1) <= MAX_ARTIFACT_BYTES &&
+    typeof reference.sha256 === "string" &&
+    /^[a-f0-9]{64}$/u.test(reference.sha256)
+  );
+}
+
+function assertArtifactReference(value: unknown): asserts value is ArtifactReference {
+  if (!isArtifactReference(value)) {
+    throw new AgentError("RECOVERY_REQUIRED", "Recovery artifact reference is malformed");
   }
 }
 
