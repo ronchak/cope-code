@@ -585,7 +585,8 @@ test("launch and attribution refuse insufficient pre-observation evidence", asyn
     observation: {
       ...preFacts,
       state: "metadata_limited",
-      limitationCodes: ["VISIBLE_STATE_BOUND_EXCEEDED"],
+      nestedRepository: "unknown",
+      limitationCodes: ["NESTED_REPOSITORY_SCAN_BOUND_EXCEEDED"],
     },
   });
   const launch = await persistence.persistLaunchReceipt({

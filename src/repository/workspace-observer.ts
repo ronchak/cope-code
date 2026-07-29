@@ -226,6 +226,7 @@ interface ObservationBoundary {
   readonly ignoredSummarySha256: string;
   readonly ignoredSummaryTruncated: boolean;
   readonly nestedRepository: "none" | "present" | "unknown";
+  readonly nestedScanBoundExceeded: boolean;
   readonly metadataLimited: boolean;
   readonly limitationCodes: readonly string[];
   readonly samples: ReadonlyMap<string, WorktreeSample>;
@@ -260,6 +261,7 @@ class ObservationRaceError extends Error {}
 
 export interface LiveWorkspaceObserverOptions {
   readonly compareTimeoutMs?: number;
+  readonly nestedScanMaxEntries?: number;
 }
 
 /**
@@ -270,6 +272,7 @@ export interface LiveWorkspaceObserverOptions {
 export class LiveWorkspaceObserver implements WorkspaceObserver {
   private readonly sampleCache = new Map<string, ReadonlyMap<string, WorktreeSample>>();
   private readonly compareTimeoutMs: number;
+  private readonly nestedScanMaxEntries: number;
 
   public constructor(
     private readonly boundary: RepositoryBoundary,
@@ -278,6 +281,17 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
   ) {
     this.compareTimeoutMs =
       options.compareTimeoutMs ?? WORKSPACE_COMPARE_TIMEOUT_MS;
+    this.nestedScanMaxEntries =
+      options.nestedScanMaxEntries ?? WORKSPACE_NESTED_SCAN_MAX_ENTRIES;
+    if (
+      !Number.isSafeInteger(this.nestedScanMaxEntries) ||
+      this.nestedScanMaxEntries < 1
+    ) {
+      throw new AgentError(
+        "PROTOCOL_INVALID",
+        "Nested repository scan entry bound must be a positive safe integer",
+      );
+    }
   }
 
   public async capturePre(
@@ -695,7 +709,10 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
       limitationCodes.push("TRANSITION_PATHS_TRUNCATED");
     }
     if (
-      second.nestedRepository !== "none" ||
+      (
+        second.nestedRepository !== "none" &&
+        !second.nestedScanBoundExceeded
+      ) ||
       (pre !== undefined && protectedBoundaryChanged(pre, second)) ||
       transition.hiddenCount > 0
     ) {
@@ -770,7 +787,8 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
       ? raw.bytes.subarray(0, Math.max(0, raw.bytes.lastIndexOf(0) + 1))
       : raw.bytes;
     const parsed = parseObservationStatus(parseableBytes);
-    const nestedRepository = await this.nestedRepositoryState(signal);
+    const nested = await this.nestedRepositoryState(signal);
+    const nestedRepository = nested.state;
     const visibleRaw = parsed.entries.filter(
       (entry) =>
         entry.kind !== "ignored" &&
@@ -795,7 +813,8 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
     const metadataLimited =
       raw.truncated ||
       visibleRaw.length > WORKSPACE_OBSERVATION_MAX_VISIBLE_ENTRIES ||
-      visibleBytes > WORKSPACE_OBSERVATION_MAX_VISIBLE_CONTENT_BYTES;
+      visibleBytes > WORKSPACE_OBSERVATION_MAX_VISIBLE_CONTENT_BYTES ||
+      nested.scanBoundExceeded;
     const status =
       metadataLimited || nestedRepository !== "none"
         ? undefined
@@ -878,13 +897,17 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
       gitTransitions: controls.normalTransitionsSha256,
       gitControls: controls.gitControlsSha256,
     };
-    const limitationCodes = metadataLimited
-      ? [
-          raw.truncated
-            ? "PORCELAIN_STATUS_BOUND_EXCEEDED"
-            : "VISIBLE_STATE_BOUND_EXCEEDED",
-        ]
-      : [];
+    const limitationCodes = [
+      ...(raw.truncated
+        ? ["PORCELAIN_STATUS_BOUND_EXCEEDED"]
+        : visibleRaw.length > WORKSPACE_OBSERVATION_MAX_VISIBLE_ENTRIES ||
+            visibleBytes > WORKSPACE_OBSERVATION_MAX_VISIBLE_CONTENT_BYTES
+          ? ["VISIBLE_STATE_BOUND_EXCEEDED"]
+          : []),
+      ...(nested.scanBoundExceeded
+        ? ["NESTED_REPOSITORY_SCAN_BOUND_EXCEEDED"]
+        : []),
+    ];
     const token = sha256(stableJson({
       branch: raw.branch,
       head: raw.head,
@@ -896,6 +919,7 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
         truncated: ignored.truncated || raw.truncated,
       },
       nestedRepository,
+      nestedScanBoundExceeded: nested.scanBoundExceeded,
       metadataLimited,
     }));
     return {
@@ -910,6 +934,7 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
       ignoredSummarySha256: ignored.sha256,
       ignoredSummaryTruncated: ignored.truncated || raw.truncated,
       nestedRepository,
+      nestedScanBoundExceeded: nested.scanBoundExceeded,
       metadataLimited,
       limitationCodes,
       samples,
@@ -1310,7 +1335,10 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
 
   private async nestedRepositoryState(
     signal: AbortSignal,
-  ): Promise<"none" | "present" | "unknown"> {
+  ): Promise<{
+    readonly state: "none" | "present" | "unknown";
+    readonly scanBoundExceeded: boolean;
+  }> {
     const queue = [this.boundary.root];
     let traversed = 0;
     while (queue.length > 0) {
@@ -1325,14 +1353,16 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
       let handle;
       try {
         const state = await lstat(directory);
-        if (!state.isDirectory() || state.isSymbolicLink()) return "unknown";
+        if (!state.isDirectory() || state.isSymbolicLink()) {
+          return { state: "unknown", scanBoundExceeded: false };
+        }
         this.boundary.assertDevice(state.dev, path.relative(
           this.boundary.root,
           directory,
         ).replaceAll(path.sep, "/"));
         handle = await opendir(directory);
       } catch {
-        return "unknown";
+        return { state: "unknown", scanBoundExceeded: false };
       }
       const children = [];
       for await (const child of handle) children.push(child);
@@ -1343,15 +1373,15 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
             "Nested repository observation was cancelled",
           );
         }
-        traversed += 1;
-        if (traversed > WORKSPACE_NESTED_SCAN_MAX_ENTRIES) {
-          return "unknown";
-        }
         if (
           directory !== this.boundary.root &&
           this.boundary.pathKey(child.name) === this.boundary.pathKey(".git")
         ) {
-          return "present";
+          return { state: "present", scanBoundExceeded: false };
+        }
+        traversed += 1;
+        if (traversed > this.nestedScanMaxEntries) {
+          return { state: "unknown", scanBoundExceeded: true };
         }
         if (
           child.isDirectory() &&
@@ -1362,7 +1392,7 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
         }
       }
     }
-    return "none";
+    return { state: "none", scanBoundExceeded: false };
   }
 
   private async pathState(

@@ -413,6 +413,83 @@ test("live observer treats policy-hidden and nested repository drift as non-clea
   assert.equal(nestedPost.nestedRepository, "present");
 });
 
+test("nested scan-cap exhaustion is metadata-limited for launch and unknown for attribution", async (context) => {
+  const fixture = await createRepositoryFixture(context);
+  const boundary = await RepositoryBoundary.create(fixture.root);
+  const observer = new LiveWorkspaceObserver(boundary, fixture.git, {
+    nestedScanMaxEntries: 1,
+  });
+  const baseline = emptyBaseline();
+  const pre = await observer.capturePre(baseline);
+  assert.equal(pre.state, "metadata_limited");
+  assert.equal(pre.nestedRepository, "unknown");
+  assert.equal(
+    pre.limitationCodes.includes(
+      "NESTED_REPOSITORY_SCAN_BOUND_EXCEEDED",
+    ),
+    true,
+  );
+  assert.equal(isWorkspaceObservation(pre), true);
+
+  await writeFile(path.join(fixture.root, "after-bound.txt"), "changed\n");
+  const post = await observer.capturePost(pre);
+  const effect = await observer.compare(pre, post, baseline);
+  assert.equal(post.state, "metadata_limited");
+  assert.equal(post.nestedRepository, "unknown");
+  assert.equal(
+    post.limitationCodes.includes(
+      "NESTED_REPOSITORY_SCAN_BOUND_EXCEEDED",
+    ),
+    true,
+  );
+  assert.equal(effect.outcome, "unknown");
+  assert.equal(effect.repositoryFingerprint, undefined);
+});
+
+test("an enumerated nested marker wins at the scan boundary while an unvisited marker remains bounded", async (context) => {
+  const fixture = await createRepositoryFixture(context);
+  const boundary = await RepositoryBoundary.create(fixture.root);
+  await execFileAsync(DEFAULT_GIT_EXECUTABLE, [
+    "init",
+    "--quiet",
+    path.join(fixture.root, "nested-low-bound"),
+  ]);
+  const rootEntryCount = (await readdir(fixture.root)).length;
+  const observer = new LiveWorkspaceObserver(boundary, fixture.git, {
+    // The root consumes the exact bound. The nested .git marker is the next
+    // enumerated child and must win before exhaustion is returned.
+    nestedScanMaxEntries: rootEntryCount,
+  });
+  const pre = await observer.capturePre(emptyBaseline());
+  assert.equal(pre.state, "protected_or_hidden_changed");
+  assert.equal(pre.nestedRepository, "present");
+  assert.equal(
+    pre.limitationCodes.includes("NESTED_REPOSITORY_PRESENT"),
+    true,
+  );
+  assert.equal(
+    pre.limitationCodes.includes(
+      "NESTED_REPOSITORY_SCAN_BOUND_EXCEEDED",
+    ),
+    false,
+  );
+
+  const boundedObserver = new LiveWorkspaceObserver(boundary, fixture.git, {
+    // Exhaust inside the root enumeration, before the queued nested directory
+    // is visited. Its marker is therefore genuinely unobserved.
+    nestedScanMaxEntries: rootEntryCount - 1,
+  });
+  const boundedPre = await boundedObserver.capturePre(emptyBaseline());
+  assert.equal(boundedPre.state, "metadata_limited");
+  assert.equal(boundedPre.nestedRepository, "unknown");
+  assert.equal(
+    boundedPre.limitationCodes.includes(
+      "NESTED_REPOSITORY_SCAN_BOUND_EXCEEDED",
+    ),
+    true,
+  );
+});
+
 test("live observer content-binds a pre-existing dirty path hidden only by policy", async (context) => {
   const fixture = await createRepositoryFixture(context, {
     isPathAllowed: (candidate) => candidate !== "policy-hidden.txt",
