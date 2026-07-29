@@ -307,16 +307,18 @@ inert even when they contain otherwise valid `cba-agent/1` or `cba/1` JSON.
 
 The following conditions must not produce an executable envelope:
 
-- more than one supported protocol block in one assistant response;
 - more than one eligible editor in a code block;
 - duplicate, missing, negative, nonnumeric, or noncontiguous line indices;
-- mixed or unsupported protocol banners;
+- changed or ambiguously owned protocol banners;
 - a body that exceeds its bound;
-- a captured fence delimiter; or
+- a standalone captured line that could close or open the reconstructed
+  protocol wrapper; or
 - a page/candidate capture exception.
 
 Capture ambiguity is not a model formatting repair and must not consume the
-protocol-repair budget.
+protocol-repair budget. Model-authored multiplicity, unsupported versions,
+invalid JSON, dialect mismatch, and quoted-but-unowned protocol fences remain
+inert but may consume the bounded formatting-repair budget.
 
 #### SR-019-03: no authority crosses DOM ownership boundaries
 
@@ -329,10 +331,10 @@ or repository content for executable JSON.
 
 #### OR-019-01: typed capture probe
 
-Provide a read-only diagnostic path, either in `cope doctor` or a narrowly
-scoped support command, that reports the source-free capture lattice for the
-latest eligible assistant envelope. It must not submit a prompt, mutate the
-conversation, or disclose content.
+Provide a read-only diagnostic path in `cope doctor` that exercises the
+host-side capture lattice with a fixed, source-free synthetic fixture. It must
+not open or read a live conversation, submit a prompt, mutate conversation
+state, or disclose content.
 
 #### OR-019-02: actionable terminal output
 
@@ -441,7 +443,9 @@ Do not infer or rewrite a materially different intent on the model's behalf.
    completed reconstruction must satisfy the normal response-stability quorum.
 8. An injected page-evaluation failure produces a typed capture failure rather
    than an empty string.
-9. A fence delimiter in captured editor content is rejected.
+9. A standalone wrapper-closing/opening fence line in captured editor content
+   is rejected, while a triple-backtick sequence inside a valid JSON string is
+   preserved and parses.
 10. A four-envelope rolling window plus one new protocol response selects,
     reconstructs, and parses only the correlated final envelope.
 

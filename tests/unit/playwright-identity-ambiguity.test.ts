@@ -323,11 +323,11 @@ test("the live adapter submits, reconstructs cba-agent/1, and parses the model t
   const quotedReceipt = await adapter.submit(quotedRequest);
   assert.equal(quotedReceipt.status, "submitted", JSON.stringify(quotedReceipt));
   const quotedResponse = await adapter.receive(quotedRequest);
-  assert.equal(quotedResponse.status, "indeterminate");
-  if (quotedResponse.status === "indeterminate") {
-    assert.equal(quotedResponse.diagnosticCode, "UNOWNED_PROTOCOL_FENCE");
-    assert.equal(quotedResponse.diagnostic?.stage, "browser_response_capture");
-    assert.equal(quotedResponse.diagnostic?.repairable, false);
+  assert.equal(quotedResponse.status, "completed");
+  if (quotedResponse.status === "completed") {
+    assert.equal(quotedResponse.captureEvidence?.status, "model_protocol_malformed");
+    assert.equal(quotedResponse.captureEvidence?.reasonCode, "MODEL_PROTOCOL_UNOWNED_FENCE");
+    assert.equal(quotedResponse.captureEvidence?.protocolErrorCode, "MISSING_ENVELOPE");
   }
 
   const legacyPayload = {
@@ -409,6 +409,60 @@ test("the live adapter submits, reconstructs cba-agent/1, and parses the model t
     mixedBannerObservation.responses.elements.at(-1)?.correlationText,
     `\`\`\`cba/1\n${JSON.stringify(legacyPayload)}\n\`\`\``,
     "legacy baseline identity must reproduce v0.1.8's exact cba/1 banner predicate",
+  );
+
+  await page.evaluate((payload) => {
+    const response = document.createElement("div");
+    response.dataset.testid = "copilot-message-reply-div";
+    const markdown = document.createElement("div");
+    markdown.dataset.testid = "markdown-reply";
+    const codeBlock = document.createElement("div");
+    codeBlock.className = "scriptor-component-code-block";
+    const banner = document.createElement("div");
+    banner.dataset.testid = "message-bar-body-info";
+    banner.textContent =
+      "cba/1 isn’t fully supported. Syntax highlighting is based on Plain Text.";
+    const editor = document.createElement("div");
+    editor.setAttribute("role", "textbox");
+    editor.setAttribute("aria-readonly", "true");
+    editor.setAttribute("aria-label", "Code editor");
+    const serialized = JSON.stringify(payload);
+    const splitAt = serialized.indexOf('"turn_id"');
+    const lineOne = document.createElement("div");
+    lineOne.dataset.lineIndex = "1";
+    lineOne.textContent = serialized.slice(0, splitAt);
+    const lineTwo = document.createElement("div");
+    lineTwo.dataset.lineIndex = "2";
+    lineTwo.textContent = serialized.slice(splitAt);
+    editor.append(lineTwo, lineOne);
+    codeBlock.append(banner, editor);
+    markdown.append(codeBlock);
+    response.append(markdown);
+    document.querySelector("#transcript")?.append(response);
+  }, legacyPayload);
+  const reversedLegacyObservation = await observeCopilotPage(
+    new PlaywrightSemanticPage(page),
+    contract,
+  );
+  const reversedLegacy = reversedLegacyObservation.responses.elements.at(-1);
+  assert.equal(reversedLegacy?.responseCapture?.status, "protocol_reconstructed");
+  assert.notEqual(
+    reversedLegacy?.correlationText,
+    `\`\`\`cba/1\n${JSON.stringify(legacyPayload)}\n\`\`\``,
+    "v0.1.8 correlation must retain DOM order instead of normalized index order",
+  );
+  assert.ok(
+    (reversedLegacy?.correlationText?.indexOf('"turn_id"') ?? -1) <
+      (reversedLegacy?.correlationText?.indexOf('{"protocol"') ?? -1),
+  );
+  assert.equal(
+    new CbaProtocolAdapter({
+      allowLegacyCorrelationRebind: true,
+    }).parseModelTurn(reversedLegacy?.text ?? "", {
+      taskId: "task_legacy_capture",
+      turnId: "turn_0001",
+    }).messages[0]?.type,
+    "tool_request",
   );
 });
 
@@ -569,7 +623,7 @@ for (const variant of ["json", "unlabeled"] as const) {
   });
 }
 
-test("unsafe Chromium protocol widgets remain typed, source-free transport failures", {
+test("Chromium protocol widgets distinguish safe data, repairable format, and capture failures", {
   skip: !existsSync(chromiumExecutable),
 }, async (t) => {
   const browser = await chromium.launch({ headless: true, executablePath: chromiumExecutable });
@@ -583,9 +637,11 @@ test("unsafe Chromium protocol widgets remain typed, source-free transport failu
   });
   const fenceCollision = JSON.stringify({
     kind: "agent_progress",
-    phase: "implementation",
+    phase: "discovering",
     summary: "quoted ``` delimiter",
   });
+  const standaloneFencePrefix =
+    '{"kind":"agent_progress","phase":"discovering","summary":"before collision"';
   await context.route("**/*", async (route) => {
     await route.fulfill({
       contentType: "text/html",
@@ -640,7 +696,7 @@ test("unsafe Chromium protocol widgets remain typed, source-free transport failu
           <div data-testid="copilot-message-reply-div" id="changed-banner">
             <div data-testid="markdown-reply">
               <div class="scriptor-component-code-block">
-                <div data-testid="message-bar-body-info">cba-agent/1 is not fully supported. Syntax highlighting uses Plain Text.</div>
+                <div data-testid="message-bar-body-info">Die Sprache cba-agent/1 wird nicht vollständig unterstützt.</div>
                 <div role="textbox" aria-readonly="true" aria-label="Code editor">
                   <div data-line-index="0">${modelIntent}</div>
                 </div>
@@ -684,6 +740,18 @@ test("unsafe Chromium protocol widgets remain typed, source-free transport failu
               </div>
             </div>
           </div>
+          <div data-testid="copilot-message-reply-div" id="standalone-fence-collision">
+            <div data-testid="markdown-reply">
+              <div class="scriptor-component-code-block">
+                <div data-testid="message-bar-body-info">cba-agent/1 isn’t fully supported. Syntax highlighting is based on Plain Text.</div>
+                <div role="textbox" aria-readonly="true" aria-label="Code editor">
+                  <div data-line-index="0">${standaloneFencePrefix}</div>
+                  <div data-line-index="1">\`\`\`</div>
+                  <div data-line-index="2">}</div>
+                </div>
+              </div>
+            </div>
+          </div>
           <div data-testid="copilot-message-reply-div" id="late-mount">
             <div data-testid="markdown-reply">
               <div class="scriptor-component-code-block">
@@ -713,19 +781,30 @@ test("unsafe Chromium protocol widgets remain typed, source-free transport failu
   assert.equal(evidence[4]?.reasonCode, "PROTOCOL_WIDGET_BANNER_CONTRACT_CHANGED");
   assert.equal(evidence[5]?.status, "model_protocol_malformed");
   assert.equal(evidence[5]?.reasonCode, "MODEL_PROTOCOL_DIALECT_MISMATCH");
-  assert.equal(evidence[6]?.status, "protocol_widget_ambiguous");
-  assert.equal(evidence[6]?.reasonCode, "UNOWNED_PROTOCOL_FENCE");
-  assert.equal(evidence[7]?.status, "protocol_widget_ambiguous");
-  assert.equal(evidence[7]?.reasonCode, "UNOWNED_PROTOCOL_FENCE");
-  assert.equal(evidence[8]?.status, "protocol_widget_ambiguous");
-  assert.equal(evidence[8]?.reasonCode, "PROTOCOL_WIDGET_FENCE_COLLISION");
-  assert.equal(evidence[9]?.status, "protocol_widget_incomplete");
-  assert.equal(evidence[9]?.reasonCode, "PROTOCOL_WIDGET_EDITOR_PENDING");
+  assert.equal(evidence[6]?.status, "model_protocol_malformed");
+  assert.equal(evidence[6]?.reasonCode, "MODEL_PROTOCOL_UNOWNED_FENCE");
+  assert.equal(evidence[6]?.protocolErrorCode, "MISSING_ENVELOPE");
+  assert.equal(evidence[7]?.status, "model_protocol_malformed");
+  assert.equal(evidence[7]?.reasonCode, "MODEL_PROTOCOL_UNOWNED_FENCE");
+  assert.equal(evidence[7]?.protocolErrorCode, "MISSING_ENVELOPE");
+  assert.equal(evidence[8]?.status, "protocol_reconstructed");
+  assert.equal(evidence[9]?.status, "protocol_widget_ambiguous");
+  assert.equal(evidence[9]?.reasonCode, "PROTOCOL_WIDGET_HOST_VERIFICATION_FAILED");
+  assert.equal(evidence[10]?.status, "protocol_widget_incomplete");
+  assert.equal(evidence[10]?.reasonCode, "PROTOCOL_WIDGET_EDITOR_PENDING");
+  const inlineFenceTurn = new CbaProtocolAdapter().parseModelTurn(
+    observation.responses.elements[8]?.text ?? "",
+    {
+      taskId: "task_inline_fence",
+      turnId: "turn_0001",
+    },
+  );
+  assert.equal(inlineFenceTurn.messages[0]?.type, "progress");
   assert.equal(
     observation.responses.elements.filter((element) =>
       element.responseCapture?.status === "protocol_reconstructed"
     ).length,
-    0,
+    1,
   );
 
   await page.evaluate((intent) => {
@@ -745,7 +824,7 @@ test("unsafe Chromium protocol widgets remain typed, source-free transport failu
     contract,
   );
   assert.equal(
-    completedObservation.responses.elements[9]?.responseCapture?.status,
+    completedObservation.responses.elements[10]?.responseCapture?.status,
     "protocol_reconstructed",
   );
 

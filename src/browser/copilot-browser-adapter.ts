@@ -589,6 +589,9 @@ export class CopilotBrowserAdapter implements ModelTransport {
     let sawCandidate = false;
     let markerCurrentlyProven = true;
     let lastCaptureIssueSha: string | undefined;
+    let lastCaptureIssue:
+      | Extract<ReturnType<typeof associatedResponse>, { readonly status: "capture_issue" }>
+      | undefined;
     let captureIssueSamples = 0;
     let captureIssueSince = this.#monotonicNow();
     let lastObservationCaptureFailure:
@@ -677,6 +680,7 @@ export class CopilotBrowserAdapter implements ModelTransport {
         }, conversationId);
       }
       if (correlation.status === "capture_issue") {
+        lastCaptureIssue = correlation;
         sawCandidate = true;
         lastCandidateSha = undefined;
         stableSamples = 0;
@@ -709,6 +713,7 @@ export class CopilotBrowserAdapter implements ModelTransport {
       if (correlation.status === "candidate") {
         const candidate = correlation.content;
         lastCaptureIssueSha = undefined;
+        lastCaptureIssue = undefined;
         captureIssueSamples = 0;
         lastObservationCaptureFailure = undefined;
         sawCandidate = true;
@@ -761,6 +766,13 @@ export class CopilotBrowserAdapter implements ModelTransport {
         status: "indeterminate",
         diagnosticCode: lastObservationCaptureFailure.diagnosticCode,
         diagnostic: lastObservationCaptureFailure.diagnostic,
+      }, activeRecord.conversationId);
+    }
+    if (lastCaptureIssue !== undefined) {
+      return this.#receiveBase(request, {
+        status: "indeterminate",
+        diagnosticCode: lastCaptureIssue.diagnosticCode,
+        diagnostic: lastCaptureIssue.diagnostic,
       }, activeRecord.conversationId);
     }
     return this.#receiveBase(request, {

@@ -18,8 +18,10 @@ four protocol-repair attempts, and terminate with the less specific
   versions, multiple blocks or editors, malformed line indices, and fence
   collisions fail closed.
 - Exact protocol fences quoted in ordinary code editors or rendered prose are
-  rejected before parser entry. Partial streaming widgets wait for the normal
-  stability quorum instead of failing on their first incomplete sample.
+  rejected before parser entry and routed through bounded formatting repair.
+  Triple backticks inside a valid JSON string remain ordinary data. Partial
+  streaming widgets wait for the normal stability quorum instead of failing on
+  their first incomplete sample.
 - Banner and body dialect must agree. Contiguous zero- and one-based editor
   line indices are supported; a changed protocol-family banner produces a
   recertification diagnostic rather than falling back to fence-free text.
@@ -53,7 +55,7 @@ four protocol-repair attempts, and terminate with the less specific
 - Chromium negatives cover inert JSON and unlabeled blocks, unsupported
   versions, multiple editors, multiple protocol blocks, orphaned or changed
   banners, dialect mismatch, quoted fences, late editor mount, page-evaluation
-  failure, and fence collision.
+  failure, inline backtick preservation, and standalone fence collision.
 - Runtime tests prove `MISSING_ENVELOPE` identity through repair, progress,
   audit, terminal exhaustion, persistence, and recovery.
 - Browser-adapter tests prove capture failures are non-repairable and verify

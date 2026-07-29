@@ -3504,6 +3504,7 @@ function modelProtocolCaptureError(
   if (capture?.status !== "model_protocol_malformed") return undefined;
   const code = capture.protocolErrorCode;
   if (
+    code !== "MISSING_ENVELOPE" &&
     code !== "MULTIPLE_ENVELOPES" &&
     code !== "UNSUPPORTED_VERSION" &&
     code !== "EMPTY_ENVELOPE" &&
@@ -3513,6 +3514,7 @@ function modelProtocolCaptureError(
     return undefined;
   }
   const messages = {
+    MISSING_ENVELOPE: "The model response quoted a protocol fence outside an owned protocol widget.",
     MULTIPLE_ENVELOPES: "The captured model response contains more than one protocol envelope.",
     UNSUPPORTED_VERSION: "The captured model response used an unsupported protocol version.",
     EMPTY_ENVELOPE: "The captured model response contains an empty protocol envelope.",

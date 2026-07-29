@@ -312,6 +312,42 @@ class MalformedCaptureTransport extends QueueTransport {
   }
 }
 
+class UnownedFenceCaptureTransport extends QueueTransport {
+  private receiveCalls = 0;
+
+  public constructor(validResponse: string) {
+    super([validResponse]);
+  }
+
+  public override async receive(request: ReceiveRequest): Promise<ReceiveResult> {
+    this.receiveCalls += 1;
+    if (this.receiveCalls > 1) return super.receive(request);
+    return {
+      contractVersion: MODEL_TRANSPORT_CONTRACT_VERSION,
+      taskId: request.taskId,
+      turnId: request.turnId,
+      submissionId: request.submissionId,
+      observedAt: "2026-01-01T00:00:00.000Z",
+      conversationId: "conversation_1",
+      status: "completed",
+      responseId: "response_unowned_fence",
+      content: "```cba-agent/1\nquoted but never executable\n```",
+      captureEvidence: {
+        contractVersion: "response-capture/v2",
+        status: "model_protocol_malformed",
+        reasonCode: "MODEL_PROTOCOL_UNOWNED_FENCE",
+        protocolErrorCode: "MISSING_ENVELOPE",
+        codeBlockCount: 1,
+        protocolBlockCount: 0,
+        editorCount: 1,
+        bannerCount: 0,
+        lineCount: 0,
+        contentBytes: 50,
+      },
+    };
+  }
+}
+
 class TerminalBlockedTransport extends QueueTransport {
   public override async receive(request: ReceiveRequest): Promise<ReceiveResult> {
     return {
@@ -3352,6 +3388,44 @@ test("runtime repairs a model-format capture error without parsing rendered widg
   );
 });
 
+test("runtime repairs an unowned quoted fence without parsing it as authority", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-unowned-fence-repair-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const validCompletion = [
+    "```cba-agent/1",
+    stableJson({
+      kind: "agent_intent",
+      intent: "complete_task",
+      arguments: {
+        summary: "Finished after repairing a quoted protocol fence.",
+        acceptance_criteria: [],
+        validation: [],
+        skipped_validation: [],
+        remaining_risks: [],
+        follow_up: [],
+      },
+      reason: "Submit the final completion report.",
+    }),
+    "```",
+  ].join("\n");
+  const transport = new UnownedFenceCaptureTransport(validCompletion);
+
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    protocol: new CbaProtocolAdapter(),
+  }).run();
+
+  assert.equal(result.status, "completed", result.reason);
+  assert.equal(localState.budgetUsage.protocolRepairs, 1);
+  assert.match(transport.submittedContents[1] ?? "", /"code":"MISSING_ENVELOPE"/u);
+  assert.doesNotMatch(transport.submittedContents[1] ?? "", /quoted but never executable/u);
+});
+
 test("runtime does not send or charge a repair after the protocol-repair budget is exhausted", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-repair-budget-"));
   const localState = state(root);
@@ -5212,6 +5286,55 @@ test("recovery preserves capture-classified model repair evidence across restart
     transport.submittedContents[0] ?? "",
     /rendered text that must never be reparsed/u,
   );
+});
+
+test("recovery rejects well-formed capture evidence outside the strict allowlist", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-capture-recovery-tamper-"));
+  const localState = state(root);
+  localState.status = "paused";
+  localState.pauseReason = "process restarted";
+  localState.turnSequence = 1;
+  localState.submission = {
+    submissionId: "submission_1",
+    turnId: "turn_0001",
+    messageHash: "a".repeat(64),
+    marker: "marker",
+    state: "answered",
+    preparedAt: "2026-01-01T00:00:00.000Z",
+    submittedAt: "2026-01-01T00:00:01.000Z",
+    answeredAt: "2026-01-01T00:00:02.000Z",
+  };
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(
+    path.join(store.sessionDirectory(localState.sessionId), "artifacts"),
+  );
+  await artifacts.put("response", "turn_0001", "untrusted rendered response");
+  await artifacts.put("response-capture", "turn_0001", stableJson({
+    contractVersion: "response-capture/v2",
+    status: "protocol_reconstructed",
+    protocolVersion: "cba-agent/1",
+    codeBlockCount: 1,
+    protocolBlockCount: 1,
+    editorCount: 1,
+    bannerCount: 1,
+    lineCount: 1,
+    contentBytes: 64,
+    unexpectedSourceBearingField: "must not survive recovery",
+  }));
+
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    artifacts,
+    transport: new QueueTransport([]),
+    protocol: new CbaProtocolAdapter(),
+  }).run();
+
+  assert.equal(result.status, "paused");
+  assert.match(result.reason ?? "", /failed strict validation/u);
+  assert.equal(localState.budgetUsage.protocolRepairs, 0);
 });
 
 test("runtime pauses instead of replaying an indeterminate mutation", async () => {

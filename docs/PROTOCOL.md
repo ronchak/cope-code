@@ -29,9 +29,11 @@ only when the correlated assistant response owns exactly one supported
 protocol widget with one exact `cba-agent/1` or legacy `cba/1` information
 banner and one eligible editor. Page evaluation returns bounded structural
 facts; trusted host code validates numeric contiguous line indices, sorts them
-by index (from either zero or one), rejects ambiguity and fence collisions,
-requires the fence label and body dialect to agree, constructs the wrapper,
-and verifies the exact version and body bytes before protocol parsing. A
+by index (from either zero or one), rejects ambiguity and standalone lines that
+could collide with the outer protocol wrapper, requires the fence label and
+body dialect to agree, constructs the wrapper, and verifies the exact version
+and body bytes before protocol parsing. Triple backticks inside a valid JSON
+string remain ordinary data and are preserved. A
 partially mounted editor/banner/line set remains pending until the normal
 streaming and response-stability quorum completes.
 
@@ -39,10 +41,11 @@ JSON shape is never capture authority. JSON, plain-text, unlabeled,
 wrong-version, multiple-editor, multiple-block, malformed-line, or otherwise
 ambiguous widgets remain inert. An exact protocol fence quoted inside an
 ordinary code editor or rendered prose is rejected before parser entry.
-Model-authored wrong-version, invalid-JSON, multiple-envelope, empty-body, and
-dialect errors receive bounded protocol repair; unsafe ownership, capture,
-banner-contract, and response-selection conditions produce a source-free,
-non-repairable browser-capture diagnostic without consuming that budget.
+Model-authored wrong-version, invalid-JSON, multiple-envelope, empty-body,
+dialect, and quoted-but-unowned-fence errors receive bounded protocol repair;
+unsafe ownership, capture, banner-contract, and response-selection conditions
+produce a source-free, non-repairable browser-capture diagnostic without
+consuming that budget.
 
 The `response-capture/v2` evidence contains only stable enums, versions,
 counts, line count, and byte length. It follows a completed response through

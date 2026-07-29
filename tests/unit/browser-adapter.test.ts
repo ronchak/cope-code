@@ -310,6 +310,37 @@ test("an incomplete streaming protocol widget waits for the normal stability quo
   }
 });
 
+test("a capture issue that never leaves streaming retains its typed diagnostic at timeout", async () => {
+  const page = new DynamicFakePage();
+  page.onActivation = () => {
+    page.streaming = true;
+    page.responseSnapshots[page.responses.length - 1] = {
+      responseCapture: {
+        contractVersion: "response-capture/v2",
+        status: "protocol_widget_incomplete",
+        protocolVersion: "cba-agent/1",
+        reasonCode: "PROTOCOL_WIDGET_LINES_PENDING",
+        codeBlockCount: 1,
+        protocolBlockCount: 1,
+        editorCount: 1,
+        bannerCount: 1,
+        lineCount: 0,
+        contentBytes: 0,
+      },
+    };
+  };
+  const { adapter } = makeHarness(page);
+  assert.equal((await adapter.submit(request)).status, "submitted");
+
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "indeterminate");
+  if (response.status === "indeterminate") {
+    assert.equal(response.diagnosticCode, "PROTOCOL_WIDGET_LINES_PENDING");
+    assert.equal(response.diagnostic?.actual?.capture_status, "protocol_widget_incomplete");
+    assert.equal(response.diagnostic?.repairable, false);
+  }
+});
+
 test("response-widget capture exceptions retain their typed non-repairable diagnostic", async () => {
   const page = new DynamicFakePage();
   const { adapter } = makeHarness(page);

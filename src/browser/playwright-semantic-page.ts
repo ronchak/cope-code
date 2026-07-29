@@ -807,7 +807,9 @@ export class PlaywrightSemanticPage implements SemanticPage {
                         | "changed_supported_banner";
                     } | undefined => {
                       const value = banner.textContent?.trim() ?? "";
-                      const match = /^((?:cba|cba-agent)\/[^\s`~]+)(?:\s|$)/u.exec(value);
+                      const match =
+                        /(?:^|[^A-Za-z0-9._/-])((?:cba|cba-agent)\/[A-Za-z0-9._-]+)(?=$|[^A-Za-z0-9._/-])/u
+                          .exec(value);
                       const version = match?.[1];
                       if (version === undefined) return undefined;
                       const descriptor = input.descriptors.find((entry) =>
@@ -1326,17 +1328,12 @@ function normalizeResponseCapture(capture: PageResponseCapture): NormalizedRespo
   const renderedContentBytes = Buffer.byteLength(capture.renderedText, "utf8");
   const correlationText = v018ResponseCorrelationText(capture);
   if (capture.unownedProtocolFenceCount > 0) {
-    return {
-      text: capture.renderedText,
-      correlationText,
-      evidence: {
-        ...sharedEvidence,
-        status: "protocol_widget_ambiguous",
-        reasonCode: "UNOWNED_PROTOCOL_FENCE",
-        lineCount: 0,
-        contentBytes: renderedContentBytes,
-      },
-    };
+    return modelProtocolMalformed(
+      capture,
+      sharedEvidence,
+      "MISSING_ENVELOPE",
+      "MODEL_PROTOCOL_UNOWNED_FENCE",
+    );
   }
   if (capture.protocolBlocks.length === 0) {
     if (capture.bannerCount > 0) {
@@ -1407,8 +1404,7 @@ function normalizeResponseCapture(capture: PageResponseCapture): NormalizedRespo
     !block.lineIndicesValid ||
     block.contentBoundExceeded ||
     block.contentBytes > DEFAULT_MAX_PROTOCOL_INPUT_BYTES ||
-    Buffer.byteLength(block.code, "utf8") !== block.contentBytes ||
-    block.code.includes("```")
+    Buffer.byteLength(block.code, "utf8") !== block.contentBytes
   );
   if (unsafeBlock !== undefined) {
     const reasonCode = unsafeBlock.editorCount !== 1
@@ -1418,9 +1414,7 @@ function normalizeResponseCapture(capture: PageResponseCapture): NormalizedRespo
         : unsafeBlock.contentBoundExceeded ||
             unsafeBlock.contentBytes > DEFAULT_MAX_PROTOCOL_INPUT_BYTES
           ? "PROTOCOL_WIDGET_CONTENT_BOUND"
-          : Buffer.byteLength(unsafeBlock.code, "utf8") !== unsafeBlock.contentBytes
-            ? "PROTOCOL_WIDGET_BYTE_COUNT_MISMATCH"
-            : "PROTOCOL_WIDGET_FENCE_COLLISION";
+          : "PROTOCOL_WIDGET_BYTE_COUNT_MISMATCH";
     return {
       text: capture.renderedText,
       correlationText,
@@ -1463,6 +1457,27 @@ function normalizeResponseCapture(capture: PageResponseCapture): NormalizedRespo
       block,
     );
   }
+  const contentBytes = block.contentBytes;
+  const normalizedText = `\`\`\`${block.version}\n${block.code}\n\`\`\``;
+  try {
+    const verified = extractCbaEnvelope(normalizedText, block.version);
+    if (verified.json !== block.code) {
+      throw new Error("Reconstructed protocol bytes changed during host verification");
+    }
+  } catch {
+    return {
+      text: capture.renderedText,
+      correlationText,
+      evidence: {
+        ...sharedEvidence,
+        status: "protocol_widget_ambiguous",
+        protocolVersion: block.version,
+        reasonCode: "PROTOCOL_WIDGET_HOST_VERIFICATION_FAILED",
+        lineCount: block.lineCount,
+        contentBytes,
+      },
+    };
+  }
   let decoded: unknown;
   try {
     decoded = JSON.parse(block.code) as unknown;
@@ -1485,27 +1500,6 @@ function normalizeResponseCapture(capture: PageResponseCapture): NormalizedRespo
     );
   }
 
-  const contentBytes = block.contentBytes;
-  const normalizedText = `\`\`\`${block.version}\n${block.code}\n\`\`\``;
-  try {
-    const verified = extractCbaEnvelope(normalizedText, block.version);
-    if (verified.json !== block.code) {
-      throw new Error("Reconstructed protocol bytes changed during host verification");
-    }
-  } catch {
-    return {
-      text: capture.renderedText,
-      correlationText,
-      evidence: {
-        ...sharedEvidence,
-        status: "protocol_widget_ambiguous",
-        protocolVersion: block.version,
-        reasonCode: "PROTOCOL_WIDGET_HOST_VERIFICATION_FAILED",
-        lineCount: block.lineCount,
-        contentBytes,
-      },
-    };
-  }
   return {
     text: normalizedText,
     correlationText,
