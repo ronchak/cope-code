@@ -16,8 +16,9 @@ After this slice:
 
 - success, nonzero exit, timeout, cancellation, and OS spawn failure all retain
   truthful process facts;
-- every launched operation has a full pre-observation and either a full
-  post-observation or an explicit non-clean observation;
+- every launched operation has a complete or explicit metadata-limited
+  pre-observation and either a complete post-observation or an explicit non-clean
+  observation;
 - created, updated, deleted, conservatively renamed, binary, staged, unstaged,
   index, HEAD, and branch effects are attributed to the operation window;
 - session-start user work remains separately identified;
@@ -60,9 +61,11 @@ Rules:
 - mode names are never used as a proxy;
 - resume never recomputes the field from current policy, config, preference, or
   mode;
-- an existing session may move from `frozen` to `observed` only in the same durable
-  transaction that expands its effective grant to add `terminal_exec`;
-- the field never downgrades during a session; and
+- the field is immutable after session creation in Slice 2: expanding a saved grant
+  does not promote an existing session, and the operator starts a new session to
+  obtain newly authorized observed semantics;
+- a later slice may add promotion only with a separately reviewed durable
+  grant/session transaction; resume never infers promotion from mutable policy; and
 - old config, grants, sessions, fixtures, and recovery records therefore remain
   frozen.
 
@@ -73,15 +76,18 @@ discriminator because every current session records them.
 Slice 2 keeps `createDefaultSessionGrant` unchanged, so ordinary/default sessions
 seed `frozen`. `observed` is reachable only through fixtures/manual composition that
 supply a hand-built terminal-capable `SessionGrant` and organization/repository
-policy documents that allow `terminal_exec` at every upper layer. Slice 3 owns the
-product path that creates this layered authorization.
+policy documents that allow `terminal_exec` at every upper layer. The mode layer
+must explicitly deny `terminal_exec` in `inspect` even when hand-built policies allow
+it; observed fixtures use a mutation-capable mode. Slice 3 owns the product path that
+creates this layered authorization.
 
 ### 2. Add a durable launch receipt, but do not invent resume-time attribution
 
 Slice 2 makes the interval between request persistence and process launch materially
 larger by inserting Git inspection and bounded before-image capture. Add a
-`terminal-launch-receipt` artifact after the full pre-observation succeeds and
-immediately before the OS spawn attempt.
+`terminal-launch-receipt` artifact after the structurally complete pre-observation
+(content-complete or explicit metadata-limited) succeeds and immediately before the
+OS spawn attempt.
 
 Recovery truth is:
 
@@ -120,6 +126,13 @@ returned. This slice makes no absence-based retry guarantee after such an event;
 known intervening power/storage loss requires conservative reconciliation on every
 host, including macOS.
 
+The distinction is an explicit operator input, not inferred from a stale lock:
+`cope resume <session-id> --recovery-context power-storage-loss` passes
+`RecoveryContext = "known_power_or_storage_loss"` to evidence inspection. Ordinary
+resume defaults to `"ordinary_process_crash"`. The former always pauses rather than
+using receipt absence as no-launch proof; without the explicit declaration, the
+documented ordinary-process-crash branch applies.
+
 A live prelaunch observation refusal returns the existing typed `status: "failure"`
 / `outcome: "spawn_failed"` outcome. The runtime completes that journal record,
 applies the normal verified-no-launch `commands` refund, and returns the failure; it
@@ -132,25 +145,26 @@ an interrupted executing operation never launched.
 
 `repositoryFingerprint` remains exactly
 `GitInspector.status().snapshotSha256`. The workspace observer must obtain this value
-through the existing inspector rather than define a parallel digest.
+through the existing inspector rather than define a parallel digest. No
+identity-limited or metadata-only digest may populate `repositoryFingerprint`.
 
-The inspector's bounded observation path must not compute worktree content
-fingerprints for `kind: "ignored"` entries: those values are already discarded from
-every existing fingerprint and summary, so skipping them is byte-compatible. For
-visible entries, the existing content-backed fingerprint remains byte-compatible
-while the entry/content bounds below hold. Above either bound, the same inspector
-degrades excess entries to an explicitly marked identity-limited fingerprint rather
-than refusing a valid command. Identity-limited entries can prove only that an
-untouched path stayed unchanged; a touched identity-limited path makes attribution
-non-clean.
+The inspector must unconditionally skip worktree content fingerprints for
+`kind: "ignored"` entries: those values are already discarded from every existing
+fingerprint and summary, so skipping them is byte-compatible. For visible entries,
+the existing content-backed fingerprint remains byte-compatible. The bounded
+observation seam first measures entry count and aggregate regular-file size with
+metadata-only facts. If either bound is exceeded, it records an explicit
+metadata-limited/non-clean observation with no `repositoryFingerprint`; it still
+permits launch, but comparison can never classify the operation as `none` or
+`observed`. It does not substitute a new digest that later completion or validation
+could fail to reproduce.
 
 Expose component fingerprints additively for index, policy-hidden state, protected
 worktree state, normal Git transitions, and non-transition Git control state.
 Existing `snapshotSha256`, `excludedStateSha256`, validation records, session-start
-facts, and completion comparisons remain byte-compatible for observations within
-the frozen bounds. Legacy sessions whose saved fingerprint cannot be reproduced
-under identity-limited evidence remain conservative rather than being silently
-reinterpreted.
+facts, and completion comparisons remain byte-compatible. Metadata-limited
+observations are non-clean and use the same actionable reconcile/new-session path as
+other insufficient evidence.
 
 ### 4. Record only meaningful or non-clean terminal mutations
 
@@ -199,10 +213,12 @@ Initial bounds:
 - at most 200 retained source-image entries;
 - at most 1 MiB per retained image;
 - at most 3 MiB raw retained source bytes;
-- at most 2 MiB index-identity input;
+- at most 2 MiB retained/serialized index-identity material; hash the complete index
+  as a stream within the phase deadline rather than loading it into memory;
 - at most 1 MiB porcelain-status input;
 - at most 25,000 non-ignored status entries and 256 MiB aggregate visible-entry
-  content-fingerprint input before excess entries degrade to identity-only evidence;
+  content-fingerprint input before the observation becomes metadata-limited and
+  explicitly non-clean;
   and
 - at most 6 MiB serialized observation artifact bytes after base64 expansion.
 
@@ -210,9 +226,11 @@ Identity-only evidence is sufficient to prove that an untouched path stayed
 unchanged. If such a path changes during the operation, its session-diff baseline
 and changed-line count become explicitly unavailable; retain exact path/change
 counts, account known facts, and make the mutation non-clean rather than inventing
-bytes or lines. Crossing the status entry/content bounds is a degradation, not a
-prelaunch refusal. Refuse before launch only when identity-only evidence itself
-cannot be captured or the complete serialized observation still exceeds its bound.
+bytes or lines. Crossing the status entry/content bounds is an explicit non-clean
+degradation, not a prelaunch refusal; a metadata-limited pre-observation is enough to
+launch but guarantees a final `unknown` mutation outcome. Refuse before launch only
+when metadata/identity evidence itself cannot be captured or the complete serialized
+observation still exceeds its bound.
 Post-launch overflow likewise produces an explicit non-clean observation while
 preserving process truth.
 
@@ -237,6 +255,13 @@ Keep `terminal-journal-result/1` byte-compatible. Its validator is exact-keyed a
 existing Slice 1 records must keep replaying. Full effect facts remain in the
 integrity-bound terminal result and observation artifacts, which effect, diff, and
 handoff consumers load through one validating persistence owner.
+
+Make `terminal-result-artifact/1` a strict exact-keyed legacy/full union. The legacy
+member retains the current keys, placeholder pre/post observations, and no launch
+receipt. The full member requires a `launch_receipt` reference bound to the same
+operation, request hash, request artifact, and pre-observation as the exit receipt,
+post-observation, and result. Consumers choose the branch from exact validated
+artifact/observation shapes; they never infer a missing receipt for a full result.
 
 ## Architecture
 
@@ -277,7 +302,9 @@ Each observation is race-checked:
    components;
 4. accept only if both boundary samples match;
 5. retry the complete observation once for ordinary concurrent churn; and
-6. reject prelaunch or return an explicit non-clean post-state after the retry.
+6. after the retry, reject prelaunch for missing identity/boundary evidence, accept
+   an explicit metadata-limited pre-state only under the frozen large-visible-state
+   degradation, or return an explicit non-clean post-state.
 
 ### Observation artifact
 
@@ -294,9 +321,14 @@ member such as `terminal-workspace-observation/1` with:
 - policy-hidden, protected, Git-transition, and Git-control component fingerprints;
 - bounded pre-worktree image records with existence, mode, size, binary status,
   SHA-256, and either retained bytes or a reconstructible blob identity;
+- a bounded, NUL-parsed transition-path inventory derived without hooks between the
+  persisted pre/post HEAD and index facts, so a clean checkout/reset/commit
+  transition does not lose every changed path merely because both final porcelain
+  states are clean;
 - bounded ignored summary with count, aggregate, and truncation flag;
 - nested-repository result;
-- `complete`, `protected_or_hidden_changed`, or `unknown` state; and
+- `complete`, `metadata_limited`, `protected_or_hidden_changed`, or `unknown` state;
+  `metadata_limited` forbids `repositoryFingerprint`; and
 - bounded, source-free limitation codes.
 
 The existing artifact envelope binds kind, operation ID, request hash, phase, body
@@ -317,6 +349,13 @@ Produce the existing frozen terminal result fields:
 - mutation outcome; and
 - final repository fingerprint only when state is known.
 
+For an `observed` effect, also copy an integrity-bound post-observation control
+anchor containing branch, HEAD, and `excludedStateFingerprint`. The anchor is
+all-or-none and comes from the exact post-observation used to construct the result,
+never from a later live inspection. It remains authoritative across later typed
+patches and catalog validations. Unknown, metadata-limited, or
+`protected_or_hidden_changed` effects contain no invented anchor.
+
 Rename classification requires a usable Git rename origin plus matching pre-state
 identity. Ambiguous or unverifiable cases degrade to create/delete. Use
 `RepositoryBoundary.pathKey` for identity and preserve display spelling, including
@@ -335,6 +374,12 @@ protected patterns, or nested-repository ambiguity yield
 `protected_or_hidden_changed`. Post-observation failure or insufficient evidence
 yields `unknown`.
 
+When branch/HEAD/index transitions leave clean porcelain on either side, merge the
+bounded direct transition inventory with ordinary status-derived paths before
+building the complete sorted effect facts. If that inventory is truncated, retain
+exact omitted counts/digest and explicit per-path-unavailable evidence rather than
+silently claiming an exhaustive diff.
+
 An OS spawn failure is still post-observed. If pre and post are identical, its
 mutation is `none`; if they differ, use `unknown`, because a process that never
 launched cannot truthfully be credited with concurrent changes.
@@ -343,6 +388,8 @@ launched cannot truthfully be credited with concurrent changes.
 
 Path attribution is bounded independently from before-image storage:
 
+- the post-observation transition inventory retains at most 2,048 endpoints and
+  256 KiB of UTF-8 path facts with exact total, truncation, and complete digest;
 - the terminal result retains at most 2,048 path endpoints and 256 KiB of UTF-8 path
   facts across all created/updated/deleted/renamed/pre-existing-touched lists;
 - the terminal mutation record retains at most 256 endpoints and 64 KiB of UTF-8
@@ -355,7 +402,8 @@ Path attribution is bounded independently from before-image storage:
   effect summary;
 - effect application size-checks the complete serialized next session state against
   the real 4 MiB session cap and falls back to the counts/digest-only terminal
-  record before persistence; and
+  record before persistence; the all-or-none post-observation control anchor is
+  never dropped by this fallback; and
 - before launch, runtime reserves 128 KiB of session-state headroom for the minimal
   counts/digest-only terminal record and reconciliation facts. If that reserve is
   unavailable, refuse before launch and refund `commands`.
@@ -375,9 +423,12 @@ this order:
    refusal follows the accepted-record prelaunch failure path and refunds;
 1. prepare authorized cwd, environment, and normalized launch facts;
 2. persist request evidence;
-3. capture and persist the full pre-observation;
+3. capture and persist the complete/content-complete-or-metadata-limited
+   pre-observation;
 4. on insufficient pre-evidence, persist a typed prelaunch failure and refund
-   `commands`;
+   `commands`; the one exception is a structurally complete metadata-limited
+   large-visible-state observation, which may launch but forces final mutation
+   outcome `unknown`;
 5. persist the launch receipt;
 6. spawn and supervise, retaining current output and cancellation behavior;
 7. persist the source-free exit receipt;
@@ -455,8 +506,8 @@ still contains the pending operation for startup recovery.
 If the persist succeeds, the pending entry and every charge/refund change together;
 replay sees an unreturned result but no pending entry and performs disclosure only.
 If a matching terminal mutation already exists while the operation remains pending,
-verify its source-free facts before repairing state; a mismatch is
-`RECOVERY_REQUIRED`.
+verify its source-free facts, including the all-or-none post-observation control
+anchor, before repairing state; a mismatch is `RECOVERY_REQUIRED`.
 
 Prelaunch recovery without a result artifact is a separate, source-free transaction:
 after validated no-launch evidence within the ordinary process-crash model,
@@ -499,19 +550,30 @@ completion, handoff, and honest bounded storage: optional `processOutcome`, exac
 per-class path totals, `pathFactsTruncated`, and the complete-facts digest. Do not
 duplicate full result facts in session state.
 
+Full `observed` terminal mutation records also require an all-or-none
+`postObservationControl` object with `branch`, `head`, and
+`excludedStateFingerprint`. These are control-freshness anchors, not a second
+repository fingerprint. Legacy Slice 1 records omit the object and remain readable;
+non-clean records must omit it.
+
 Update strict validators additively:
 
 - legacy six-key patch records remain valid;
 - optional `kind: "patch"` records remain valid;
 - current Slice 1 terminal records and sessions remain readable;
 - new terminal records require exact operation/result/observation binding;
+- a full `observed` record requires a complete post-observation control anchor and
+  effect application verifies that anchor against the bound result before applying
+  it exactly once;
 - terminal records never receive a patch checkpoint ID or update
   `lastCheckpointId`; and
 - non-clean records contain no invented fingerprint.
 
 Legacy placeholder results replay exact process/output truth, retain or restore their
 pending effect ID, and block completion with an actionable reconcile/new-session
-message. They are never retroactively attributed from the current worktree.
+message. Every non-clean Slice 2 record likewise names its operation ID and tells the
+operator to reconcile the worktree and start a new session; records are not silently
+superseded. They are never retroactively attributed from the current worktree.
 
 ### Session diff and handoff
 
@@ -574,15 +636,19 @@ session-start branch, HEAD, and excluded-state checks.
 
 1. rejects unresolved journal operations;
 2. rejects legacy pending terminal effect IDs;
-3. skips the session-start branch, HEAD, and excluded-state freeze only after any
-   recorded `kind: "terminal"` mutation whose `observationOutcome` is `observed`;
-4. selects the existing repository fingerprint from the latest trustworthy effect
-   or validation;
-5. allows a later catalog validation to become authoritative only at the current
-   `mutationSequence` and exact current repository fingerprint;
-6. requires the live completion snapshot to equal the selected facts;
-7. rejects post-result editor/process drift; and
-8. requires every configured named `run_command` validation to succeed after the
+3. locates the latest recorded `kind: "terminal"` mutation whose
+   `observationOutcome` is `observed`, even when a typed patch is the latest overall
+   mutation;
+4. skips the session-start branch, HEAD, and excluded-state freeze only when that
+   record has a complete valid post-observation control anchor, and requires the
+   live branch, HEAD, and excluded-state fingerprint to equal that anchor;
+5. never lets a validation record replace or refresh those three control facts;
+6. independently selects the ordinary repository fingerprint from the latest
+   trustworthy effect or a catalog validation at the current `mutationSequence`;
+7. requires the live completion fingerprint to equal that selected fingerprint;
+8. rejects post-result editor/process drift, including branch/HEAD/excluded drift
+   that occurred before a later validation; and
+9. requires every configured named `run_command` validation to succeed after the
    latest mutation.
 
 `terminal_exec` never creates a `ValidationRecord` and never satisfies a required
@@ -595,10 +661,12 @@ effect paths plus organization/repository policies that allow `terminal_exec`; S
 3 must create a Developer grant whose intended project write scope supports the
 advertised workflows without weakening protected/hidden boundaries.
 
-No separate branch/HEAD/index fields are needed in `TerminalMutationRecord` for
-completion. The unchanged `GitInspector.status().snapshotSha256` already binds
-branch, HEAD, and every visible index/worktree entry. Component fingerprints support
-effect classification and diagnostics, not a second completion identity.
+The post-observation control anchor is required because one repository fingerprint
+cannot serve both roles: comparing live state to the older terminal fingerprint
+would reject a legitimate later patch, while replacing it with a later validation
+fingerprint could launder manual branch/HEAD/excluded drift. The anchor preserves
+those three terminal-attributed control facts while ordinary fingerprints continue
+to track later typed patch and validation state.
 
 ## Shared contract gate
 
@@ -609,25 +677,29 @@ attribution.
 Required contract decisions:
 
 1. unchanged `GitInspector.status().snapshotSha256` identity;
-2. persisted, capability-seeded, monotonic `completionAuthority`;
+2. persisted, capability-seeded, Slice-2-immutable `completionAuthority`;
 3. `terminal-launch-receipt` added to every exact artifact-kind/reference validator,
    with artifact-root and receipt-kind directory sync hardening where the existing
    host capability supports it, but no power-loss proof claim;
 4. non-throwing post-hoc budget API;
-5. strict legacy/full observation union with only pre/post phases;
+5. strict legacy/full observation and terminal-result unions with only pre/post
+   observation phases and a required launch receipt in the full result member;
 6. no journal metadata key additions;
 7. bounded before-images without a full index manifest or post-images;
-8. mixed patch/terminal session-diff resolver with per-path unavailable evidence;
+8. mixed patch/terminal session-diff resolver with per-path unavailable evidence
+   plus a bounded transition-path inventory for clean HEAD/index transitions;
 9. `completionAuthority` added to the exact top-level session-key validator while
    remaining optional for legacy sessions;
 10. a strict incomplete-terminal-evidence reader that distinguishes no request,
     request/pre without launch, partial/corrupt receipt, launch-receipt-only,
-    exit-receipt-without-result, and completed/failed-pending-without-result states;
+    exit-receipt-without-result, and completed/failed-pending-without-result states,
+    parameterized by explicit ordinary-process-crash versus operator-declared
+    power/storage-loss recovery context;
 11. `pendingOperations` to unreturned/completed state as the durable exactly-once
     application transition for every terminal result, including `none`;
-12. use-site artifact-reference validators that allow a launch receipt only in its
-    receipt position and do not widen stdout/stderr stream references to arbitrary
-    `terminal-*` kinds;
+12. use-site artifact-reference validators that bind the launch receipt only in the
+    full result/evidence chain and preserve explicit stdout/stderr stream-kind
+    membership rather than accepting arbitrary `terminal-*` kinds;
 13. byte/count-bounded result and session path summaries with exact totals,
     truncation, and complete-facts digests; and
 14. prelaunch session-headroom reservation plus non-throwing serialized-next-state
@@ -638,12 +710,16 @@ Required contract decisions:
     `plannedDisclosureBytes` keys. It adds no journal metadata discriminator. Both
     the live prelaunch return and recovery `markFailed` write this shape, and the
     recovery reader recognizes it only for a terminal operation together with
-    validated absence of launch, exit, and result evidence.
+    validated absence of launch, exit, and result evidence; and
+16. an all-or-none post-observation control anchor on full `observed` terminal
+    mutation records, retained in counts-only fallback and used independently from
+    later validation fingerprints.
 
 Expected contract files:
 
 - `src/repository/workspace-observer.ts`;
 - additive types in `src/repository/git.ts`;
+- additive full-result/path-summary types in `src/protocol/terminal-exec.ts`;
 - `src/session/terminal-artifacts.ts`;
 - `src/session/artifact-store.ts`;
 - a shared session directory-sync helper factored from `session/store.ts`;
@@ -651,6 +727,9 @@ Expected contract files:
 - `src/session/store.ts`;
 - `src/session/budgets.ts`;
 - `src/repository/snapshot-diff.ts`;
+- `src/policy/engine.ts` for an explicit mode-layer `terminal_exec` denial in
+  `inspect`;
+- `src/cli/arguments.ts` for the explicit recovery-context input;
 - `src/cli/commands.ts` for creation-time authority seeding; and
 - compile-only completion/runtime wiring.
 
@@ -710,6 +789,8 @@ primary pushes and merges.
 - conservative rename, ambiguous rename degradation, and case-only rename;
 - empty file, executable-bit-only, LF/CRLF-only, and binary effects;
 - commit, branch creation/switch, detached HEAD, and index-only effects;
+- clean checkout/reset/commit transitions retain a bounded direct transition-path
+  inventory or exact omitted/unavailable counts;
 - ignored summary without an exhaustive claim;
 - hidden/protected path, hook/config/control drift, and nested repository;
 - unreadable or over-bound post-state;
@@ -722,7 +803,11 @@ primary pushes and merges.
 - pre-observation deadline expiry refuses/refunds, post-observation expiry becomes
   non-clean `unknown`, and a fixture with at least 10,000 untracked plus 10,000
   individually matched ignored paths completes within 40 seconds and still launches
-  a second command;
+  a second command; use pinned short path names and assert the fixture remains below
+  the frozen porcelain byte ceiling;
+- visible status beyond the entry/content fingerprint bound still launches but
+  records metadata-limited non-clean evidence with no substitute repository
+  fingerprint;
 - HEAD/ref/index transitions classify as observed while hook/config/info/protected
   changes classify as non-clean;
 - over-bound effect paths preserve exact totals/digest and explicit truncation under
@@ -734,6 +819,8 @@ primary pushes and merges.
 ### Executor and artifacts
 
 - full observation and result reference binding;
+- the exact legacy/full result union accepts Slice 1 bytes, requires a bound launch
+  receipt for a full result, and rejects a launch receipt as stdout/stderr;
 - legacy placeholder branch remains byte-compatible;
 - post-observation after success, nonzero, timeout, cancellation, and OS spawn
   failure;
@@ -766,6 +853,8 @@ Inject crashes:
 - with a completed journal record and a still-pending session operation at startup;
 - with a completed/failed pending no-result record whose exact source-free metadata
   does and does not prove `spawn_failed`/no launch;
+- with identical absent-receipt evidence under ordinary process-crash and
+  operator-declared power/storage-loss contexts, proving only the former refunds;
 - after effect application;
 - after budget persistence;
 - after pending-ID clearing; and
@@ -804,6 +893,8 @@ and zero partial accounting.
   persists its counts/digest-only record instead of entering a restart loop;
 - insufficient minimal session-state headroom refuses before launch and refunds;
 - mismatched duplicate facts require recovery;
+- replay applies a post-observation control anchor once, retains it in counts-only
+  fallback, and rejects an artifact/record anchor mismatch;
 - files-only, lines-only, and combined overruns persist actual usage before pausing;
 - approved, denied, and unavailable budget raises;
 - live prelaunch refusal and process-crash-model prelaunch recovery restore
@@ -826,7 +917,9 @@ and zero partial accounting.
 - observed authority is read only from the persisted field;
 - default Slice 2 session creation seeds frozen while a hand-built terminal-capable
   grant plus allowing organization/repository fixtures seed observed;
-- old `auto`, config v1, old grants, and absent-field sessions stay frozen;
+- inspect mode denies `terminal_exec` even with allowing layered policy;
+- old `auto`, config v1, old grants, absent-field sessions, and sessions whose grant
+  expands after creation stay frozen;
 - frozen branch/HEAD drift still rejects;
 - non-clean terminal records reject under frozen and observed authority and never
   fall back to the session-start fingerprint;
@@ -834,6 +927,12 @@ and zero partial accounting.
   explicit test/manual grant covering the same path can complete;
 - an attributed branch/HEAD/index transition completes only after fresh named
   validation;
+- terminal-then-patch-then-fresh-validation completes when live branch, HEAD, and
+  excluded-state facts match the latest observed terminal control anchor;
+- manual branch-only, HEAD-only, or excluded-state-only drift before a later passing
+  validation still rejects and cannot be laundered by that validation;
+- repeated observed terminals use the latest clean control anchor; missing, partial,
+  malformed, legacy-unanchored-under-observed, or mismatched anchors fail closed;
 - unknown/protected effects reject even after passing validation;
 - post-result drift rejects;
 - a no-op terminal command still permits informational completion;
@@ -889,8 +988,8 @@ accounting is a merge blocker.
 
 Slice 2 is mergeable only on one immutable exact head where:
 
-1. every launched operation has a full pre-observation and full or explicit
-   non-clean post-observation;
+1. every launched operation has a complete or explicit metadata-limited
+   pre-observation and a complete or explicit non-clean post-observation;
 2. failed, timed-out, and cancelled commands preserve both process and effect truth;
 3. all required project and Git effect classes have operation-scoped tests;
 4. session-start user work remains separately identified and recoverable;
@@ -900,10 +999,13 @@ Slice 2 is mergeable only on one immutable exact head where:
    output/refund/effect accounting, including for verified no-op;
 8. unknown/protected effects reject under every completion authority and cannot be
    masked by validation or a session-start fingerprint fallback;
-9. validation freshness matches the latest sequence and exact fingerprint;
+9. validation freshness matches the latest sequence and exact ordinary repository
+   fingerprint but never replaces the latest terminal-attributed branch, HEAD, or
+   excluded-state control anchor;
 10. observed sessions can complete after attributed Git transitions while old and
     frozen sessions retain their current restrictions;
-11. external drift after the last recorded effect or validation rejects completion;
+11. external drift after the last recorded effect rejects completion, including
+    control-state drift discovered before a later validation;
 12. session diff contains terminal baselines or per-path unavailable evidence
     without discarding healthy paths, including exact omitted counts above diff
     bounds;
