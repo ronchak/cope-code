@@ -102,16 +102,20 @@ The receipt is trusted for an absence-based retry decision only when the host/st
 can prove the directory entry durable. On hosts where
 `HostPlatform.supportsDirectoryFsync` is true, pre-create the first-write receipt-kind
 directory and sync the artifact root, then write/fsync/rename the receipt and sync
-the kind directory before spawn. Both directory syncs must succeed. If the host
+the kind directory after both content and manifest renames before spawn. Both
+directory syncs must succeed; any sync failure refuses launch. If the host
 cannot provide that guarantee, receipt absence remains indeterminate; this is the
 conservative Windows fallback. Existing file-flush plus atomic-replace semantics
 still receive ordinary process-crash coverage on every supported host, but they do
 not justify refund or retry from absence alone. Do not claim sudden-power-loss
 durability where Node cannot provide it.
 
-A live prelaunch observation refusal follows the ordinary journal `markFailed` path
-and returns the existing non-persisted typed failure outcome. It does not manufacture
-a `terminal-result` artifact, because that schema requires a bound exit receipt.
+A live prelaunch observation refusal returns the existing typed `status: "failure"`
+/ `outcome: "spawn_failed"` outcome. The runtime completes that journal record,
+applies the normal verified-no-launch `commands` refund, and returns the failure; it
+does not manufacture a `terminal-result` artifact, because that schema requires a
+bound exit receipt. `OperationJournal.markFailed` is used only by recovery when
+durable receipt absence proves an interrupted executing operation never launched.
 
 ### 3. Preserve the repository fingerprint definition
 
@@ -231,7 +235,9 @@ Each observation is race-checked:
 
 1. capture status, branch, HEAD, index identity, and component fingerprints;
 2. retain the required bounded before-images;
-3. recapture the cheap boundary facts;
+3. recapture the full authoritative boundary set: branch, HEAD, index identity,
+   visible status fingerprint, protected/policy-hidden fingerprint, and Git-control
+   components;
 4. accept only if both boundary samples match;
 5. retry the complete observation once for ordinary concurrent churn; and
 6. reject prelaunch or return an explicit non-clean post-state after the retry.
@@ -283,14 +289,43 @@ Changed lines use deterministic before/post content while the post-state is curr
 Binary paths are counted separately and excluded from line counts. Do not read a
 later worktree to recompute a persisted terminal result.
 
-An identical complete pre/post fingerprint yields `none`.
-Protected/hidden/Git-control/nested-repository drift yields
+An identical complete pre/post fingerprint yields `none`. HEAD, normal refs,
+`packed-refs`, and index deltas are normal attributable Git transitions and yield
+`observed` when the rest of the observation is trustworthy. Hooks, `config`,
+`config.worktree`, `info/attributes`, `info/exclude`, policy-hidden entries,
+protected patterns, or nested-repository ambiguity yield
 `protected_or_hidden_changed`. Post-observation failure or insufficient evidence
 yields `unknown`.
 
 An OS spawn failure is still post-observed. If pre and post are identical, its
 mutation is `none`; if they differ, use `unknown`, because a process that never
 launched cannot truthfully be credited with concurrent changes.
+
+### Bounded effect facts
+
+Path attribution is bounded independently from before-image storage:
+
+- the terminal result retains at most 2,048 path endpoints and 256 KiB of UTF-8 path
+  facts across all created/updated/deleted/renamed/pre-existing-touched lists;
+- the terminal mutation record retains at most 256 endpoints and 64 KiB of UTF-8
+  path facts;
+- deterministic path ordering, exact per-class total counts, a
+  `pathFactsTruncated` flag, and a digest of the complete sorted facts make
+  truncation explicit;
+- result construction size-checks the complete serialized result against the real
+  8 MiB artifact cap and reduces model-visible excerpts before dropping the bounded
+  effect summary;
+- effect application size-checks the complete serialized next session state against
+  the real 4 MiB session cap and falls back to the counts/digest-only terminal
+  record before persistence; and
+- before launch, runtime reserves 128 KiB of session-state headroom for the minimal
+  counts/digest-only terminal record and reconciliation facts. If that reserve is
+  unavailable, refuse before launch and refund `commands`.
+
+Full path detail needed by session diff remains in the integrity-bound result and
+observation artifacts within their own bounds. If those artifacts themselves
+truncate required detail, the affected terminal baseline is per-path unavailable;
+the session record never claims its retained sample is exhaustive.
 
 ### Terminal executor ordering
 
@@ -350,11 +385,16 @@ Implementation ordering is mandatory:
 
 1. load and verify all artifacts and compute the complete effect without mutating
    session state;
-2. construct the complete next session state from a clone;
+2. deep-snapshot every in-place field the transaction will mutate, including budget
+   usage, mutations, sequence, pending effect IDs, pending operations, and
+   unreturned IDs;
 3. apply mutation, sequence, budgets, marker cleanup, pending removal, and
-   unreturned insertion to that clone;
-4. persist the complete clone atomically;
-5. publish it as the runtime state only after persistence succeeds; and
+   unreturned insertion in place so the existing `BudgetMeter` and composition
+   closures retain the same state object;
+4. serialize and size-check the complete next state, degrading bounded path detail
+   to counts/digest-only form when needed;
+5. persist the in-place state exactly once, restoring the snapshot on any failure;
+   and
 6. emit idempotent/deduplicated audit facts after durable state.
 
 Terminal effect application therefore runs before the live path's existing
@@ -394,9 +434,10 @@ Recovery and replay never charge any counter twice.
 
 ### Terminal mutation and compatibility
 
-Use the existing terminal mutation shape. Add only source-free facts that completion
-or handoff cannot otherwise obtain cheaply, at most an optional `processOutcome`.
-Do not duplicate full result facts in session state.
+Use the existing terminal mutation shape. Add only the source-free facts needed for
+completion, handoff, and honest bounded storage: optional `processOutcome`, exact
+per-class path totals, `pathFactsTruncated`, and the complete-facts digest. Do not
+duplicate full result facts in session state.
 
 Update strict validators additively:
 
@@ -479,6 +520,13 @@ session-start branch, HEAD, and excluded-state checks.
 `terminal_exec` never creates a `ValidationRecord` and never satisfies a required
 command ID.
 
+Observed authority does not relax the existing `outOfScopePaths` completion gate.
+Terminal-attributed visible paths must still fall within the effective grant's write
+scope for completion. Slice 2 fixtures use an explicit test/manual grant covering
+their effect paths; Slice 3 must create a Developer grant whose intended project
+write scope supports the advertised workflows without weakening protected/hidden
+boundaries.
+
 No separate branch/HEAD/index fields are needed in `TerminalMutationRecord` for
 completion. The unchanged `GitInspector.status().snapshotSha256` already binds
 branch, HEAD, and every visible index/worktree entry. Component fingerprints support
@@ -506,12 +554,16 @@ Required contract decisions:
 9. `completionAuthority` added to the exact top-level session-key validator while
    remaining optional for legacy sessions;
 10. a strict incomplete-terminal-evidence reader that distinguishes absent,
-    partial/corrupt, launch-receipt-only, and exit-receipt-without-result states; and
+    partial/corrupt, launch-receipt-only, and exit-receipt-without-result states;
 11. `pendingOperations` to unreturned/completed state as the durable exactly-once
-    application transition for every terminal result, including `none`; and
+    application transition for every terminal result, including `none`;
 12. use-site artifact-reference validators that allow a launch receipt only in its
     receipt position and do not widen stdout/stderr stream references to arbitrary
-    `terminal-*` kinds.
+    `terminal-*` kinds;
+13. byte/count-bounded result and session path summaries with exact totals,
+    truncation, and complete-facts digests; and
+14. prelaunch session-headroom reservation plus non-throwing serialized-next-state
+    size preflight and counts-only fallback.
 
 Expected contract files:
 
@@ -582,6 +634,10 @@ primary pushes and merges.
 - unreadable or over-bound post-state;
 - required pre-image overrun refuses launch;
 - one concurrent-churn retry, then explicit unknown;
+- HEAD/ref/index transitions classify as observed while hook/config/info/protected
+  changes classify as non-clean;
+- over-bound effect paths preserve exact totals/digest and explicit truncation under
+  both result and session caps;
 - spaces, Unicode, leading dash, and host-specific path spelling; and
 - observer fingerprint equals an independent
   `GitInspector.status().snapshotSha256`.
@@ -595,6 +651,8 @@ primary pushes and merges.
 - post-observation starts after tree termination and ignores the caller's aborted
   signal;
 - prelaunch refusal launches nothing and refunds;
+- first-write receipt durability syncs the artifact root and the receipt-kind
+  directory after both content and manifest renames before spawn;
 - post-observation failure persists process truth with mutation `unknown`;
 - output scanning denial preserves mutation truth;
 - artifact/result persistence failure stays indeterminate; and
@@ -642,9 +700,16 @@ and zero partial accounting.
   records that still have a session-pending operation;
 - effect preparation/validation failure after journal completion retains pending
   state and cannot persist unreturned/partial accounting;
+- effect-transaction persist failure restores the same state object, meter usage,
+  pending key, and composition-closure view;
+- a large effect that fits the result artifact but not a full session record
+  persists its counts/digest-only record instead of entering a restart loop;
+- insufficient minimal session-state headroom refuses before launch and refunds;
 - mismatched duplicate facts require recovery;
 - files-only, lines-only, and combined overruns persist actual usage before pausing;
 - approved, denied, and unavailable budget raises;
+- live prelaunch refusal and durably proven prelaunch recovery restore `commands`
+  usage to its pre-request value exactly once;
 - command and output counters remain exactly once; and
 - old validation becomes stale after a terminal mutation.
 
@@ -662,6 +727,8 @@ and zero partial accounting.
 - frozen branch/HEAD drift still rejects;
 - non-clean terminal records reject under frozen and observed authority and never
   fall back to the session-start fingerprint;
+- a terminal effect outside effective writable paths remains rejected, while an
+  explicit test/manual grant covering the same path can complete;
 - an attributed branch/HEAD/index transition completes only after fresh named
   validation;
 - unknown/protected effects reject even after passing validation;
@@ -739,11 +806,14 @@ Slice 2 is mergeable only on one immutable exact head where:
     without discarding healthy paths;
 13. handoff separates user work, terminal effects, process outcomes, validation, and
     limitations;
-14. Windows and macOS hosted behavior is green without unexpected skips; and
+14. Windows and macOS hosted behavior is green without unexpected skips;
 15. existing terminal replay, process cleanup, browser/protocol, typed-patch,
-    catalog command, old session/config, and offline fixture tests remain green; and
+    catalog command, old session/config, and offline fixture tests remain green;
 16. receipt-absence refund is proven only on directory-fsync-capable hosts; Windows
-    uses a stable indeterminate pause with zero duplicate execution.
+    uses a stable indeterminate pause with zero duplicate execution;
+17. bounded path facts retain exact totals/digest and cannot strand session
+    persistence above the 4 MiB cap; and
+18. observed authority preserves the effective write-scope completion gate.
 
 Run on the exact final SHA:
 
