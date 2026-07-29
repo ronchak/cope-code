@@ -262,6 +262,10 @@ class ObservationRaceError extends Error {}
 export interface LiveWorkspaceObserverOptions {
   readonly compareTimeoutMs?: number;
   readonly nestedScanMaxEntries?: number;
+  /** Deterministic test seam for bounded worktree content-read accounting. */
+  readonly testObserveWorktreeContentRead?: (
+    repositoryRelativePath: string,
+  ) => void;
 }
 
 /**
@@ -273,6 +277,9 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
   private readonly sampleCache = new Map<string, ReadonlyMap<string, WorktreeSample>>();
   private readonly compareTimeoutMs: number;
   private readonly nestedScanMaxEntries: number;
+  private readonly testObserveWorktreeContentRead:
+    | ((repositoryRelativePath: string) => void)
+    | undefined;
 
   public constructor(
     private readonly boundary: RepositoryBoundary,
@@ -283,6 +290,8 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
       options.compareTimeoutMs ?? WORKSPACE_COMPARE_TIMEOUT_MS;
     this.nestedScanMaxEntries =
       options.nestedScanMaxEntries ?? WORKSPACE_NESTED_SCAN_MAX_ENTRIES;
+    this.testObserveWorktreeContentRead =
+      options.testObserveWorktreeContentRead;
     if (
       !Number.isSafeInteger(this.nestedScanMaxEntries) ||
       this.nestedScanMaxEntries < 1
@@ -969,9 +978,35 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
         }
         continue;
       }
+      const cachedSample = boundary.samples.get(
+        this.boundary.pathKey(candidate),
+      );
+      const cachedSampleNeedsFingerprint =
+        cachedSample?.exists === true &&
+        (
+          cachedSample.mode === undefined ||
+          cachedSample.size === undefined ||
+          cachedSample.sha256 === undefined ||
+          cachedSample.binary === undefined
+        );
+      const cachedSampleCanRetainMissingBytes =
+        cachedSample?.exists === true &&
+        cachedSample.bytes === undefined &&
+        cachedSample.size !== undefined &&
+        cachedSample.size <= WORKSPACE_OBSERVATION_MAX_IMAGE_BYTES &&
+        retainedBytes + cachedSample.size <=
+          WORKSPACE_OBSERVATION_MAX_RETAINED_BYTES;
       const sample =
-        boundary.samples.get(this.boundary.pathKey(candidate)) ??
-        await this.readWorktree(candidate, true, signal);
+        cachedSample === undefined ||
+        (
+          isBaseline &&
+          (
+            cachedSampleNeedsFingerprint ||
+            cachedSampleCanRetainMissingBytes
+          )
+        )
+          ? await this.readWorktree(candidate, true, signal)
+          : cachedSample;
       if (!sample.exists) {
         if (isBaseline && !(await baseline.hasReconstructibleBaseline(candidate))) {
           throw unreconstructible(candidate);
@@ -1268,6 +1303,7 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
       fileId: before.ino.toString(),
     };
     if (!includeContent) return identity;
+    this.testObserveWorktreeContentRead?.(repositoryRelativePath);
     const handle = await open(
       resolved.absolutePath,
       fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
@@ -2055,7 +2091,8 @@ function parseObservationStatus(bytes: Buffer): {
         ...(fields[7] === undefined ? {} : { indexObject: fields[7] }),
       });
     } else if (record.startsWith("2 ")) {
-      const originalPath = records[index + 1] ?? "";
+      const originalPath = records[index + 1];
+      if (originalPath === undefined || originalPath === "") continue;
       index += 1;
       entries.push({
         path: fields.slice(9).join(" "),

@@ -14,6 +14,7 @@ import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
+import { TERMINAL_EXEC_CONTRACT } from "../../src/protocol/terminal-exec.js";
 import {
   LiveWorkspaceObserver,
   WORKSPACE_OBSERVATION_CONTRACT,
@@ -33,6 +34,8 @@ import {
   type GitObservationEntry,
   type GitStatusResult,
 } from "../../src/repository/git.js";
+import { SessionArtifactStore } from "../../src/session/artifact-store.js";
+import { TerminalArtifactPersistence } from "../../src/session/terminal-artifacts.js";
 import { sha256, stableJson } from "../../src/shared/crypto.js";
 import { createFilesystemIdentity } from "../../src/shared/filesystem-identity.js";
 
@@ -444,6 +447,195 @@ test("nested scan-cap exhaustion is metadata-limited for launch and unknown for 
   );
   assert.equal(effect.outcome, "unknown");
   assert.equal(effect.repositoryFingerprint, undefined);
+});
+
+test("metadata-limited pre-observation refreshes small baseline bytes and still refuses a large unavailable baseline", async (context) => {
+  const fixture = await createRepositoryFixture(context);
+  const boundary = await RepositoryBoundary.create(fixture.root);
+  const contentReads = new Map<string, number>();
+  const observer = new LiveWorkspaceObserver(boundary, fixture.git, {
+    nestedScanMaxEntries: 1,
+    testObserveWorktreeContentRead: (repositoryRelativePath) => {
+      contentReads.set(
+        repositoryRelativePath,
+        (contentReads.get(repositoryRelativePath) ?? 0) + 1,
+      );
+    },
+  });
+  await writeFile(
+    path.join(fixture.root, "README.md"),
+    "dirty session-start work\n",
+  );
+  await writeFile(
+    path.join(fixture.root, "user-note.txt"),
+    "untracked session-start work\n",
+  );
+  const unavailable: SessionPreExistingBaseline = {
+    paths: ["README.md", "user-note.txt"],
+    hasReconstructibleBaseline: async () => false,
+  };
+
+  const pre = await observer.capturePre(unavailable);
+  assert.equal(pre.state, "metadata_limited");
+  assert.equal(pre.nestedRepository, "unknown");
+  assert.equal(
+    pre.limitationCodes.includes(
+      "NESTED_REPOSITORY_SCAN_BOUND_EXCEEDED",
+    ),
+    true,
+  );
+  assert.equal(isWorkspaceObservation(pre), true);
+  const retained = new Map(
+    pre.beforeImages
+      .filter((image) => image.kind === "retained")
+      .map((image) => [image.identity.path, image]),
+  );
+  assert.equal(
+    Buffer.from(retained.get("README.md")?.contentBase64 ?? "", "base64")
+      .toString("utf8"),
+    "dirty session-start work\n",
+  );
+  assert.equal(
+    Buffer.from(retained.get("user-note.txt")?.contentBase64 ?? "", "base64")
+      .toString("utf8"),
+    "untracked session-start work\n",
+  );
+  assert.equal(contentReads.get("README.md"), 1);
+  assert.equal(contentReads.get("user-note.txt"), 1);
+
+  const artifactDirectory = await mkdtemp(
+    path.join(os.tmpdir(), "cope-observer-launchable-"),
+  );
+  context.after(async () =>
+    rm(artifactDirectory, { recursive: true, force: true }));
+  const persistence = new TerminalArtifactPersistence(
+    new SessionArtifactStore(path.join(artifactDirectory, "artifacts")),
+  );
+  const operationId = "op_observer_launchable";
+  const request = await persistence.persistRequest({
+    operation_id: operationId,
+    request_hash: HASH,
+    invocation: {
+      contract: TERMINAL_EXEC_CONTRACT,
+      mode: "shell",
+      command: "true",
+      cwd: ".",
+    },
+    execution: {
+      cwd: fixture.root,
+      executable: "/bin/sh",
+      arguments: ["-c", "true"],
+      timeout_ms: 30_000,
+      max_output_bytes: 4_096,
+      inherited_environment_keys: ["PATH"],
+      removed_environment_keys: [],
+      environment_keys_hash: HASH,
+    },
+  });
+  const persistedPre = await persistence.persistWorkspaceObservation({
+    operationId,
+    requestHash: HASH,
+    observation: pre,
+  });
+  const launch = await persistence.persistLaunchReceipt({
+    operationId,
+    requestHash: HASH,
+    request,
+    preObservation: persistedPre,
+    recordedAt: "2026-07-29T00:00:00.500Z",
+  });
+  assert.equal(launch.kind, "terminal-launch-receipt");
+
+  await writeFile(
+    path.join(fixture.root, "large-unavailable.bin"),
+    Buffer.alloc(1024 * 1024 + 1, 1),
+  );
+  await assert.rejects(
+    observer.capturePre({
+      paths: ["large-unavailable.bin"],
+      hasReconstructibleBaseline: async () => false,
+    }),
+    /reconstructible prelaunch baseline/iu,
+  );
+});
+
+test("baseline content reads skip an unretainable large sample and refresh an aggregate-stripped small sample", async (context) => {
+  const fixture = await createRepositoryFixture(context);
+  const boundary = await RepositoryBoundary.create(fixture.root);
+  await writeFile(
+    path.join(fixture.root, "large-baseline.bin"),
+    Buffer.alloc(2 * 1024 * 1024, 1),
+  );
+  const largeReads = new Map<string, number>();
+  const largeObserver = new LiveWorkspaceObserver(boundary, fixture.git, {
+    testObserveWorktreeContentRead: (repositoryRelativePath) => {
+      largeReads.set(
+        repositoryRelativePath,
+        (largeReads.get(repositoryRelativePath) ?? 0) + 1,
+      );
+    },
+  });
+  const largePre = await largeObserver.capturePre({
+    paths: ["large-baseline.bin"],
+    hasReconstructibleBaseline: async () => true,
+  });
+  assert.equal(largePre.state, "complete");
+  assert.equal(largeReads.get("large-baseline.bin"), 2);
+  assert.equal(
+    largePre.beforeImages.some(
+      (image) =>
+        image.kind === "identity_only" &&
+        image.identity.path === "large-baseline.bin",
+    ),
+    true,
+  );
+
+  await rm(path.join(fixture.root, "large-baseline.bin"));
+  for (let index = 0; index < 3; index += 1) {
+    await writeFile(
+      path.join(fixture.root, `z-blocker-${String(index)}.bin`),
+      Buffer.alloc(1024 * 1024, index + 1),
+    );
+  }
+  await writeFile(
+    path.join(fixture.root, "a-small-baseline.txt"),
+    "aggregate-stripped baseline\n",
+  );
+  const reorderedInspector = new TargetLastPorcelainInspector(
+    boundary,
+    "a-small-baseline.txt",
+  );
+  const aggregateReads = new Map<string, number>();
+  const aggregateObserver = new LiveWorkspaceObserver(
+    boundary,
+    reorderedInspector,
+    {
+      testObserveWorktreeContentRead: (repositoryRelativePath) => {
+        aggregateReads.set(
+          repositoryRelativePath,
+          (aggregateReads.get(repositoryRelativePath) ?? 0) + 1,
+        );
+      },
+    },
+  );
+  const aggregatePre = await aggregateObserver.capturePre({
+    paths: ["a-small-baseline.txt"],
+    hasReconstructibleBaseline: async () => false,
+  });
+  assert.equal(aggregatePre.state, "complete");
+  assert.equal(aggregateReads.get("a-small-baseline.txt"), 3);
+  const smallImage = aggregatePre.beforeImages.find(
+    (image) =>
+      image.kind === "retained" &&
+      image.identity.path === "a-small-baseline.txt",
+  );
+  assert.equal(smallImage?.kind, "retained");
+  assert.equal(
+    smallImage?.kind === "retained"
+      ? Buffer.from(smallImage.contentBase64, "base64").toString("utf8")
+      : undefined,
+    "aggregate-stripped baseline\n",
+  );
 });
 
 test("an enumerated nested marker wins at the scan boundary while an unvisited marker remains bounded", async (context) => {
@@ -1020,6 +1212,49 @@ test("live observer degrades oversized porcelain input to metadata-limited evide
   );
 });
 
+test("truncated porcelain drops a dangling rename while retaining valid persistent evidence", async (context) => {
+  const fixture = await createRepositoryFixture(context);
+  await git(fixture.root, ["mv", "README.md", "renamed.md"]);
+  await writeFile(path.join(fixture.root, "kept.txt"), "kept\n");
+  const boundary = await RepositoryBoundary.create(fixture.root);
+  const artifactDirectory = await mkdtemp(
+    path.join(os.tmpdir(), "cope-observer-dangling-rename-"),
+  );
+  context.after(async () =>
+    rm(artifactDirectory, { recursive: true, force: true }));
+  const persistence = new TerminalArtifactPersistence(
+    new SessionArtifactStore(path.join(artifactDirectory, "artifacts")),
+  );
+
+  for (const [index, partialOrigin] of [false, true].entries()) {
+    const inspector = new DanglingRenamePorcelainInspector(
+      boundary,
+      partialOrigin,
+    );
+    const observer = new LiveWorkspaceObserver(boundary, inspector);
+    const pre = await observer.capturePre(emptyBaseline());
+    assert.equal(pre.state, "metadata_limited");
+    assert.equal(
+      pre.limitationCodes.includes("PORCELAIN_STATUS_BOUND_EXCEEDED"),
+      true,
+    );
+    assert.deepEqual(
+      pre.entries.map((entry) => ({
+        path: entry.path,
+        originalPath: entry.originalPath,
+      })),
+      [{ path: "kept.txt", originalPath: undefined }],
+    );
+    assert.equal(isWorkspaceObservation(pre), true);
+    const persisted = await persistence.persistWorkspaceObservation({
+      operationId: `op_dangling_rename_${String(index)}`,
+      requestHash: HASH,
+      observation: pre,
+    });
+    assert.equal(persisted.kind, "terminal-pre-observation");
+  }
+});
+
 test("live observer streams and truncates a large clean HEAD transition with exact totals and digest", async (context) => {
   const fixture = await createRepositoryFixture(context);
   const pre = await fixture.observer.capturePre(emptyBaseline());
@@ -1240,6 +1475,88 @@ class OversizedPorcelainInspector extends GitInspector {
       truncated: true,
       branch: "main",
       head: null,
+    };
+  }
+}
+
+class DanglingRenamePorcelainInspector extends GitInspector {
+  public constructor(
+    boundary: RepositoryBoundary,
+    private readonly partialOrigin: boolean,
+  ) {
+    super(boundary);
+  }
+
+  public override async readIsolated(
+    fixedArguments: readonly string[],
+    maxBytes: number,
+    signal?: AbortSignal,
+    allowTruncation = false,
+  ): Promise<IsolatedGitReadResult> {
+    const actual = await super.readIsolated(
+      fixedArguments,
+      maxBytes,
+      signal,
+      allowTruncation,
+    );
+    if (fixedArguments[0] !== "status") return actual;
+    const renameHeader = actual.bytes
+      .toString("utf8")
+      .split("\0")
+      .find((record) => record.startsWith("2 "));
+    if (renameHeader === undefined) {
+      throw new Error("expected porcelain-v2 rename header");
+    }
+    return {
+      ...actual,
+      bytes: Buffer.concat([
+        Buffer.from(`? kept.txt\0${renameHeader}\0`, "utf8"),
+        ...(this.partialOrigin ? [Buffer.from("partial-origin", "utf8")] : []),
+      ]),
+      truncated: true,
+    };
+  }
+}
+
+class TargetLastPorcelainInspector extends GitInspector {
+  public constructor(
+    boundary: RepositoryBoundary,
+    private readonly target: string,
+  ) {
+    super(boundary);
+  }
+
+  public override async readIsolated(
+    fixedArguments: readonly string[],
+    maxBytes: number,
+    signal?: AbortSignal,
+    allowTruncation = false,
+  ): Promise<IsolatedGitReadResult> {
+    const actual = await super.readIsolated(
+      fixedArguments,
+      maxBytes,
+      signal,
+      allowTruncation,
+    );
+    if (fixedArguments[0] !== "status") return actual;
+    const records = actual.bytes
+      .toString("utf8")
+      .split("\0")
+      .filter((record) => record !== "");
+    const targetRecord = records.find(
+      (record) => record === `? ${this.target}`,
+    );
+    if (targetRecord === undefined) {
+      throw new Error("expected target porcelain-v2 record");
+    }
+    return {
+      ...actual,
+      bytes: Buffer.from(
+        `${records
+          .filter((record) => record !== targetRecord)
+          .join("\0")}\0${targetRecord}\0`,
+        "utf8",
+      ),
     };
   }
 }
