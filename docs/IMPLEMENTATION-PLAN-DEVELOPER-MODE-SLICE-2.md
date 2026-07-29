@@ -110,6 +110,9 @@ pre-create the first-write receipt-kind directory and sync the artifact root, th
 write/fsync/rename the receipt and sync the kind directory after both content and
 manifest renames before spawn. Any sync failure refuses launch. Factor and reuse the
 existing session directory-sync helper rather than duplicate platform logic.
+This artifact receipt deliberately supersedes the parent MVP plan's advice against a
+second pre-execution transaction: it is not a second journal transaction, and it is
+required to distinguish the materially enlarged prelaunch window without replay.
 
 Power loss, storage rollback, network/filesystem cache loss, and macOS drive-cache
 loss can erase a receipt after launch even when Node `fsync` and directory sync
@@ -131,10 +134,23 @@ an interrupted executing operation never launched.
 `GitInspector.status().snapshotSha256`. The workspace observer must obtain this value
 through the existing inspector rather than define a parallel digest.
 
+The inspector's bounded observation path must not compute worktree content
+fingerprints for `kind: "ignored"` entries: those values are already discarded from
+every existing fingerprint and summary, so skipping them is byte-compatible. For
+visible entries, the existing content-backed fingerprint remains byte-compatible
+while the entry/content bounds below hold. Above either bound, the same inspector
+degrades excess entries to an explicitly marked identity-limited fingerprint rather
+than refusing a valid command. Identity-limited entries can prove only that an
+untouched path stayed unchanged; a touched identity-limited path makes attribution
+non-clean.
+
 Expose component fingerprints additively for index, policy-hidden state, protected
 worktree state, normal Git transitions, and non-transition Git control state.
 Existing `snapshotSha256`, `excludedStateSha256`, validation records, session-start
-facts, and completion comparisons remain byte-compatible.
+facts, and completion comparisons remain byte-compatible for observations within
+the frozen bounds. Legacy sessions whose saved fingerprint cannot be reproduced
+under identity-limited evidence remain conservative rather than being silently
+reinterpreted.
 
 ### 4. Record only meaningful or non-clean terminal mutations
 
@@ -184,15 +200,19 @@ Initial bounds:
 - at most 1 MiB per retained image;
 - at most 3 MiB raw retained source bytes;
 - at most 2 MiB index-identity input;
-- at most 1 MiB porcelain-status input; and
+- at most 1 MiB porcelain-status input;
+- at most 25,000 non-ignored status entries and 256 MiB aggregate visible-entry
+  content-fingerprint input before excess entries degrade to identity-only evidence;
+  and
 - at most 6 MiB serialized observation artifact bytes after base64 expansion.
 
 Identity-only evidence is sufficient to prove that an untouched path stayed
 unchanged. If such a path changes during the operation, its session-diff baseline
 and changed-line count become explicitly unavailable; retain exact path/change
 counts, account known facts, and make the mutation non-clean rather than inventing
-bytes or lines. Refuse before launch only when identity-only evidence itself cannot
-be captured or the complete serialized observation still exceeds its bound.
+bytes or lines. Crossing the status entry/content bounds is a degradation, not a
+prelaunch refusal. Refuse before launch only when identity-only evidence itself
+cannot be captured or the complete serialized observation still exceeds its bound.
 Post-launch overflow likewise produces an explicit non-clean observation while
 preserving process truth.
 
@@ -425,8 +445,10 @@ Implementation ordering is mandatory:
 Terminal effect application therefore runs before the live path's existing
 `clearPending` and `markOperationAwaitingReturn` calls; those calls move inside this
 transaction. If artifact preparation or validation throws after journal completion,
-the `operationWasCommitted` catch path must retain the pending entry, must not mark
-the result unreturned, and must not persist any partial accounting. If session
+the `operationWasCommitted` catch path applies this retain-pending/no-unreturned
+behavior only to `terminal_exec`. Every other tool retains the current
+`clearPending` plus `markOperationAwaitingReturn` behavior so patch or catalog
+operations cannot be stranded by terminal-only recovery rules. If session
 persistence fails, restore the prior in-memory state and stop; the durable old state
 still contains the pending operation for startup recovery.
 
@@ -450,6 +472,10 @@ no-effect transaction: refund once, consume the pending key, and mark the failur
 unreturned. A complete launch receipt always takes precedence and pauses. Any other
 no-result completed/failed shape pauses indeterminate or requires recovery; it never
 infers no effect.
+
+Startup snapshots the `pendingOperations` list before reconciliation. Removing an
+entry during an effect transaction must not depend on iterator behavior over an
+array that the transaction replaces in place.
 
 ### Post-hoc budgets
 
@@ -548,8 +574,8 @@ session-start branch, HEAD, and excluded-state checks.
 
 1. rejects unresolved journal operations;
 2. rejects legacy pending terminal effect IDs;
-3. skips the session-start branch, HEAD, and excluded-state freeze only after a
-   `kind: "terminal"` record whose `observationOutcome` is `observed`;
+3. skips the session-start branch, HEAD, and excluded-state freeze only after any
+   recorded `kind: "terminal"` mutation whose `observationOutcome` is `observed`;
 4. selects the existing repository fingerprint from the latest trustworthy effect
    or validation;
 5. allows a later catalog validation to become authoritative only at the current
@@ -605,7 +631,14 @@ Required contract decisions:
 13. byte/count-bounded result and session path summaries with exact totals,
     truncation, and complete-facts digests; and
 14. prelaunch session-headroom reservation plus non-throwing serialized-next-state
-    size preflight and counts-only fallback.
+    size preflight and counts-only fallback; and
+15. an exact-keyed `TerminalPrelaunchFailureMetadata` contract with required
+    `reasonCode`, `outcome: "spawn_failed"`, and `mutation_outcome: "none"` plus only
+    the existing optional runtime-injected `runtimeBudgetLimits` and
+    `plannedDisclosureBytes` keys. It adds no journal metadata discriminator. Both
+    the live prelaunch return and recovery `markFailed` write this shape, and the
+    recovery reader recognizes it only for a terminal operation together with
+    validated absence of launch, exit, and result evidence.
 
 Expected contract files:
 
@@ -630,7 +663,7 @@ All tracks branch from the exact reviewed `S2-C0` SHA.
 
 | Track | Exclusive production ownership | Focused tests |
 | --- | --- | --- |
-| A — repository observation | `workspace-observer.ts`; observation-only additions to `git.ts`, `context.ts`, repository exports | observer and Git fixtures |
+| A — repository observation | `workspace-observer.ts`; observation-only additions to `git.ts` and `context.ts` | observer and Git fixtures |
 | B — persistence/evidence | `terminal-artifacts.ts`, `artifact-store.ts`, shared session directory-sync helper, artifact/observation validators | artifact binding, compatibility, durability |
 | C — session diff | `snapshot-diff.ts` and narrow terminal resolver | mixed patch/terminal diff |
 | P — primary serialized integration | `session/types.ts`, `session/store.ts`, `terminal-executor.ts`, `tool-host.ts`, `agent-runtime.ts`, `budgets.ts`, `completion.ts`, `runtime-composition.ts`, `cli/commands.ts`, handoff/review package | session compatibility, executor, runtime, accounting, completion, end-to-end, reliability |
@@ -638,8 +671,9 @@ All tracks branch from the exact reviewed `S2-C0` SHA.
 No two worktrees edit an integration file concurrently. The primary owns all
 contract changes after `S2-C0`, all conflict resolution, every push, and every merge.
 Executor and runtime integration are deliberately serialized.
-After `S2-C0`, only the primary edits `session/types.ts` or `session/store.ts`;
-specialists return any newly discovered contract need instead of changing them.
+After `S2-C0`, only the primary edits `session/types.ts`, `session/store.ts`, or
+`repository/index.ts`; specialists return any newly discovered contract or export
+need instead of changing them.
 
 ## Pull request and integration sequence
 
@@ -686,7 +720,9 @@ primary pushes and merges.
   launch;
 - one concurrent-churn retry, then explicit unknown;
 - pre-observation deadline expiry refuses/refunds, post-observation expiry becomes
-  non-clean `unknown`, and a large-repository fixture completes within 40 seconds;
+  non-clean `unknown`, and a fixture with at least 10,000 untracked plus 10,000
+  individually matched ignored paths completes within 40 seconds and still launches
+  a second command;
 - HEAD/ref/index transitions classify as observed while hook/config/info/protected
   changes classify as non-clean;
 - over-bound effect paths preserve exact totals/digest and explicit truncation under
@@ -759,6 +795,9 @@ and zero partial accounting.
   records that still have a session-pending operation;
 - effect preparation/validation failure after journal completion retains pending
   state and cannot persist unreturned/partial accounting;
+- patch-mutation accounting failure retains the existing non-terminal behavior:
+  clear its pending entry and mark its result unreturned rather than stranding it
+  under terminal recovery rules;
 - effect-transaction persist failure restores the same state object, meter usage,
   pending key, and composition-closure view;
 - a large effect that fits the result artifact but not a full session record
@@ -775,6 +814,9 @@ and zero partial accounting.
 ### Diff, completion, and compatibility
 
 - terminal-only, patch-then-terminal, terminal-then-patch, and repeated touches;
+- an observed terminal mutation followed by a patch can validate at the current
+  sequence and complete because observed authority depends on any recorded observed
+  terminal mutation, not only the latest mutation kind;
 - earliest pre-existing user bytes remain the baseline;
 - rename endpoints, per-path unavailable baseline behavior, and whole-diff integrity
   failure;
