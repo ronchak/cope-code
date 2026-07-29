@@ -165,7 +165,13 @@ test("review package is deterministic, integrity protected, and contains only sa
   assert.equal(first.integrity.bodySha256, sha256(stableJson(first.body)));
   assert.equal(verifyReviewPackage(first), true);
   assert.deepEqual(first.body.mutations, [
-    { operationId: "op-edit", checkpointId: "checkpoint_1", changedFileCount: 2, changedLines: 7 },
+    {
+      operationId: "op-edit",
+      kind: "patch",
+      checkpointId: "checkpoint_1",
+      changedFileCount: 2,
+      changedLines: 7,
+    },
   ]);
   assert.deepEqual(first.body.audit, {
     eventCount: 2,
@@ -271,8 +277,12 @@ test("review package rejects mismatched identities and free-form values in expor
     /audit metadata is inconsistent/,
   );
 
+  const mutation = state.mutations[0];
+  if (mutation === undefined || mutation.kind === "terminal") {
+    throw new Error("expected patch mutation fixture");
+  }
   const unsafeState = makeState({
-    mutations: [{ ...state.mutations[0]!, checkpointId: "C:\\private\\checkpoint" }],
+    mutations: [{ ...mutation, checkpointId: "C:\\private\\checkpoint" }],
   });
   assert.throws(
     () => createReviewPackage({ state: unsafeState, ...evidence }),

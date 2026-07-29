@@ -5,4 +5,5 @@ export * from "./envelopes.js";
 export * from "./bootstrap.js";
 export * from "./model-facing.js";
 export * from "./intent-normalizer.js";
+export * from "./terminal-exec.js";
 export * from "../shared/operation-id.js";

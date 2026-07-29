@@ -17,6 +17,28 @@ test("source-bearing recovery artifacts are isolated and integrity checked", asy
   await assert.rejects(() => store.get("outbox", "submission_1"));
 });
 
+test("terminal artifacts return integrity-bound references", async () => {
+  const session = await mkdtemp(path.join(tmpdir(), "cba-terminal-artifact-"));
+  const store = new SessionArtifactStore(path.join(session, "artifacts"));
+  const reference = await store.putReferenced(
+    "terminal-result",
+    "terminal_operation_1",
+    "{\"contract\":\"terminal-exec-result/1\"}",
+  );
+  assert.equal(reference.kind, "terminal-result");
+  assert.equal(reference.id, "terminal_operation_1");
+  assert.equal(reference.bytes, Buffer.byteLength("{\"contract\":\"terminal-exec-result/1\"}"));
+  assert.match(reference.sha256, /^[a-f0-9]{64}$/u);
+  assert.equal(
+    await store.get(reference.kind, reference.id),
+    "{\"contract\":\"terminal-exec-result/1\"}",
+  );
+  await assert.rejects(
+    () => store.getReferenced({ ...reference, bytes: reference.bytes + 1 }),
+    /does not match its durable reference/u,
+  );
+});
+
 test("source-bearing recovery artifacts reject oversized writes and partial manifests", async () => {
   const session = await mkdtemp(path.join(tmpdir(), "cba-artifact-bounds-"));
   const root = path.join(session, "artifacts");

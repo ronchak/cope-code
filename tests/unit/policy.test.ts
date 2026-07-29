@@ -51,6 +51,56 @@ test("default policy documents and generated session grant validate", () => {
   assert.equal(validateSessionGrant(session()).valid, true);
 });
 
+test("all default policy projections explicitly deny terminal execution", () => {
+  const defaultSession = session("auto", { tools: TOOL_NAMES });
+  for (const tools of [
+    DEFAULT_ORGANIZATION_POLICY.capabilities.tools,
+    DEFAULT_REPOSITORY_POLICY.capabilities.tools,
+    defaultSession.capabilities.tools,
+  ]) {
+    assert.deepEqual(tools?.deny, ["terminal_exec"]);
+    assert.equal(tools?.allow?.includes("terminal_exec"), false);
+  }
+  const result = engine(defaultSession).evaluate(operation({ tool: "terminal_exec" }));
+  assert.equal(result.decision, "deny");
+  assert.ok(result.reasons.some((reason) => reason.reason_code === "TOOL_NOT_GRANTED"));
+});
+
+test("session deny cannot be erased by capability expansion under legacy upper policies", () => {
+  const legacyOrganization: PolicyDocument = {
+    ...DEFAULT_ORGANIZATION_POLICY,
+    capabilities: {
+      ...DEFAULT_ORGANIZATION_POLICY.capabilities,
+      tools: { allow: DEFAULT_ORGANIZATION_POLICY.capabilities.tools!.allow! },
+    },
+  };
+  const legacyRepository: PolicyDocument = {
+    ...DEFAULT_REPOSITORY_POLICY,
+    capabilities: {
+      ...DEFAULT_REPOSITORY_POLICY.capabilities,
+      tools: { allow: DEFAULT_REPOSITORY_POLICY.capabilities.tools!.allow! },
+    },
+  };
+  const original = session("auto", { tools: TOOL_NAMES });
+  const expansion = engine(
+    original,
+    legacyOrganization,
+    legacyRepository,
+  ).expandSessionGrant(
+    { kind: "tool", tool: "terminal_exec" },
+    zeroPolicyBudgetUsage(),
+  );
+  assert.equal(expansion.decision, "deny");
+  assert.equal(expansion.grant, original);
+  assert.ok(
+    expansion.reasons.some(
+      (reason) =>
+        reason.layer === "session" &&
+        reason.reason_code === "CAPABILITY_EXPANSION_DENIED",
+    ),
+  );
+});
+
 test("default session budgets retain narrowly scoped approval headroom across shipped policies", () => {
   const defaultSession = session();
   assert.deepEqual(

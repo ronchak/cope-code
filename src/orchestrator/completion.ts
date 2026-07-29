@@ -97,6 +97,13 @@ export function verifyCompletion(
   if (requirements.requireCleanPendingOperations && state.pendingOperations.length > 0) {
     reasons.push(`${state.pendingOperations.length} tool operation(s) remain unresolved.`);
   }
+  const pendingTerminalEffects =
+    state.pendingTerminalEffectOperationIds ?? [];
+  if (pendingTerminalEffects.length > 0) {
+    reasons.push(
+      `${pendingTerminalEffects.length} terminal operation(s) still require project-effect attribution.`,
+    );
+  }
   if (state.submission?.state === "indeterminate") {
     reasons.push("The most recent browser submission has indeterminate delivery state.");
   }

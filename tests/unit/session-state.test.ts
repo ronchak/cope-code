@@ -97,6 +97,58 @@ test("session store writes atomically and rejects mismatched identity", async ()
   await assert.rejects(() => store.read(state.sessionId), /does not match/);
 });
 
+test("session store accepts legacy patch records and bounded terminal attribution state", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-session-terminal-contract-"));
+  const store = new SessionStore(root);
+  const state = makeState({
+    pendingTerminalEffectOperationIds: ["op_terminal_1"],
+    mutations: [
+      {
+        operationId: "op_patch_1",
+        checkpointId: "checkpoint_1",
+        changedPaths: ["src/a.ts"],
+        changedLines: 1,
+        completedAt: "2026-01-01T00:00:01.000Z",
+        repositoryFingerprint: "e".repeat(64),
+      },
+      {
+        kind: "terminal",
+        operationId: "op_terminal_1",
+        changedPaths: ["src/generated.ts"],
+        changedLines: 12,
+        createdPaths: ["src/generated.ts"],
+        updatedPaths: [],
+        deletedPaths: [],
+        renamedPaths: [],
+        preExistingTouchedPaths: [],
+        completedAt: "2026-01-01T00:00:02.000Z",
+        observationOutcome: "observed",
+        terminalResult: {
+          kind: "terminal-result",
+          id: "op_terminal_1",
+          bytes: 128,
+          sha256: "f".repeat(64),
+        },
+        repositoryFingerprint: "a".repeat(64),
+      },
+    ],
+  });
+  await store.create(state);
+  assert.deepEqual(await store.read(state.sessionId), state);
+
+  state.pendingTerminalEffectOperationIds = ["op_terminal_1", "op_terminal_1"];
+  await assert.rejects(() => store.write(state), /malformed durable records/u);
+
+  state.pendingTerminalEffectOperationIds = ["op_terminal_1"];
+  const terminal = state.mutations[1];
+  if (terminal?.kind !== "terminal") throw new Error("expected terminal mutation");
+  state.mutations[1] = {
+    ...terminal,
+    checkpointId: "checkpoint_not_allowed",
+  } as never;
+  await assert.rejects(() => store.write(state), /malformed durable records/u);
+});
+
 test("session store migrates legacy non-completed terminal handoffs on load", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-session-legacy-handoff-"));
   const store = new SessionStore(root);

@@ -8,6 +8,7 @@ import {
   DarwinHostPlatform,
   UnsupportedHostPlatform,
   WindowsHostPlatform,
+  resolveTerminalLaunch,
   selectHostPlatform,
   type ProbeRunner,
 } from "../../src/platform/index.js";
@@ -64,6 +65,45 @@ test("Windows host preserves state, Edge, Git, and probe-environment order", () 
   assert.equal(host.supportsDirectoryFsync, false);
   assert.equal(host.caseInsensitiveByDefault, true);
   assert.equal(host.nullDevice, "NUL");
+});
+
+test("terminal host launch selection is explicit and never uses implicit shell quoting", () => {
+  const windows = new WindowsHostPlatform("x64");
+  assert.deepEqual(
+    resolveTerminalLaunch(windows, { mode: "shell", command: "echo safe" }, {
+      COMSPEC: "C:\\Windows\\System32\\cmd.exe",
+    }),
+    {
+      executable: "C:\\Windows\\System32\\cmd.exe",
+      arguments: ["/d", "/s", "/c", "echo safe"],
+    },
+  );
+  assert.deepEqual(
+    resolveTerminalLaunch(windows, {
+      mode: "argv",
+      executable: "tool.exe",
+      arguments: ["literal & not syntax", "\"quoted\""],
+    }, {}),
+    {
+      executable: "tool.exe",
+      arguments: ["literal & not syntax", "\"quoted\""],
+    },
+  );
+  assert.throws(
+    () => resolveTerminalLaunch(windows, {
+      mode: "argv",
+      executable: "C:\\repo\\tool.CmD",
+      arguments: ["literal & must not be reinterpreted"],
+    }, {}),
+    /require terminal shell mode/u,
+  );
+  const posix = new UnsupportedHostPlatform("linux", "x64");
+  assert.deepEqual(
+    resolveTerminalLaunch(posix, { mode: "shell", command: "printf safe" }, {
+      SHELL: "/bin/zsh",
+    }),
+    { executable: "/bin/zsh", arguments: ["-c", "printf safe"] },
+  );
 });
 
 test("Windows host refuses high integrity and accepts a medium token", async () => {

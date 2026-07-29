@@ -161,6 +161,35 @@ test("completion verifier rejects stale validation and unresolved work", () => {
   assert.match(result.reasons.join(" "), /stale/);
 });
 
+test("completion rejects terminal effects until project attribution is durable", () => {
+  const current = state();
+  current.pendingTerminalEffectOperationIds = ["op_terminal_pending"];
+  const result = verifyCompletion(
+    current,
+    claim,
+    {
+      pathKey: completionPathKey,
+      known: true,
+      fingerprint: currentFingerprint,
+      excludedStateFingerprint: excludedFingerprint,
+      hasConflicts: false,
+      changedPaths: [],
+      outOfScopePaths: [],
+      gitStatusSummary: "clean",
+    },
+    {
+      requiredCommandIds: ["test"],
+      requireValidationAfterLastMutation: true,
+      requireCleanPendingOperations: true,
+    },
+  );
+  assert.equal(result.accepted, false);
+  assert.match(
+    result.reasons.join(" "),
+    /terminal operation.*require project-effect attribution/iu,
+  );
+});
+
 test("completion verifier rejects repository fingerprint drift and merge conflicts", () => {
   const fingerprintDrift = verifyCompletion(
     state(),

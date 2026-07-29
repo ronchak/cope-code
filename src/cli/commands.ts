@@ -420,6 +420,7 @@ async function runNewSession(
       user,
       ...(prepared.idFactory === undefined ? {} : { idFactory: prepared.idFactory }),
       onProgress: progressReporter(command.json, io),
+      onTerminalOutput: terminalOutputReporter(command.json, io),
       host,
     });
     setupControl.bindRuntime(composed.runtime);
@@ -599,6 +600,7 @@ async function resumeSession(
       user,
       ...(prepared.idFactory === undefined ? {} : { idFactory: prepared.idFactory }),
       onProgress: progressReporter(command.json, io),
+      onTerminalOutput: terminalOutputReporter(command.json, io),
       host,
     });
     setupControl.bindRuntime(composed.runtime);
@@ -1540,6 +1542,33 @@ function progressReporter(json: boolean, io: CliIo): (event: RuntimeProgressEven
       }
     }
     destination.write(`${cyan(symbols.arrow)} ${detail}\n`);
+  };
+}
+
+function terminalOutputReporter(
+  json: boolean,
+  io: CliIo,
+): (
+  operationId: string,
+  stream: "stdout" | "stderr",
+  chunk: Uint8Array,
+  cumulativeBytes: number,
+) => void {
+  const destination = json ? io.stderr : io.stdout;
+  return (operationId, stream, chunk, cumulativeBytes) => {
+    const content = Buffer.from(chunk).toString("utf8");
+    if (json) {
+      destination.write(`${JSON.stringify({
+        event: "terminal.output",
+        operationId,
+        stream,
+        content,
+        cumulativeBytes,
+      })}\n`);
+      return;
+    }
+    destination.write(`${cyan(symbols.arrow)} terminal ${stream}: ${content}`);
+    if (!content.endsWith("\n")) destination.write("\n");
   };
 }
 

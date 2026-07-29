@@ -5,6 +5,15 @@ import {
   OPERATION_ID_MIN_LENGTH,
   OPERATION_ID_PATTERN_SOURCE,
 } from "../shared/operation-id.js";
+import {
+  TERMINAL_EXEC_MAX_ARGUMENTS,
+  TERMINAL_EXEC_MAX_ARGUMENT_BYTES,
+  TERMINAL_EXEC_MAX_COMMAND_BYTES,
+  TERMINAL_EXEC_MAX_EXECUTABLE_BYTES,
+  TERMINAL_EXEC_MAX_OUTPUT_BYTES,
+  TERMINAL_EXEC_MAX_TIMEOUT_MS,
+  TERMINAL_EXEC_MAX_TOTAL_ARGUMENT_BYTES,
+} from "./terminal-exec.js";
 
 import {
   BUDGET_METRICS,
@@ -35,6 +44,9 @@ const operationIdentifier = {
 
 const shortString = { type: "string", minLength: 1, maxLength: 4_096 } as const;
 const pathString = { type: "string", minLength: 1, maxLength: 1_024, pattern: "^[^\\u0000]+$" } as const;
+const terminalString = { type: "string", minLength: 1, maxLength: TERMINAL_EXEC_MAX_COMMAND_BYTES, pattern: "^[^\\u0000]+$" } as const;
+const terminalExecutable = { type: "string", minLength: 1, maxLength: TERMINAL_EXEC_MAX_EXECUTABLE_BYTES, pattern: "^[^\\u0000]+$" } as const;
+const terminalArgument = { type: "string", maxLength: TERMINAL_EXEC_MAX_ARGUMENT_BYTES, pattern: "^[^\\u0000]*$" } as const;
 const sha256 = { type: "string", pattern: "^[a-fA-F0-9]{64}$" } as const;
 
 const strictObject = (
@@ -261,6 +273,39 @@ const completeTaskSchema = strictObject(
   ["summary", "acceptance_criteria", "validation", "skipped_validation", "remaining_risks", "follow_up"],
 );
 
+const terminalExecSharedProperties = {
+  contract: { const: "terminal-exec/1" },
+  cwd: pathString,
+  timeout_ms: { type: "integer", minimum: 1, maximum: TERMINAL_EXEC_MAX_TIMEOUT_MS },
+  max_output_bytes: { type: "integer", minimum: 1, maximum: TERMINAL_EXEC_MAX_OUTPUT_BYTES },
+} as const;
+
+const terminalExecSchema: JsonSchema = {
+  oneOf: [
+    strictObject(
+      {
+        ...terminalExecSharedProperties,
+        mode: { const: "shell" },
+        command: terminalString,
+      },
+      ["contract", "mode", "command"],
+    ),
+    strictObject(
+      {
+        ...terminalExecSharedProperties,
+        mode: { const: "argv" },
+        executable: terminalExecutable,
+        arguments: {
+          type: "array",
+          maxItems: TERMINAL_EXEC_MAX_ARGUMENTS,
+          items: terminalArgument,
+        },
+      },
+      ["contract", "mode", "executable", "arguments"],
+    ),
+  ],
+};
+
 function deepFreeze<T>(value: T): T {
   if (value === null || typeof value !== "object" || Object.isFrozen(value)) return value;
   for (const child of Object.values(value as Readonly<Record<string, unknown>>)) deepFreeze(child);
@@ -276,6 +321,7 @@ export const TOOL_ARGUMENT_SCHEMAS = deepFreeze({
   edit_text: editTextSchema,
   apply_patch: applyPatchSchema,
   run_command: runCommandSchema,
+  terminal_exec: terminalExecSchema,
   request_user_input: requestUserInputSchema,
   request_capability: requestCapabilitySchema,
   complete_task: completeTaskSchema,
@@ -466,9 +512,75 @@ export function validateToolArguments<TName extends ToolName>(
 ): SchemaValidationResult<ToolArgumentsByName[TName]> {
   const validate = argumentValidators[tool];
   const valid = validate(value);
-  return valid
-    ? { valid: true, value: value as ToolArgumentsByName[TName], errors: [] }
-    : { valid: false, errors: validate.errors ?? [] };
+  if (!valid) return { valid: false, errors: validate.errors ?? [] };
+  if (tool === "terminal_exec") {
+    const errors = validateTerminalExecByteBounds(value);
+    if (errors.length > 0) return { valid: false, errors };
+  }
+  return { valid: true, value: value as ToolArgumentsByName[TName], errors: [] };
+}
+
+function validateTerminalExecByteBounds(value: unknown): readonly ErrorObject[] {
+  const input = value as Readonly<Record<string, unknown>>;
+  if (input.mode === "shell") {
+    return utf8BoundError(
+      input.command as string,
+      TERMINAL_EXEC_MAX_COMMAND_BYTES,
+      "/command",
+    );
+  }
+  const errors: ErrorObject[] = [
+    ...utf8BoundError(
+      input.executable as string,
+      TERMINAL_EXEC_MAX_EXECUTABLE_BYTES,
+      "/executable",
+    ),
+  ];
+  const argumentsValue = input.arguments as readonly string[];
+  let totalBytes = 0;
+  for (let index = 0; index < argumentsValue.length; index += 1) {
+    const argument = argumentsValue[index] ?? "";
+    const argumentBytes = Buffer.byteLength(argument);
+    totalBytes += argumentBytes;
+    errors.push(
+      ...utf8BoundError(
+        argument,
+        TERMINAL_EXEC_MAX_ARGUMENT_BYTES,
+        `/arguments/${index}`,
+      ),
+    );
+  }
+  if (totalBytes > TERMINAL_EXEC_MAX_TOTAL_ARGUMENT_BYTES) {
+    errors.push(byteLengthError(
+      "/arguments",
+      TERMINAL_EXEC_MAX_TOTAL_ARGUMENT_BYTES,
+      totalBytes,
+    ));
+  }
+  return errors;
+}
+
+function utf8BoundError(
+  value: string,
+  limit: number,
+  instancePath: string,
+): readonly ErrorObject[] {
+  const actual = Buffer.byteLength(value);
+  return actual > limit ? [byteLengthError(instancePath, limit, actual)] : [];
+}
+
+function byteLengthError(
+  instancePath: string,
+  limit: number,
+  actual: number,
+): ErrorObject {
+  return {
+    instancePath,
+    schemaPath: "#/utf8ByteLength",
+    keyword: "utf8ByteLength",
+    params: { limit, actual },
+    message: `must be at most ${limit} UTF-8 bytes`,
+  };
 }
 
 export function formatSchemaErrors(errors: readonly ErrorObject[]): readonly string[] {

@@ -13,6 +13,8 @@ import {
   BUDGET_METRICS,
   DEFAULT_LIST_FILES_MAX_RESULTS,
   MAX_LIST_FILES_RESULTS,
+  TERMINAL_EXEC_MAX_OUTPUT_BYTES,
+  TERMINAL_EXEC_MAX_TIMEOUT_MS,
   isToolName,
   TOOL_NAMES,
   toolRequiresContext,
@@ -45,6 +47,14 @@ const OPERATION_SCOPED_BUDGET_METRICS = new Set<BudgetMetric>([
   "commands",
   "command_output_bytes",
 ]);
+
+const DEFAULT_TERMINAL_TIMEOUT_MS = 300_000;
+const DEFAULT_TERMINAL_OUTPUT_BYTES = 256 * 1_024;
+
+interface TerminalExecutionBounds {
+  readonly timeoutMs: number;
+  readonly maxOutputBytes: number;
+}
 
 export interface LayeredRuntimePolicyOptions {
   readonly engine: PolicyEngine;
@@ -213,7 +223,11 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
         };
       }
       const effectiveCall = effectiveToolCall(engine, call);
-      const operation = await this.buildOperation(effectiveCall, false);
+      const terminal =
+        effectiveCall.name === "terminal_exec"
+          ? terminalExecutionBounds(engine, effectiveCall, this.options.currentUsage())
+          : undefined;
+      const operation = await this.buildOperation(effectiveCall, false, terminal);
       const preliminary = engine.evaluate(operation);
       if (preliminary.decision !== "allow" || !toolRequiresContext(call.name, "change")) {
         return decisionFor(
@@ -222,17 +236,19 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
           this.options.commandCatalog,
           operation,
           effectiveCall === call ? undefined : effectiveCall.arguments,
+          terminal,
         );
       }
       // Exact line accounting requires local before-images. It is performed
       // only after all higher-layer path and change-kind checks allow access.
-      const exact = await this.buildOperation(effectiveCall, true);
+      const exact = await this.buildOperation(effectiveCall, true, terminal);
       return decisionFor(
         engine.evaluate(exact),
         effectiveCall,
         this.options.commandCatalog,
         exact,
         effectiveCall === call ? undefined : effectiveCall.arguments,
+        terminal,
       );
     } catch (error) {
       if (error instanceof AgentError && error.code === "STALE_STATE") {
@@ -459,7 +475,11 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
     return this.engineValue.evaluate(operation).decision === "allow";
   }
 
-  private async buildOperation(call: NormalizedToolCall, exactPatchLines: boolean): Promise<PolicyOperation> {
+  private async buildOperation(
+    call: NormalizedToolCall,
+    exactPatchLines: boolean,
+    terminal?: TerminalExecutionBounds,
+  ): Promise<PolicyOperation> {
     const usage = { ...this.options.currentUsage() };
     const paths = pathFacts(call);
     let disclosure: PolicyOperation["disclosure"];
@@ -508,6 +528,20 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
       disclosure = disclosureFact(this.classification, resolved.maxOutputBytes, 1);
       usage.commands += 1;
       usage.command_output_bytes += resolved.maxOutputBytes;
+    } else if (call.name === "terminal_exec") {
+      if (terminal === undefined) {
+        throw new AgentError(
+          "INTERNAL_ERROR",
+          "Terminal execution bounds are unavailable",
+        );
+      }
+      disclosure = disclosureFact(
+        this.classification,
+        terminal.maxOutputBytes + terminalInvocationSourceBytes(call),
+        1,
+      );
+      usage.commands += 1;
+      usage.command_output_bytes += terminal.maxOutputBytes;
     } else if (call.name === "apply_patch") {
       const changes = patchChanges(call.arguments.changes);
       const changedLines = exactPatchLines ? await this.countExactChangedLines(changes) : 0;
@@ -724,6 +758,7 @@ function decisionFor(
   catalog: CommandCatalog,
   operation: PolicyOperation,
   effectiveArguments?: Readonly<Record<string, unknown>>,
+  terminal?: TerminalExecutionBounds,
 ): AuthorizationDecision {
   if (policy.decision === "allow") {
     return {
@@ -731,6 +766,7 @@ function decisionFor(
       reasonCode: "ALLOWED",
       explanation: "Operation is inside the effective grant.",
       ...(effectiveArguments === undefined ? {} : { effectiveArguments }),
+      ...(terminal === undefined ? {} : { terminal }),
       ...(operation.planned_disclosure_bytes === undefined
         ? {}
         : { plannedDisclosureBytes: operation.planned_disclosure_bytes }),
@@ -766,6 +802,108 @@ function decisionFor(
     },
     ...(primary?.details === undefined ? {} : { details: primary.details }),
   };
+}
+
+function terminalExecutionBounds(
+  engine: PolicyEngine,
+  call: NormalizedToolCall,
+  usage: PolicyBudgetUsage,
+): TerminalExecutionBounds {
+  const requestedTimeout =
+    positiveInteger(call.arguments.timeout_ms) ?? DEFAULT_TERMINAL_TIMEOUT_MS;
+  const timeoutCeilings = [
+    TERMINAL_EXEC_MAX_TIMEOUT_MS,
+    engine.organization.capabilities.commands?.max_timeout_ms,
+    engine.repository.capabilities.commands?.max_timeout_ms,
+    engine.session.capabilities.commands?.max_timeout_ms,
+  ].filter((value): value is number => value !== undefined);
+  const timeoutMs = Math.min(requestedTimeout, ...timeoutCeilings);
+
+  const requestedOutput =
+    positiveInteger(call.arguments.max_output_bytes) ??
+    DEFAULT_TERMINAL_OUTPUT_BYTES;
+  const effectiveBudgets = engine.getEffectiveBudgetLimits();
+  const commandOutputRemaining = Math.max(
+    0,
+    (effectiveBudgets.command_output_bytes ??
+      DEFAULT_POLICY_BUDGETS.command_output_bytes) -
+      usage.command_output_bytes,
+  );
+  const disclosedRemaining = Math.max(
+    0,
+    (effectiveBudgets.disclosed_bytes ?? DEFAULT_POLICY_BUDGETS.disclosed_bytes) -
+      usage.disclosed_bytes -
+      CONTROL_PLANE_RESERVE_BYTES,
+  );
+  const invocationSourceBytes = terminalInvocationSourceBytes(call);
+  const disclosureSourceCeiling = maximumSourceBytesForDisclosure(
+    disclosedRemaining,
+    invocationSourceBytes,
+  );
+  const perOperationDisclosureBytes =
+    engine.getEffectiveDisclosureLimits().max_bytes_per_operation ??
+    TERMINAL_EXEC_MAX_OUTPUT_BYTES;
+  const perOperationSourceCeiling = maximumSourceBytesForDisclosure(
+    perOperationDisclosureBytes,
+    invocationSourceBytes,
+  );
+  const maxOutputBytes = Math.max(
+    1,
+    Math.min(
+      requestedOutput,
+      TERMINAL_EXEC_MAX_OUTPUT_BYTES,
+      commandOutputRemaining,
+      disclosureSourceCeiling,
+      perOperationSourceCeiling,
+    ),
+  );
+  return { timeoutMs, maxOutputBytes };
+}
+
+function maximumSourceBytesForDisclosure(
+  disclosureBytes: number,
+  fixedSourceBytes = 0,
+): number {
+  if (disclosureBytes <= 0) return 0;
+  let lower = 0;
+  let upper = Math.min(disclosureBytes, TERMINAL_EXEC_MAX_OUTPUT_BYTES);
+  while (lower < upper) {
+    const middle = Math.ceil((lower + upper) / 2);
+    if (
+      plannedToolResultDisclosureBytes(
+        fixedSourceBytes + middle,
+        0,
+      ) <= disclosureBytes
+    ) {
+      lower = middle;
+    } else {
+      upper = middle - 1;
+    }
+  }
+  return lower;
+}
+
+function terminalInvocationSourceBytes(call: NormalizedToolCall): number {
+  const cwd =
+    typeof call.arguments.cwd === "string"
+      ? Buffer.byteLength(call.arguments.cwd)
+      : 1;
+  if (call.arguments.mode === "shell") {
+    return cwd + Buffer.byteLength(String(call.arguments.command ?? ""));
+  }
+  const executable =
+    typeof call.arguments.executable === "string"
+      ? Buffer.byteLength(call.arguments.executable)
+      : 0;
+  const argumentsValue = Array.isArray(call.arguments.arguments)
+    ? call.arguments.arguments
+    : [];
+  return argumentsValue.reduce(
+    (total, argument) =>
+      total +
+      (typeof argument === "string" ? Buffer.byteLength(argument) : 0),
+    cwd + executable,
+  );
 }
 
 export interface ListFilesRuntimeBounds {

@@ -79,6 +79,24 @@ test("model-facing observation batches accept only independent read tools", () =
       error instanceof ProtocolParseError &&
       error.protocolCode === "SCHEMA_INVALID",
   );
+  assert.throws(
+    () => parseModelFacingEnvelope(envelope({
+      kind: "agent_intent",
+      intent: "observe",
+      observations: [{
+        tool: "terminal_exec",
+        arguments: {
+          contract: "terminal-exec/1",
+          mode: "shell",
+          command: "npm test",
+        },
+      }],
+      reason: "Terminal execution cannot be batched as observation.",
+    })),
+    (error: unknown) =>
+      error instanceof ProtocolParseError &&
+      error.protocolCode === "SCHEMA_INVALID",
+  );
 });
 
 test("agent answers, blocked states, and progress omit transport identity", () => {

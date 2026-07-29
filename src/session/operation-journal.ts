@@ -3,6 +3,10 @@ import path from "node:path";
 import { newId, sha256, stableJson } from "../shared/crypto.js";
 import { AgentError } from "../shared/errors.js";
 import { isJournalOperationId } from "../shared/operation-id.js";
+import {
+  isTerminalJournalResultMetadata,
+  type TerminalJournalResultMetadata,
+} from "./terminal-artifacts.js";
 
 export type OperationStatus = "accepted" | "executing" | "completed" | "failed" | "indeterminate";
 
@@ -129,6 +133,44 @@ export class OperationJournal {
       });
     }
     return this.update(record, "completed", now, outcome, safeResult);
+  }
+
+  /**
+   * Promotes an executing terminal record after artifact-backed recovery has
+   * verified the exact request and result. This deliberately cannot resolve an
+   * already-indeterminate record, preserving the existing no-blind-replay
+   * state machine.
+   */
+  public async resolveTerminalCompleted(
+    operationId: string,
+    requestHash: string,
+    now: string,
+    safeResult: TerminalJournalResultMetadata,
+  ): Promise<OperationRecord> {
+    assertOperationId(operationId);
+    const record = await this.read(operationId);
+    if (
+      record.status !== "executing" ||
+      record.tool !== "terminal_exec" ||
+      !record.mutating ||
+      record.requestHash !== requestHash ||
+      !isTerminalJournalResultMetadata(safeResult) ||
+      safeResult.operation_id !== operationId ||
+      safeResult.request_hash !== requestHash
+    ) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Executing terminal operation does not match its recovered durable result",
+        { operationId },
+      );
+    }
+    return this.update(
+      record,
+      "completed",
+      now,
+      terminalJournalOutcome(safeResult.outcome),
+      { ...safeResult },
+    );
   }
 
   public async markFailed(
@@ -312,4 +354,27 @@ function isIsoTimestamp(value: unknown): value is string {
   if (typeof value !== "string" || value.length > 64) return false;
   return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/u.test(value) &&
     Number.isFinite(Date.parse(value));
+}
+
+function terminalJournalOutcome(
+  outcome: TerminalJournalResultMetadata["outcome"],
+): string {
+  switch (outcome) {
+    case "completed":
+      return "success";
+    case "completed_nonzero":
+    case "spawn_failed":
+      return "failure";
+    case "timed_out":
+      return "timeout";
+    case "cancelled":
+      return "cancelled";
+    case "indeterminate":
+      return "indeterminate";
+    case "persistence_failed":
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "A persistence-failed terminal result cannot be promoted to completed",
+      );
+  }
 }

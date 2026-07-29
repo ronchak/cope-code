@@ -1,3 +1,5 @@
+import { TERMINAL_EXEC_CONTRACT } from "./terminal-exec.js";
+
 /** The first wire contract. Values are deliberately literal and versioned. */
 export const PROTOCOL_VERSION = "cba/1" as const;
 export type ProtocolVersion = typeof PROTOCOL_VERSION;
@@ -136,6 +138,22 @@ export const TOOL_REGISTRY = defineToolRegistry({
     batchable: false,
     required_context: ["command", "network"],
     bootstrap_example: { command_id: "test-unit" },
+  },
+  terminal_exec: {
+    purpose: "Run one shell or direct-argv command in the selected project under a durable developer grant.",
+    execution: "local",
+    read_only: false,
+    batchable: false,
+    required_context: [],
+    bootstrap_example: {
+      contract: TERMINAL_EXEC_CONTRACT,
+      mode: "argv",
+      executable: "node",
+      arguments: ["scripts/check.mjs"],
+      cwd: ".",
+      timeout_ms: 300_000,
+      max_output_bytes: 524_288,
+    },
   },
   request_user_input: {
     purpose: "Pause for genuinely missing information or a necessary development decision.",
@@ -419,6 +437,28 @@ export interface CompleteTaskArguments {
   readonly follow_up: readonly string[];
 }
 
+interface TerminalExecArgumentsBase {
+  readonly contract: typeof TERMINAL_EXEC_CONTRACT;
+  readonly cwd?: string;
+  readonly timeout_ms?: number;
+  readonly max_output_bytes?: number;
+}
+
+export interface TerminalExecShellArguments extends TerminalExecArgumentsBase {
+  readonly mode: "shell";
+  readonly command: string;
+}
+
+export interface TerminalExecArgvArguments extends TerminalExecArgumentsBase {
+  readonly mode: "argv";
+  readonly executable: string;
+  readonly arguments: readonly string[];
+}
+
+export type TerminalExecArguments =
+  | TerminalExecShellArguments
+  | TerminalExecArgvArguments;
+
 export interface ToolArgumentsByName {
   readonly list_files: ListFilesArguments;
   readonly search_text: SearchTextArguments;
@@ -428,6 +468,7 @@ export interface ToolArgumentsByName {
   readonly edit_text: EditTextArguments;
   readonly apply_patch: ApplyPatchArguments;
   readonly run_command: RunCommandArguments;
+  readonly terminal_exec: TerminalExecArguments;
   readonly request_user_input: RequestUserInputArguments;
   readonly request_capability: RequestCapabilityArguments;
   readonly complete_task: CompleteTaskArguments;

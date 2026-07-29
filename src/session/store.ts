@@ -10,7 +10,11 @@ import {
 import { currentHost, workspaceKey } from "./paths.js";
 import { SESSION_SCHEMA_VERSION, type SessionState } from "./types.js";
 import { allowedTransitions, isTerminal } from "./state-machine.js";
-import { SessionArtifactStore } from "./artifact-store.js";
+import {
+  ARTIFACT_KINDS,
+  SessionArtifactStore,
+  type ArtifactReference,
+} from "./artifact-store.js";
 import {
   CompletionHandoffStore,
   isCompletionHandoffReference,
@@ -51,6 +55,7 @@ const SESSION_KEYS = [
   "pendingOperations",
   "completedOperationIds",
   "unreturnedOperationIds",
+  "pendingTerminalEffectOperationIds",
   "submission",
   "transportConversationId",
   "queuedOutbound",
@@ -400,6 +405,9 @@ function assertValidSessionState(value: Partial<SessionState>): asserts value is
     (value.unreturnedOperationIds !== undefined &&
       (!Array.isArray(value.unreturnedOperationIds) ||
         value.unreturnedOperationIds.length > 100_000)) ||
+    (value.pendingTerminalEffectOperationIds !== undefined &&
+      (!Array.isArray(value.pendingTerminalEffectOperationIds) ||
+        value.pendingTerminalEffectOperationIds.length > 100_000)) ||
     !Array.isArray(value.mutations) || value.mutations.length > 100_000 ||
     !Array.isArray(value.validations) || value.validations.length > 100_000 ||
     !Number.isSafeInteger(value.protocolRepairStreak) ||
@@ -421,6 +429,10 @@ function assertValidSessionState(value: Partial<SessionState>): asserts value is
         value.unreturnedOperationIds.some(
           (operationId) => !value.completedOperationIds?.includes(operationId),
         ))) ||
+    (value.pendingTerminalEffectOperationIds !== undefined &&
+      (!value.pendingTerminalEffectOperationIds.every(isJournalOperationId) ||
+        new Set(value.pendingTerminalEffectOperationIds).size !==
+          value.pendingTerminalEffectOperationIds.length)) ||
     !value.mutations.every(isMutationRecord) ||
     !value.validations.every(isValidationRecord)
   ) {
@@ -583,13 +595,67 @@ function isPendingOperation(value: unknown): value is SessionState["pendingOpera
 function isMutationRecord(value: unknown): value is SessionState["mutations"][number] {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const item = value as Partial<SessionState["mutations"][number]>;
-  return hasExactKeys(item, [
-    "operationId", "checkpointId", "changedPaths", "changedLines", "completedAt", "repositoryFingerprint",
-  ]) &&
-    isOperationId(item.operationId) && typeof item.checkpointId === "string" && item.checkpointId.length <= 128 &&
+  const commonIsValid =
+    isOperationId(item.operationId) &&
     boundedStringArray(item.changedPaths, 100_000, 32_768) &&
     typeof item.changedLines === "number" && Number.isSafeInteger(item.changedLines) && item.changedLines >= 0 &&
-    isIsoTimestamp(item.completedAt) && typeof item.repositoryFingerprint === "string" && HASH_PATTERN.test(item.repositoryFingerprint);
+    isIsoTimestamp(item.completedAt);
+  if (!commonIsValid) return false;
+  if (item.kind === undefined || item.kind === "patch") {
+    return hasExactKeys(item, [
+      "kind", "operationId", "checkpointId", "changedPaths", "changedLines", "completedAt",
+      "repositoryFingerprint",
+    ], true) &&
+      typeof item.checkpointId === "string" && item.checkpointId.length <= 128 &&
+      typeof item.repositoryFingerprint === "string" &&
+      HASH_PATTERN.test(item.repositoryFingerprint);
+  }
+  if (item.kind !== "terminal") return false;
+  const terminal = item as Partial<Extract<SessionState["mutations"][number], { readonly kind: "terminal" }>>;
+  return hasExactKeys(terminal, [
+    "kind", "operationId", "changedPaths", "changedLines", "createdPaths", "updatedPaths",
+    "deletedPaths", "renamedPaths", "preExistingTouchedPaths", "completedAt",
+    "observationOutcome", "preObservation", "postObservation", "terminalResult",
+    "repositoryFingerprint",
+  ], true) &&
+    boundedStringArray(terminal.createdPaths, 100_000, 32_768) &&
+    boundedStringArray(terminal.updatedPaths, 100_000, 32_768) &&
+    boundedStringArray(terminal.deletedPaths, 100_000, 32_768) &&
+    boundedStringArray(terminal.preExistingTouchedPaths, 100_000, 32_768) &&
+    Array.isArray(terminal.renamedPaths) &&
+    terminal.renamedPaths.length <= 100_000 &&
+    terminal.renamedPaths.every((rename) =>
+      hasExactKeys(rename, ["from", "to"]) &&
+      typeof rename.from === "string" && rename.from.length <= 32_768 &&
+      typeof rename.to === "string" && rename.to.length <= 32_768
+    ) &&
+    ["none", "observed", "protected_or_hidden_changed", "unknown"].includes(
+      terminal.observationOutcome ?? "",
+    ) &&
+    (terminal.preObservation === undefined ||
+      (isArtifactReference(terminal.preObservation) &&
+        terminal.preObservation.kind === "terminal-pre-observation")) &&
+    (terminal.postObservation === undefined ||
+      (isArtifactReference(terminal.postObservation) &&
+        terminal.postObservation.kind === "terminal-post-observation")) &&
+    isArtifactReference(terminal.terminalResult) &&
+    terminal.terminalResult.kind === "terminal-result" &&
+    (terminal.repositoryFingerprint === undefined ||
+      HASH_PATTERN.test(terminal.repositoryFingerprint));
+}
+
+function isArtifactReference(value: unknown): value is ArtifactReference {
+  if (!hasExactKeys(value, ["kind", "id", "bytes", "sha256"])) return false;
+  const reference = value as Partial<ArtifactReference>;
+  return typeof reference.kind === "string" &&
+    (ARTIFACT_KINDS as readonly string[]).includes(reference.kind) &&
+    typeof reference.id === "string" &&
+    /^[A-Za-z0-9._-]{3,160}$/u.test(reference.id) &&
+    typeof reference.bytes === "number" &&
+    Number.isSafeInteger(reference.bytes) &&
+    reference.bytes >= 0 &&
+    typeof reference.sha256 === "string" &&
+    HASH_PATTERN.test(reference.sha256);
 }
 
 function isValidationRecord(value: unknown): value is SessionState["validations"][number] {

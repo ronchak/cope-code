@@ -20,6 +20,10 @@ import type {
   CompletionHandoffStore,
 } from "../session/completion-handoff-store.js";
 import type { OperationJournal, OperationRecord } from "../session/operation-journal.js";
+import {
+  isTerminalJournalResultMetadata,
+  type TerminalJournalResultMetadata,
+} from "../session/terminal-artifacts.js";
 import type { SessionStore } from "../session/store.js";
 import {
   isTerminal,
@@ -64,6 +68,7 @@ import {
   CONTROL_PLANE_RESERVE_BYTES,
   EMERGENCY_NOTICE_RESERVE_BYTES,
   TOOL_RESULT_ENVELOPE_RESERVE_BYTES,
+  plannedToolResultDisclosureBytes,
 } from "./disclosure-budget.js";
 
 export interface AgentRuntimeDependencies {
@@ -593,6 +598,46 @@ export class AgentRuntime {
           await this.persist();
         }
         continue;
+      }
+      if (
+        pending.tool === "terminal_exec" &&
+        pending.mutating &&
+        pending.status === "executing" &&
+        record.status === "executing"
+      ) {
+        const recovered = await this.dependencies.tools.recoverCompleted?.({
+          operationId: pending.operationId,
+          tool: "terminal_exec",
+          requestHash: record.requestHash,
+        });
+        if (recovered !== undefined) {
+          assertRecoveredToolOutcome(recovered, pending.operationId, "terminal_exec");
+          if (!isTerminalJournalResultMetadata(recovered.safeMetadata)) {
+            throw new AgentError(
+              "RECOVERY_REQUIRED",
+              "Recovered terminal result is missing its exact durable journal binding",
+              { operationId: pending.operationId },
+            );
+          }
+          await this.dependencies.journal.resolveTerminalCompleted(
+            pending.operationId,
+            record.requestHash,
+            this.now(),
+            recovered.safeMetadata,
+          );
+          await this.dependencies.audit.append({
+            type: "session.recovered",
+            taskId: this.state.taskId,
+            operationId: pending.operationId,
+            data: {
+              decision: "promote_completed",
+              reasonCode: "DURABLE_TERMINAL_RESULT",
+              journalStatus: record.status,
+              sessionStatus: pending.status,
+            },
+          });
+          continue;
+        }
       }
       if (!pending.mutating || record.status === "completed" || record.status === "failed") continue;
       const indeterminate = { ...pending, status: "indeterminate" as const };
@@ -2130,20 +2175,26 @@ export class AgentRuntime {
         };
       }
       const replayBudgetLimits = storedRuntimeBudgetLimits(registration.record.safeResult);
+      const outcome = await outcomeFromRecord(
+        call,
+        registration.record,
+        this.dependencies.tools,
+      );
       const replayPlannedDisclosureBytes = storedPlannedDisclosureBytes(
         registration.record.safeResult,
+        outcome.data,
       );
       this.reserveToolResultDisclosure(
         replayPlannedDisclosureBytes,
         replayBudgetLimits,
       );
-      const outcome = outcomeFromRecord(call, registration.record);
       if (registration.record.status === "completed") {
         await this.recordToolEffects(
           call,
           outcome,
           turnId,
           replayBudgetLimits,
+          wasPending,
         );
       }
       this.clearPending(call.operationId);
@@ -2425,8 +2476,21 @@ export class AgentRuntime {
       const outcome = await this.dependencies.tools.execute(
         executionCall,
         this.controller.signal,
-        policy.outcome === "allow" && policy.plannedMutation !== undefined
-          ? { plannedMutation: policy.plannedMutation }
+        policy.outcome === "allow" &&
+          (policy.plannedMutation !== undefined || policy.terminal !== undefined)
+          ? {
+              ...(policy.plannedMutation === undefined
+                ? {}
+                : { plannedMutation: policy.plannedMutation }),
+              ...(policy.terminal === undefined
+                ? {}
+                : {
+                    terminal: {
+                      ...policy.terminal,
+                      requestHash: executing.requestHash,
+                    },
+                  }),
+            }
           : undefined,
       );
       if (outcome.status === "indeterminate" && mutating) {
@@ -2608,6 +2672,7 @@ export class AgentRuntime {
     outcome: ToolOutcome,
     turnId: string,
     oneTimeBudgetLimits: RuntimeBudgetLimits = {},
+    terminalEffectsNeeded = true,
   ): Promise<void> {
     const metadata = outcome.safeMetadata;
     if (
@@ -2653,6 +2718,55 @@ export class AgentRuntime {
         turnId,
         operationId: call.operationId,
         data: { checkpointId, changedPaths, changedLines, repositoryFingerprint },
+      });
+    }
+
+    if (call.name === "terminal_exec" && terminalEffectsNeeded) {
+      const processOutcome = stringMetadata(
+        metadata,
+        "outcome",
+        outcome.status,
+      );
+      if (processOutcome === "spawn_failed") {
+        this.meter.refund("commands");
+      }
+      const mutationOutcome = terminalMutationOutcome(
+        metadata.mutation_outcome ?? metadata.mutationOutcome,
+      );
+      if (
+        mutationOutcome !== undefined &&
+        mutationOutcome !== "none"
+      ) {
+        const pending =
+          this.state.pendingTerminalEffectOperationIds ?? [];
+        if (!pending.includes(call.operationId)) {
+          this.state.pendingTerminalEffectOperationIds = [
+            ...pending,
+            call.operationId,
+          ];
+        }
+      }
+      const outputBytes = terminalOutputBytes(metadata, outcome.data);
+      if (outputBytes > 0) {
+        this.meter.consume(
+          "commandOutputBytes",
+          outputBytes,
+          oneTimeBudgetLimits.commandOutputBytes,
+        );
+      }
+      await this.dependencies.audit.append({
+        type: "command.completed",
+        taskId: this.state.taskId,
+        turnId,
+        operationId: call.operationId,
+        data: {
+          tool: call.name,
+          outcome: processOutcome,
+          outputBytes,
+          ...(mutationOutcome === undefined
+            ? {}
+            : { mutationOutcome }),
+        },
       });
     }
 
@@ -3348,7 +3462,7 @@ function budgetRecoveryRequestId(
 }
 
 function specializedBudgetCounter(tool: string): "commands" | "readFiles" | undefined {
-  if (tool === "run_command") return "commands";
+  if (tool === "run_command" || tool === "terminal_exec") return "commands";
   if (tool === "read_file") return "readFiles";
   return undefined;
 }
@@ -3444,16 +3558,96 @@ function storedRuntimeBudgetLimits(
 
 function storedPlannedDisclosureBytes(
   safeMetadata: Readonly<Record<string, unknown>> | undefined,
+  terminalData?: Readonly<Record<string, unknown>>,
 ): number {
   const value = safeMetadata?.plannedDisclosureBytes;
-  return typeof value === "number" &&
+  if (typeof value === "number" &&
     Number.isSafeInteger(value) &&
     value >= TOOL_RESULT_ENVELOPE_RESERVE_BYTES
-    ? value
-    : TOOL_RESULT_ENVELOPE_RESERVE_BYTES;
+  ) {
+    return value;
+  }
+  if (
+    safeMetadata !== undefined &&
+    isTerminalJournalResultMetadata(safeMetadata)
+  ) {
+    const replaySourceBytes =
+      terminalData === undefined
+        ? undefined
+        : terminalResultSourceBytes(terminalData);
+    return plannedToolResultDisclosureBytes(
+      replaySourceBytes ??
+        (safeMetadata.stdout_bytes + safeMetadata.stderr_bytes),
+    );
+  }
+  return TOOL_RESULT_ENVELOPE_RESERVE_BYTES;
 }
 
-function outcomeFromRecord(call: NormalizedToolCall, record: OperationRecord): ToolOutcome {
+function terminalResultSourceBytes(
+  data: Readonly<Record<string, unknown>>,
+): number | undefined {
+  const outputBytes = retainedTerminalOutputBytes(data);
+  const invocation = data.invocation;
+  if (
+    outputBytes === undefined ||
+    invocation === null ||
+    typeof invocation !== "object" ||
+    Array.isArray(invocation)
+  ) {
+    return undefined;
+  }
+  const item = invocation as Readonly<Record<string, unknown>>;
+  let total = outputBytes;
+  for (const key of ["cwd", "command", "executable"] as const) {
+    const value = item[key];
+    if (value === undefined) continue;
+    if (typeof value !== "string") return undefined;
+    total += Buffer.byteLength(value);
+  }
+  const argumentsValue = item.arguments;
+  if (argumentsValue !== undefined) {
+    if (
+      !Array.isArray(argumentsValue) ||
+      !argumentsValue.every((entry) => typeof entry === "string")
+    ) {
+      return undefined;
+    }
+    total += argumentsValue.reduce(
+      (sum, entry) => sum + Buffer.byteLength(entry),
+      0,
+    );
+  }
+  return Number.isSafeInteger(total) ? total : undefined;
+}
+
+async function outcomeFromRecord(
+  call: NormalizedToolCall,
+  record: OperationRecord,
+  tools: ToolExecutor,
+): Promise<ToolOutcome> {
+  if (
+    call.name === "terminal_exec" &&
+    record.status === "completed" &&
+    terminalJournalMetadata(record.safeResult) !== undefined
+  ) {
+    const recovered = await tools.recoverCompleted?.({
+      operationId: call.operationId,
+      tool: call.name,
+      requestHash: record.requestHash,
+    });
+    if (recovered === undefined) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        `Completed terminal operation ${call.operationId} has no verified result artifact`,
+      );
+    }
+    assertRecoveredToolOutcome(recovered, call.operationId, call.name);
+    return {
+      ...recovered,
+      data: { ...recovered.data, replayed: true },
+      safeMetadata: { ...recovered.safeMetadata, replayed: true },
+    };
+  }
   const status = record.status === "completed" && record.outcome === "success" ? "success" : "failure";
   const {
     runtimeBudgetLimits: _runtimeBudgetLimits,
@@ -3467,6 +3661,37 @@ function outcomeFromRecord(call: NormalizedToolCall, record: OperationRecord): T
     data: { replayed: true, outcome: record.outcome, ...safeResult },
     safeMetadata: { replayed: true, ...safeResult },
   };
+}
+
+function terminalJournalMetadata(
+  safeMetadata: Readonly<Record<string, unknown>> | undefined,
+): TerminalJournalResultMetadata | undefined {
+  if (safeMetadata === undefined) return undefined;
+  const {
+    runtimeBudgetLimits: _runtimeBudgetLimits,
+    plannedDisclosureBytes: _plannedDisclosureBytes,
+    ...candidate
+  } = safeMetadata;
+  return isTerminalJournalResultMetadata(candidate) ? candidate : undefined;
+}
+
+function assertRecoveredToolOutcome(
+  outcome: ToolOutcome,
+  operationId: string,
+  tool: "terminal_exec",
+): void {
+  if (outcome.operationId !== operationId || outcome.tool !== tool) {
+    throw new AgentError(
+      "RECOVERY_REQUIRED",
+      "Recovered terminal result does not match the durable operation identity",
+      {
+        expectedOperationId: operationId,
+        actualOperationId: outcome.operationId,
+        expectedTool: tool,
+        actualTool: outcome.tool,
+      },
+    );
+  }
 }
 
 function numericMetadata(metadata: Readonly<Record<string, unknown>>, key: string): number {
@@ -3487,6 +3712,53 @@ function hashMetadata(metadata: Readonly<Record<string, unknown>>, key: string):
 function stringArrayMetadata(metadata: Readonly<Record<string, unknown>>, key: string): string[] {
   const value = metadata[key];
   return Array.isArray(value) && value.every((entry) => typeof entry === "string") ? value : [];
+}
+
+function terminalMutationOutcome(
+  value: unknown,
+):
+  | "none"
+  | "observed"
+  | "protected_or_hidden_changed"
+  | "unknown"
+  | undefined {
+  return value === "none" ||
+    value === "observed" ||
+    value === "protected_or_hidden_changed" ||
+    value === "unknown"
+    ? value
+    : undefined;
+}
+
+function terminalOutputBytes(
+  metadata: Readonly<Record<string, unknown>>,
+  data: Readonly<Record<string, unknown>>,
+): number {
+  const retained = retainedTerminalOutputBytes(data);
+  if (retained !== undefined) return retained;
+  const combined = numericMetadata(metadata, "outputBytes");
+  if (combined > 0) return combined;
+  const stdout = numericMetadata(metadata, "stdout_bytes");
+  const stderr = numericMetadata(metadata, "stderr_bytes");
+  return Number.isSafeInteger(stdout + stderr) ? stdout + stderr : 0;
+}
+
+function retainedTerminalOutputBytes(
+  data: Readonly<Record<string, unknown>>,
+): number | undefined {
+  let total = 0;
+  for (const key of ["stdout", "stderr"] as const) {
+    const stream = data[key];
+    if (stream === null || typeof stream !== "object" || Array.isArray(stream)) {
+      return undefined;
+    }
+    const head = (stream as Readonly<Record<string, unknown>>).head;
+    const tail = (stream as Readonly<Record<string, unknown>>).tail;
+    if (typeof head !== "string" || typeof tail !== "string") return undefined;
+    total += Buffer.byteLength(head) + Buffer.byteLength(tail);
+    if (!Number.isSafeInteger(total)) return undefined;
+  }
+  return total;
 }
 
 function mapValidationOutcome(

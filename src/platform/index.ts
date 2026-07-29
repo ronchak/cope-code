@@ -11,6 +11,11 @@ export { runHostProbe } from "./common.js";
 export { DarwinHostPlatform } from "./darwin.js";
 export { UnsupportedHostPlatform } from "./unsupported.js";
 export { WindowsHostPlatform } from "./windows.js";
+export {
+  resolveTerminalLaunch,
+  TerminalLaunchError,
+  type TerminalLaunch,
+} from "./terminal.js";
 
 export function selectHostPlatform(
   currentPlatform: NodeJS.Platform = platform(),

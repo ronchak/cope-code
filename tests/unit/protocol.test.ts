@@ -37,6 +37,7 @@ test("canonical tool registry drives names, capabilities, schemas, and bootstrap
     "edit_text",
     "apply_patch",
     "run_command",
+    "terminal_exec",
     "request_user_input",
     "request_capability",
     "complete_task",
@@ -88,6 +89,63 @@ test("canonical tool registry drives names, capabilities, schemas, and bootstrap
     getBootstrapToolDefinitions(undefined, false),
     TOOL_NAMES.map((name) => ({ name, purpose: TOOL_REGISTRY[name].purpose })),
   );
+});
+
+test("terminal_exec enforces strict disjoint shell and argv forms", () => {
+  assert.equal(validateToolArguments("terminal_exec", {
+    contract: "terminal-exec/1",
+    mode: "shell",
+    command: "npm test",
+  }).valid, true);
+  assert.equal(validateToolArguments("terminal_exec", {
+    contract: "terminal-exec/1",
+    mode: "argv",
+    executable: "node",
+    arguments: ["scripts/check.mjs"],
+    cwd: ".",
+    timeout_ms: 300_000,
+    max_output_bytes: 524_288,
+  }).valid, true);
+  assert.equal(validateToolArguments("terminal_exec", {
+    contract: "terminal-exec/1",
+    mode: "shell",
+    command: "npm test",
+    executable: "npm",
+    arguments: ["test"],
+  }).valid, false);
+  assert.equal(validateToolArguments("terminal_exec", {
+    contract: "terminal-exec/1",
+    mode: "argv",
+    executable: "node",
+  }).valid, false);
+  assert.equal(validateToolArguments("terminal_exec", {
+    contract: "terminal-exec/1",
+    mode: "shell",
+    command: "npm\u0000test",
+  }).valid, false);
+  assert.equal(validateToolArguments("terminal_exec", {
+    contract: "terminal-exec/1",
+    mode: "shell",
+    command: "😀".repeat(65_537),
+  }).valid, false);
+  assert.equal(validateToolArguments("terminal_exec", {
+    contract: "terminal-exec/1",
+    mode: "argv",
+    executable: "node",
+    arguments: Array.from({ length: 9 }, () => "a".repeat(32_768)),
+  }).valid, false);
+  assert.equal(validateToolArguments("terminal_exec", {
+    contract: "terminal-exec/1",
+    mode: "argv",
+    executable: "😀".repeat(8_193),
+    arguments: [],
+  }).valid, false);
+  assert.equal(validateToolArguments("terminal_exec", {
+    contract: "terminal-exec/1",
+    mode: "argv",
+    executable: "node",
+    arguments: ["😀".repeat(8_193)],
+  }).valid, false);
 });
 
 function request(operations: readonly unknown[] = [

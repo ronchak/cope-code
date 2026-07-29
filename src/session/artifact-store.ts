@@ -3,17 +3,32 @@ import path from "node:path";
 import { newId, sha256, stableJson } from "../shared/crypto.js";
 import { AgentError } from "../shared/errors.js";
 
-export type ArtifactKind = "outbox" | "response" | "response-capture" | "decision";
+export const ARTIFACT_KINDS = [
+  "outbox",
+  "response",
+  "response-capture",
+  "decision",
+  "terminal-request",
+  "terminal-pre-observation",
+  "terminal-exit-receipt",
+  "terminal-post-observation",
+  "terminal-result",
+] as const;
+
+export type ArtifactKind = (typeof ARTIFACT_KINDS)[number];
 
 const MAX_ARTIFACT_BYTES = 8 * 1024 * 1024;
 const MAX_MANIFEST_BYTES = 64 * 1024;
 
-interface ArtifactManifest {
-  readonly schemaVersion: 1;
+export interface ArtifactReference {
   readonly kind: ArtifactKind;
   readonly id: string;
   readonly bytes: number;
   readonly sha256: string;
+}
+
+interface ArtifactManifest extends ArtifactReference {
+  readonly schemaVersion: 1;
 }
 
 /**
@@ -50,6 +65,20 @@ export class SessionArtifactStore {
       await unlink(this.contentPath(kind, id)).catch(() => undefined);
       throw error;
     }
+  }
+
+  public async putReferenced(
+    kind: ArtifactKind,
+    id: string,
+    content: string,
+  ): Promise<ArtifactReference> {
+    await this.put(kind, id, content);
+    return {
+      kind,
+      id,
+      bytes: Buffer.byteLength(content),
+      sha256: sha256(content),
+    };
   }
 
   public async get(kind: ArtifactKind, id: string): Promise<string> {
@@ -117,6 +146,27 @@ export class SessionArtifactStore {
     return this.get(kind, id);
   }
 
+  /**
+   * Reads an artifact through a previously persisted reference. The manifest
+   * protects the artifact on disk; this additional comparison protects the
+   * caller's durable binding to the exact artifact bytes it selected.
+   */
+  public async getReferenced(reference: ArtifactReference): Promise<string> {
+    assertArtifactReference(reference);
+    const content = await this.get(reference.kind, reference.id);
+    if (
+      reference.bytes !== Buffer.byteLength(content) ||
+      reference.sha256 !== sha256(content)
+    ) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Source-bearing recovery artifact does not match its durable reference",
+        { kind: reference.kind, id: reference.id },
+      );
+    }
+    return content;
+  }
+
   public async remove(kind: ArtifactKind, id: string): Promise<void> {
     assertSafeArtifactId(id);
     await Promise.all([
@@ -156,6 +206,28 @@ async function atomicWrite(filename: string, content: string): Promise<void> {
 function assertSafeArtifactId(id: string): void {
   if (!/^[A-Za-z0-9._-]{3,160}$/u.test(id)) {
     throw new AgentError("INTERNAL_ERROR", "Unsafe recovery artifact identifier");
+  }
+}
+
+export function isArtifactReference(value: unknown): value is ArtifactReference {
+  if (!hasExactKeys(value, ["kind", "id", "bytes", "sha256"])) return false;
+  const reference = value as Partial<ArtifactReference>;
+  return (
+    typeof reference.kind === "string" &&
+    (ARTIFACT_KINDS as readonly string[]).includes(reference.kind) &&
+    typeof reference.id === "string" &&
+    /^[A-Za-z0-9._-]{3,160}$/u.test(reference.id) &&
+    Number.isSafeInteger(reference.bytes) &&
+    (reference.bytes ?? -1) >= 0 &&
+    (reference.bytes ?? MAX_ARTIFACT_BYTES + 1) <= MAX_ARTIFACT_BYTES &&
+    typeof reference.sha256 === "string" &&
+    /^[a-f0-9]{64}$/u.test(reference.sha256)
+  );
+}
+
+function assertArtifactReference(value: unknown): asserts value is ArtifactReference {
+  if (!isArtifactReference(value)) {
+    throw new AgentError("RECOVERY_REQUIRED", "Recovery artifact reference is malformed");
   }
 }
 

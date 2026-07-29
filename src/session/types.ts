@@ -1,3 +1,5 @@
+import type { ArtifactReference } from "./artifact-store.js";
+
 export const SESSION_SCHEMA_VERSION = 1 as const;
 
 export type AutonomyMode = "inspect" | "edit" | "auto";
@@ -82,7 +84,8 @@ export interface QueuedOutbound {
   };
 }
 
-export interface MutationRecord {
+export interface PatchMutationRecord {
+  readonly kind?: "patch";
   readonly operationId: string;
   readonly checkpointId: string;
   readonly changedPaths: readonly string[];
@@ -90,6 +93,34 @@ export interface MutationRecord {
   readonly completedAt: string;
   readonly repositoryFingerprint: string;
 }
+
+export interface TerminalMutationRecord {
+  readonly kind: "terminal";
+  readonly operationId: string;
+  readonly checkpointId?: never;
+  readonly changedPaths: readonly string[];
+  readonly changedLines: number;
+  readonly createdPaths: readonly string[];
+  readonly updatedPaths: readonly string[];
+  readonly deletedPaths: readonly string[];
+  readonly renamedPaths: readonly {
+    readonly from: string;
+    readonly to: string;
+  }[];
+  readonly preExistingTouchedPaths: readonly string[];
+  readonly completedAt: string;
+  readonly observationOutcome:
+    | "none"
+    | "observed"
+    | "protected_or_hidden_changed"
+    | "unknown";
+  readonly preObservation?: ArtifactReference;
+  readonly postObservation?: ArtifactReference;
+  readonly terminalResult: ArtifactReference;
+  readonly repositoryFingerprint?: string;
+}
+
+export type MutationRecord = PatchMutationRecord | TerminalMutationRecord;
 
 export interface ValidationRecord {
   readonly operationId: string;
@@ -147,6 +178,11 @@ export interface SessionState {
    * durable queued outbound artifact. Optional for legacy session records.
    */
   unreturnedOperationIds?: string[];
+  /**
+   * Completed terminal operations whose project effects still need durable
+   * attribution. Optional for legacy session records.
+   */
+  pendingTerminalEffectOperationIds?: string[];
   submission?: SubmissionIntent;
   transportConversationId?: string;
   queuedOutbound?: QueuedOutbound;
