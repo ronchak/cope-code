@@ -141,6 +141,14 @@ bound exit receipt. `OperationJournal.markFailed` is used only by recovery when
 validated launch/exit/result absence within the ordinary process-crash model proves
 an interrupted executing operation never launched.
 
+The live no-result prelaunch path is one source-free session transaction: clear the
+pending operation, insert it into the completed and unreturned sets, and apply the
+one-time `commands` refund in one session persist. It does not enter the
+result-backed applicator. No durable state may retain a pending terminal operation
+whose command charge was already refunded; recovery therefore either observes the
+old charged/pending state and performs the transaction once or the new
+refunded/completed state and performs no accounting.
+
 ### 3. Preserve the repository fingerprint definition
 
 `repositoryFingerprint` remains exactly
@@ -208,6 +216,15 @@ For before-state reconstruction:
 - persist an index identity hash, not the full clean inventory; and
 - missing or ambiguous evidence yields `unknown`, never an invented baseline.
 
+Before launch, every session-start pre-existing dirty or untracked path must have a
+durable reconstructible baseline: retained exact bytes, an immutable matching Git
+blob, or an already verified checkpoint/observation baseline. Identity-only evidence
+is not sufficient for pre-existing user work. If any such path lacks a
+reconstruction source, return a typed fail/ask prelaunch outcome that tells the
+operator to preserve or reconcile it first. Large clean tracked files remain safe
+through their HEAD blob, and later agent-created paths may use bounded unavailable
+evidence because no original user bytes are at risk.
+
 Initial bounds:
 
 - at most 200 retained source-image entries;
@@ -260,8 +277,11 @@ Make `terminal-result-artifact/1` a strict exact-keyed legacy/full union. The le
 member retains the current keys, placeholder pre/post observations, and no launch
 receipt. The full member requires a `launch_receipt` reference bound to the same
 operation, request hash, request artifact, and pre-observation as the exit receipt,
-post-observation, and result. Consumers choose the branch from exact validated
-artifact/observation shapes; they never infer a missing receipt for a full result.
+post-observation, and result, plus the optional all-or-none hidden control anchor
+required exactly when the full mutation outcome is `observed`. Consumers choose the
+branch from exact validated artifact/observation shapes; they never infer a missing
+receipt for a full result, and the executor strips envelope-only control facts from
+model-visible data.
 
 ## Architecture
 
@@ -286,8 +306,11 @@ interface WorkspaceObserver {
 
 The implementation has no browser, model, session-store, or runtime imports. It uses
 direct Git argv, NUL-delimited porcelain v2, the existing repository boundary and
-path identity, and bounded reads. It never invokes hooks, filters, aliases, a pager,
-or a shell.
+path identity, and bounded reads. Export the existing `GitInspector` isolated-view
+read seam and route every observer Git invocation through it, retaining
+`--no-optional-locks`, pager/fsmonitor/filter/alias neutralization, and the temporary
+index environment. It never invokes hooks, filters, aliases, a pager, or a shell,
+and observation must not refresh or rewrite the real index.
 
 `capturePost` owns a short observation deadline. It must not reuse an already-aborted
 process signal after timeout or cancellation. It starts only after process-tree
@@ -299,7 +322,10 @@ Each observation is race-checked:
 2. retain the required bounded before-images;
 3. recapture the full authoritative boundary set: branch, HEAD, index identity,
    visible status fingerprint, protected/policy-hidden fingerprint, and Git-control
-   components;
+   components. Reuse an accepted sample's per-entry content hash only when the
+   complete host identity tuple (path key, device/file ID where available, mode,
+   size, mtime, and ctime) is unchanged; rehash every changed or unreliable entry so
+   the resulting canonical fingerprint is byte-identical to a full rescan;
 4. accept only if both boundary samples match;
 5. retry the complete observation once for ordinary concurrent churn; and
 6. after the retry, reject prelaunch for missing identity/boundary evidence, accept
@@ -349,12 +375,16 @@ Produce the existing frozen terminal result fields:
 - mutation outcome; and
 - final repository fingerprint only when state is known.
 
-For an `observed` effect, also copy an integrity-bound post-observation control
-anchor containing branch, HEAD, and `excludedStateFingerprint`. The anchor is
-all-or-none and comes from the exact post-observation used to construct the result,
-never from a later live inspection. It remains authoritative across later typed
-patches and catalog validations. Unknown, metadata-limited, or
-`protected_or_hidden_changed` effects contain no invented anchor.
+For an `observed` effect, the persistence owner also writes an integrity-bound
+post-observation control anchor containing branch, HEAD, and
+`excludedStateFingerprint` on the full terminal-result artifact envelope, outside
+the model-visible `TerminalExecResult`. The anchor is all-or-none and comes from the
+exact post-observation used to construct the result, never from a later live
+inspection. Effect application copies it into the source-free session record, where
+it remains authoritative across later typed patches and catalog validations.
+Unknown, metadata-limited, or `protected_or_hidden_changed` effects contain no
+invented anchor. Model output, handoff, audit, and review projections never disclose
+the excluded-state fingerprint.
 
 Rename classification requires a usable Git rename origin plus matching pre-state
 identity. Ambiguous or unverifiable cases degrade to create/delete. Use
@@ -534,14 +564,15 @@ Add a non-throwing terminal/post-hoc budget API. It:
 
 - validates bounded nonnegative input;
 - applies safe, saturating arithmetic without throwing before state is updated;
-- records the actual known changed-file/line usage once;
+- records actual known `changedFiles`, `changedLines`, and `commandOutputBytes`
+  usage once in the same call;
 - returns all exceeded dimensions and effective one-time/persisted limits; and
 - allows the runtime to persist truth before entering the existing budget-recovery
   pause.
 
 `commands` remains charged once at the launch boundary and refunded only when no
-process launched. `commandOutputBytes` remains charged once from the durable result.
-Recovery and replay never charge any counter twice.
+process launched. No counter inside terminal effect application uses the throwing
+`consume` path. Recovery and replay never charge any counter twice.
 
 ### Terminal mutation and compatibility
 
@@ -681,7 +712,8 @@ Required contract decisions:
 3. `terminal-launch-receipt` added to every exact artifact-kind/reference validator,
    with artifact-root and receipt-kind directory sync hardening where the existing
    host capability supports it, but no power-loss proof claim;
-4. non-throwing post-hoc budget API;
+4. non-throwing post-hoc budget API for changed files, changed lines, and command
+   output bytes;
 5. strict legacy/full observation and terminal-result unions with only pre/post
    observation phases and a required launch receipt in the full result member;
 6. no journal metadata key additions;
@@ -689,7 +721,8 @@ Required contract decisions:
 8. mixed patch/terminal session-diff resolver with per-path unavailable evidence
    plus a bounded transition-path inventory for clean HEAD/index transitions;
 9. `completionAuthority` added to the exact top-level session-key validator while
-   remaining optional for legacy sessions;
+   remaining optional for legacy sessions and accepting only `"frozen"` or
+   `"observed"`;
 10. a strict incomplete-terminal-evidence reader that distinguishes no request,
     request/pre without launch, partial/corrupt receipt, launch-receipt-only,
     exit-receipt-without-result, and completed/failed-pending-without-result states,
@@ -713,7 +746,12 @@ Required contract decisions:
     validated absence of launch, exit, and result evidence; and
 16. an all-or-none post-observation control anchor on full `observed` terminal
     mutation records, retained in counts-only fallback and used independently from
-    later validation fingerprints.
+    later validation fingerprints, but never included in model/audit/handoff/review
+    projections;
+17. a prelaunch reconstructibility gate for every session-start dirty/untracked path
+    using exact bytes, an immutable matching blob, or a verified prior baseline; and
+18. one exported isolated-view Git read seam used by every observer invocation,
+    including safe content-hash reuse that cannot rewrite the real index.
 
 Expected contract files:
 
@@ -764,11 +802,11 @@ Use five reviewable PRs:
    with the strict artifact owner.
 3. **S2-C — session diff.** Land mixed patch/terminal baselines against the reviewed
    observation reader. Exact Opus review `R2-1` runs on the integrated A+B+C head so
-   silent diff omission is reviewed with fixtures before executor integration;
-   `R2-2` repeats it through real runtime-created terminal records.
+   silent diff omission is reviewed with fixtures before executor integration.
 4. **S2-P1+P2 — executor and effects.** Replace placeholders, add the launch
    receipt, preserve process ordering, implement startup/live/replay effect
-   application and post-hoc accounting. Exact Opus review `R2-2`.
+   application and post-hoc accounting. Exact Opus review `R2-2` repeats the diff
+   review through real runtime-created terminal records.
 5. **S2-P3 — completion and acceptance.** Persist/consume completion authority,
    integrate freshness, handoff/review facts, cross-layer tests, and hosted evidence.
    Exact final-head Opus review `R2-3`.
@@ -794,17 +832,21 @@ primary pushes and merges.
 - ignored summary without an exhaustive claim;
 - hidden/protected path, hook/config/control drift, and nested repository;
 - unreadable or over-bound post-state;
-- oversized dirty/untracked path uses identity-only evidence and does not block when
-  untouched;
+- an oversized dirty/untracked path that is not session-start user work uses
+  identity-only evidence and does not block when untouched;
+- an oversized/non-reconstructible session-start dirty or untracked path refuses or
+  asks before launch, while a large clean tracked path uses its immutable HEAD blob;
 - a changed identity-only path becomes explicit non-clean/per-path unavailable;
 - failure to capture identity-only evidence or the bounded observation refuses
   launch;
 - one concurrent-churn retry, then explicit unknown;
 - pre-observation deadline expiry refuses/refunds, post-observation expiry becomes
-  non-clean `unknown`, and a fixture with at least 10,000 untracked plus 10,000
-  individually matched ignored paths completes within 40 seconds and still launches
-  a second command; use pinned short path names and assert the fixture remains below
-  the frozen porcelain byte ceiling;
+  non-clean `unknown`; a disk-backed fixture uses at least 10,000 untracked plus
+  10,000 individually matched ignored paths on macOS and a recorded host-tuned
+  Windows count, completes within 40 seconds, and still launches a second command;
+  a synthetic injected-observer fixture exercises the full 20,000-entry bound on
+  every host; use pinned short path names and assert the fixtures remain below the
+  frozen porcelain byte ceiling;
 - visible status beyond the entry/content fingerprint bound still launches but
   records metadata-limited non-clean evidence with no substitute repository
   fingerprint;
@@ -814,13 +856,20 @@ primary pushes and merges.
   both result and session caps;
 - spaces, Unicode, leading dash, and host-specific path spelling; and
 - observer fingerprint equals an independent
-  `GitInspector.status().snapshotSha256`.
+  `GitInspector.status().snapshotSha256`;
+- unchanged identity tuples reuse content hashes while changed/unreliable tuples
+  rehash, producing the same canonical digest as a full rescan; and
+- complete pre/post observation leaves the real Git index byte-identical, while
+  racing or hard-linked ignored files do not alter the canonical fingerprint or
+  fail the observation.
 
 ### Executor and artifacts
 
 - full observation and result reference binding;
 - the exact legacy/full result union accepts Slice 1 bytes, requires a bound launch
   receipt for a full result, and rejects a launch receipt as stdout/stderr;
+- the persisted/session control anchor validates but is absent from model-visible
+  result data, audit, handoff, and review projections;
 - legacy placeholder branch remains byte-compatible;
 - post-observation after success, nonzero, timeout, cancellation, and OS spawn
   failure;
@@ -880,6 +929,9 @@ and zero partial accounting.
   interim marker, and still blocks completion;
 - nonzero, timeout, and cancellation use identical effect accounting;
 - live, replay, startup promotion, and repeated recovery remain idempotent;
+- live no-result prelaunch failure refunds, clears pending, and inserts
+  completed/unreturned in one persist; crashes before/after that persist never
+  double-refund;
 - startup applies effects for both executing-promoted and already-completed journal
   records that still have a session-pending operation;
 - effect preparation/validation failure after journal completion retains pending
@@ -896,6 +948,8 @@ and zero partial accounting.
 - replay applies a post-observation control anchor once, retains it in counts-only
   fallback, and rejects an artifact/record anchor mismatch;
 - files-only, lines-only, and combined overruns persist actual usage before pausing;
+- a command-output overrun uses the same non-throwing transaction, persists the full
+  effect, clears pending, and pauses without a replay loop;
 - approved, denied, and unavailable budget raises;
 - live prelaunch refusal and process-crash-model prelaunch recovery restore
   `commands` usage to its pre-request value exactly once;
@@ -992,7 +1046,9 @@ Slice 2 is mergeable only on one immutable exact head where:
    pre-observation and a complete or explicit non-clean post-observation;
 2. failed, timed-out, and cancelled commands preserve both process and effect truth;
 3. all required project and Git effect classes have operation-scoped tests;
-4. session-start user work remains separately identified and recoverable;
+4. session-start user work remains separately identified and recoverable, and a
+   terminal command cannot launch while any such dirty/untracked path lacks a
+   durable reconstruction source;
 5. each result applies at most one mutation, sequence increment, and budget charge;
 6. post-hoc overrun truth is durable before later work pauses;
 7. the pending-operation application key clears only in the same persist as final
