@@ -221,9 +221,10 @@ export class SessionArtifactStore {
     assertSafeArtifactId(id);
     const contentPath = this.contentPath(kind, id);
     const manifestPath = this.manifestPath(kind, id);
-    const existence = await Promise.allSettled([access(contentPath), access(manifestPath)]);
-    const contentExists = existence[0]?.status === "fulfilled";
-    const manifestExists = existence[1]?.status === "fulfilled";
+    const [contentExists, manifestExists] = await Promise.all([
+      artifactPathExists(contentPath, kind, id),
+      artifactPathExists(manifestPath, kind, id),
+    ]);
     if (!contentExists && !manifestExists) return undefined;
     if (!contentExists || !manifestExists) {
       throw new AgentError("RECOVERY_REQUIRED", "Source-bearing recovery artifact is incomplete", {
@@ -242,6 +243,30 @@ export class SessionArtifactStore {
   public async getReferenced(reference: ArtifactReference): Promise<string> {
     assertArtifactReference(reference);
     const content = await this.get(reference.kind, reference.id);
+    if (
+      reference.bytes !== Buffer.byteLength(content) ||
+      reference.sha256 !== sha256(content)
+    ) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Source-bearing recovery artifact does not match its durable reference",
+        { kind: reference.kind, id: reference.id },
+      );
+    }
+    return content;
+  }
+
+  /**
+   * Preserves the recovery distinction between evidence that is wholly absent
+   * and evidence that is partial, corrupt, or different from its bound
+   * reference. Only the first case returns undefined.
+   */
+  public async getOptionalReferenced(
+    reference: ArtifactReference,
+  ): Promise<string | undefined> {
+    assertArtifactReference(reference);
+    const content = await this.getOptional(reference.kind, reference.id);
+    if (content === undefined) return undefined;
     if (
       reference.bytes !== Buffer.byteLength(content) ||
       reference.sha256 !== sha256(content)
@@ -329,6 +354,25 @@ async function exists(filename: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+async function artifactPathExists(
+  filename: string,
+  kind: ArtifactKind,
+  id: string,
+): Promise<boolean> {
+  try {
+    await access(filename);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw new AgentError(
+      "RECOVERY_REQUIRED",
+      "Source-bearing recovery artifact cannot be inspected",
+      { kind, id },
+      { cause: error },
+    );
   }
 }
 

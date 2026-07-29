@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import {
   TERMINAL_EXEC_CONTRACT,
   TERMINAL_EXEC_RESULT_CONTRACT,
@@ -9,9 +11,16 @@ import {
   TERMINAL_RESULT_MAX_PATH_BYTES,
   TERMINAL_RESULT_MAX_PATH_ENDPOINTS,
   isWorkspaceObservation,
+  type WorkspaceBeforeImage,
   type WorkspaceObservation,
   type WorkspacePostObservationControl,
 } from "../repository/workspace-observer.js";
+import type { CheckpointFileSnapshot } from "../repository/checkpoint.js";
+import type {
+  TerminalBeforeImageResolution,
+  TerminalBeforeImageResolver,
+  TerminalSessionMutationDiffRecord,
+} from "../repository/snapshot-diff.js";
 import { sha256, stableJson } from "../shared/crypto.js";
 import { AgentError } from "../shared/errors.js";
 import { isJournalOperationId } from "../shared/operation-id.js";
@@ -166,7 +175,10 @@ export type IncompleteTerminalEvidence =
   | {
       readonly state: "request_without_launch";
       readonly recoveryContext: TerminalRecoveryContext;
-      readonly hasPreObservation: boolean;
+      readonly preEvidence:
+        | "none"
+        | "legacy_placeholder"
+        | "full_workspace_observation";
     }
   | {
       readonly state: "launch_without_exit";
@@ -230,6 +242,93 @@ export interface RecoveredTerminalResult {
   readonly result: TerminalExecResult;
   readonly reference: ArtifactReference;
   readonly safeMetadata: TerminalJournalResultMetadata;
+}
+
+/**
+ * Receipt absence is usable as no-launch proof only in the documented
+ * ordinary-process-crash model. Operator-declared power/storage loss always
+ * disables this proof, even when the surviving evidence shape is otherwise
+ * identical.
+ */
+export function terminalEvidenceProvesNoLaunch(
+  evidence: IncompleteTerminalEvidence,
+): boolean {
+  return (
+    evidence.recoveryContext === "ordinary_process_crash" &&
+    (
+      evidence.state === "none" ||
+      (
+        evidence.state === "request_without_launch" &&
+        evidence.preEvidence !== "legacy_placeholder"
+      ) ||
+      evidence.state === "completed_prelaunch_failure"
+    )
+  );
+}
+
+export interface VerifiedTerminalResultEvidence {
+  readonly artifact: TerminalResultArtifact;
+  readonly request: TerminalRequestArtifact;
+  readonly preObservation: TerminalObservationArtifact;
+  readonly launchReceipt?: TerminalLaunchReceiptArtifact;
+  readonly exitReceipt: TerminalExitReceiptArtifact;
+  readonly postObservation: TerminalObservationArtifact;
+  readonly reference: ArtifactReference;
+}
+
+export interface TerminalBeforeImageEvidenceReferences {
+  readonly terminalResult: ArtifactReference;
+  readonly preObservation?: ArtifactReference;
+}
+
+export interface TerminalImmutableHeadPath {
+  readonly objectId: string;
+  readonly mode: number;
+  readonly bytes: Buffer;
+}
+
+export interface TerminalBeforeImageResolverOptions {
+  /**
+   * Resolves the durable references stored on the full session mutation.
+   * Legacy records may omit preObservation; a full result may not.
+   */
+  readonly resolveReferences: (
+    mutation: TerminalSessionMutationDiffRecord,
+    signal?: AbortSignal,
+  ) => Promise<TerminalBeforeImageEvidenceReferences | undefined>;
+  /** Reads the exact immutable object ID named by a persisted before-image. */
+  readonly readGitBlob?: (
+    objectId: string,
+    signal?: AbortSignal,
+  ) => Promise<Buffer | undefined>;
+  /** Resolves one path through the exact immutable pre-observation HEAD. */
+  readonly readHeadPath?: (
+    head: string,
+    repositoryRelativePath: string,
+    signal?: AbortSignal,
+  ) => Promise<TerminalImmutableHeadPath | undefined>;
+  /**
+   * Returns an already integrity-verified earlier session baseline. The
+   * persistence owner still verifies its path and self-authenticating bytes.
+   */
+  readonly resolvePriorBaseline?: (
+    mutation: TerminalSessionMutationDiffRecord,
+    repositoryRelativePath: string,
+    signal?: AbortSignal,
+  ) => Promise<{
+    readonly baselineId: string;
+    readonly entry: CheckpointFileSnapshot;
+  } | undefined>;
+  /** RepositoryBoundary.pathKey on case-insensitive repositories. */
+  readonly pathKey?: (repositoryRelativePath: string) => string;
+}
+
+interface VerifiedFullTerminalResultEvidence
+  extends VerifiedTerminalResultEvidence {
+  readonly artifact: FullTerminalResultArtifact;
+  readonly preObservation: TerminalWorkspaceObservationArtifact;
+  readonly launchReceipt: TerminalLaunchReceiptArtifact;
+  readonly postObservation: TerminalWorkspaceObservationArtifact;
 }
 
 export class TerminalArtifactPersistence {
@@ -550,6 +649,18 @@ export class TerminalArtifactPersistence {
     const post = postRaw === undefined
       ? undefined
       : parseTerminalObservationArtifact(postRaw);
+    if (
+      request === undefined &&
+      (pre !== undefined ||
+        launch !== undefined ||
+        exit !== undefined ||
+        post !== undefined)
+    ) {
+      throw recoveryError(
+        "Terminal evidence exists without its persisted request",
+        input,
+      );
+    }
     for (const evidence of [request, pre, launch, exit, post]) {
       if (
         evidence !== undefined &&
@@ -602,6 +713,33 @@ export class TerminalArtifactPersistence {
         input,
       );
     }
+    if (exit !== undefined && pre === undefined) {
+      throw recoveryError(
+        "Terminal exit receipt has no pre-observation",
+        input,
+      );
+    }
+    if (
+      pre !== undefined &&
+      post !== undefined &&
+      pre.contract !== post.contract
+    ) {
+      throw recoveryError(
+        "Terminal pre/post observations use incompatible contracts",
+        input,
+      );
+    }
+    if (
+      exit !== undefined &&
+      pre?.contract ===
+        TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT &&
+      launch === undefined
+    ) {
+      throw recoveryError(
+        "A full terminal exit receipt has no launch receipt",
+        input,
+      );
+    }
     if (
       post?.contract === TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT &&
       launch === undefined
@@ -637,7 +775,10 @@ export class TerminalArtifactPersistence {
       input.journalStatus === "completed" ||
       input.journalStatus === "failed"
     ) {
-      if (isTerminalPrelaunchFailureMetadata(input.journalSafeResult)) {
+      if (
+        isTerminalPrelaunchFailureMetadata(input.journalSafeResult) &&
+        pre?.contract !== TERMINAL_OBSERVATION_ARTIFACT_CONTRACT
+      ) {
         return {
           state: "completed_prelaunch_failure",
           recoveryContext: input.recoveryContext,
@@ -655,7 +796,12 @@ export class TerminalArtifactPersistence {
     return {
       state: "request_without_launch",
       recoveryContext: input.recoveryContext,
-      hasPreObservation: pre !== undefined,
+      preEvidence:
+        pre === undefined
+          ? "none"
+          : pre.contract === TERMINAL_OBSERVATION_ARTIFACT_CONTRACT
+            ? "legacy_placeholder"
+            : "full_workspace_observation",
     };
   }
 
@@ -699,94 +845,11 @@ export class TerminalArtifactPersistence {
     }
     const raw = await this.artifacts.getOptional("terminal-result", input.operationId);
     if (raw === undefined) {
-      const requestRaw = await this.artifacts.getOptional(
-        "terminal-request",
-        input.operationId,
-      );
-      const preRaw = await this.artifacts.getOptional(
-        "terminal-pre-observation",
-        input.operationId,
-      );
-      const launchRaw = await this.artifacts.getOptional(
-        "terminal-launch-receipt",
-        input.operationId,
-      );
-      const exitRaw = await this.artifacts.getOptional(
-        "terminal-exit-receipt",
-        input.operationId,
-      );
-      const postRaw = await this.artifacts.getOptional(
-        "terminal-post-observation",
-        input.operationId,
-      );
-      const request =
-        requestRaw === undefined ? undefined : parseTerminalRequestArtifact(requestRaw);
-      const pre =
-        preRaw === undefined ? undefined : parseTerminalObservationArtifact(preRaw);
-      const launch =
-        launchRaw === undefined ? undefined : parseTerminalLaunchReceiptArtifact(launchRaw);
-      const exit =
-        exitRaw === undefined ? undefined : parseTerminalExitReceiptArtifact(exitRaw);
-      const post =
-        postRaw === undefined ? undefined : parseTerminalObservationArtifact(postRaw);
-      for (const evidence of [request, pre, launch, exit, post]) {
-        if (
-          evidence !== undefined &&
-          (evidence.operation_id !== input.operationId ||
-            evidence.request_hash !== input.requestHash)
-        ) {
-          throw recoveryError(
-            "Incomplete terminal evidence does not match the recovery request",
-            input,
-          );
-        }
-      }
-      if (pre !== undefined && (pre.phase !== "pre" || request === undefined)) {
-        throw recoveryError("Terminal pre-observation has an incomplete evidence chain", input);
-      }
-      if (launch !== undefined && (request === undefined || pre === undefined)) {
-        throw recoveryError("Terminal launch receipt has an incomplete evidence chain", input);
-      }
-      if (launch !== undefined && requestRaw !== undefined && preRaw !== undefined) {
-        if (
-          pre?.contract !== TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT
-        ) {
-          throw recoveryError(
-            "Terminal launch receipt does not bind a full pre-observation",
-            input,
-          );
-        }
-        assertLaunchablePreObservation(pre, "RECOVERY_REQUIRED");
-        assertLaunchReceiptBinding(
-          launch,
-          input.operationId,
-          input.requestHash,
-          referenceFor("terminal-request", requestRaw, input.operationId),
-          referenceFor(
-            "terminal-pre-observation",
-            preRaw,
-            input.operationId,
-          ),
-        );
-      }
-      if (post !== undefined && post.phase !== "post") {
-        throw recoveryError("Terminal post-observation phase does not match", input);
-      }
-      if (post !== undefined && exit === undefined) {
-        throw recoveryError(
-          "Terminal post-observation has no exit receipt",
-          input,
-        );
-      }
-      if (
-        post?.contract === TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT &&
-        launch === undefined
-      ) {
-        throw recoveryError(
-          "A full terminal post-observation has no launch receipt",
-          input,
-        );
-      }
+      await this.inspectIncompleteEvidence({
+        operationId: input.operationId,
+        requestHash: input.requestHash,
+        recoveryContext: "ordinary_process_crash",
+      });
       return undefined;
     }
     const artifact = parseTerminalResultArtifact(raw);
@@ -926,6 +989,319 @@ export class TerminalArtifactPersistence {
     return artifact;
   }
 
+  /**
+   * Reads one result through its durable reference and validates the complete
+   * request/observation/receipt chain before returning any source-bearing
+   * evidence to an effect or diff consumer.
+   */
+  public async readResultReference(input: {
+    readonly operationId: string;
+    readonly reference: ArtifactReference;
+    readonly requestHash?: string;
+  }): Promise<VerifiedTerminalResultEvidence> {
+    assertExpectedReference(input.reference, "terminal-result");
+    if (
+      input.reference.id !== input.operationId ||
+      !isJournalOperationId(input.operationId)
+    ) {
+      throw recoveryError(
+        "Terminal result reference does not match the requested operation",
+        {
+          operationId: input.operationId,
+          requestHash: input.requestHash ?? "0".repeat(64),
+        },
+      );
+    }
+    const raw = await this.artifacts.getReferenced(input.reference);
+    const artifact = parseTerminalResultArtifact(raw);
+    const requestHash = input.requestHash ?? artifact.request_hash;
+    assertRecoveryIdentity(input.operationId, requestHash);
+    if (
+      artifact.operation_id !== input.operationId ||
+      artifact.request_hash !== requestHash
+    ) {
+      throw recoveryError(
+        "Terminal result identity or request hash does not match",
+        { operationId: input.operationId, requestHash },
+      );
+    }
+    const request = await this.readRequestReference(artifact.request);
+    const preObservation = await this.readObservationReference(
+      artifact.pre_observation,
+      "pre",
+    );
+    const exitReceipt = await this.readExitReceiptReference(
+      artifact.exit_receipt,
+    );
+    const postObservation = await this.readObservationReference(
+      artifact.post_observation,
+      "post",
+    );
+    assertEvidenceBinding(
+      input.operationId,
+      requestHash,
+      request,
+      preObservation,
+      exitReceipt,
+      postObservation,
+      artifact.result,
+    );
+    if (!("launch_receipt" in artifact)) {
+      if (
+        preObservation.contract ===
+          TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT ||
+        postObservation.contract ===
+          TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT
+      ) {
+        throw recoveryError(
+          "Legacy terminal result contains full observations without a launch receipt",
+          { operationId: input.operationId, requestHash },
+        );
+      }
+      return {
+        artifact,
+        request,
+        preObservation,
+        exitReceipt,
+        postObservation,
+        reference: input.reference,
+      };
+    }
+    const launchReceipt = await this.readLaunchReceiptReference(
+      artifact.launch_receipt,
+    );
+    if (
+      preObservation.contract !==
+        TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT ||
+      postObservation.contract !==
+        TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT
+    ) {
+      throw recoveryError(
+        "Full terminal result contains legacy observations",
+        { operationId: input.operationId, requestHash },
+      );
+    }
+    assertLaunchablePreObservation(preObservation, "RECOVERY_REQUIRED");
+    assertLaunchReceiptBinding(
+      launchReceipt,
+      input.operationId,
+      requestHash,
+      artifact.request,
+      artifact.pre_observation,
+    );
+    assertPostObservationControl(
+      artifact.result.mutation.outcome,
+      artifact.post_observation_control,
+      preObservation,
+      postObservation,
+      artifact.result,
+      "RECOVERY_REQUIRED",
+    );
+    return {
+      artifact,
+      request,
+      preObservation,
+      launchReceipt,
+      exitReceipt,
+      postObservation,
+      reference: input.reference,
+    };
+  }
+
+  /**
+   * Produces the narrow callback consumed by SnapshotDiffInspector. Every
+   * operation is loaded through the integrity-bound result reference before a
+   * retained image, immutable Git object, or prior verified baseline is used.
+   */
+  public createBeforeImageResolver(
+    options: TerminalBeforeImageResolverOptions,
+  ): TerminalBeforeImageResolver {
+    const loaded = new Map<
+      string,
+      Promise<
+        | { readonly kind: "legacy" }
+        | { readonly kind: "missing" }
+        | {
+            readonly kind: "full";
+            readonly evidence: VerifiedFullTerminalResultEvidence;
+          }
+      >
+    >();
+    return async (
+      mutation,
+      repositoryRelativePath,
+      signal,
+    ): Promise<TerminalBeforeImageResolution> => {
+      throwIfAborted(signal);
+      const references = await options.resolveReferences(mutation, signal);
+      throwIfAborted(signal);
+      if (references === undefined) {
+        return { available: false, reason: "missing_evidence" };
+      }
+      const evidenceKey = stableJson({
+        operationId: mutation.operationId,
+        terminalResult: references.terminalResult,
+        preObservation: references.preObservation ?? null,
+      });
+      let evidencePromise = loaded.get(evidenceKey);
+      if (evidencePromise === undefined) {
+        evidencePromise = this.loadBeforeImageEvidence(
+          mutation,
+          references,
+          signal,
+        );
+        loaded.set(evidenceKey, evidencePromise);
+      }
+      let loadedEvidence:
+        | { readonly kind: "legacy" }
+        | { readonly kind: "missing" }
+        | {
+            readonly kind: "full";
+            readonly evidence: VerifiedFullTerminalResultEvidence;
+          };
+      try {
+        loadedEvidence = await evidencePromise;
+      } catch (error) {
+        loaded.delete(evidenceKey);
+        throw error;
+      }
+      throwIfAborted(signal);
+      if (loadedEvidence.kind === "legacy") {
+        return { available: false, reason: "legacy_placeholder" };
+      }
+      if (loadedEvidence.kind === "missing") {
+        return { available: false, reason: "missing_evidence" };
+      }
+      return resolveBeforeImage(
+        loadedEvidence.evidence,
+        mutation,
+        repositoryRelativePath,
+        options,
+        signal,
+      );
+    };
+  }
+
+  private async loadBeforeImageEvidence(
+    mutation: TerminalSessionMutationDiffRecord,
+    references: TerminalBeforeImageEvidenceReferences,
+    signal: AbortSignal | undefined,
+  ): Promise<
+    | { readonly kind: "legacy" }
+    | { readonly kind: "missing" }
+    | {
+        readonly kind: "full";
+        readonly evidence: VerifiedFullTerminalResultEvidence;
+      }
+  > {
+    assertExpectedReference(references.terminalResult, "terminal-result");
+    if (references.terminalResult.id !== mutation.operationId) {
+      throw recoveryError(
+        "Terminal mutation result reference has a mismatched operation ID",
+        {
+          operationId: mutation.operationId,
+          requestHash: "0".repeat(64),
+        },
+      );
+    }
+    const resultRaw = await this.artifacts.getOptionalReferenced(
+      references.terminalResult,
+    );
+    if (resultRaw === undefined) return { kind: "missing" };
+    const resultArtifact = parseTerminalResultArtifact(resultRaw);
+    if (resultArtifact.operation_id !== mutation.operationId) {
+      throw recoveryError(
+        "Terminal mutation does not bind its result operation",
+        {
+          operationId: mutation.operationId,
+          requestHash: resultArtifact.request_hash,
+        },
+      );
+    }
+    if (!("launch_receipt" in resultArtifact)) {
+      if (
+        references.preObservation !== undefined &&
+        stableJson(references.preObservation) !==
+          stableJson(resultArtifact.pre_observation)
+      ) {
+        throw recoveryError(
+          "Legacy terminal mutation does not bind the result pre-observation",
+          {
+            operationId: mutation.operationId,
+            requestHash: resultArtifact.request_hash,
+          },
+        );
+      }
+      for (const reference of [
+        resultArtifact.request,
+        resultArtifact.pre_observation,
+        resultArtifact.exit_receipt,
+        resultArtifact.post_observation,
+      ]) {
+        if (
+          await this.artifacts.getOptionalReferenced(reference) === undefined
+        ) {
+          return { kind: "missing" };
+        }
+      }
+      await this.readResultReference({
+        operationId: mutation.operationId,
+        reference: references.terminalResult,
+      });
+      return { kind: "legacy" };
+    }
+    if (
+      references.preObservation === undefined ||
+      stableJson(references.preObservation) !==
+        stableJson(resultArtifact.pre_observation)
+    ) {
+      throw recoveryError(
+        "Terminal mutation does not bind the result pre-observation",
+        {
+          operationId: mutation.operationId,
+          requestHash: resultArtifact.request_hash,
+        },
+      );
+    }
+    const sourceReferences = [
+      resultArtifact.request,
+      resultArtifact.pre_observation,
+      resultArtifact.launch_receipt,
+      resultArtifact.exit_receipt,
+      resultArtifact.post_observation,
+    ];
+    for (const reference of sourceReferences) {
+      if (
+        await this.artifacts.getOptionalReferenced(reference) === undefined
+      ) {
+        return { kind: "missing" };
+      }
+    }
+    const evidence = await this.readResultReference({
+      operationId: mutation.operationId,
+      reference: references.terminalResult,
+    });
+    if (
+      evidence.preObservation.contract !==
+        TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT ||
+      evidence.postObservation.contract !==
+        TERMINAL_WORKSPACE_OBSERVATION_ARTIFACT_CONTRACT ||
+      evidence.launchReceipt === undefined
+    ) {
+      throw recoveryError(
+        "Terminal mutation does not bind the verified pre-observation",
+        {
+          operationId: mutation.operationId,
+          requestHash: evidence.artifact.request_hash,
+        },
+      );
+    }
+    return {
+      kind: "full",
+      evidence: evidence as VerifiedFullTerminalResultEvidence,
+    };
+  }
+
   private async readLaunchReceiptReference(
     reference: ArtifactReference,
   ): Promise<TerminalLaunchReceiptArtifact> {
@@ -976,6 +1352,425 @@ export function terminalJournalResultMetadata(
     changed_files: result.mutation.changed_files,
     changed_lines: result.mutation.changed_lines,
   };
+}
+
+async function resolveBeforeImage(
+  evidence: VerifiedFullTerminalResultEvidence,
+  mutation: TerminalSessionMutationDiffRecord,
+  repositoryRelativePath: string,
+  options: TerminalBeforeImageResolverOptions,
+  signal: AbortSignal | undefined,
+): Promise<TerminalBeforeImageResolution> {
+  const observation = evidence.preObservation.observation;
+  const key = options.pathKey ?? ((value: string) => value);
+  const requestedKey = safePathKey(
+    key,
+    repositoryRelativePath,
+    mutation.operationId,
+    evidence.artifact.request_hash,
+  );
+  const matchingImages = (observation.beforeImages ?? []).filter(
+    (image) =>
+      safePathKey(
+        key,
+        beforeImagePath(image),
+        mutation.operationId,
+        evidence.artifact.request_hash,
+      ) === requestedKey,
+  );
+  if (matchingImages.length > 1) {
+    throw recoveryError(
+      "Terminal pre-observation contains ambiguous before-images",
+      {
+        operationId: mutation.operationId,
+        requestHash: evidence.artifact.request_hash,
+      },
+    );
+  }
+  const image = matchingImages[0];
+  const prior = await options.resolvePriorBaseline?.(
+    mutation,
+    repositoryRelativePath,
+    signal,
+  );
+  throwIfAborted(signal);
+  if (prior !== undefined) {
+    assertVerifiedPriorBaseline(
+      prior,
+      repositoryRelativePath,
+      image,
+      key,
+      mutation.operationId,
+      evidence.artifact.request_hash,
+    );
+    return { available: true, ...prior };
+  }
+  if (image !== undefined) {
+    return resolvePersistedBeforeImage(
+      image,
+      mutation.operationId,
+      options,
+      signal,
+      evidence.artifact.request_hash,
+    );
+  }
+  if (observation.state === "unknown") {
+    return { available: false, reason: "unknown_observation" };
+  }
+
+  const matchingEntries = (observation.entries ?? []).filter(
+    (entry) =>
+      safePathKey(
+        key,
+        entry.path,
+        mutation.operationId,
+        evidence.artifact.request_hash,
+      ) === requestedKey ||
+      (
+        entry.originalPath !== undefined &&
+        safePathKey(
+          key,
+          entry.originalPath,
+          mutation.operationId,
+          evidence.artifact.request_hash,
+        ) === requestedKey
+      ),
+  );
+  if (matchingEntries.length > 1) {
+    throw recoveryError(
+      "Terminal pre-observation contains ambiguous path entries",
+      {
+        operationId: mutation.operationId,
+        requestHash: evidence.artifact.request_hash,
+      },
+    );
+  }
+  if (matchingEntries.length > 0) {
+    // Dirty, staged, untracked, and rename-origin paths require an explicit
+    // before-image. Falling back to HEAD would erase the user's actual
+    // pre-command worktree bytes.
+    return {
+      available: false,
+      reason:
+        evidence.artifact.result.mutation.path_facts_truncated === true
+          ? "bounded_out"
+          : "missing_evidence",
+    };
+  }
+
+  const result = evidence.artifact.result;
+  const isCreated =
+    result.mutation.outcome === "observed" &&
+    (
+      includesPath(
+        result.mutation.created,
+        requestedKey,
+        key,
+        mutation.operationId,
+        evidence.artifact.request_hash,
+      ) ||
+      result.mutation.renamed.some(
+        (rename) => safePathKey(
+          key,
+          rename.to,
+          mutation.operationId,
+          evidence.artifact.request_hash,
+        ) === requestedKey,
+      )
+    );
+  if (isCreated) {
+    return {
+      available: true,
+      baselineId: `terminal:${mutation.operationId}:pre`,
+      entry: {
+        path: repositoryRelativePath,
+        existed: false,
+        bytes: null,
+        mode: null,
+        sha256: null,
+      },
+    };
+  }
+
+  const wasTracked =
+    includesPath(
+      result.mutation.updated,
+      requestedKey,
+      key,
+      mutation.operationId,
+      evidence.artifact.request_hash,
+    ) ||
+    includesPath(
+      result.mutation.deleted,
+      requestedKey,
+      key,
+      mutation.operationId,
+      evidence.artifact.request_hash,
+    ) ||
+    result.mutation.renamed.some(
+      (rename) => safePathKey(
+        key,
+        rename.from,
+        mutation.operationId,
+        evidence.artifact.request_hash,
+      ) === requestedKey,
+    );
+  if (wasTracked && typeof observation.head === "string") {
+    if (options.readHeadPath === undefined) {
+      return { available: false, reason: "missing_evidence" };
+    }
+    const resolved = await options.readHeadPath(
+      observation.head,
+      repositoryRelativePath,
+      signal,
+    );
+    throwIfAborted(signal);
+    if (resolved === undefined) {
+      return { available: false, reason: "missing_evidence" };
+    }
+    assertImmutableHeadPath(
+      resolved,
+      mutation.operationId,
+      evidence.artifact.request_hash,
+    );
+    return {
+      available: true,
+      baselineId:
+        `terminal:${mutation.operationId}:head:${resolved.objectId}`,
+      entry: checkpointEntry(
+        repositoryRelativePath,
+        resolved.bytes,
+        resolved.mode,
+      ),
+    };
+  }
+
+  return {
+    available: false,
+    reason:
+      observation.state === "metadata_limited" ||
+      result.mutation.path_facts_truncated === true
+        ? "bounded_out"
+        : "missing_evidence",
+  };
+}
+
+async function resolvePersistedBeforeImage(
+  image: WorkspaceBeforeImage,
+  operationId: string,
+  options: TerminalBeforeImageResolverOptions,
+  signal: AbortSignal | undefined,
+  requestHash: string,
+): Promise<TerminalBeforeImageResolution> {
+  if (image.kind === "absent") {
+    return {
+      available: true,
+      baselineId: `terminal:${operationId}:pre`,
+      entry: {
+        path: image.path,
+        existed: false,
+        bytes: null,
+        mode: null,
+        sha256: null,
+      },
+    };
+  }
+  if (image.kind === "identity_only") {
+    return { available: false, reason: "bounded_out" };
+  }
+  let bytes: Buffer;
+  if (image.kind === "retained") {
+    bytes = Buffer.from(image.contentBase64, "base64");
+  } else {
+    if (options.readGitBlob === undefined) {
+      return { available: false, reason: "missing_evidence" };
+    }
+    const loaded = await options.readGitBlob(image.blob, signal);
+    throwIfAborted(signal);
+    if (loaded === undefined) {
+      return { available: false, reason: "missing_evidence" };
+    }
+    bytes = loaded;
+  }
+  if (
+    bytes.length !== image.identity.size ||
+    sha256(bytes) !== image.sha256 ||
+    (
+      image.kind === "git_blob" &&
+      gitBlobObjectId(bytes, image.blob.length) !== image.blob
+    )
+  ) {
+    throw recoveryError(
+      "Terminal before-image bytes do not match their persisted identity",
+      { operationId, requestHash },
+    );
+  }
+  return {
+    available: true,
+    baselineId:
+      image.kind === "git_blob"
+        ? `terminal:${operationId}:blob:${image.blob}`
+        : `terminal:${operationId}:pre`,
+    entry: checkpointEntry(
+      image.identity.path,
+      bytes,
+      image.identity.mode,
+    ),
+  };
+}
+
+function assertVerifiedPriorBaseline(
+  prior: {
+    readonly baselineId: string;
+    readonly entry: CheckpointFileSnapshot;
+  },
+  repositoryRelativePath: string,
+  image: WorkspaceBeforeImage | undefined,
+  pathKey: (repositoryRelativePath: string) => string,
+  operationId: string,
+  requestHash: string,
+): void {
+  const priorKey = safePathKey(
+    pathKey,
+    prior.entry.path,
+    operationId,
+    requestHash,
+  );
+  const requestedKey = safePathKey(
+    pathKey,
+    repositoryRelativePath,
+    operationId,
+    requestHash,
+  );
+  if (
+    prior.baselineId.length === 0 ||
+    priorKey !== requestedKey ||
+    (
+      prior.entry.bytes === null
+        ? prior.entry.existed ||
+          prior.entry.sha256 !== null ||
+          prior.entry.mode !== null
+        : !prior.entry.existed ||
+          prior.entry.sha256 !== sha256(prior.entry.bytes) ||
+          !validNonnegativeInteger(prior.entry.mode)
+    )
+  ) {
+    throw recoveryError(
+      "Verified prior terminal baseline is malformed or mismatched",
+      { operationId, requestHash },
+    );
+  }
+  if (image === undefined) return;
+  if (image.kind === "absent") {
+    if (
+      prior.entry.existed ||
+      prior.entry.bytes !== null ||
+      prior.entry.mode !== null ||
+      prior.entry.sha256 !== null
+    ) {
+      throw recoveryError(
+        "Verified prior terminal baseline conflicts with an absent pre-image",
+        { operationId, requestHash },
+      );
+    }
+    return;
+  }
+  if (
+    prior.entry.bytes === null ||
+    prior.entry.sha256 !== image.sha256 ||
+    prior.entry.bytes.length !== image.identity.size ||
+    prior.entry.mode !== image.identity.mode
+  ) {
+    throw recoveryError(
+      "Verified prior terminal baseline does not match the pre-observation",
+      { operationId, requestHash },
+    );
+  }
+}
+
+function assertImmutableHeadPath(
+  value: TerminalImmutableHeadPath,
+  operationId: string,
+  requestHash: string,
+): void {
+  if (
+    !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/u.test(value.objectId) ||
+    !validNonnegativeInteger(value.mode) ||
+    !Buffer.isBuffer(value.bytes) ||
+    gitBlobObjectId(value.bytes, value.objectId.length) !== value.objectId
+  ) {
+    throw recoveryError(
+      "Immutable pre-HEAD baseline is malformed",
+      { operationId, requestHash },
+    );
+  }
+}
+
+function gitBlobObjectId(bytes: Buffer, objectIdLength: number): string {
+  const algorithm = objectIdLength === 40 ? "sha1" : "sha256";
+  const header = Buffer.from(`blob ${bytes.length}\0`, "utf8");
+  return createHash(algorithm).update(header).update(bytes).digest("hex");
+}
+
+function checkpointEntry(
+  repositoryRelativePath: string,
+  bytes: Buffer,
+  mode: number,
+): CheckpointFileSnapshot {
+  return {
+    path: repositoryRelativePath,
+    existed: true,
+    bytes,
+    mode,
+    sha256: sha256(bytes),
+  };
+}
+
+function beforeImagePath(image: WorkspaceBeforeImage): string {
+  return image.kind === "absent" ? image.path : image.identity.path;
+}
+
+function includesPath(
+  paths: readonly string[],
+  requestedKey: string,
+  pathKey: (repositoryRelativePath: string) => string,
+  operationId: string,
+  requestHash: string,
+): boolean {
+  return paths.some(
+    (path) =>
+      safePathKey(pathKey, path, operationId, requestHash) === requestedKey,
+  );
+}
+
+function safePathKey(
+  pathKey: (repositoryRelativePath: string) => string,
+  repositoryRelativePath: string,
+  operationId: string,
+  requestHash: string,
+): string {
+  try {
+    const value = pathKey(repositoryRelativePath);
+    if (typeof value !== "string" || value.length === 0) throw new Error();
+    return value;
+  } catch (error) {
+    throw new AgentError(
+      "RECOVERY_REQUIRED",
+      "Terminal before-image path identity is invalid",
+      { operationId, requestHash },
+      { cause: error },
+    );
+  }
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted !== true) return;
+  throw signal.reason instanceof Error
+    ? signal.reason
+    : new AgentError(
+        "COMMAND_CANCELLED",
+        "Terminal before-image resolution was cancelled",
+      );
 }
 
 export function isTerminalJournalResultMetadata(

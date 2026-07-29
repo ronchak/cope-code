@@ -9,8 +9,9 @@ export interface DirectorySyncOptions {
 }
 
 /**
- * Best-effort host capability wrapper for durability-sensitive directory
- * publication. Callers must not treat this as proof against power loss.
+ * Host-capability wrapper for durability-sensitive directory publication.
+ * A supported-host failure is propagated so callers can refuse launch.
+ * Successful sync is hardening, not proof against power or storage loss.
  */
 export async function syncDirectory(
   directory: string,

@@ -1,7 +1,7 @@
 import { execFile, spawn } from "node:child_process";
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { lstat, mkdir, mkdtemp, open, opendir, readlink, realpath, rm, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, mkdtemp, open, opendir, readlink, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -71,6 +71,25 @@ export interface GitObservationEntry extends GitStatusEntry {
     readonly fileId?: string;
     readonly contentSha256?: string;
   };
+}
+
+export interface IsolatedGitReadResult {
+  readonly bytes: Buffer;
+  readonly truncated: boolean;
+  readonly branch: string | null;
+  readonly head: string | null;
+}
+
+export interface IsolatedGitNulReadResult {
+  readonly records: number;
+  readonly branch: string | null;
+  readonly head: string | null;
+}
+
+export interface GitObservationControlFingerprints {
+  readonly protectedWorktreeSha256: string;
+  readonly normalTransitionsSha256: string;
+  readonly gitControlsSha256: string;
 }
 
 /**
@@ -146,7 +165,7 @@ export class GitInspector {
   }
 
   public async status(signal?: AbortSignal): Promise<GitStatusResult> {
-    const output = await this.invoke(
+    const output = await this.readIsolated(
       [
         "status",
         "--porcelain=v2",
@@ -224,6 +243,349 @@ export class GitInspector {
         entries,
         excludedStateSha256,
       })),
+    };
+  }
+
+  /**
+   * The repository observer's only direct Git execution seam. Commands execute
+   * without a shell against the isolated, temporary-index view used by normal
+   * inspection, and callers must provide their own strict output bound.
+   */
+  public async readIsolated(
+    fixedArguments: readonly string[],
+    maxBytes: number,
+    signal?: AbortSignal,
+    allowTruncation = false,
+  ): Promise<IsolatedGitReadResult> {
+    if (
+      !Number.isSafeInteger(maxBytes) ||
+      maxBytes < 1 ||
+      maxBytes > 64 * 1024 * 1024
+    ) {
+      throw new AgentError("PROTOCOL_INVALID", "Isolated Git read bound is invalid");
+    }
+    const command = fixedArguments[0];
+    if (
+      command === undefined ||
+      !ISOLATED_READ_BUILTINS.has(command) ||
+      fixedArguments.some((argument) => argument.includes("\0")) ||
+      (command === "hash-object" && fixedArguments.includes("-w"))
+    ) {
+      throw new AgentError(
+        "PROTOCOL_INVALID",
+        "Isolated Git reads require a fixed read-only builtin and NUL-free arguments",
+      );
+    }
+    return this.invoke(fixedArguments, maxBytes, signal, allowTruncation);
+  }
+
+  /**
+   * Streams a complete NUL-delimited read without retaining aggregate output.
+   * This is used for exact large transition inventories under a per-record cap.
+   */
+  public async readIsolatedNul(
+    fixedArguments: readonly string[],
+    maxRecordBytes: number,
+    onRecord: (record: Buffer) => void | Promise<void>,
+    signal?: AbortSignal,
+  ): Promise<IsolatedGitNulReadResult> {
+    const command = fixedArguments[0];
+    if (
+      command === undefined ||
+      !ISOLATED_READ_BUILTINS.has(command) ||
+      fixedArguments.some((argument) => argument.includes("\0")) ||
+      (command === "hash-object" && fixedArguments.includes("-w")) ||
+      !Number.isSafeInteger(maxRecordBytes) ||
+      maxRecordBytes < 1 ||
+      maxRecordBytes > 256 * 1024
+    ) {
+      throw new AgentError("PROTOCOL_INVALID", "Streaming isolated Git read is invalid");
+    }
+    const isolation = await createIsolatedGitView(
+      this.gitExecutable,
+      this.boundary.root,
+      signal,
+    );
+    try {
+      const child = spawn(
+        this.gitExecutable,
+        [
+          "--no-optional-locks",
+          "-c",
+          "core.pager=cat",
+          "-c",
+          "core.fsmonitor=false",
+          "-c",
+          "diff.external=",
+          "-C",
+          this.boundary.root,
+          ...fixedArguments,
+        ],
+        {
+          shell: false,
+          windowsHide: true,
+          stdio: ["ignore", "pipe", "pipe"],
+          env: { ...gitEnvironment(), ...isolation.environment },
+          signal,
+        },
+      );
+      const errors: Buffer[] = [];
+      let errorBytes = 0;
+      const closePromise = new Promise<{
+        readonly code: number | null;
+        readonly closeSignal: NodeJS.Signals | null;
+      }>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("close", (code, closeSignal) => resolve({ code, closeSignal }));
+      });
+      child.stderr.on("data", (chunk: Buffer) => {
+        if (errorBytes >= 64 * 1024) return;
+        const retained = chunk.subarray(0, 64 * 1024 - errorBytes);
+        errors.push(retained);
+        errorBytes += retained.length;
+      });
+      let pending = Buffer.alloc(0);
+      let records = 0;
+      try {
+        for await (const chunk of child.stdout) {
+          pending = Buffer.concat([pending, Buffer.from(chunk)]);
+          let delimiter = pending.indexOf(0);
+          while (delimiter !== -1) {
+            const record = pending.subarray(0, delimiter);
+            if (record.length > maxRecordBytes) {
+              child.kill();
+              throw new AgentError(
+                "BUDGET_EXCEEDED",
+                "Streaming Git record exceeds its path bound",
+                { maxRecordBytes },
+              );
+            }
+            await onRecord(record);
+            records += 1;
+            pending = pending.subarray(delimiter + 1);
+            delimiter = pending.indexOf(0);
+          }
+          if (pending.length > maxRecordBytes) {
+            child.kill();
+            throw new AgentError(
+              "BUDGET_EXCEEDED",
+              "Streaming Git record exceeds its path bound",
+              { maxRecordBytes },
+            );
+          }
+        }
+      } catch (error) {
+        if (child.exitCode === null && child.signalCode === null) child.kill();
+        await closePromise.catch(() => undefined);
+        if (signal?.aborted === true) {
+          throw new AgentError("COMMAND_CANCELLED", "Git operation was cancelled", {}, {
+            cause: error,
+          });
+        }
+        throw error;
+      }
+      const close = await closePromise;
+      if (signal?.aborted === true) {
+        throw new AgentError("COMMAND_CANCELLED", "Git operation was cancelled");
+      }
+      if (close.code !== 0 || pending.length !== 0) {
+        throw new AgentError("COMMAND_FAILED", "Streaming Git inspection failed", {
+          exitCode: close.code,
+          signal: close.closeSignal,
+          partialRecordBytes: pending.length,
+          stderr: Buffer.concat(errors).toString("utf8"),
+        });
+      }
+      return {
+        records,
+        branch: isolation.branch,
+        head: isolation.head,
+      };
+    } finally {
+      await isolation.cleanup();
+    }
+  }
+
+  /** Path identity/disclosure decision shared with bounded observation. */
+  public observationPathAllowed(repositoryRelativePath: string): boolean {
+    return this.isPathAllowed(repositoryRelativePath, "git_status");
+  }
+
+  /** Uses the inspector's configured keyed or unkeyed fingerprint definition. */
+  public observationDigest(value: string | Uint8Array): string {
+    return this.digest(value);
+  }
+
+  /** Content-backed policy-hidden component, kept separate from Git controls. */
+  public async observationPolicyHiddenStateSha256(
+    signal?: AbortSignal,
+  ): Promise<string> {
+    const output = await this.readIsolated(
+      [
+        "status",
+        "--porcelain=v2",
+        "--branch",
+        "-z",
+        "--untracked-files=all",
+        "--ignored=matching",
+        "--ignore-submodules=all",
+      ],
+      this.maxStatusBytes,
+      signal,
+      false,
+    );
+    const parsed = parseStatus(output.bytes);
+    const hidden: GitStatusEntry[] = [];
+    for (const entry of parsed.entries) {
+      if (entry.kind === "ignored") continue;
+      const visible =
+        this.isPathAllowed(entry.path, "git_status") &&
+        (
+          entry.originalPath === undefined ||
+          this.isPathAllowed(entry.originalPath, "git_status")
+        );
+      if (visible) continue;
+      hidden.push({
+        ...entry,
+        stateSha256: this.digest(stableJson({
+          gitStateSha256: entry.stateSha256,
+          worktreeStateSha256: await this.worktreeStateSha256(entry.path),
+        })),
+      });
+    }
+    hidden.sort((left, right) =>
+      compareGitPathBytes(left.path, right.path) ||
+      compareGitPathBytes(left.originalPath ?? "", right.originalPath ?? ""));
+    return this.digest(stableJson(hidden));
+  }
+
+  /** Object format used to authenticate an exact worktree blob identity. */
+  public async observationObjectFormat(
+    signal?: AbortSignal,
+  ): Promise<"sha1" | "sha256"> {
+    const output = await this.readIsolated(
+      ["rev-parse", "--show-object-format"],
+      64,
+      signal,
+    );
+    const value = output.bytes.toString("utf8").trim();
+    if (value !== "sha1" && value !== "sha256") {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Git repository object format is unsupported",
+        { objectFormat: value },
+      );
+    }
+    return value;
+  }
+
+  /** Verifies an existing blob without writing or refreshing repository state. */
+  public async observationBlobExists(
+    objectId: string,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/u.test(objectId)) {
+      throw new AgentError("PROTOCOL_INVALID", "Git blob identity is malformed");
+    }
+    try {
+      await this.readIsolated(
+        ["cat-file", "-e", `${objectId}^{blob}`],
+        1,
+        signal,
+      );
+      return true;
+    } catch (error) {
+      if (
+        error instanceof AgentError &&
+        error.code === "COMMAND_FAILED" &&
+        signal?.aborted !== true
+      ) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Streams the complete real-index identity without retaining an index
+   * manifest. The isolated command view receives a copy of these exact bytes.
+   */
+  public async observationIndexIdentity(
+    signal?: AbortSignal,
+  ): Promise<GitIndexIdentity> {
+    const indexPathRaw = await gitMetadata(
+      this.gitExecutable,
+      this.boundary.root,
+      ["rev-parse", "--git-path", "index"],
+      signal,
+    );
+    const indexPath = resolveGitMetadataPath(this.boundary.root, indexPathRaw);
+    let handle;
+    try {
+      handle = await open(
+        indexPath,
+        fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
+      );
+    } catch (error) {
+      if (isMissingFileSystemError(error)) {
+        return { sha256: this.digest(Buffer.alloc(0)), bytes: 0 };
+      }
+      throw error;
+    }
+    try {
+      const before = await handle.stat({ bigint: true });
+      if (!before.isFile() || before.nlink > 1n) {
+        throw new AgentError(
+          "RECOVERY_REQUIRED",
+          "Git index identity cannot be captured safely",
+        );
+      }
+      const digest = this.fingerprintKey === undefined
+        ? createHash("sha256")
+        : createHmac("sha256", this.fingerprintKey);
+      let bytes = 0;
+      for await (const chunk of handle.createReadStream({ autoClose: false })) {
+        if (signal?.aborted === true) {
+          throw new AgentError("COMMAND_CANCELLED", "Git index inspection was cancelled");
+        }
+        const data = Buffer.from(chunk);
+        bytes += data.length;
+        digest.update(data);
+      }
+      const after = await handle.stat({ bigint: true });
+      const afterPath = await lstat(indexPath, { bigint: true });
+      if (
+        before.dev !== afterPath.dev ||
+        before.ino !== afterPath.ino ||
+        before.size !== after.size ||
+        before.mtimeNs !== after.mtimeNs ||
+        before.ctimeNs !== after.ctimeNs ||
+        afterPath.isSymbolicLink() ||
+        afterPath.nlink > 1n
+      ) {
+        throw new AgentError(
+          "RECOVERY_REQUIRED",
+          "Git index changed while its identity was captured",
+        );
+      }
+      return { sha256: digest.digest("hex"), bytes };
+    } finally {
+      await handle.close();
+    }
+  }
+
+  /** Additive component facts; status().snapshotSha256 remains unchanged. */
+  public async observationControlFingerprints(
+    signal?: AbortSignal,
+  ): Promise<GitObservationControlFingerprints> {
+    const [protectedWorktreeSha256, controls] = await Promise.all([
+      this.integritySensitiveStateSha256(),
+      this.gitControlComponentState(signal),
+    ]);
+    return {
+      protectedWorktreeSha256,
+      normalTransitionsSha256: controls.normalTransitionsSha256,
+      gitControlsSha256: controls.gitControlsSha256,
     };
   }
 
@@ -601,7 +963,12 @@ export class GitInspector {
           path: repositoryRelativePath,
         });
       }
-      const bytes = await handle.readFile();
+      const contentDigest = this.fingerprintKey === undefined
+        ? createHash("sha256")
+        : createHmac("sha256", this.fingerprintKey);
+      for await (const chunk of handle.createReadStream({ autoClose: false })) {
+        contentDigest.update(chunk);
+      }
       const afterRead = await handle.stat();
       if (
         opened.size !== afterRead.size ||
@@ -612,7 +979,10 @@ export class GitInspector {
           path: repositoryRelativePath,
         });
       }
-      return this.digest(stableJson({ state: "file", contentSha256: this.digest(bytes) }));
+      return this.digest(stableJson({
+        state: "file",
+        contentSha256: contentDigest.digest("hex"),
+      }));
     } finally {
       await handle.close();
     }
@@ -660,7 +1030,8 @@ export class GitInspector {
     if (!firstListing.equals(secondListing)) {
       throw new AgentError("RECOVERY_REQUIRED", "Ignored worktree changed during command-boundary inventory");
     }
-    inventory.sort((left, right) => left.pathSha256.localeCompare(right.pathSha256));
+    inventory.sort((left, right) =>
+      compareGitPathBytes(left.pathSha256, right.pathSha256));
     return this.digest(stableJson(inventory));
   }
 
@@ -689,7 +1060,8 @@ export class GitInspector {
         }
         children.push(child);
       }
-      children.sort((left, right) => left.name.localeCompare(right.name));
+      children.sort((left, right) =>
+        compareGitPathBytes(left.name, right.name));
       for (const child of children) {
         const relativePath = directory.relativePath === ""
           ? child.name
@@ -723,7 +1095,8 @@ export class GitInspector {
         throw new AgentError("RECOVERY_REQUIRED", "Repository changed during protected-state inventory");
       }
     }
-    inventory.sort((left, right) => left.pathSha256.localeCompare(right.pathSha256));
+    inventory.sort((left, right) =>
+      compareGitPathBytes(left.pathSha256, right.pathSha256));
     return this.digest(stableJson(inventory));
   }
 
@@ -734,6 +1107,14 @@ export class GitInspector {
    * ref, index, or repository-local configuration file.
    */
   private async gitControlStateSha256(signal?: AbortSignal): Promise<string> {
+    return (await this.gitControlComponentState(signal)).combinedSha256;
+  }
+
+  private async gitControlComponentState(signal?: AbortSignal): Promise<{
+    readonly combinedSha256: string;
+    readonly normalTransitionsSha256: string;
+    readonly gitControlsSha256: string;
+  }> {
     const [gitDirectoryRaw, commonDirectoryRaw, indexPathRaw] = await Promise.all([
       gitMetadata(this.gitExecutable, this.boundary.root, ["rev-parse", "--absolute-git-dir"], signal),
       gitMetadata(this.gitExecutable, this.boundary.root, ["rev-parse", "--git-common-dir"], signal),
@@ -751,7 +1132,11 @@ export class GitInspector {
       detectFilesystemIdentity(commonDirectory),
       detectFilesystemIdentity(path.dirname(indexPath)),
     ]);
-    const inventory: Array<{ readonly pathSha256: string; readonly stateSha256: string }> = [];
+    const inventory: Array<{
+      readonly pathSha256: string;
+      readonly stateSha256: string;
+      readonly category: "transition" | "control";
+    }> = [];
     const seen = new Set<string>();
     let entries = 0;
     let bytes = 0;
@@ -759,6 +1144,7 @@ export class GitInspector {
       absolutePath: string,
       identity: string,
       filesystemIdentity: FilesystemIdentity,
+      category: "transition" | "control",
     ): Promise<void> => {
       const key = `${String(filesystemIdentity.device)}:${filesystemIdentity.pathKey(absolutePath)}`;
       if (seen.has(key)) return;
@@ -787,7 +1173,7 @@ export class GitInspector {
           control: identity,
         });
       }
-      bytes += before.size;
+      if (identity !== "gitdir/index") bytes += before.size;
       if (bytes > MAX_GIT_CONTROL_BYTES) {
         throw new AgentError("BUDGET_EXCEEDED", "Git control inventory exceeds its byte bound", {
           maxBytes: MAX_GIT_CONTROL_BYTES,
@@ -796,7 +1182,12 @@ export class GitInspector {
       const handle = await open(absolutePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
       try {
         const opened = await handle.stat();
-        const content = await handle.readFile();
+        const contentDigest = this.fingerprintKey === undefined
+          ? createHash("sha256")
+          : createHmac("sha256", this.fingerprintKey);
+        for await (const chunk of handle.createReadStream({ autoClose: false })) {
+          contentDigest.update(chunk);
+        }
         const after = await handle.stat();
         const afterPath = await lstat(absolutePath);
         if (
@@ -815,7 +1206,8 @@ export class GitInspector {
         }
         inventory.push({
           pathSha256: this.digest(identity),
-          stateSha256: this.digest(content),
+          stateSha256: contentDigest.digest("hex"),
+          category,
         });
       } finally {
         await handle.close();
@@ -825,6 +1217,7 @@ export class GitInspector {
       root: string,
       identityRoot: string,
       filesystemIdentity: FilesystemIdentity,
+      category: "transition" | "control",
     ): Promise<void> => {
       let rootState;
       try {
@@ -853,7 +1246,8 @@ export class GitInspector {
         const handle = await opendir(directory.absolutePath);
         const children = [];
         for await (const child of handle) children.push(child);
-        children.sort((left, right) => left.name.localeCompare(right.name));
+        children.sort((left, right) =>
+          compareGitPathBytes(left.name, right.name));
         for (const child of children) {
           const absolutePath = path.join(directory.absolutePath, child.name);
           const identity = `${directory.identity}/${child.name}`;
@@ -867,26 +1261,41 @@ export class GitInspector {
           if (childState.isDirectory() && !childState.isSymbolicLink()) {
             queue.push({ absolutePath, identity });
           } else {
-            await inspectFile(absolutePath, identity, filesystemIdentity);
+            await inspectFile(absolutePath, identity, filesystemIdentity, category);
           }
         }
       }
     };
 
     await Promise.all([
-      inspectFile(path.join(gitDirectory, "HEAD"), "gitdir/HEAD", gitIdentity),
-      inspectFile(path.join(gitDirectory, "config.worktree"), "gitdir/config.worktree", gitIdentity),
-      inspectFile(indexPath, "gitdir/index", indexIdentity),
-      inspectFile(path.join(commonDirectory, "config"), "common/config", commonIdentity),
-      inspectFile(path.join(commonDirectory, "packed-refs"), "common/packed-refs", commonIdentity),
-      inspectFile(path.join(commonDirectory, "shallow"), "common/shallow", commonIdentity),
-      inspectFile(path.join(commonDirectory, "info", "attributes"), "common/info/attributes", commonIdentity),
-      inspectFile(path.join(commonDirectory, "info", "exclude"), "common/info/exclude", commonIdentity),
-      scanDirectory(path.join(commonDirectory, "refs"), "common/refs", commonIdentity),
-      scanDirectory(path.join(commonDirectory, "hooks"), "common/hooks", commonIdentity),
+      inspectFile(path.join(gitDirectory, "HEAD"), "gitdir/HEAD", gitIdentity, "transition"),
+      inspectFile(path.join(gitDirectory, "config.worktree"), "gitdir/config.worktree", gitIdentity, "control"),
+      inspectFile(indexPath, "gitdir/index", indexIdentity, "transition"),
+      inspectFile(path.join(commonDirectory, "config"), "common/config", commonIdentity, "control"),
+      inspectFile(path.join(commonDirectory, "packed-refs"), "common/packed-refs", commonIdentity, "transition"),
+      inspectFile(path.join(commonDirectory, "shallow"), "common/shallow", commonIdentity, "transition"),
+      inspectFile(path.join(commonDirectory, "info", "attributes"), "common/info/attributes", commonIdentity, "control"),
+      inspectFile(path.join(commonDirectory, "info", "exclude"), "common/info/exclude", commonIdentity, "control"),
+      scanDirectory(path.join(commonDirectory, "refs"), "common/refs", commonIdentity, "transition"),
+      scanDirectory(path.join(commonDirectory, "hooks"), "common/hooks", commonIdentity, "control"),
     ]);
-    inventory.sort((left, right) => left.pathSha256.localeCompare(right.pathSha256));
-    return this.digest(stableJson(inventory));
+    inventory.sort((left, right) =>
+      compareGitPathBytes(left.pathSha256, right.pathSha256));
+    const withoutCategory = inventory.map(({ pathSha256, stateSha256 }) => ({
+      pathSha256,
+      stateSha256,
+    }));
+    const transitionInventory = inventory
+      .filter((entry) => entry.category === "transition")
+      .map(({ pathSha256, stateSha256 }) => ({ pathSha256, stateSha256 }));
+    const controlInventory = inventory
+      .filter((entry) => entry.category === "control")
+      .map(({ pathSha256, stateSha256 }) => ({ pathSha256, stateSha256 }));
+    return {
+      combinedSha256: this.digest(stableJson(withoutCategory)),
+      normalTransitionsSha256: this.digest(stableJson(transitionInventory)),
+      gitControlsSha256: this.digest(stableJson(controlInventory)),
+    };
   }
 
   private matchesIntegrityPattern(repositoryRelativePath: string): boolean {
@@ -924,6 +1333,18 @@ const DEFAULT_INTEGRITY_PATTERNS = [
   "secrets*",
 ] as const;
 
+const ISOLATED_READ_BUILTINS = new Set([
+  "cat-file",
+  "diff",
+  "diff-tree",
+  "hash-object",
+  "ls-files",
+  "ls-tree",
+  "rev-parse",
+  "status",
+  "symbolic-ref",
+]);
+
 function shouldSkipIntegrityDirectory(repositoryRelativePath: string): boolean {
   const normalized = repositoryRelativePath.replaceAll("\\", "/").toLowerCase();
   const name = normalized.split("/").at(-1) ?? normalized;
@@ -954,13 +1375,28 @@ export async function createIsolatedGitView(
   repositoryRoot: string,
   signal?: AbortSignal,
 ): Promise<IsolatedGitView> {
-  const [gitDirectoryRaw, commonDirectoryRaw, indexPathRaw, head, branch] = await Promise.all([
+  const [
+    gitDirectoryRaw,
+    commonDirectoryRaw,
+    indexPathRaw,
+    head,
+    branch,
+    objectFormat,
+  ] = await Promise.all([
     gitMetadata(gitExecutable, repositoryRoot, ["rev-parse", "--absolute-git-dir"], signal),
     gitMetadata(gitExecutable, repositoryRoot, ["rev-parse", "--git-common-dir"], signal),
     gitMetadata(gitExecutable, repositoryRoot, ["rev-parse", "--git-path", "index"], signal),
     optionalGitMetadata(gitExecutable, repositoryRoot, ["rev-parse", "--verify", "HEAD"], signal),
     optionalGitMetadata(gitExecutable, repositoryRoot, ["symbolic-ref", "--quiet", "--short", "HEAD"], signal),
+    gitMetadata(gitExecutable, repositoryRoot, ["rev-parse", "--show-object-format"], signal),
   ]);
+  if (objectFormat !== "sha1" && objectFormat !== "sha256") {
+    throw new AgentError(
+      "COMMAND_FAILED",
+      "Git repository object format is unsupported",
+      { objectFormat },
+    );
+  }
   const gitDirectory = await realpath(resolveGitMetadataPath(repositoryRoot, gitDirectoryRaw));
   const commonDirectory = await realpath(resolveGitMetadataPath(repositoryRoot, commonDirectoryRaw));
   const indexPath = await canonicalIfExists(resolveGitMetadataPath(repositoryRoot, indexPathRaw));
@@ -987,6 +1423,13 @@ export async function createIsolatedGitView(
       `${objectsDirectory.replaceAll("\\", "/")}\n`,
       { flag: "wx", mode: 0o600, flush: true },
     );
+    if (objectFormat === "sha256") {
+      await writeFile(
+        path.join(shadow, "config"),
+        "[core]\n\trepositoryFormatVersion = 1\n[extensions]\n\tobjectFormat = sha256\n",
+        { flag: "wx", mode: 0o600, flush: true },
+      );
+    }
     if (head === undefined) {
       await writeFile(path.join(shadow, "HEAD"), "ref: refs/heads/cba-unborn\n", {
         flag: "wx",
@@ -1003,13 +1446,19 @@ export async function createIsolatedGitView(
         flush: true,
       });
     }
+    const isolatedIndexPath = path.join(shadow, "index");
+    try {
+      await cp(indexPath, isolatedIndexPath, { preserveTimestamps: true });
+    } catch (error) {
+      if (!isMissingFileSystemError(error)) throw error;
+    }
     return {
       branch: branch ?? null,
       head: head ?? null,
       environment: {
         GIT_DIR: shadow,
         GIT_WORK_TREE: repositoryRoot,
-        GIT_INDEX_FILE: indexPath,
+        GIT_INDEX_FILE: isolatedIndexPath,
         GIT_ATTR_NOSYSTEM: "1",
       },
       cleanup: async () => rm(shadow, { recursive: true, force: true }),
@@ -1205,6 +1654,10 @@ function isMissingFileSystemError(error: unknown): boolean {
 function isMissingPathError(error: unknown): boolean {
   return error instanceof AgentError && error.code === "PATH_OUTSIDE_REPOSITORY" &&
     /does not exist/iu.test(error.message);
+}
+
+function compareGitPathBytes(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
 }
 
 function gitEnvironment(): NodeJS.ProcessEnv {

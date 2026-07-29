@@ -6,6 +6,7 @@ import { GitInspector, type GitInspectorOptions } from "./git.js";
 import { PatchEngine, type PatchBudgets } from "./patch-engine.js";
 import { RepositoryTools, type RepositoryToolsOptions } from "./repository-tools.js";
 import { SnapshotDiffInspector } from "./snapshot-diff.js";
+import { LiveWorkspaceObserver } from "./workspace-observer.js";
 import type { FilesystemIdentity } from "../shared/filesystem-identity.js";
 
 export interface RepositoryContextConfig {
@@ -30,6 +31,7 @@ export class RepositoryContext {
     public readonly checkpoints: CheckpointStore,
     public readonly patchEngine: PatchEngine,
     public readonly snapshotDiff: SnapshotDiffInspector,
+    public readonly workspaceObserver: LiveWorkspaceObserver,
   ) {}
 
   public static async create(config: RepositoryContextConfig): Promise<RepositoryContext> {
@@ -94,6 +96,15 @@ export class RepositoryContext {
       ...(config.checkpoints?.maxFiles === undefined ? {} : { maxFiles: config.checkpoints.maxFiles }),
       isPathAllowed: (candidate) => tools.isPathAllowed(candidate, "git_diff"),
     });
-    return new RepositoryContext(boundary, tools, git, checkpoints, patchEngine, snapshotDiff);
+    const workspaceObserver = new LiveWorkspaceObserver(boundary, git);
+    return new RepositoryContext(
+      boundary,
+      tools,
+      git,
+      checkpoints,
+      patchEngine,
+      snapshotDiff,
+      workspaceObserver,
+    );
   }
 }

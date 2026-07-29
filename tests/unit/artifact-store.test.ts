@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -41,6 +41,15 @@ test("terminal artifacts return integrity-bound references", async () => {
     () => store.getReferenced({ ...reference, bytes: reference.bytes + 1 }),
     /does not match its durable reference/u,
   );
+  await assert.rejects(
+    () => store.getOptionalReferenced({
+      ...reference,
+      sha256: "f".repeat(64),
+    }),
+    /does not match its durable reference/u,
+  );
+  await store.remove(reference.kind, reference.id);
+  assert.equal(await store.getOptionalReferenced(reference), undefined);
 });
 
 test("source-bearing recovery artifacts reject oversized writes and partial manifests", async () => {
@@ -93,6 +102,32 @@ test("artifact preflight and references recognize the launch-receipt contract", 
   ]);
 });
 
+test("durable publication syncs the kind directory after each ordered rename", async () => {
+  const session = await mkdtemp(path.join(tmpdir(), "cba-launch-order-"));
+  const root = path.join(session, "artifacts");
+  const observedNames: string[][] = [];
+  const store = new SessionArtifactStore(root, {
+    syncDirectory: async (directory) => {
+      if (directory !== path.join(root, "terminal-launch-receipt")) return;
+      const { readdir } = await import("node:fs/promises");
+      observedNames.push((await readdir(directory)).sort());
+    },
+  });
+  await store.putReferencedDurable(
+    "terminal-launch-receipt",
+    "terminal_operation_1",
+    "{}",
+    { syncDirectories: true },
+  );
+  assert.deepEqual(observedNames, [
+    ["terminal_operation_1.txt"],
+    [
+      "terminal_operation_1.manifest.json",
+      "terminal_operation_1.txt",
+    ],
+  ]);
+});
+
 test("a directory-sync failure refuses durable launch-receipt publication", async () => {
   const session = await mkdtemp(path.join(tmpdir(), "cba-launch-sync-failure-"));
   const root = path.join(session, "artifacts");
@@ -117,4 +152,42 @@ test("a directory-sync failure refuses durable launch-receipt publication", asyn
     ),
     undefined,
   );
+});
+
+test("failure of either receipt-kind barrier refuses durable publication", async () => {
+  for (const failingBarrier of [1, 2]) {
+    const session = await mkdtemp(
+      path.join(tmpdir(), `cba-launch-sync-${failingBarrier}-`),
+    );
+    const root = path.join(session, "artifacts");
+    const directory = path.join(root, "terminal-launch-receipt");
+    await mkdir(directory, { recursive: true });
+    let barrier = 0;
+    const store = new SessionArtifactStore(root, {
+      syncDirectory: async (candidate) => {
+        if (candidate !== directory) return;
+        barrier += 1;
+        if (barrier === failingBarrier) {
+          throw new Error(`injected barrier ${failingBarrier} failure`);
+        }
+      },
+    });
+    await assert.rejects(
+      () => store.putReferencedDurable(
+        "terminal-launch-receipt",
+        `terminal_operation_${failingBarrier}`,
+        "{}",
+        { syncDirectories: true },
+      ),
+      new RegExp(`injected barrier ${failingBarrier} failure`, "u"),
+    );
+    assert.equal(barrier, failingBarrier);
+    await assert.rejects(
+      () => store.getOptional(
+        "terminal-launch-receipt",
+        `terminal_operation_${failingBarrier}`,
+      ),
+      /incomplete/u,
+    );
+  }
 });
