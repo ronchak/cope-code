@@ -220,10 +220,14 @@ export async function composeRuntime(options: ComposeRuntimeOptions): Promise<Co
     completionPathScope: policy,
     sessionDiffState: () => ({
       ...(state.lastCheckpointId === undefined ? {} : { lastCheckpointId: state.lastCheckpointId }),
-      mutations: state.mutations.map((mutation) => ({
-        checkpointId: mutation.checkpointId,
-        changedPaths: mutation.changedPaths,
-      })),
+      mutations: state.mutations.flatMap((mutation) =>
+        mutation.kind === "terminal"
+          ? []
+          : [{
+              checkpointId: mutation.checkpointId,
+              changedPaths: mutation.changedPaths,
+            }]
+      ),
     }),
   });
   const protocol = new CbaProtocolAdapter({

@@ -55,8 +55,53 @@ export function getBootstrapToolDefinitions(
     if (unique.has(tool)) throw new TypeError(`Duplicate bootstrap tool '${tool}'`);
     unique.add(tool);
     const base = { name: tool, purpose: TOOL_REGISTRY[tool].purpose } as const;
-    return includeArgumentSchemas ? { ...base, arguments_schema: TOOL_ARGUMENT_SCHEMAS[tool] } : base;
+    return includeArgumentSchemas
+      ? {
+          ...base,
+          arguments_schema: bootstrapArgumentSchema(
+            TOOL_ARGUMENT_SCHEMAS[tool],
+            tools.includes("terminal_exec"),
+          ),
+        }
+      : base;
   });
+}
+
+function bootstrapArgumentSchema(
+  value: unknown,
+  terminalGranted: boolean,
+): Readonly<Record<string, unknown>> {
+  if (terminalGranted || value === null || typeof value !== "object" || Array.isArray(value)) {
+    return value as Readonly<Record<string, unknown>>;
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([key, child]) => {
+      if (
+        key === "enum" &&
+        Array.isArray(child) &&
+        child.includes("terminal_exec") &&
+        child.every((entry) => isToolName(entry))
+      ) {
+        return [key, child.filter((entry) => entry !== "terminal_exec")];
+      }
+      if (Array.isArray(child)) {
+        return [
+          key,
+          child.map((entry) =>
+            entry !== null && typeof entry === "object" && !Array.isArray(entry)
+              ? bootstrapArgumentSchema(entry, false)
+              : entry
+          ),
+        ];
+      }
+      return [
+        key,
+        child !== null && typeof child === "object"
+          ? bootstrapArgumentSchema(child, false)
+          : child,
+      ];
+    }),
+  );
 }
 
 export function renderBootstrapContract(options: BootstrapContractOptions): string {

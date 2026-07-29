@@ -505,6 +505,20 @@ export class ToolHost {
           },
         };
       }
+      case "terminal_exec": {
+        return {
+          operationId: call.operationId,
+          tool: call.name,
+          status: "denied",
+          data: {
+            code: "TERMINAL_EXEC_NOT_IMPLEMENTED",
+            message: "Terminal execution is not implemented in this build.",
+          },
+          safeMetadata: {
+            reasonCode: "TERMINAL_EXEC_NOT_IMPLEMENTED",
+          },
+        };
+      }
     }
   }
 

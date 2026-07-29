@@ -182,7 +182,19 @@ export interface ToolExecutor {
     signal: AbortSignal,
     context?: ToolExecutionContext,
   ): Promise<ToolOutcome>;
+  /**
+   * Loads a result that was durably persisted before an executing journal
+   * record could be marked complete. Implementations must verify the exact
+   * request hash and operation identity and must never launch work here.
+   */
+  recoverCompleted?(input: RecoverCompletedToolCall): Promise<ToolOutcome | undefined>;
   inspectCompletionState(): Promise<RepositoryCompletionState>;
+}
+
+export interface RecoverCompletedToolCall {
+  readonly operationId: string;
+  readonly tool: ToolName;
+  readonly requestHash: string;
 }
 
 export interface ToolExecutionContext {
@@ -190,6 +202,11 @@ export interface ToolExecutionContext {
   readonly plannedMutation?: {
     readonly changedFiles: number;
     readonly changedLines: number;
+  };
+  /** Locally authorized and clamped bounds for terminal-exec/1. */
+  readonly terminal?: {
+    readonly timeoutMs: number;
+    readonly maxOutputBytes: number;
   };
 }
 

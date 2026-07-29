@@ -54,6 +54,28 @@ test("ToolHost rejects every registry orchestrator tool and unknown runtime name
   }
 });
 
+test("ToolHost keeps terminal execution source-free and unavailable at the C0 gate", async () => {
+  const host = new ToolHost({
+    repository: {} as never,
+    git: {} as never,
+    patchEngine: {} as never,
+    processRunner: {} as never,
+    policy: { authorize: () => ({ outcome: "allow" }) },
+  });
+  const outcome = await host.dispatch({
+    operationId: "terminal_c0_denial",
+    name: "terminal_exec",
+    arguments: {
+      contract: "terminal-exec/1",
+      mode: "shell",
+      command: "printf secret-source",
+    },
+  });
+  assert.equal(outcome.status, "denied");
+  assert.equal(outcome.data.code, "TERMINAL_EXEC_NOT_IMPLEMENTED");
+  assert.equal(JSON.stringify(outcome).includes("secret-source"), false);
+});
+
 test("ToolHost bounds production-shaped list and status results at policy planning caps", async () => {
   const listEntries = Array.from({ length: 500 }, (_, index) => ({
     path: `src/${String(index).padStart(4, "0")}-${"l".repeat(1_024)}.txt`,

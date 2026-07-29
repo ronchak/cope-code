@@ -917,6 +917,20 @@ function expandGrant(
     });
   }
 
+  if (
+    expansion.kind === "tool" &&
+    session.capabilities.tools?.deny?.includes(expansion.tool) === true
+  ) {
+    reasons.push({
+      layer: "session",
+      dimension: "tool",
+      decision: "deny",
+      reason_code: "CAPABILITY_EXPANSION_DENIED",
+      message: `Session policy does not permit expansion '${capabilityKey}'.`,
+      capability_key: capabilityKey,
+    });
+  }
+
   for (const layer of higherLayers) {
     const decision = expansionDecision(layer, expansion, pathKey);
     if (decision === "allow") continue;

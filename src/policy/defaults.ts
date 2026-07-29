@@ -9,6 +9,10 @@ import {
   type SessionGrant,
 } from "./types.js";
 
+export const DEFAULT_ENABLED_TOOL_NAMES: readonly ToolName[] = Object.freeze(
+  TOOL_NAMES.filter((tool) => tool !== "terminal_exec"),
+);
+
 const PROTECTED_MUTATION_PATHS = [
   ".git",
   ".git/**",
@@ -91,7 +95,7 @@ export const DEFAULT_ORGANIZATION_POLICY: PolicyDocument = {
   layer: "organization",
   default_decision: "allow",
   capabilities: {
-    tools: { allow: TOOL_NAMES },
+    tools: { allow: DEFAULT_ENABLED_TOOL_NAMES, deny: ["terminal_exec"] },
     paths: { excluded: EXCLUDED_DISCLOSURE_PATHS, protected: PROTECTED_MUTATION_PATHS },
     commands: {
       risks: { low: "allow", medium: "allow", high: "ask" },
@@ -131,7 +135,7 @@ export const DEFAULT_REPOSITORY_POLICY: PolicyDocument = {
   layer: "repository",
   default_decision: "allow",
   capabilities: {
-    tools: { allow: TOOL_NAMES },
+    tools: { allow: DEFAULT_ENABLED_TOOL_NAMES, deny: ["terminal_exec"] },
     paths: { excluded: EXCLUDED_DISCLOSURE_PATHS, protected: PROTECTED_MUTATION_PATHS },
     commands: { risks: { low: "allow", medium: "allow", high: "ask" }, side_effects: "allow" },
     disclosure: { secrets: "deny" },
@@ -164,6 +168,9 @@ export interface DefaultSessionGrantOptions {
 
 export function createDefaultSessionGrant(options: DefaultSessionGrantOptions): SessionGrant {
   const branch = options.branch === undefined ? {} : { branch: options.branch };
+  const allowedTools = (options.tools ?? DEFAULT_ENABLED_TOOL_NAMES).filter(
+    (tool) => tool !== "terminal_exec",
+  );
   return {
     schema_version: SESSION_GRANT_SCHEMA_VERSION,
     grant_id: options.grant_id,
@@ -173,7 +180,7 @@ export function createDefaultSessionGrant(options: DefaultSessionGrantOptions): 
     mode: options.mode,
     default_decision: "ask",
     capabilities: {
-      tools: { allow: options.tools ?? TOOL_NAMES, unmatched: "ask" },
+      tools: { allow: allowedTools, deny: ["terminal_exec"], unmatched: "ask" },
       paths: {
         read: { allow: options.readable_paths ?? ["**"], unmatched: "ask" },
         write: { allow: options.writable_paths ?? [], unmatched: "ask" },

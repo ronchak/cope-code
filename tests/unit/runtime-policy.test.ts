@@ -15,6 +15,7 @@ import {
   LayeredRuntimePolicy,
   listFilesRuntimeBounds,
 } from "../../src/orchestrator/runtime-policy.js";
+import { CbaProtocolAdapter } from "../../src/orchestrator/cba-protocol-adapter.js";
 import {
   CONTROL_PLANE_RESERVE_BYTES,
 } from "../../src/orchestrator/disclosure-budget.js";
@@ -120,6 +121,28 @@ test("layered runtime policy allows in-scope reads, patches, and catalog command
   assert.equal((await policy.authorize({ operationId: "op_test", name: "run_command", arguments: { command_id: "test" } })).outcome, "allow");
   assert.equal(policy.isPathInScope("src/a.txt"), true);
   assert.equal(policy.isPathInScope("README.md"), false);
+});
+
+test("default grants never advertise terminal execution in any existing mode", async () => {
+  for (const mode of ["inspect", "edit", "auto"] as const) {
+    const { policy } = await harness(mode);
+    const summary = policy.summarize();
+    assert.equal(
+      Array.isArray(summary.tools) && summary.tools.includes("terminal_exec"),
+      false,
+      mode,
+    );
+    const bootstrap = new CbaProtocolAdapter().renderBootstrap({
+      sessionId: `session_${mode}`,
+      taskId: `task_${mode}`,
+      objective: "Test the default projection.",
+      acceptanceCriteria: [],
+      policySummary: summary,
+      budgetSummary: {},
+    });
+    assert.doesNotMatch(bootstrap, /terminal_exec/u, mode);
+    assert.doesNotMatch(bootstrap, /terminal-exec\/1/u, mode);
+  }
 });
 
 test("layered runtime policy denies protected controls and inspect-mode mutation", async () => {

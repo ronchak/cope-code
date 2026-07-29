@@ -84,7 +84,13 @@ export interface ReviewPackageBody {
   };
   readonly mutations: readonly {
     readonly operationId: string;
-    readonly checkpointId: string;
+    readonly kind: "patch" | "terminal";
+    readonly checkpointId?: string;
+    readonly observationOutcome?:
+      | "none"
+      | "observed"
+      | "protected_or_hidden_changed"
+      | "unknown";
     readonly changedFileCount: number;
     readonly changedLines: number;
   }[];
@@ -209,7 +215,13 @@ export function createReviewPackage(input: ReviewPackageInput): ReviewPackage {
     },
     mutations: state.mutations.map((mutation) => ({
       operationId: mutation.operationId,
-      checkpointId: mutation.checkpointId,
+      kind: mutation.kind ?? "patch",
+      ...(mutation.checkpointId === undefined
+        ? {}
+        : { checkpointId: mutation.checkpointId }),
+      ...(mutation.kind === "terminal"
+        ? { observationOutcome: mutation.observationOutcome }
+        : {}),
       changedFileCount: new Set(mutation.changedPaths).size,
       changedLines: mutation.changedLines,
     })),
@@ -405,7 +417,16 @@ function assertSafeSessionState(state: SessionState): void {
   for (const mutation of state.mutations) {
     if (
       !isOperationId(mutation.operationId) ||
-      !isSafeId(mutation.checkpointId) ||
+      !["patch", "terminal"].includes(mutation.kind ?? "patch") ||
+      (mutation.kind === "terminal"
+        ? mutation.checkpointId !== undefined ||
+          ![
+            "none",
+            "observed",
+            "protected_or_hidden_changed",
+            "unknown",
+          ].includes(mutation.observationOutcome)
+        : !isSafeId(mutation.checkpointId)) ||
       !Array.isArray(mutation.changedPaths) ||
       !isNonNegativeInteger(mutation.changedLines)
     ) {

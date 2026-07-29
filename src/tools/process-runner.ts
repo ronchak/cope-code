@@ -9,6 +9,62 @@ import type { CommandCatalog, ResolvedCommand, RunCommandRequest } from "./comma
 import { CURRENT_HOST_PLATFORM, type HostPlatform } from "../platform/index.js";
 import { spawnSupervisedProcess } from "./process-supervisor.js";
 
+export type TerminalOutputStream = "stdout" | "stderr";
+
+export interface TerminalOutputSink {
+  write(stream: TerminalOutputStream, chunk: Uint8Array): void | Promise<void>;
+}
+
+interface TerminalProcessRequestBase {
+  readonly operationId: string;
+  readonly cwd: string;
+  readonly timeoutMs: number;
+  readonly maxOutputBytes: number;
+  readonly environment: NodeJS.ProcessEnv;
+}
+
+export type TerminalProcessRequest =
+  | (TerminalProcessRequestBase & {
+      readonly mode: "shell";
+      readonly command: string;
+    })
+  | (TerminalProcessRequestBase & {
+      readonly mode: "argv";
+      readonly executable: string;
+      readonly arguments: readonly string[];
+    });
+
+export type TerminalProcessOutcomeKind =
+  | "completed"
+  | "completed_nonzero"
+  | "spawn_failed"
+  | "timed_out"
+  | "cancelled"
+  | "indeterminate";
+
+export interface TerminalProcessOutcome {
+  readonly outcome: TerminalProcessOutcomeKind;
+  readonly exitCode: number | null;
+  readonly signal: NodeJS.Signals | null;
+  readonly startedAt: string;
+  readonly completedAt: string;
+  readonly durationMs: number;
+  readonly stdoutBytes: number;
+  readonly stderrBytes: number;
+}
+
+/**
+ * Slice 1 implements this execution surface. C0 deliberately exports only the
+ * contract so the existing catalog runner cannot accidentally grant it.
+ */
+export interface TerminalProcessExecutor {
+  runTerminal(
+    request: TerminalProcessRequest,
+    sink: TerminalOutputSink,
+    signal?: AbortSignal,
+  ): Promise<TerminalProcessOutcome>;
+}
+
 export type CommandOutcomeKind =
   | "success"
   | "failure"

@@ -3,17 +3,32 @@ import path from "node:path";
 import { newId, sha256, stableJson } from "../shared/crypto.js";
 import { AgentError } from "../shared/errors.js";
 
-export type ArtifactKind = "outbox" | "response" | "response-capture" | "decision";
+export const ARTIFACT_KINDS = [
+  "outbox",
+  "response",
+  "response-capture",
+  "decision",
+  "terminal-request",
+  "terminal-pre-observation",
+  "terminal-exit-receipt",
+  "terminal-post-observation",
+  "terminal-result",
+] as const;
+
+export type ArtifactKind = (typeof ARTIFACT_KINDS)[number];
 
 const MAX_ARTIFACT_BYTES = 8 * 1024 * 1024;
 const MAX_MANIFEST_BYTES = 64 * 1024;
 
-interface ArtifactManifest {
-  readonly schemaVersion: 1;
+export interface ArtifactReference {
   readonly kind: ArtifactKind;
   readonly id: string;
   readonly bytes: number;
   readonly sha256: string;
+}
+
+interface ArtifactManifest extends ArtifactReference {
+  readonly schemaVersion: 1;
 }
 
 /**
@@ -50,6 +65,20 @@ export class SessionArtifactStore {
       await unlink(this.contentPath(kind, id)).catch(() => undefined);
       throw error;
     }
+  }
+
+  public async putReferenced(
+    kind: ArtifactKind,
+    id: string,
+    content: string,
+  ): Promise<ArtifactReference> {
+    await this.put(kind, id, content);
+    return {
+      kind,
+      id,
+      bytes: Buffer.byteLength(content),
+      sha256: sha256(content),
+    };
   }
 
   public async get(kind: ArtifactKind, id: string): Promise<string> {
