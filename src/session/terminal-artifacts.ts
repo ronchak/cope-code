@@ -253,9 +253,10 @@ export class TerminalArtifactPersistence {
 
   /**
    * Returns a replay result only after validating the complete reference
-   * chain. Absence before durable process truth is recoverable by the existing
-   * journal state machine; an exit receipt without a result is never treated
-   * as safe to retry.
+   * chain. An absent result returns undefined after validating any partial
+   * evidence so the journal state machine can distinguish retry-safe accepted
+   * work from executing work that must become indeterminate. In particular,
+   * an exit receipt without a result is never treated as completed or replayed.
    */
   public async recoverCompleted(
     input: RecoverTerminalResultInput,
@@ -317,12 +318,6 @@ export class TerminalArtifactPersistence {
       }
       if (post !== undefined && post.phase !== "post") {
         throw recoveryError("Terminal post-observation phase does not match", input);
-      }
-      if (exit !== undefined || post !== undefined) {
-        throw recoveryError(
-          "Terminal exit receipt exists without a complete durable result",
-          input,
-        );
       }
       return undefined;
     }

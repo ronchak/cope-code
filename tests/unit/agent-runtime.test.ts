@@ -1031,6 +1031,85 @@ test("recovery promotes a durable terminal result before journal re-registration
   assert.equal(returned[0]?.data?.outcome, "completed");
 });
 
+test("terminal recovery without a complete result stabilizes as indeterminate across resumes", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-terminal-indeterminate-"));
+  const localState = state(root);
+  localState.status = "executing_tools";
+  localState.budgetUsage = {
+    ...localState.budgetUsage,
+    operations: 1,
+    commands: 1,
+  };
+  const call = {
+    operationId: "op_terminal_incomplete",
+    name: "terminal_exec" as const,
+    arguments: {
+      contract: "terminal-exec/1",
+      mode: "shell",
+      command: "printf uncertain",
+    },
+  };
+  const journal = new OperationJournal(
+    path.join(root, "operations"),
+    localState.sessionId,
+  );
+  const registration = await journal.register(
+    call.operationId,
+    call.name,
+    true,
+    call,
+    "2026-01-01T00:00:00.000Z",
+  );
+  const executing = await journal.markExecuting(
+    registration.record,
+    "2026-01-01T00:00:01.000Z",
+  );
+  localState.pendingOperations = [{
+    operationId: call.operationId,
+    tool: call.name,
+    mutating: true,
+    requestHash: executing.requestHash,
+    status: "executing",
+    acceptedAt: executing.acceptedAt,
+  }];
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  let recoveries = 0;
+  const recoverCompleted = async (): Promise<undefined> => {
+    recoveries += 1;
+    return undefined;
+  };
+  const execute = async (): Promise<never> => {
+    throw new Error("indeterminate terminal operation must not execute");
+  };
+
+  const first = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport: new QueueTransport([]),
+    execute,
+    recoverCompleted,
+  }).run();
+  assert.equal(first.status, "paused");
+  assert.match(first.reason ?? "", /may have executed/u);
+  assert.equal(localState.pendingOperations[0]?.status, "indeterminate");
+  assert.equal((await journal.read(call.operationId)).status, "executing");
+
+  const second = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport: new QueueTransport([]),
+    execute,
+    recoverCompleted,
+  }).run();
+  assert.equal(second.status, "paused");
+  assert.match(second.reason ?? "", /may have executed/u);
+  assert.equal(localState.pendingOperations[0]?.status, "indeterminate");
+  assert.equal(recoveries, 1);
+});
+
 test("terminal prelaunch rejection refunds the command launch budget", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-terminal-prelaunch-"));
   const localState = state(root);

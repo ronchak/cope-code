@@ -46,10 +46,13 @@ test("terminal artifact crash windows never infer or replay uncertain execution"
           tool: "terminal_exec",
           requestHash,
         });
-      if (boundary === "request" || boundary === "pre") {
+      if (
+        boundary === "request" ||
+        boundary === "pre" ||
+        boundary === "exit" ||
+        boundary === "post"
+      ) {
         assert.equal(await recover(), undefined, boundary);
-      } else if (boundary === "exit" || boundary === "post") {
-        await assert.rejects(recover, /without a complete durable result/u);
       } else {
         const replay = await recover();
         assert.equal(replay?.stdout.head, "exact");

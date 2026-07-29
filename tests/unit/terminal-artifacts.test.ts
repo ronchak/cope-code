@@ -134,7 +134,7 @@ test("terminal recovery rejects request-hash and complete-result mismatches", as
   );
 });
 
-test("terminal recovery returns undefined before process truth and rejects exit-without-result", async () => {
+test("terminal recovery returns undefined for valid incomplete evidence", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "cope-terminal-partial-"));
   const artifacts = new SessionArtifactStore(path.join(directory, "artifacts"));
   const persistence = new TerminalArtifactPersistence(artifacts);
@@ -150,14 +150,13 @@ test("terminal recovery returns undefined before process truth and rejects exit-
   );
 
   await persistence.persistExitReceipt(exitReceipt());
-  await assert.rejects(
-    () =>
-      persistence.recoverCompleted({
-        operationId: OPERATION_ID,
-        tool: "terminal_exec",
-        requestHash: REQUEST_HASH,
-      }),
-    /without a complete durable result/u,
+  assert.equal(
+    await persistence.recoverCompleted({
+      operationId: OPERATION_ID,
+      tool: "terminal_exec",
+      requestHash: REQUEST_HASH,
+    }),
+    undefined,
   );
 });
 
