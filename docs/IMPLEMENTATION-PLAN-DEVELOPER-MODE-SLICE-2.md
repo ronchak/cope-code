@@ -78,9 +78,11 @@ Recovery truth is:
 
 | Durable evidence | Recovery action |
 | --- | --- |
-| request/pre-observation, no launch receipt | complete as a deterministic prelaunch failure, refund the command reservation, never claim a process ran |
+| request evidence, with or without a complete pre-observation, no launch receipt, and the host/store proves durable receipt absence | mark the existing journal record failed with a source-free prelaunch reason, refund the command reservation, clear the durable pending operation, and never claim a process ran |
+| request evidence, with or without a complete pre-observation, no launch receipt, but durable receipt absence is not provable on this host/store | pause indeterminate and never rerun |
+| partial, corrupt, or manifest-mismatched launch receipt | `RECOVERY_REQUIRED`; never treat corrupt evidence as absence |
 | launch receipt, no exit receipt | pause indeterminate, never rerun |
-| exit receipt, no complete result | pause indeterminate, never rerun; expose a source-free reconciliation summary from durable evidence |
+| exit receipt, no complete result | mark/persist an indeterminate journal record with a source-free reconciliation summary, never rerun |
 | complete matching result, no applied effects | promote the journal, apply effects exactly once, and replay |
 | complete result and applied effects | replay only; no effect or budget changes |
 
@@ -89,12 +91,18 @@ editor or user activity may have happened during the gap, and a later cleanup co
 even erase the command's effects. Such an observation cannot prove either `none` or
 `observed`.
 
-The receipt is trusted for ordinary hard-process-crash recovery only after the
-artifact store has completed its atomic write. Add a parent-directory durability
-step after rename on POSIX/macOS. Preserve Windows support using the strongest
-available file-flush plus atomic-replace semantics and cover ordinary process-crash
-visibility in hosted tests. Do not claim sudden-power-loss durability on hosts where
-Node cannot provide it; power-loss recovery is outside this MVP's guarantee.
+The receipt is trusted for an absence-based retry decision only when the host/store
+can prove the directory entry durable. Add a parent-directory durability step after
+rename on hosts where `HostPlatform.supportsDirectoryFsync` is true. If the host
+cannot provide that guarantee, receipt absence remains indeterminate; this is the
+conservative Windows fallback. Existing file-flush plus atomic-replace semantics
+still receive ordinary process-crash coverage on every supported host, but they do
+not justify retry from absence alone. Do not claim sudden-power-loss durability
+where Node cannot provide it.
+
+A live prelaunch observation refusal follows the ordinary journal `markFailed` path
+and returns the existing non-persisted typed failure outcome. It does not manufacture
+a `terminal-result` artifact, because that schema requires a bound exit receipt.
 
 ### 3. Preserve the repository fingerprint definition
 
@@ -116,10 +124,19 @@ facts, and completion comparisons remain byte-compatible.
   `mutationSequence`.
 - verified `none`: append no mutation and do not increment `mutationSequence`.
 
-Every case clears the interim pending effect ID only in the same atomic session
+Every case clears any interim pending effect ID only in the same atomic session
 update that records the final attribution/accounting state. A non-clean record still
-blocks completion explicitly. A verified no-op must not make an informational
-`kind: "answer"` completion impossible merely because a mutation record exists.
+blocks completion explicitly under both frozen and observed authority. A verified
+no-op must not make an informational `kind: "answer"` completion impossible merely
+because a mutation record exists.
+
+The durable applied-once key is the operation's entry in `pendingOperations`, not the
+presence of a mutation record. That key exists for every executing terminal
+operation, including a verified no-op. Effect application removes it and adds the
+operation to the unreturned-result set in the same session persist that records
+output accounting, any command refund, any mutation, its sequence increment, and
+changed-file/line accounting. A later artifact replay therefore cannot apply effects
+again even when the verified mutation outcome was `none`.
 
 ### 5. Keep observation bounded without rejecting large clean repositories
 
@@ -296,19 +313,33 @@ verified terminal result artifact. Invoke it from:
 The current startup promotion path must not stop after journal promotion; it must
 apply effects before continuing.
 
-One in-memory state update followed by one atomic session persist performs:
+The sole apply condition is a matching durable `pendingOperations` entry. An
+operation already in the unreturned/completed sets is a verified no-op; an operation
+in neither state is `RECOVERY_REQUIRED`. One in-memory state update followed by one
+atomic session persist performs:
 
 - terminal mutation insertion when required;
 - `mutationSequence` increment when required;
 - changed-file/line post-hoc accounting;
-- pending terminal effect ID removal;
-- completed/unreturned bookkeeping needed by the surrounding transaction; and
+- `commandOutputBytes` accounting;
+- the one-time `commands` refund when verified evidence proves no process launched;
+- pending terminal effect ID removal when one exists;
+- removal from `pendingOperations`;
+- insertion into the unreturned-result set; and
 - durable pause facts for any budget overrun.
 
-If the session persist fails, the durable old state retains the pending ID and replay
-retries the same idempotent application. If a matching operation record already
-exists, verify its source-free facts and perform only idempotent cleanup. A mismatch
-is `RECOVERY_REQUIRED`.
+If the session persist fails, the durable old state retains the pending operation and
+recovery retries the same idempotent application. If the persist succeeds, the
+pending entry and every charge/refund change together; replay sees an unreturned
+result but no pending entry and performs disclosure only. If a matching terminal
+mutation already exists while the operation remains pending, verify its source-free
+facts before repairing state; a mismatch is `RECOVERY_REQUIRED`.
+
+Prelaunch recovery without a result artifact is a separate, source-free transaction:
+after durable-absence proof, `OperationJournal.markFailed` records the prelaunch
+reason and one session persist refunds `commands`, removes the pending operation,
+and marks its failure awaiting return. It never enters the result-backed effect
+applicator.
 
 ### Post-hoc budgets
 
@@ -353,8 +384,11 @@ does not import the terminal artifact store.
 
 For each task-mutated path, choose the earliest verified baseline across typed patch
 checkpoints and terminal pre-observations. Include both rename endpoints. Missing,
-corrupt, placeholder, bounded-out, or unknown terminal evidence returns an explicit
-unknown/recovery-required diff.
+placeholder, bounded-out, or unknown terminal evidence produces a per-path
+`unavailable` marker and increments a bounded unavailable count while retaining
+healthy path diffs. Integrity violations remain whole-diff
+`RECOVERY_REQUIRED`; ordinary missing evidence for one path must not discard every
+healthy patch or terminal baseline.
 
 The final handoff separately reports:
 
@@ -366,21 +400,37 @@ The final handoff separately reports:
 - named validation outcomes; and
 - skipped checks.
 
-The review package stays source-free. Cleanup must not erase the source-free
-reconciliation summary for blocked, aborted, or failed terminal sessions.
+The review package stays source-free. For exit-receipt-without-result recovery, add a
+strict read seam that validates the incomplete evidence chain and derives a bounded
+advisory. Persist that advisory in the indeterminate `OperationRecord.safeResult`,
+which survives source-artifact and failed-handoff cleanup. Artifact cleanup may
+remove source evidence later, but must not erase this journal summary for blocked,
+aborted, or failed terminal sessions.
 
 ### Completion
 
-`frozen` authority preserves current behavior verbatim.
+Before authority-specific checks, completion rejects:
+
+- every unresolved terminal pending effect;
+- every terminal mutation with outcome `unknown` or
+  `protected_or_hidden_changed`; and
+- a latest terminal mutation that lacks an authoritative repository fingerprint.
+
+These gates are authority-independent. They prevent a non-clean record from falling
+back to `repositoryFingerprintAtStart` and becoming completable merely because the
+live worktree happens to match session start.
+
+`frozen` authority otherwise preserves current behavior verbatim, including
+session-start branch, HEAD, and excluded-state checks.
 
 `observed` authority:
 
 1. rejects unresolved journal operations;
 2. rejects legacy pending terminal effect IDs;
-3. rejects terminal records with `unknown` or
-   `protected_or_hidden_changed`;
-4. selects expected branch, HEAD, index, component, and repository facts from the
-   latest recorded effect;
+3. skips the session-start branch, HEAD, and excluded-state freeze after a
+   trustworthy attributed effect;
+4. selects the existing repository fingerprint from the latest trustworthy effect
+   or validation;
 5. allows a later catalog validation to become authoritative only at the current
    `mutationSequence` and exact current repository fingerprint;
 6. requires the live completion snapshot to equal the selected facts;
@@ -390,6 +440,11 @@ reconciliation summary for blocked, aborted, or failed terminal sessions.
 
 `terminal_exec` never creates a `ValidationRecord` and never satisfies a required
 command ID.
+
+No separate branch/HEAD/index fields are needed in `TerminalMutationRecord` for
+completion. The unchanged `GitInspector.status().snapshotSha256` already binds
+branch, HEAD, and every visible index/worktree entry. Component fingerprints support
+effect classification and diagnostics, not a second completion identity.
 
 ## Shared contract gate
 
@@ -401,12 +456,20 @@ Required contract decisions:
 
 1. unchanged `GitInspector.status().snapshotSha256` identity;
 2. persisted, capability-seeded, monotonic `completionAuthority`;
-3. launch-receipt artifact and its host durability guarantee;
+3. `terminal-launch-receipt` added to every exact artifact-kind/reference validator,
+   with durable-absence recovery gated by
+   `HostPlatform.supportsDirectoryFsync`;
 4. non-throwing post-hoc budget API;
 5. strict legacy/full observation union with only pre/post phases;
 6. no journal metadata key additions;
 7. bounded before-images without a full index manifest or post-images; and
-8. mixed patch/terminal session-diff resolver interface.
+8. mixed patch/terminal session-diff resolver with per-path unavailable evidence;
+9. `completionAuthority` added to the exact top-level session-key validator while
+   remaining optional for legacy sessions;
+10. a strict incomplete-terminal-evidence reader that distinguishes absent,
+    partial/corrupt, launch-receipt-only, and exit-receipt-without-result states; and
+11. `pendingOperations` to unreturned/completed state as the durable exactly-once
+    application transition for every terminal result, including `none`.
 
 Expected contract files:
 
@@ -418,6 +481,8 @@ Expected contract files:
 - `src/session/store.ts`;
 - `src/session/budgets.ts`;
 - `src/repository/snapshot-diff.ts`; and
+- `src/platform/contracts.ts` and host capability consumers where receipt
+  durability is selected; and
 - compile-only completion/runtime wiring.
 
 The contract gate must include byte-compatible Slice 1 artifact, journal, session,
@@ -511,15 +576,19 @@ Inject crashes:
 - after pending-ID clearing; and
 - after outbox queueing.
 
-Every row proves zero duplicate launches. No receipt is retry-safe for ordinary
-process crash. Receipt without exit pauses. Exit without result pauses with an
-advisory report. Complete result promotes and applies effects once.
+Every row proves zero duplicate launches. No receipt becomes a failed/refundable
+prelaunch outcome only when the host/store proves durable absence; otherwise it
+pauses. A partial or corrupt receipt requires recovery. Receipt without exit pauses.
+Exit without result persists an indeterminate journal advisory. Complete result
+promotes, consumes the durable pending-operation application key, accounts output
+and any refund once, and becomes unreturned without applying effects twice.
 
 ### Accounting and session state
 
 - observed nonempty effect records once, increments once, charges once, and clears
-  pending once;
-- verified none records no mutation and no sequence increment;
+  the pending operation once;
+- verified none records no mutation and no sequence increment, but still consumes
+  its durable pending-operation key and accounts output once;
 - unknown/protected records a non-clean effect, increments the sequence, clears the
   interim marker, and still blocks completion;
 - nonzero, timeout, and cancellation use identical effect accounting;
@@ -534,11 +603,14 @@ advisory report. Complete result promotes and applies effects once.
 
 - terminal-only, patch-then-terminal, terminal-then-patch, and repeated touches;
 - earliest pre-existing user bytes remain the baseline;
-- rename endpoints and missing/corrupt/placeholder baseline behavior;
+- rename endpoints, per-path unavailable baseline behavior, and whole-diff integrity
+  failure;
 - no terminal-mutated path is silently omitted;
 - observed authority is read only from the persisted field;
 - old `auto`, config v1, old grants, and absent-field sessions stay frozen;
 - frozen branch/HEAD drift still rejects;
+- non-clean terminal records reject under frozen and observed authority and never
+  fall back to the session-start fingerprint;
 - an attributed branch/HEAD/index transition completes only after fresh named
   validation;
 - unknown/protected effects reject even after passing validation;
@@ -557,7 +629,9 @@ Windows:
 - case-only rename and CRLF fixtures;
 - `.cmd` shell-mode effects;
 - `taskkill /T /F` completes before post-observation; and
-- launch-receipt visibility across an ordinary hard process crash.
+- launch-receipt visibility across an ordinary hard process crash, with
+  receipt-absence recovery remaining conservative when directory durability is not
+  supported.
 
 macOS:
 
@@ -599,13 +673,16 @@ Slice 2 is mergeable only on one immutable exact head where:
 4. session-start user work remains separately identified and recoverable;
 5. each result applies at most one mutation, sequence increment, and budget charge;
 6. post-hoc overrun truth is durable before later work pauses;
-7. pending effect IDs clear only after final effect/accounting persistence;
-8. unknown/protected effects cannot be masked by validation;
+7. the pending-operation application key clears only in the same persist as final
+   output/refund/effect accounting, including for verified no-op;
+8. unknown/protected effects reject under every completion authority and cannot be
+   masked by validation or a session-start fingerprint fallback;
 9. validation freshness matches the latest sequence and exact fingerprint;
 10. observed sessions can complete after attributed Git transitions while old and
     frozen sessions retain their current restrictions;
 11. external drift after the last recorded effect or validation rejects completion;
-12. session diff contains terminal baselines or explicit unavailable evidence;
+12. session diff contains terminal baselines or per-path unavailable evidence
+    without discarding healthy paths;
 13. handoff separates user work, terminal effects, process outcomes, validation, and
     limitations;
 14. Windows and macOS hosted behavior is green without unexpected skips; and
