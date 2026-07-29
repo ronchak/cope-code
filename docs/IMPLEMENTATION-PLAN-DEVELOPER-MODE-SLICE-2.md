@@ -35,6 +35,8 @@ After this slice:
 
 Slice 2 does not enable terminal authority for normal users. Config v2, product
 posture, onboarding, grants, and release documentation remain Slice 3 work.
+Receipt-absence prelaunch refund is available only on directory-fsync-capable hosts
+in this slice; Windows conservatively pauses when that absence cannot be proven.
 
 ## Planning decisions
 
@@ -67,6 +69,10 @@ This combines capability as the source of truth with a creation-time durable
 compatibility decision. Presence of session-start branch/HEAD facts cannot be the
 discriminator because every current session records them.
 
+Slice 2 keeps `createDefaultSessionGrant` unchanged, so ordinary/default sessions
+seed `frozen`. `observed` is reachable only through explicit test/manual
+terminal-capable grants until Slice 3 adds the product grant path.
+
 ### 2. Add a durable launch receipt, but do not invent resume-time attribution
 
 Slice 2 makes the interval between request persistence and process launch materially
@@ -78,6 +84,7 @@ Recovery truth is:
 
 | Durable evidence | Recovery action |
 | --- | --- |
+| no request artifact | retain Slice 1's indeterminate pause; absence of a launch receipt alone is not enough to refund |
 | request evidence, with or without a complete pre-observation, no launch receipt, and the host/store proves durable receipt absence | mark the existing journal record failed with a source-free prelaunch reason, refund the command reservation, clear the durable pending operation, and never claim a process ran |
 | request evidence, with or without a complete pre-observation, no launch receipt, but durable receipt absence is not provable on this host/store | pause indeterminate and never rerun |
 | partial, corrupt, or manifest-mismatched launch receipt | `RECOVERY_REQUIRED`; never treat corrupt evidence as absence |
@@ -92,13 +99,15 @@ even erase the command's effects. Such an observation cannot prove either `none`
 `observed`.
 
 The receipt is trusted for an absence-based retry decision only when the host/store
-can prove the directory entry durable. Add a parent-directory durability step after
-rename on hosts where `HostPlatform.supportsDirectoryFsync` is true. If the host
+can prove the directory entry durable. On hosts where
+`HostPlatform.supportsDirectoryFsync` is true, pre-create the first-write receipt-kind
+directory and sync the artifact root, then write/fsync/rename the receipt and sync
+the kind directory before spawn. Both directory syncs must succeed. If the host
 cannot provide that guarantee, receipt absence remains indeterminate; this is the
 conservative Windows fallback. Existing file-flush plus atomic-replace semantics
 still receive ordinary process-crash coverage on every supported host, but they do
-not justify retry from absence alone. Do not claim sudden-power-loss durability
-where Node cannot provide it.
+not justify refund or retry from absence alone. Do not claim sudden-power-loss
+durability where Node cannot provide it.
 
 A live prelaunch observation refusal follows the ordinary journal `markFailed` path
 and returns the existing non-persisted typed failure outcome. It does not manufacture
@@ -124,11 +133,12 @@ facts, and completion comparisons remain byte-compatible.
   `mutationSequence`.
 - verified `none`: append no mutation and do not increment `mutationSequence`.
 
-Every case clears any interim pending effect ID only in the same atomic session
-update that records the final attribution/accounting state. A non-clean record still
-blocks completion explicitly under both frozen and observed authority. A verified
-no-op must not make an informational `kind: "answer"` completion impossible merely
-because a mutation record exists.
+A full Slice 2 result clears a matching interim pending effect ID, if one was
+durably created before interruption, only in the same atomic session update that
+records the final attribution/accounting state. A legacy placeholder result never
+clears its marker. A non-clean record still blocks completion explicitly under both
+frozen and observed authority. A verified no-op must not make an informational
+`kind: "answer"` completion impossible merely because a mutation record exists.
 
 The durable applied-once key is the operation's entry in `pendingOperations`, not the
 presence of a mutation record. That key exists for every executing terminal
@@ -166,6 +176,11 @@ Initial bounds:
 Exceeding required prelaunch evidence refuses launch with a bounded recovery action.
 Post-launch overflow produces an explicit `unknown` observation while preserving
 process truth.
+
+Freeze a measured pre/post observation deadline and record observation duration in
+source-free diagnostics. The single race retry is a complete re-observation and must
+remain inside the documented total bound; no unbounded Git/control-state walk may
+silently extend terminal latency.
 
 ### 6. Session diff is part of Slice 2
 
@@ -307,11 +322,14 @@ Create one idempotent effect applicator keyed by operation ID and sourced only f
 verified terminal result artifact. Invoke it from:
 
 1. live journal completion;
-2. replay of a pending/unreturned completed result; and
-3. startup promotion of an executing journal record with a verified result.
+2. replay of a completed result whose session operation is still pending;
+3. startup promotion of an executing journal record with a verified result; and
+4. startup reconciliation of a session-pending operation whose journal record is
+   already completed with a verified result.
 
-The current startup promotion path must not stop after journal promotion; it must
-apply effects before continuing.
+The current startup path must not stop after journal promotion or skip an already
+completed record merely because it no longer needs promotion. Both states apply the
+same effects before recovery continues.
 
 The sole apply condition is a matching durable `pendingOperations` entry. An
 operation already in the unreturned/completed sets is a verified no-op; an operation
@@ -328,12 +346,30 @@ atomic session persist performs:
 - insertion into the unreturned-result set; and
 - durable pause facts for any budget overrun.
 
-If the session persist fails, the durable old state retains the pending operation and
-recovery retries the same idempotent application. If the persist succeeds, the
-pending entry and every charge/refund change together; replay sees an unreturned
-result but no pending entry and performs disclosure only. If a matching terminal
-mutation already exists while the operation remains pending, verify its source-free
-facts before repairing state; a mismatch is `RECOVERY_REQUIRED`.
+Implementation ordering is mandatory:
+
+1. load and verify all artifacts and compute the complete effect without mutating
+   session state;
+2. construct the complete next session state from a clone;
+3. apply mutation, sequence, budgets, marker cleanup, pending removal, and
+   unreturned insertion to that clone;
+4. persist the complete clone atomically;
+5. publish it as the runtime state only after persistence succeeds; and
+6. emit idempotent/deduplicated audit facts after durable state.
+
+Terminal effect application therefore runs before the live path's existing
+`clearPending` and `markOperationAwaitingReturn` calls; those calls move inside this
+transaction. If artifact preparation or validation throws after journal completion,
+the `operationWasCommitted` catch path must retain the pending entry, must not mark
+the result unreturned, and must not persist any partial accounting. If session
+persistence fails, restore the prior in-memory state and stop; the durable old state
+still contains the pending operation for startup recovery.
+
+If the persist succeeds, the pending entry and every charge/refund change together;
+replay sees an unreturned result but no pending entry and performs disclosure only.
+If a matching terminal mutation already exists while the operation remains pending,
+verify its source-free facts before repairing state; a mismatch is
+`RECOVERY_REQUIRED`.
 
 Prelaunch recovery without a result artifact is a separate, source-free transaction:
 after durable-absence proof, `OperationJournal.markFailed` records the prelaunch
@@ -388,7 +424,9 @@ placeholder, bounded-out, or unknown terminal evidence produces a per-path
 `unavailable` marker and increments a bounded unavailable count while retaining
 healthy path diffs. Integrity violations remain whole-diff
 `RECOVERY_REQUIRED`; ordinary missing evidence for one path must not discard every
-healthy patch or terminal baseline.
+healthy patch or terminal baseline. This degradation applies only to terminal
+baselines; a missing typed-patch checkpoint entry retains the current whole-diff
+`CHECKPOINT_CORRUPT` behavior.
 
 The final handoff separately reports:
 
@@ -458,18 +496,22 @@ Required contract decisions:
 2. persisted, capability-seeded, monotonic `completionAuthority`;
 3. `terminal-launch-receipt` added to every exact artifact-kind/reference validator,
    with durable-absence recovery gated by
-   `HostPlatform.supportsDirectoryFsync`;
+   `HostPlatform.supportsDirectoryFsync`, artifact-root sync, and receipt-kind
+   directory sync before spawn;
 4. non-throwing post-hoc budget API;
 5. strict legacy/full observation union with only pre/post phases;
 6. no journal metadata key additions;
-7. bounded before-images without a full index manifest or post-images; and
+7. bounded before-images without a full index manifest or post-images;
 8. mixed patch/terminal session-diff resolver with per-path unavailable evidence;
 9. `completionAuthority` added to the exact top-level session-key validator while
    remaining optional for legacy sessions;
 10. a strict incomplete-terminal-evidence reader that distinguishes absent,
     partial/corrupt, launch-receipt-only, and exit-receipt-without-result states; and
 11. `pendingOperations` to unreturned/completed state as the durable exactly-once
-    application transition for every terminal result, including `none`.
+    application transition for every terminal result, including `none`; and
+12. use-site artifact-reference validators that allow a launch receipt only in its
+    receipt position and do not widen stdout/stderr stream references to arbitrary
+    `terminal-*` kinds.
 
 Expected contract files:
 
@@ -480,9 +522,8 @@ Expected contract files:
 - `src/session/types.ts`;
 - `src/session/store.ts`;
 - `src/session/budgets.ts`;
-- `src/repository/snapshot-diff.ts`; and
-- `src/platform/contracts.ts` and host capability consumers where receipt
-  durability is selected; and
+- `src/repository/snapshot-diff.ts`;
+- `src/cli/commands.ts` for creation-time authority seeding; and
 - compile-only completion/runtime wiring.
 
 The contract gate must include byte-compatible Slice 1 artifact, journal, session,
@@ -497,7 +538,7 @@ All tracks branch from the exact reviewed `S2-C0` SHA.
 | A — repository observation | `workspace-observer.ts`; observation-only additions to `git.ts`, `context.ts`, repository exports | observer and Git fixtures |
 | B — persistence/evidence | `terminal-artifacts.ts`, `artifact-store.ts`, observation/session validators | artifact binding, compatibility, durability |
 | C — session diff | `snapshot-diff.ts` and narrow terminal resolver | mixed patch/terminal diff |
-| P — primary serialized integration | `terminal-executor.ts`, `tool-host.ts`, `agent-runtime.ts`, `budgets.ts`, `completion.ts`, `runtime-composition.ts`, handoff/review package | executor, runtime, accounting, completion, end-to-end, reliability |
+| P — primary serialized integration | `terminal-executor.ts`, `tool-host.ts`, `agent-runtime.ts`, `budgets.ts`, `completion.ts`, `runtime-composition.ts`, `cli/commands.ts`, handoff/review package | executor, runtime, accounting, completion, end-to-end, reliability |
 
 No two worktrees edit an integration file concurrently. The primary owns all
 contract changes after `S2-C0`, all conflict resolution, every push, and every merge.
@@ -571,6 +612,8 @@ Inject crashes:
 - after post-observation;
 - after full result;
 - after journal completion;
+- after journal completion with effect preparation/validation throwing;
+- with a completed journal record and a still-pending session operation at startup;
 - after effect application;
 - after budget persistence;
 - after pending-ID clearing; and
@@ -582,6 +625,8 @@ pauses. A partial or corrupt receipt requires recovery. Receipt without exit pau
 Exit without result persists an indeterminate journal advisory. Complete result
 promotes, consumes the durable pending-operation application key, accounts output
 and any refund once, and becomes unreturned without applying effects twice.
+Effect preparation failure after journal completion preserves the pending operation
+and zero partial accounting.
 
 ### Accounting and session state
 
@@ -593,6 +638,10 @@ and any refund once, and becomes unreturned without applying effects twice.
   interim marker, and still blocks completion;
 - nonzero, timeout, and cancellation use identical effect accounting;
 - live, replay, startup promotion, and repeated recovery remain idempotent;
+- startup applies effects for both executing-promoted and already-completed journal
+  records that still have a session-pending operation;
+- effect preparation/validation failure after journal completion retains pending
+  state and cannot persist unreturned/partial accounting;
 - mismatched duplicate facts require recovery;
 - files-only, lines-only, and combined overruns persist actual usage before pausing;
 - approved, denied, and unavailable budget raises;
@@ -607,6 +656,8 @@ and any refund once, and becomes unreturned without applying effects twice.
   failure;
 - no terminal-mutated path is silently omitted;
 - observed authority is read only from the persisted field;
+- default Slice 2 session creation seeds frozen while an explicit
+  terminal-capable test/manual grant seeds observed;
 - old `auto`, config v1, old grants, and absent-field sessions stay frozen;
 - frozen branch/HEAD drift still rejects;
 - non-clean terminal records reject under frozen and observed authority and never
@@ -642,6 +693,9 @@ macOS:
 - parent-directory sync after receipt rename.
 
 Neither host claims child-process containment or exhaustive out-of-project effects.
+Receipt-absence refund is a directory-fsync-capable POSIX/macOS behavior in Slice 2;
+Windows acceptance requires a stable indeterminate pause with zero duplicate launch,
+not a refundable retry.
 
 ## Review checkpoints
 
@@ -687,7 +741,9 @@ Slice 2 is mergeable only on one immutable exact head where:
     limitations;
 14. Windows and macOS hosted behavior is green without unexpected skips; and
 15. existing terminal replay, process cleanup, browser/protocol, typed-patch,
-    catalog command, old session/config, and offline fixture tests remain green.
+    catalog command, old session/config, and offline fixture tests remain green; and
+16. receipt-absence refund is proven only on directory-fsync-capable hosts; Windows
+    uses a stable indeterminate pause with zero duplicate execution.
 
 Run on the exact final SHA:
 
