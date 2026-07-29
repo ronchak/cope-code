@@ -9,6 +9,7 @@ import {
   PolicyEngine,
   createDefaultSessionGrant,
   type BudgetUsage as PolicyBudgetUsage,
+  type RuleSet,
   zeroPolicyBudgetUsage,
 } from "../../src/policy/index.js";
 import {
@@ -18,6 +19,7 @@ import {
 import { CbaProtocolAdapter } from "../../src/orchestrator/cba-protocol-adapter.js";
 import {
   CONTROL_PLANE_RESERVE_BYTES,
+  plannedToolResultDisclosureBytes,
 } from "../../src/orchestrator/disclosure-budget.js";
 import { RepositoryBoundary } from "../../src/repository/boundary.js";
 import { CommandCatalog } from "../../src/tools/command-catalog.js";
@@ -38,6 +40,7 @@ async function harness(
     readonly higherDisclosedBytes?: number;
     readonly budgets?: Readonly<Partial<Record<BudgetMetric, number>>>;
     readonly currentUsage?: PolicyBudgetUsage;
+    readonly terminalEnabled?: boolean;
   } = {},
 ) {
   const root = await mkdtemp(path.join(tmpdir(), "cba-policy-adapter-"));
@@ -55,7 +58,7 @@ async function harness(
       fixedArguments: ["--version"],
     },
   ]);
-  const session = createDefaultSessionGrant({
+  const baseSession = createDefaultSessionGrant({
     grant_id: "grant_1",
     task_id: "task_1",
     repository_root: root,
@@ -65,7 +68,16 @@ async function harness(
     ...(options.budgets === undefined ? {} : { budgets: options.budgets }),
     ...(options.tools === undefined ? {} : { tools: options.tools }),
   });
-  const organization =
+  const session = options.terminalEnabled === true
+    ? {
+        ...baseSession,
+        capabilities: {
+          ...baseSession.capabilities,
+          tools: allowTerminalTool(baseSession.capabilities.tools),
+        },
+      }
+    : baseSession;
+  const baseOrganization =
     options.maxDisclosureFiles === undefined &&
     options.maxDisclosureBytes === undefined &&
     options.higherDisclosedBytes === undefined
@@ -93,10 +105,30 @@ async function harness(
               }),
         },
       };
+  const organization = options.terminalEnabled === true
+    ? {
+        ...baseOrganization,
+        capabilities: {
+          ...baseOrganization.capabilities,
+          tools: allowTerminalTool(baseOrganization.capabilities.tools),
+        },
+      }
+    : baseOrganization;
+  const repository = options.terminalEnabled === true
+    ? {
+        ...DEFAULT_REPOSITORY_POLICY,
+        capabilities: {
+          ...DEFAULT_REPOSITORY_POLICY.capabilities,
+          tools: allowTerminalTool(
+            DEFAULT_REPOSITORY_POLICY.capabilities.tools,
+          ),
+        },
+      }
+    : DEFAULT_REPOSITORY_POLICY;
   const policy = new LayeredRuntimePolicy({
     engine: new PolicyEngine({
       organization,
-      repository: DEFAULT_REPOSITORY_POLICY,
+      repository,
       session,
     }),
     boundary,
@@ -108,6 +140,20 @@ async function harness(
     ...(options.maxPatchBytes === undefined ? {} : { maxPatchBytes: options.maxPatchBytes }),
   });
   return { root, policy, boundary, catalog };
+}
+
+function allowTerminalTool(
+  rules: RuleSet<ToolName> | undefined,
+): RuleSet<ToolName> {
+  const { deny: _deny, ...rest } = rules ?? {};
+  const allow = [...(rules?.allow ?? [])];
+  if (!allow.includes("terminal_exec")) allow.push("terminal_exec");
+  const deny = rules?.deny?.filter((tool) => tool !== "terminal_exec") ?? [];
+  return {
+    ...rest,
+    allow,
+    ...(deny.length === 0 ? {} : { deny }),
+  };
 }
 
 test("layered runtime policy allows in-scope reads, patches, and catalog commands", async () => {
@@ -143,6 +189,56 @@ test("default grants never advertise terminal execution in any existing mode", a
     assert.doesNotMatch(bootstrap, /terminal_exec/u, mode);
     assert.doesNotMatch(bootstrap, /terminal-exec\/1/u, mode);
   }
+});
+
+test("an explicit terminal grant receives clamped execution and disclosure bounds", async () => {
+  const { policy } = await harness("auto", { terminalEnabled: true });
+  const decision = await policy.authorize({
+    operationId: "op_terminal_bounds",
+    name: "terminal_exec",
+    arguments: {
+      contract: "terminal-exec/1",
+      mode: "shell",
+      command: "npm test",
+      cwd: ".",
+      timeout_ms: 3_600_000,
+      max_output_bytes: 900_000,
+    },
+  });
+  assert.equal(decision.outcome, "allow");
+  if (decision.outcome !== "allow") return;
+  assert.equal(decision.terminal?.timeoutMs, 3_600_000);
+  assert.equal((decision.terminal?.maxOutputBytes ?? 0) > 0, true);
+  assert.equal((decision.terminal?.maxOutputBytes ?? 0) < 900_000, true);
+  assert.equal(
+    (decision.plannedDisclosureBytes ?? 0) + CONTROL_PLANE_RESERVE_BYTES <=
+      2_000_000,
+    true,
+  );
+
+  const command = "x".repeat(32_768);
+  const longDecision = await policy.authorize({
+    operationId: "op_terminal_long_invocation",
+    name: "terminal_exec",
+    arguments: {
+      contract: "terminal-exec/1",
+      mode: "shell",
+      command,
+      cwd: ".",
+      max_output_bytes: 1,
+    },
+  });
+  assert.equal(longDecision.outcome, "allow");
+  if (longDecision.outcome !== "allow") return;
+  assert.equal(
+    (longDecision.plannedDisclosureBytes ?? 0) >=
+      plannedToolResultDisclosureBytes(
+        Buffer.byteLength(command) +
+          Buffer.byteLength(".") +
+          (longDecision.terminal?.maxOutputBytes ?? 0),
+      ),
+    true,
+  );
 });
 
 test("layered runtime policy denies protected controls and inspect-mode mutation", async () => {

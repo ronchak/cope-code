@@ -12,6 +12,7 @@ import {
   TERMINAL_EXEC_MAX_EXECUTABLE_BYTES,
   TERMINAL_EXEC_MAX_OUTPUT_BYTES,
   TERMINAL_EXEC_MAX_TIMEOUT_MS,
+  TERMINAL_EXEC_MAX_TOTAL_ARGUMENT_BYTES,
 } from "./terminal-exec.js";
 
 import {
@@ -511,9 +512,75 @@ export function validateToolArguments<TName extends ToolName>(
 ): SchemaValidationResult<ToolArgumentsByName[TName]> {
   const validate = argumentValidators[tool];
   const valid = validate(value);
-  return valid
-    ? { valid: true, value: value as ToolArgumentsByName[TName], errors: [] }
-    : { valid: false, errors: validate.errors ?? [] };
+  if (!valid) return { valid: false, errors: validate.errors ?? [] };
+  if (tool === "terminal_exec") {
+    const errors = validateTerminalExecByteBounds(value);
+    if (errors.length > 0) return { valid: false, errors };
+  }
+  return { valid: true, value: value as ToolArgumentsByName[TName], errors: [] };
+}
+
+function validateTerminalExecByteBounds(value: unknown): readonly ErrorObject[] {
+  const input = value as Readonly<Record<string, unknown>>;
+  if (input.mode === "shell") {
+    return utf8BoundError(
+      input.command as string,
+      TERMINAL_EXEC_MAX_COMMAND_BYTES,
+      "/command",
+    );
+  }
+  const errors: ErrorObject[] = [
+    ...utf8BoundError(
+      input.executable as string,
+      TERMINAL_EXEC_MAX_EXECUTABLE_BYTES,
+      "/executable",
+    ),
+  ];
+  const argumentsValue = input.arguments as readonly string[];
+  let totalBytes = 0;
+  for (let index = 0; index < argumentsValue.length; index += 1) {
+    const argument = argumentsValue[index] ?? "";
+    const argumentBytes = Buffer.byteLength(argument);
+    totalBytes += argumentBytes;
+    errors.push(
+      ...utf8BoundError(
+        argument,
+        TERMINAL_EXEC_MAX_ARGUMENT_BYTES,
+        `/arguments/${index}`,
+      ),
+    );
+  }
+  if (totalBytes > TERMINAL_EXEC_MAX_TOTAL_ARGUMENT_BYTES) {
+    errors.push(byteLengthError(
+      "/arguments",
+      TERMINAL_EXEC_MAX_TOTAL_ARGUMENT_BYTES,
+      totalBytes,
+    ));
+  }
+  return errors;
+}
+
+function utf8BoundError(
+  value: string,
+  limit: number,
+  instancePath: string,
+): readonly ErrorObject[] {
+  const actual = Buffer.byteLength(value);
+  return actual > limit ? [byteLengthError(instancePath, limit, actual)] : [];
+}
+
+function byteLengthError(
+  instancePath: string,
+  limit: number,
+  actual: number,
+): ErrorObject {
+  return {
+    instancePath,
+    schemaPath: "#/utf8ByteLength",
+    keyword: "utf8ByteLength",
+    params: { limit, actual },
+    message: `must be at most ${limit} UTF-8 bytes`,
+  };
 }
 
 export function formatSchemaErrors(errors: readonly ErrorObject[]): readonly string[] {

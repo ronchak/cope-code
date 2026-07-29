@@ -123,6 +123,29 @@ test("terminal_exec enforces strict disjoint shell and argv forms", () => {
     mode: "shell",
     command: "npm\u0000test",
   }).valid, false);
+  assert.equal(validateToolArguments("terminal_exec", {
+    contract: "terminal-exec/1",
+    mode: "shell",
+    command: "😀".repeat(65_537),
+  }).valid, false);
+  assert.equal(validateToolArguments("terminal_exec", {
+    contract: "terminal-exec/1",
+    mode: "argv",
+    executable: "node",
+    arguments: Array.from({ length: 9 }, () => "a".repeat(32_768)),
+  }).valid, false);
+  assert.equal(validateToolArguments("terminal_exec", {
+    contract: "terminal-exec/1",
+    mode: "argv",
+    executable: "😀".repeat(8_193),
+    arguments: [],
+  }).valid, false);
+  assert.equal(validateToolArguments("terminal_exec", {
+    contract: "terminal-exec/1",
+    mode: "argv",
+    executable: "node",
+    arguments: ["😀".repeat(8_193)],
+  }).valid, false);
 });
 
 function request(operations: readonly unknown[] = [

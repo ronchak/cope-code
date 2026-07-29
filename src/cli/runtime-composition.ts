@@ -38,6 +38,7 @@ import { AgentError } from "../shared/errors.js";
 import { SessionArtifactStore } from "../session/artifact-store.js";
 import { CompletionHandoffStore } from "../session/completion-handoff-store.js";
 import { OperationJournal } from "../session/operation-journal.js";
+import { TerminalArtifactPersistence } from "../session/terminal-artifacts.js";
 import type { SessionStore } from "../session/store.js";
 import {
   DEFAULT_BUDGET_LIMITS,
@@ -47,8 +48,10 @@ import {
 import {
   CommandCatalog,
   ProcessRunner,
+  TerminalExecutor,
   ToolHost,
   preauthorizedToolPolicy,
+  type TerminalLiveOutput,
 } from "../tools/index.js";
 import type { ModelTransport } from "../transport/index.js";
 import { writeSessionGrant } from "./session-files.js";
@@ -64,6 +67,7 @@ export interface ComposeRuntimeOptions {
   readonly idFactory?: (prefix: string) => string;
   readonly signal?: AbortSignal;
   readonly onProgress?: (event: RuntimeProgressEvent) => void;
+  readonly onTerminalOutput?: TerminalLiveOutput;
   readonly host: HostPlatform;
 }
 
@@ -212,9 +216,23 @@ export async function composeRuntime(options: ComposeRuntimeOptions): Promise<Co
     contentProcessor: contentSecurity,
     host: options.host,
   });
+  const artifacts = new SessionArtifactStore(
+    path.join(sessionDirectory, "artifacts"),
+  );
+  const terminalExecutor = new TerminalExecutor({
+    boundary: repository.boundary,
+    process: processRunner,
+    persistence: new TerminalArtifactPersistence(artifacts),
+    host: options.host,
+    contentProcessor: contentSecurity,
+    ...(options.onTerminalOutput === undefined
+      ? {}
+      : { onTerminalOutput: options.onTerminalOutput }),
+  });
   const tools = new ToolHost({
     context: repository,
     processRunner,
+    terminalExecutor,
     policy: preauthorizedToolPolicy,
     resultProcessor: contentSecurity,
     completionPathScope: policy,
@@ -257,7 +275,7 @@ export async function composeRuntime(options: ComposeRuntimeOptions): Promise<Co
     },
     ...(options.idFactory === undefined ? {} : { idFactory: options.idFactory }),
     ...(options.signal === undefined ? {} : { signal: options.signal }),
-    artifacts: new SessionArtifactStore(path.join(sessionDirectory, "artifacts")),
+    artifacts,
     completionHandoffs: new CompletionHandoffStore(
       path.join(sessionDirectory, "handoff"),
       state.sessionId,

@@ -136,6 +136,11 @@ export type AuthorizationDecision =
       readonly plannedDisclosureBytes?: number;
       /** Effective ceilings approved only for this exact operation. */
       readonly oneTimeBudgetLimits?: Readonly<Partial<Record<BudgetMetric, number>>>;
+      /** Locally authorized terminal-exec/1 bounds for this exact call. */
+      readonly terminal?: {
+        readonly timeoutMs: number;
+        readonly maxOutputBytes: number;
+      };
       /**
        * Deterministically policy-bounded arguments to execute in place of the
        * original request. The operation identity and journaled request remain
@@ -207,6 +212,8 @@ export interface ToolExecutionContext {
   readonly terminal?: {
     readonly timeoutMs: number;
     readonly maxOutputBytes: number;
+    /** Exact hash of the already-journaled NormalizedToolCall. */
+    readonly requestHash: string;
   };
 }
 

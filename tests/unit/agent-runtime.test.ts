@@ -654,6 +654,7 @@ function runtimeForTest(input: {
   readonly artifacts?: SessionArtifactStore;
   readonly completionHandoffs?: CompletionHandoffStore;
   readonly execute?: ToolExecutor["execute"];
+  readonly recoverCompleted?: ToolExecutor["recoverCompleted"];
   readonly inspectCompletionState?: ToolExecutor["inspectCompletionState"];
   readonly disclosure?: DisclosureGuard;
   readonly policy?: RuntimePolicy;
@@ -675,6 +676,9 @@ function runtimeForTest(input: {
     },
     tools: {
       execute: input.execute ?? (async () => { throw new Error("unused"); }),
+      ...(input.recoverCompleted === undefined
+        ? {}
+        : { recoverCompleted: input.recoverCompleted }),
       inspectCompletionState: input.inspectCompletionState ?? (async () => ({
         pathKey: completionPathKey,
         known: true,
@@ -798,6 +802,296 @@ test("runtime completes a multi-turn autonomous tool loop", async () => {
   const durableHandoff = await completionHandoffs.read(localState.completionHandoff);
   assert.equal(durableHandoff.claim.summary, "Repository inspected.");
   assert.equal(durableHandoff.verification.accepted, true);
+});
+
+test("runtime passes terminal bounds without changing the journaled request", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-terminal-context-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(
+    path.join(store.sessionDirectory(localState.sessionId), "artifacts"),
+  );
+  const terminalArguments = {
+    contract: "terminal-exec/1",
+    mode: "shell",
+    command: "npm test",
+  } as const;
+  const transport = new QueueTransport([
+    JSON.stringify([{
+      type: "tool_request",
+      calls: [{
+        operationId: "op_terminal_context",
+        name: "terminal_exec",
+        arguments: terminalArguments,
+      }],
+    }]),
+    JSON.stringify([{
+      type: "blocked",
+      reasonCode: "TEST_COMPLETE",
+      summary: "Terminal context was observed.",
+      needed: [],
+      recoverable: false,
+    }]),
+  ]);
+  let observedContext: Parameters<ToolExecutor["execute"]>[2];
+  let observedArguments: Readonly<Record<string, unknown>> | undefined;
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+    policy: {
+      summarize: () => ({}),
+      authorize: () => ({
+        outcome: "allow",
+        reasonCode: "ALLOWED",
+        explanation: "allowed",
+        plannedDisclosureBytes: 64 * 1024,
+        terminal: { timeoutMs: 30_000, maxOutputBytes: 8_192 },
+      }),
+      expandSessionGrant: async () => false,
+    },
+    execute: async (call, _signal, context) => {
+      observedArguments = call.arguments;
+      observedContext = context;
+      return {
+        operationId: call.operationId,
+        tool: call.name,
+        status: "success",
+        data: { outcome: "completed", exit_code: 0 },
+        safeMetadata: {
+          outcome: "completed",
+          outputBytes: 128,
+          mutationOutcome: "observed",
+        },
+      };
+    },
+  }).run();
+  assert.equal(result.status, "blocked");
+  assert.deepEqual(observedArguments, terminalArguments);
+  assert.deepEqual(observedContext, {
+    terminal: {
+      timeoutMs: 30_000,
+      maxOutputBytes: 8_192,
+      requestHash: (await new OperationJournal(
+        path.join(root, "operations"),
+        localState.sessionId,
+      ).read("op_terminal_context")).requestHash,
+    },
+  });
+  assert.equal(localState.budgetUsage.commands, 1);
+  assert.equal(localState.budgetUsage.commandOutputBytes, 128);
+  assert.deepEqual(
+    localState.pendingTerminalEffectOperationIds,
+    ["op_terminal_context"],
+  );
+});
+
+test("recovery promotes a durable terminal result before journal re-registration", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-terminal-recovery-"));
+  const localState = state(root);
+  localState.status = "executing_tools";
+  localState.turnSequence = 1;
+  localState.budgetUsage = {
+    ...localState.budgetUsage,
+    operations: 1,
+    commands: 1,
+  };
+  localState.submission = {
+    submissionId: "submission_1",
+    turnId: "turn_0001",
+    messageHash: "a".repeat(64),
+    marker: "marker",
+    state: "answered",
+    preparedAt: "2026-01-01T00:00:00.000Z",
+    answeredAt: "2026-01-01T00:00:01.000Z",
+  };
+  const call = {
+    operationId: "op_terminal_recovery",
+    name: "terminal_exec" as const,
+    arguments: {
+      contract: "terminal-exec/1",
+      mode: "shell",
+      command: "printf recovered",
+    },
+  };
+  const journal = new OperationJournal(
+    path.join(root, "operations"),
+    localState.sessionId,
+  );
+  const registration = await journal.register(
+    call.operationId,
+    call.name,
+    true,
+    call,
+    "2026-01-01T00:00:00.000Z",
+  );
+  const executing = await journal.markExecuting(
+    registration.record,
+    "2026-01-01T00:00:01.000Z",
+  );
+  localState.pendingOperations = [{
+    operationId: call.operationId,
+    tool: call.name,
+    mutating: true,
+    requestHash: executing.requestHash,
+    status: "executing",
+    acceptedAt: executing.acceptedAt,
+  }];
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(
+    path.join(store.sessionDirectory(localState.sessionId), "artifacts"),
+  );
+  await artifacts.put(
+    "response",
+    "turn_0001",
+    JSON.stringify([{ type: "tool_request", calls: [call] }]),
+  );
+  let recoveries = 0;
+  let executions = 0;
+  const recoveredOutcome = {
+    operationId: call.operationId,
+    tool: call.name,
+    status: "success" as const,
+    data: {
+      contract: "terminal-exec-result/1",
+      outcome: "completed",
+      stdout: { head: "recovered", tail: "", bytes: 9, truncated: false },
+      replayed: false,
+    },
+    safeMetadata: {
+      contract: "terminal-journal-result/1",
+      operation_id: call.operationId,
+      request_hash: executing.requestHash,
+      terminal_result: {
+        kind: "terminal-result",
+        id: call.operationId,
+        bytes: 1024,
+        sha256: "f".repeat(64),
+      },
+      outcome: "completed",
+      exit_code: 0,
+      signal: null,
+      completed_at: "2026-01-01T00:00:02.000Z",
+      duration_ms: 1_000,
+      stdout_bytes: 9,
+      stderr_bytes: 0,
+      redaction_count: 0,
+      disclosure: "complete",
+      mutation_outcome: "none",
+      changed_files: 0,
+      changed_lines: 0,
+    },
+  };
+  const transport = new QueueTransport([JSON.stringify([{
+    type: "blocked",
+    reasonCode: "TEST_COMPLETE",
+    summary: "Recovered terminal result was returned.",
+    needed: [],
+    recoverable: false,
+  }])]);
+
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    artifacts,
+    execute: async () => {
+      executions += 1;
+      throw new Error("recovered terminal operation must not execute");
+    },
+    recoverCompleted: async (input) => {
+      recoveries += 1;
+      assert.deepEqual(input, {
+        operationId: call.operationId,
+        tool: call.name,
+        requestHash: executing.requestHash,
+      });
+      return recoveredOutcome;
+    },
+  }).run();
+
+  assert.equal(result.status, "blocked", result.reason);
+  assert.equal(executions, 0);
+  assert.equal(recoveries, 2);
+  assert.equal((await journal.read(call.operationId)).status, "completed");
+  assert.equal(localState.pendingOperations.length, 0);
+  assert.deepEqual(localState.completedOperationIds, [call.operationId]);
+  assert.equal(localState.budgetUsage.commands, 1);
+  assert.equal(localState.budgetUsage.commandOutputBytes, 9);
+  assert.equal(localState.pendingTerminalEffectOperationIds, undefined);
+  const returned = JSON.parse(transport.submittedContents[0] ?? "[]") as ReadonlyArray<{
+    readonly data?: { readonly replayed?: boolean; readonly outcome?: string };
+  }>;
+  assert.equal(returned[0]?.data?.replayed, true);
+  assert.equal(returned[0]?.data?.outcome, "completed");
+});
+
+test("terminal prelaunch rejection refunds the command launch budget", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-terminal-prelaunch-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport: new QueueTransport([
+      JSON.stringify([{
+        type: "tool_request",
+        calls: [{
+          operationId: "op_terminal_prelaunch",
+          name: "terminal_exec",
+          arguments: {
+            contract: "terminal-exec/1",
+            mode: "argv",
+            executable: "script.cmd",
+            arguments: [],
+          },
+        }],
+      }]),
+      JSON.stringify([{
+        type: "blocked",
+        reasonCode: "TEST_COMPLETE",
+        summary: "Prelaunch rejection observed.",
+        needed: [],
+        recoverable: false,
+      }]),
+    ]),
+    policy: {
+      summarize: () => ({}),
+      authorize: () => ({
+        outcome: "allow",
+        reasonCode: "ALLOWED",
+        explanation: "allowed",
+        plannedDisclosureBytes: 64 * 1024,
+        terminal: { timeoutMs: 30_000, maxOutputBytes: 8_192 },
+      }),
+      expandSessionGrant: async () => false,
+    },
+    execute: async (call) => ({
+      operationId: call.operationId,
+      tool: call.name,
+      status: "failure",
+      data: {
+        code: "TERMINAL_PRELAUNCH_REJECTED",
+        outcome: "spawn_failed",
+      },
+      safeMetadata: {
+        reasonCode: "TERMINAL_PRELAUNCH_REJECTED",
+        outcome: "spawn_failed",
+        mutation_outcome: "none",
+      },
+    }),
+  }).run();
+
+  assert.equal(result.status, "blocked");
+  assert.equal(localState.budgetUsage.commands, 0);
+  assert.equal(localState.pendingTerminalEffectOperationIds, undefined);
 });
 
 test("recoverable model blocking pauses with a durable reassessment turn and does not replay the response", async () => {

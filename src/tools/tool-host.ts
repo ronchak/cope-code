@@ -15,6 +15,7 @@ import type {
 } from "../repository/snapshot-diff.js";
 import type { ContentProcessor } from "../repository/types.js";
 import type { ProcessRunner } from "./process-runner.js";
+import type { TerminalExecutor } from "./terminal-executor.js";
 import { isLocalToolName, type LocalToolName } from "../protocol/types.js";
 import {
   GIT_STATUS_RESULT_BYTES,
@@ -33,6 +34,11 @@ export interface ToolHostExecutionContext {
   readonly plannedMutation?: {
     readonly changedFiles: number;
     readonly changedLines: number;
+  };
+  readonly terminal?: {
+    readonly timeoutMs: number;
+    readonly maxOutputBytes: number;
+    readonly requestHash: string;
   };
 }
 
@@ -61,6 +67,7 @@ export interface SessionDiffState {
 
 interface ToolHostCommonDependencies {
   readonly processRunner: ProcessRunner;
+  readonly terminalExecutor?: TerminalExecutor;
   readonly policy: ToolPolicyEvaluator;
   readonly resultProcessor?: ContentProcessor;
   readonly completionPathScope?: CompletionPathScope;
@@ -146,6 +153,15 @@ export class ToolHost {
     context?: ToolHostExecutionContext,
   ): Promise<ToolHostOutcome> {
     return this.dispatch(call, signal, context);
+  }
+
+  public async recoverCompleted(input: {
+    readonly operationId: string;
+    readonly tool: LocalToolName;
+    readonly requestHash: string;
+  }): Promise<ToolHostOutcome | undefined> {
+    if (input.tool !== "terminal_exec") return undefined;
+    return this.dependencies.terminalExecutor?.recoverCompleted(input);
   }
 
   public async dispatch(
@@ -506,18 +522,32 @@ export class ToolHost {
         };
       }
       case "terminal_exec": {
-        return {
-          operationId: call.operationId,
-          tool: call.name,
-          status: "denied",
-          data: {
-            code: "TERMINAL_EXEC_NOT_IMPLEMENTED",
-            message: "Terminal execution is not implemented in this build.",
+        if (
+          this.dependencies.terminalExecutor === undefined ||
+          context?.terminal === undefined
+        ) {
+          return {
+            operationId: call.operationId,
+            tool: call.name,
+            status: "denied",
+            data: {
+              code: "TERMINAL_EXEC_NOT_IMPLEMENTED",
+              message: "Terminal execution is not enabled in this runtime.",
+            },
+            safeMetadata: {
+              reasonCode: "TERMINAL_EXEC_NOT_IMPLEMENTED",
+            },
+          };
+        }
+        return this.dependencies.terminalExecutor.execute(
+          {
+            operationId: call.operationId,
+            name: call.name,
+            arguments: call.arguments,
           },
-          safeMetadata: {
-            reasonCode: "TERMINAL_EXEC_NOT_IMPLEMENTED",
-          },
-        };
+          context.terminal,
+          signal,
+        );
       }
     }
   }
