@@ -47,6 +47,13 @@ four protocol-repair attempts, and terminate with the less specific
 - `cope doctor` exercises the host normalizer with a fixed source-free fixture
   without opening or reading a live Copilot conversation.
 
+## Dependency security
+
+- The production lock refreshes `brace-expansion` to 5.0.8, which fixes
+  CVE-2026-14257, and `fast-uri` to 3.1.4, which fixes CVE-2026-16221.
+- `npm audit --omit=dev` reports zero known vulnerabilities for the release
+  dependency graph.
+
 ## Regression coverage
 
 - The real-Chromium M365-shaped test now reconstructs `cba-agent/1`, passes it
@@ -54,8 +61,9 @@ four protocol-repair attempts, and terminate with the less specific
   `cba/1` widget whose DOM lines are intentionally out of order.
 - Chromium negatives cover inert JSON and unlabeled blocks, unsupported
   versions, multiple editors, multiple protocol blocks, orphaned or changed
-  banners, dialect mismatch, quoted fences, late editor mount, page-evaluation
-  failure, inline backtick preservation, and standalone fence collision.
+  banners, dialect mismatch, quoted fences, virtualized line suffixes, late
+  editor mount, page-evaluation failure, inline backtick preservation, and
+  standalone fence collision.
 - Runtime tests prove `MISSING_ENVELOPE` identity through repair, progress,
   audit, terminal exhaustion, persistence, and recovery.
 - Browser-adapter tests prove capture failures are non-repairable and verify
