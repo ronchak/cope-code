@@ -915,7 +915,7 @@ export class PlaywrightSemanticPage implements SemanticPage {
                           lines.length > 0 &&
                           firstLineIndex !== undefined &&
                           Number.isSafeInteger(firstLineIndex) &&
-                          firstLineIndex >= 0 &&
+                          (firstLineIndex === 0 || firstLineIndex === 1) &&
                           sortedLines.every((line, lineOffset) =>
                             Number.isSafeInteger(line.index) &&
                             line.index === firstLineIndex + lineOffset

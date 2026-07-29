@@ -752,6 +752,18 @@ test("Chromium protocol widgets distinguish safe data, repairable format, and ca
               </div>
             </div>
           </div>
+          <div data-testid="copilot-message-reply-div" id="virtualized-suffix">
+            <div data-testid="markdown-reply">
+              <div class="scriptor-component-code-block">
+                <div data-testid="message-bar-body-info">cba-agent/1 isn’t fully supported. Syntax highlighting is based on Plain Text.</div>
+                <div role="textbox" aria-readonly="true" aria-label="Code editor">
+                  <div data-line-index="42">{"kind":"agent_progress",</div>
+                  <div data-line-index="43">"phase":"discovering",</div>
+                  <div data-line-index="44">"summary":"partial mounted suffix"}</div>
+                </div>
+              </div>
+            </div>
+          </div>
           <div data-testid="copilot-message-reply-div" id="late-mount">
             <div data-testid="markdown-reply">
               <div class="scriptor-component-code-block">
@@ -790,8 +802,10 @@ test("Chromium protocol widgets distinguish safe data, repairable format, and ca
   assert.equal(evidence[8]?.status, "protocol_reconstructed");
   assert.equal(evidence[9]?.status, "protocol_widget_ambiguous");
   assert.equal(evidence[9]?.reasonCode, "PROTOCOL_WIDGET_HOST_VERIFICATION_FAILED");
-  assert.equal(evidence[10]?.status, "protocol_widget_incomplete");
-  assert.equal(evidence[10]?.reasonCode, "PROTOCOL_WIDGET_EDITOR_PENDING");
+  assert.equal(evidence[10]?.status, "protocol_widget_ambiguous");
+  assert.equal(evidence[10]?.reasonCode, "PROTOCOL_WIDGET_LINE_INDEX_INVALID");
+  assert.equal(evidence[11]?.status, "protocol_widget_incomplete");
+  assert.equal(evidence[11]?.reasonCode, "PROTOCOL_WIDGET_EDITOR_PENDING");
   const inlineFenceTurn = new CbaProtocolAdapter().parseModelTurn(
     observation.responses.elements[8]?.text ?? "",
     {
@@ -824,7 +838,7 @@ test("Chromium protocol widgets distinguish safe data, repairable format, and ca
     contract,
   );
   assert.equal(
-    completedObservation.responses.elements[10]?.responseCapture?.status,
+    completedObservation.responses.elements[11]?.responseCapture?.status,
     "protocol_reconstructed",
   );
 
