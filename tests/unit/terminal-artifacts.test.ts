@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -18,6 +19,7 @@ import {
   TerminalArtifactPersistence,
   isTerminalJournalResultMetadata,
   isTerminalPrelaunchFailureMetadata,
+  terminalEvidenceProvesNoLaunch,
 } from "../../src/session/terminal-artifacts.js";
 import { sha256, stableJson } from "../../src/shared/crypto.js";
 
@@ -329,30 +331,120 @@ test("incomplete terminal reader recognizes only exact prelaunch failure metadat
     plannedDisclosureBytes: 4096,
   } as const;
   assert.equal(isTerminalPrelaunchFailureMetadata(metadata), true);
-  assert.equal(
-    (await persistence.inspectIncompleteEvidence({
+  const ordinary = await persistence.inspectIncompleteEvidence({
       operationId: OPERATION_ID,
       requestHash: REQUEST_HASH,
       recoveryContext: "ordinary_process_crash",
       journalStatus: "failed",
       journalSafeResult: metadata,
-    })).state,
-    "completed_prelaunch_failure",
-  );
+    });
+  assert.equal(ordinary.state, "completed_prelaunch_failure");
+  assert.equal(terminalEvidenceProvesNoLaunch(ordinary), true);
   assert.equal(isTerminalPrelaunchFailureMetadata({
     ...metadata,
     extra: true,
   }), false);
-  assert.equal(
-    (await persistence.inspectIncompleteEvidence({
+  const powerLoss = await persistence.inspectIncompleteEvidence({
       operationId: OPERATION_ID,
       requestHash: REQUEST_HASH,
       recoveryContext: "known_power_or_storage_loss",
       journalStatus: "failed",
-      journalSafeResult: { ...metadata, extra: true },
-    })).state,
+      journalSafeResult: metadata,
+    });
+  assert.equal(powerLoss.state, "completed_prelaunch_failure");
+  assert.equal(terminalEvidenceProvesNoLaunch(powerLoss), false);
+  const malformed = await persistence.inspectIncompleteEvidence({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    recoveryContext: "known_power_or_storage_loss",
+    journalStatus: "failed",
+    journalSafeResult: { ...metadata, extra: true },
+  });
+  assert.equal(malformed.state, "completed_unproven_without_result");
+  assert.equal(terminalEvidenceProvesNoLaunch(malformed), false);
+});
+
+test("receipt absence proves no launch only for no-pre or full receipt-era pre evidence", async () => {
+  const noPreDirectory = await mkdtemp(
+    path.join(tmpdir(), "cope-terminal-no-pre-"),
+  );
+  const noPre = new TerminalArtifactPersistence(
+    new SessionArtifactStore(path.join(noPreDirectory, "artifacts")),
+  );
+  await persistRequest(noPre);
+  const noPreEvidence = await noPre.inspectIncompleteEvidence({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    recoveryContext: "ordinary_process_crash",
+  });
+  assert.deepEqual(noPreEvidence, {
+    state: "request_without_launch",
+    recoveryContext: "ordinary_process_crash",
+    preEvidence: "none",
+  });
+  assert.equal(terminalEvidenceProvesNoLaunch(noPreEvidence), true);
+
+  const legacyDirectory = await mkdtemp(
+    path.join(tmpdir(), "cope-terminal-legacy-pre-"),
+  );
+  const legacy = new TerminalArtifactPersistence(
+    new SessionArtifactStore(path.join(legacyDirectory, "artifacts")),
+  );
+  await persistRequestAndPre(legacy);
+  const legacyEvidence = await legacy.inspectIncompleteEvidence({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    recoveryContext: "ordinary_process_crash",
+  });
+  assert.deepEqual(legacyEvidence, {
+    state: "request_without_launch",
+    recoveryContext: "ordinary_process_crash",
+    preEvidence: "legacy_placeholder",
+  });
+  assert.equal(terminalEvidenceProvesNoLaunch(legacyEvidence), false);
+  const legacyCompletedEvidence = await legacy.inspectIncompleteEvidence({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    recoveryContext: "ordinary_process_crash",
+    journalStatus: "failed",
+    journalSafeResult: {
+      reasonCode: "PRE_OBSERVATION_UNAVAILABLE",
+      outcome: "spawn_failed",
+      mutation_outcome: "none",
+    },
+  });
+  assert.equal(
+    legacyCompletedEvidence.state,
     "completed_unproven_without_result",
   );
+  assert.equal(
+    terminalEvidenceProvesNoLaunch(legacyCompletedEvidence),
+    false,
+  );
+
+  const fullDirectory = await mkdtemp(
+    path.join(tmpdir(), "cope-terminal-full-pre-"),
+  );
+  const full = new TerminalArtifactPersistence(
+    new SessionArtifactStore(path.join(fullDirectory, "artifacts")),
+  );
+  await persistRequest(full);
+  await full.persistWorkspaceObservation({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    observation: workspaceObservation("pre", "a".repeat(64)),
+  });
+  const fullEvidence = await full.inspectIncompleteEvidence({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    recoveryContext: "ordinary_process_crash",
+  });
+  assert.deepEqual(fullEvidence, {
+    state: "request_without_launch",
+    recoveryContext: "ordinary_process_crash",
+    preEvidence: "full_workspace_observation",
+  });
+  assert.equal(terminalEvidenceProvesNoLaunch(fullEvidence), true);
 });
 
 test("a full no-effect result binds every canonical Git component", async () => {
@@ -493,7 +585,8 @@ test("launch and attribution refuse insufficient pre-observation evidence", asyn
     observation: {
       ...preFacts,
       state: "metadata_limited",
-      limitationCodes: ["VISIBLE_STATE_BOUND_EXCEEDED"],
+      nestedRepository: "unknown",
+      limitationCodes: ["NESTED_REPOSITORY_SCAN_BOUND_EXCEEDED"],
     },
   });
   const launch = await persistence.persistLaunchReceipt({
@@ -556,11 +649,460 @@ test("launch and attribution refuse insufficient pre-observation evidence", asyn
   );
 });
 
+test("bound before-image resolver validates the result chain and reconstructs every supported source", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "cope-terminal-resolver-"));
+  const persistence = new TerminalArtifactPersistence(
+    new SessionArtifactStore(path.join(directory, "artifacts")),
+  );
+  const request = await persistRequest(persistence);
+  const retainedBytes = Buffer.from("retained before\n");
+  const blobBytes = Buffer.from("blob before\n");
+  const priorBytes = Buffer.from("prior before\n");
+  const blobObjectId = gitBlobObjectId(blobBytes);
+  const headBytes = Buffer.from("clean HEAD\n");
+  const headObjectId = gitBlobObjectId(headBytes);
+  const preObservation = {
+    ...workspaceObservation("pre", "a".repeat(64)),
+    beforeImages: [
+      {
+        kind: "retained" as const,
+        exists: true as const,
+        identity: {
+          path: "retained.txt",
+          mode: 0o100644,
+          size: retainedBytes.length,
+        },
+        sha256: sha256(retainedBytes),
+        binary: false,
+        contentBase64: retainedBytes.toString("base64"),
+      },
+      {
+        kind: "git_blob" as const,
+        exists: true as const,
+        identity: {
+          path: "blob.txt",
+          mode: 0o100644,
+          size: blobBytes.length,
+        },
+        sha256: sha256(blobBytes),
+        binary: false,
+        blob: blobObjectId,
+        blobRole: "index" as const,
+      },
+      {
+        kind: "identity_only" as const,
+        exists: true as const,
+        identity: {
+          path: "prior.txt",
+          mode: 0o100644,
+          size: priorBytes.length,
+        },
+        sha256: sha256(priorBytes),
+        binary: false,
+      },
+      {
+        kind: "identity_only" as const,
+        exists: true as const,
+        identity: {
+          path: "bounded.txt",
+          mode: 0o100644,
+          size: 2_000_000,
+        },
+        sha256: "2".repeat(64),
+        binary: false,
+      },
+      {
+        kind: "absent" as const,
+        exists: false as const,
+        path: "explicit-created.txt",
+      },
+    ],
+  } satisfies WorkspaceObservation;
+  const pre = await persistence.persistWorkspaceObservation({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    observation: preObservation,
+  });
+  const launch = await persistence.persistLaunchReceipt({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    request,
+    preObservation: pre,
+    recordedAt: "2026-07-29T00:00:00.500Z",
+  });
+  const exit = await persistence.persistExitReceipt(exitReceipt());
+  const repositoryFingerprint = "9".repeat(64);
+  const post = await persistence.persistWorkspaceObservation({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    observation: workspaceObservation("post", repositoryFingerprint),
+  });
+  const changed = [
+    "blob.txt",
+    "bounded.txt",
+    "clean.txt",
+    "explicit-created.txt",
+    "implicit-created.txt",
+    "prior.txt",
+    "retained.txt",
+  ];
+  const result: TerminalExecResult = {
+    ...terminalResult(),
+    mutation: {
+      outcome: "observed",
+      created: ["explicit-created.txt", "implicit-created.txt"],
+      updated: [
+        "blob.txt",
+        "bounded.txt",
+        "clean.txt",
+        "prior.txt",
+        "retained.txt",
+      ],
+      deleted: [],
+      renamed: [],
+      pre_existing_touched: [],
+      changed_files: changed.length,
+      changed_lines: 1,
+      binary_files: 0,
+      ignored_summary: "",
+      repository_fingerprint: repositoryFingerprint,
+      created_total: 2,
+      updated_total: 5,
+      deleted_total: 0,
+      renamed_total: 0,
+      pre_existing_touched_total: 0,
+      path_endpoint_total: 7,
+      path_endpoint_omitted: 0,
+      path_facts_truncated: false,
+      path_facts_sha256: "e".repeat(64),
+      unavailable_baseline_count: 1,
+    },
+  };
+  const persisted = await persistence.persistFullResult({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    request,
+    preObservation: pre,
+    launchReceipt: launch,
+    exitReceipt: exit,
+    postObservation: post,
+    result,
+    postObservationControl: {
+      branch: "main",
+      head: "b".repeat(40),
+      excludedStateFingerprint: "3".repeat(64),
+    },
+  });
+  const resolver = persistence.createBeforeImageResolver({
+    resolveReferences: async () => ({
+      terminalResult: persisted.reference,
+      preObservation: pre,
+    }),
+    readGitBlob: async (objectId) =>
+      objectId === blobObjectId ? blobBytes : undefined,
+    readHeadPath: async (head, repositoryRelativePath) =>
+      head === "b".repeat(40) && repositoryRelativePath === "clean.txt"
+        ? {
+            objectId: headObjectId,
+            mode: 0o100644,
+            bytes: headBytes,
+          }
+        : undefined,
+    resolvePriorBaseline: async (_mutation, repositoryRelativePath) =>
+      repositoryRelativePath === "prior.txt"
+        ? {
+            baselineId: "verified:session-start",
+            entry: {
+              path: "prior.txt",
+              existed: true,
+              bytes: priorBytes,
+              mode: 0o100644,
+              sha256: sha256(priorBytes),
+            },
+          }
+        : undefined,
+  });
+  const mutation = {
+    kind: "terminal" as const,
+    operationId: OPERATION_ID,
+    changedPaths: changed,
+  };
+  assert.deepEqual(
+    (await resolver(mutation, "retained.txt"))?.available,
+    true,
+  );
+  assert.deepEqual(
+    (await resolver(mutation, "blob.txt"))?.available,
+    true,
+  );
+  assert.equal(
+    (await resolver(mutation, "prior.txt")).available,
+    true,
+  );
+  assert.deepEqual(await resolver(mutation, "bounded.txt"), {
+    available: false,
+    reason: "bounded_out",
+  });
+  assert.equal(
+    (await resolver(mutation, "explicit-created.txt")).available,
+    true,
+  );
+  assert.equal(
+    (await resolver(mutation, "implicit-created.txt")).available,
+    true,
+  );
+  const clean = await resolver(mutation, "clean.txt");
+  assert.equal(clean.available, true);
+  if (clean.available) {
+    assert.equal(clean.entry.bytes?.toString("utf8"), "clean HEAD\n");
+  }
+
+  const corruptBlobResolver = persistence.createBeforeImageResolver({
+    resolveReferences: async () => ({
+      terminalResult: persisted.reference,
+      preObservation: pre,
+    }),
+    readGitBlob: async () => Buffer.from("wrong blob"),
+  });
+  await assert.rejects(
+    () => corruptBlobResolver(mutation, "blob.txt"),
+    (error: { code?: string }) => error.code === "RECOVERY_REQUIRED",
+  );
+  const mismatchedReferenceResolver = persistence.createBeforeImageResolver({
+    resolveReferences: async () => ({
+      terminalResult: persisted.reference,
+      preObservation: { ...pre, sha256: "f".repeat(64) },
+    }),
+  });
+  await assert.rejects(
+    () => mismatchedReferenceResolver(mutation, "retained.txt"),
+    (error: { code?: string }) => error.code === "RECOVERY_REQUIRED",
+  );
+  const conflictingAbsentPriorResolver = persistence.createBeforeImageResolver({
+    resolveReferences: async () => ({
+      terminalResult: persisted.reference,
+      preObservation: pre,
+    }),
+    resolvePriorBaseline: async (_mutation, repositoryRelativePath) =>
+      repositoryRelativePath === "explicit-created.txt"
+        ? {
+            baselineId: "verified:conflicting",
+            entry: {
+              path: repositoryRelativePath,
+              existed: true,
+              bytes: Buffer.from("not absent"),
+              mode: 0o100644,
+              sha256: sha256("not absent"),
+            },
+          }
+        : undefined,
+  });
+  await assert.rejects(
+    () => conflictingAbsentPriorResolver(
+      mutation,
+      "explicit-created.txt",
+    ),
+    (error: { code?: string }) => error.code === "RECOVERY_REQUIRED",
+  );
+  const unauthenticatedHeadResolver = persistence.createBeforeImageResolver({
+    resolveReferences: async () => ({
+      terminalResult: persisted.reference,
+      preObservation: pre,
+    }),
+    readHeadPath: async () => ({
+      objectId: "3".repeat(40),
+      mode: 0o100644,
+      bytes: headBytes,
+    }),
+  });
+  await assert.rejects(
+    () => unauthenticatedHeadResolver(mutation, "clean.txt"),
+    (error: { code?: string }) => error.code === "RECOVERY_REQUIRED",
+  );
+
+  const firstRecord = {
+    ...mutation,
+    changedPaths: ["retained.txt"],
+  };
+  const secondRecordWithoutReferences = {
+    ...mutation,
+    changedPaths: ["retained.txt", "second-record"],
+  };
+  const perRecordResolver = persistence.createBeforeImageResolver({
+    resolveReferences: async (candidate) =>
+      candidate.changedPaths.includes("second-record")
+        ? undefined
+        : {
+            terminalResult: persisted.reference,
+            preObservation: pre,
+          },
+  });
+  assert.equal(
+    (await perRecordResolver(firstRecord, "retained.txt")).available,
+    true,
+  );
+  assert.deepEqual(
+    await perRecordResolver(
+      secondRecordWithoutReferences,
+      "retained.txt",
+    ),
+    { available: false, reason: "missing_evidence" },
+  );
+
+  const secondRecordWithMismatch = {
+    ...mutation,
+    changedPaths: ["retained.txt", "mismatched-record"],
+  };
+  const perTupleResolver = persistence.createBeforeImageResolver({
+    resolveReferences: async (candidate) =>
+      candidate.changedPaths.includes("mismatched-record")
+        ? {
+            terminalResult: persisted.reference,
+            preObservation: { ...pre, sha256: "f".repeat(64) },
+          }
+        : {
+            terminalResult: persisted.reference,
+            preObservation: pre,
+          },
+  });
+  assert.equal(
+    (await perTupleResolver(firstRecord, "retained.txt")).available,
+    true,
+  );
+  await assert.rejects(
+    () => perTupleResolver(secondRecordWithMismatch, "retained.txt"),
+    (error: { code?: string }) => error.code === "RECOVERY_REQUIRED",
+  );
+});
+
+test("incomplete evidence rejects impossible full chains and keeps Slice 1 exit evidence readable", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "cope-terminal-chain-"));
+  const persistence = new TerminalArtifactPersistence(
+    new SessionArtifactStore(path.join(directory, "artifacts")),
+  );
+  await persistence.persistExitReceipt(exitReceipt());
+  await assert.rejects(
+    () => persistence.inspectIncompleteEvidence({
+      operationId: OPERATION_ID,
+      requestHash: REQUEST_HASH,
+      recoveryContext: "ordinary_process_crash",
+    }),
+    (error: { code?: string }) => error.code === "RECOVERY_REQUIRED",
+  );
+
+  const legacyDirectory = await mkdtemp(
+    path.join(tmpdir(), "cope-terminal-legacy-exit-"),
+  );
+  const legacy = new TerminalArtifactPersistence(
+    new SessionArtifactStore(path.join(legacyDirectory, "artifacts")),
+  );
+  await persistRequestAndPre(legacy);
+  await legacy.persistExitReceipt(exitReceipt());
+  assert.equal(
+    (await legacy.inspectIncompleteEvidence({
+      operationId: OPERATION_ID,
+      requestHash: REQUEST_HASH,
+      recoveryContext: "ordinary_process_crash",
+    })).state,
+    "exit_without_result",
+  );
+
+  const fullDirectory = await mkdtemp(
+    path.join(tmpdir(), "cope-terminal-full-exit-"),
+  );
+  const full = new TerminalArtifactPersistence(
+    new SessionArtifactStore(path.join(fullDirectory, "artifacts")),
+  );
+  await persistRequest(full);
+  await full.persistWorkspaceObservation({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    observation: workspaceObservation("pre", "a".repeat(64)),
+  });
+  await full.persistExitReceipt(exitReceipt());
+  await assert.rejects(
+    () => full.inspectIncompleteEvidence({
+      operationId: OPERATION_ID,
+      requestHash: REQUEST_HASH,
+      recoveryContext: "ordinary_process_crash",
+    }),
+    /no launch receipt/u,
+  );
+});
+
+test("before-image resolver classifies validated legacy and wholly missing evidence", async () => {
+  const legacy = await createCompleteFixture();
+  const mutation = {
+    kind: "terminal" as const,
+    operationId: OPERATION_ID,
+    changedPaths: ["legacy.txt"],
+  };
+  const legacyResolver = legacy.persistence.createBeforeImageResolver({
+    resolveReferences: async () => ({
+      terminalResult: legacy.resultReference,
+      preObservation: legacy.preReference,
+    }),
+  });
+  assert.deepEqual(await legacyResolver(mutation, "legacy.txt"), {
+    available: false,
+    reason: "legacy_placeholder",
+  });
+  const legacyOmissionResolver = legacy.persistence.createBeforeImageResolver({
+    resolveReferences: async () => ({
+      terminalResult: legacy.resultReference,
+    }),
+  });
+  assert.deepEqual(await legacyOmissionResolver(mutation, "legacy.txt"), {
+    available: false,
+    reason: "legacy_placeholder",
+  });
+  const legacyMismatchResolver = legacy.persistence.createBeforeImageResolver({
+    resolveReferences: async () => ({
+      terminalResult: legacy.resultReference,
+      preObservation: {
+        ...legacy.preReference,
+        sha256: "f".repeat(64),
+      },
+    }),
+  });
+  await assert.rejects(
+    () => legacyMismatchResolver(mutation, "legacy.txt"),
+    (error: { code?: string }) => error.code === "RECOVERY_REQUIRED",
+  );
+  const missingResolver = legacy.persistence.createBeforeImageResolver({
+    resolveReferences: async () => undefined,
+  });
+  assert.deepEqual(await missingResolver(mutation, "missing.txt"), {
+    available: false,
+    reason: "missing_evidence",
+  });
+  await legacy.artifacts.remove(
+    legacy.preReference.kind,
+    legacy.preReference.id,
+  );
+  const cleanedSourceResolver = legacy.persistence.createBeforeImageResolver({
+    resolveReferences: async () => ({
+      terminalResult: legacy.resultReference,
+      preObservation: legacy.preReference,
+    }),
+  });
+  assert.deepEqual(await cleanedSourceResolver(mutation, "legacy.txt"), {
+    available: false,
+    reason: "missing_evidence",
+  });
+});
+
 async function createCompleteFixture(): Promise<{
   readonly root: string;
   readonly artifacts: SessionArtifactStore;
   readonly persistence: TerminalArtifactPersistence;
   readonly result: TerminalExecResult;
+  readonly preReference: Awaited<
+    ReturnType<TerminalArtifactPersistence["persistObservation"]>
+  >;
+  readonly resultReference: Awaited<
+    ReturnType<TerminalArtifactPersistence["persistResult"]>
+  >["reference"];
   readonly safeMetadata: Awaited<
     ReturnType<TerminalArtifactPersistence["persistResult"]>
   >["safeMetadata"];
@@ -592,6 +1134,8 @@ async function createCompleteFixture(): Promise<{
     artifacts,
     persistence,
     result,
+    preReference: pre,
+    resultReference: persisted.reference,
     safeMetadata: persisted.safeMetadata,
   };
 }
@@ -746,4 +1290,11 @@ function workspaceObservation(
     nestedRepository: "none",
     limitationCodes: [],
   };
+}
+
+function gitBlobObjectId(bytes: Buffer): string {
+  return createHash("sha1")
+    .update(Buffer.from(`blob ${bytes.length}\0`, "utf8"))
+    .update(bytes)
+    .digest("hex");
 }
