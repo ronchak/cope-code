@@ -437,6 +437,53 @@ test("live observer content-binds a pre-existing dirty path hidden only by polic
   assert.equal(effect.outcome, "protected_or_hidden_changed");
 });
 
+test("live observer never retains or classifies policy-hidden clean HEAD transitions", async (context) => {
+  const hiddenPath = "policy-hidden.txt";
+  const fixture = await createRepositoryFixture(context, {
+    isPathAllowed: (candidate) => candidate !== hiddenPath,
+  });
+  await writeFile(path.join(fixture.root, hiddenPath), "hidden baseline\n");
+  await git(fixture.root, ["add", "--", hiddenPath]);
+  await git(fixture.root, [
+    "-c",
+    "user.name=Cope Test",
+    "-c",
+    "user.email=cope@example.invalid",
+    "commit",
+    "--quiet",
+    "-m",
+    "hidden baseline",
+  ]);
+
+  const pre = await fixture.observer.capturePre(emptyBaseline());
+  await writeFile(path.join(fixture.root, hiddenPath), "hidden transition\n");
+  await writeFile(path.join(fixture.root, "README.md"), "visible transition\n");
+  await git(fixture.root, ["add", "--", hiddenPath, "README.md"]);
+  await git(fixture.root, [
+    "-c",
+    "user.name=Cope Test",
+    "-c",
+    "user.email=cope@example.invalid",
+    "commit",
+    "--quiet",
+    "-m",
+    "mixed policy transition",
+  ]);
+
+  const post = await fixture.observer.capturePost(pre);
+  assert.equal(post.state, "protected_or_hidden_changed");
+  assert.deepEqual(post.transitionPaths.paths, ["README.md"]);
+  assert.equal(post.transitionPaths.total, 1);
+  assert.equal(post.transitionPaths.omitted, 0);
+  assert.equal(post.limitationCodes.includes("POLICY_HIDDEN_TRANSITION"), true);
+  assert.notEqual(post.components?.excluded, pre.components?.excluded);
+  assert.equal(JSON.stringify(post).includes(hiddenPath), false);
+
+  const effect = await fixture.observer.compare(pre, post, emptyBaseline());
+  assert.equal(effect.outcome, "protected_or_hidden_changed");
+  assert.equal(JSON.stringify(effect).includes(hiddenPath), false);
+});
+
 test("live observer bounds ignored summaries and separates Git control drift", async (context) => {
   const fixture = await createRepositoryFixture(context);
   await writeFile(path.join(fixture.root, ".gitignore"), "*.ignored\n");

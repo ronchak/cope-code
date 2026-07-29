@@ -250,6 +250,12 @@ interface ImmutableTransitionFacts {
   >;
 }
 
+interface CapturedTransitionInventory {
+  readonly inventory: WorkspaceTransitionPathInventory;
+  readonly hiddenCount: number;
+  readonly hiddenSha256: string;
+}
+
 class ObservationRaceError extends Error {}
 
 export interface LiveWorkspaceObserverOptions {
@@ -657,10 +663,26 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
     if (first.token !== second.token) {
       throw new ObservationRaceError("Repository changed during observation");
     }
-    const transitionPaths =
+    const transition =
       phase === "post" && pre !== undefined
         ? await this.transitionInventory(pre, second, signal)
-        : transitionInventory([]);
+        : {
+            inventory: transitionInventory([]),
+            hiddenCount: 0,
+            hiddenSha256: sha256("[]"),
+          };
+    const transitionPaths = transition.inventory;
+    const components =
+      transition.hiddenCount === 0
+        ? second.components
+        : {
+            ...second.components,
+            excluded: this.git.observationDigest(stableJson({
+              excludedStateSha256: second.components.excluded,
+              hiddenTransitionCount: transition.hiddenCount,
+              hiddenTransitionSha256: transition.hiddenSha256,
+            })),
+          };
     let state: WorkspaceObservationState =
       second.metadataLimited ? "metadata_limited" : "complete";
     const limitationCodes = [...second.limitationCodes];
@@ -669,13 +691,16 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
     }
     if (
       second.nestedRepository !== "none" ||
-      (pre !== undefined && protectedBoundaryChanged(pre, second))
+      (pre !== undefined && protectedBoundaryChanged(pre, second)) ||
+      transition.hiddenCount > 0
     ) {
       state = "protected_or_hidden_changed";
       limitationCodes.push(
         second.nestedRepository !== "none"
           ? "NESTED_REPOSITORY_PRESENT"
-          : "PROTECTED_OR_HIDDEN_STATE_CHANGED",
+          : transition.hiddenCount > 0
+            ? "POLICY_HIDDEN_TRANSITION"
+            : "PROTECTED_OR_HIDDEN_STATE_CHANGED",
       );
     }
     const common = {
@@ -685,7 +710,7 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
       durationMs: Math.max(0, Date.now() - started),
       branch: second.branch,
       head: second.head,
-      components: second.components,
+      components,
       entries: second.entries,
       beforeImages,
       transitionPaths,
@@ -1023,7 +1048,7 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
     pre: WorkspaceObservation,
     post: ObservationBoundary,
     signal: AbortSignal,
-  ): Promise<WorkspaceTransitionPathInventory> {
+  ): Promise<CapturedTransitionInventory> {
     const statusPaths = uniqueSorted([
       ...entryEndpoints(pre.entries ?? []),
       ...entryEndpoints(post.entries),
@@ -1058,11 +1083,17 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
           ];
       const digest = createHash("sha256");
       digest.update("[");
+      const hiddenDigest = createHash("sha256");
+      hiddenDigest.update("[");
       const retained: string[] = [];
       let retainedBytes = 0;
       let total = 0;
+      let hiddenCount = 0;
       let first = true;
+      let hiddenFirst = true;
       let previous: string | undefined;
+      let previousRaw: string | undefined;
+      let previousHidden: string | undefined;
       let statusIndex = 0;
       const emit = (value: string): void => {
         if (value === previous) return;
@@ -1090,6 +1121,15 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
         32_768,
         (record) => {
           const value = record.toString("utf8");
+          if (
+            previousRaw !== undefined &&
+            compareGitPathBytes(previousRaw, value) > 0
+          ) {
+            throw new ObservationRaceError(
+              "Git transition paths were not canonically ordered",
+            );
+          }
+          previousRaw = value;
           while (
             statusIndex < statusPaths.length &&
             compareGitPathBytes(statusPaths[statusIndex] ?? "", value) < 0
@@ -1098,6 +1138,16 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
             statusIndex += 1;
           }
           if (statusPaths[statusIndex] === value) statusIndex += 1;
+          if (!this.git.observationPathAllowed(value)) {
+            if (value !== previousHidden) {
+              hiddenDigest.update(hiddenFirst ? "" : ",");
+              hiddenDigest.update(JSON.stringify(value));
+              hiddenFirst = false;
+              hiddenCount += 1;
+              previousHidden = value;
+            }
+            return;
+          }
           emit(value);
         },
         signal,
@@ -1107,15 +1157,27 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
         statusIndex += 1;
       }
       digest.update("]");
+      hiddenDigest.update("]");
       return {
-        paths: retained,
-        total,
-        omitted: total - retained.length,
-        truncated: total !== retained.length,
-        completeFactsSha256: digest.digest("hex"),
+        inventory: {
+          paths: retained,
+          total,
+          omitted: total - retained.length,
+          truncated: total !== retained.length,
+          completeFactsSha256: digest.digest("hex"),
+        },
+        hiddenCount,
+        hiddenSha256: this.git.observationDigest(stableJson({
+          count: hiddenCount,
+          digest: hiddenDigest.digest("hex"),
+        })),
       };
     }
-    return transitionInventory(statusPaths);
+    return {
+      inventory: transitionInventory(statusPaths),
+      hiddenCount: 0,
+      hiddenSha256: sha256("[]"),
+    };
   }
 
   private async readWorktree(
