@@ -2,12 +2,18 @@ import { randomUUID } from "node:crypto";
 
 import type { ElementHandle, Locator, Page } from "playwright-core";
 
+import {
+  DEFAULT_MAX_PROTOCOL_INPUT_BYTES,
+  extractCbaEnvelope,
+} from "../protocol/parser.js";
 import { AgentError } from "../shared/errors.js";
 import {
+  RESPONSE_CAPTURE_CONTRACT_VERSION,
   toRegExp,
   type ElementSnapshot,
   type GroupSnapshot,
   type LocatorGroup,
+  type ResponseCaptureEvidence,
   type SemanticActionGuard,
   type SemanticLocator,
   type SemanticObservationCompletion,
@@ -29,6 +35,46 @@ interface BrowserOperationTimeoutPoint {
   readonly locatorKind?: SemanticLocator["kind"];
   readonly locatorCandidateIndex?: number;
   readonly elementIndex?: number;
+}
+
+const RESPONSE_PROTOCOL_DESCRIPTORS = [
+  {
+    version: "cba-agent/1",
+    banner: "cba-agent/1 isn’t fully supported. Syntax highlighting is based on Plain Text.",
+  },
+  {
+    version: "cba/1",
+    banner: "cba/1 isn’t fully supported. Syntax highlighting is based on Plain Text.",
+  },
+] as const;
+
+interface PageProtocolBlockCapture {
+  readonly version: string;
+  readonly bannerContract: "supported" | "unsupported_version" | "changed_supported_banner";
+  readonly code: string;
+  readonly editorCount: number;
+  readonly bannerCount: number;
+  readonly lineCount: number;
+  readonly lineIndicesValid: boolean;
+  readonly contentBytes: number;
+  readonly contentBoundExceeded: boolean;
+}
+
+interface PageResponseCapture {
+  readonly renderedText: string;
+  readonly codeBlockCount: number;
+  readonly editorCount: number;
+  readonly bannerCount: number;
+  readonly unownedProtocolFenceCount: number;
+  /** Exact v0.1.8 DOM-order reconstruction output, before joining. */
+  readonly legacyProtocolBlocks: readonly string[];
+  readonly protocolBlocks: readonly PageProtocolBlockCapture[];
+}
+
+interface NormalizedResponseCapture {
+  readonly text: string;
+  readonly correlationText: string;
+  readonly evidence: ResponseCaptureEvidence;
 }
 
 /** The only module that translates the UI contract into Playwright locators. */
@@ -706,86 +752,256 @@ export class PlaywrightSemanticPage implements SemanticPage {
           ))?.trim().toLowerCase() !== "true";
         });
         const captureText = group.capture !== "presence";
-        const text = captureText
-          ? await safeString(() => traceOperation(
-              trace,
-              traceKey,
-              point("locator.innerText", index),
-              async () => {
-                const renderedText = await item.innerText();
-                if (
-                  group.signal !== "responses" ||
-                  typeof item.evaluate !== "function"
-                ) {
-                  return renderedText;
-                }
-                return item.evaluate((node, fallbackText): string => {
-                    if (!(node instanceof HTMLElement)) return node.textContent ?? "";
-                    const protocolBlocks: string[] = [];
-                    const editors = node.querySelectorAll<HTMLElement>(
-                      '[role="textbox"][aria-readonly="true"][aria-label="Code editor"]',
-                    );
-                    for (const editor of editors) {
-                      const codeBlock = editor.closest<HTMLElement>(
-                        ".scriptor-component-code-block",
-                      );
-                      if (
-                        codeBlock === null ||
-                        !node.contains(codeBlock) ||
-                        codeBlock.querySelectorAll(
-                          '[role="textbox"][aria-readonly="true"][aria-label="Code editor"]',
-                        ).length !== 1
-                      ) {
-                        continue;
+        let text = "";
+        let correlationText: string | undefined;
+        let responseCapture: ResponseCaptureEvidence | undefined;
+        if (captureText) {
+          if (group.signal === "responses" && typeof item.evaluate === "function") {
+            let normalized: NormalizedResponseCapture;
+            try {
+              normalized = await traceOperation(
+                trace,
+                traceKey,
+                point("locator.responseCapture", index),
+                async () => {
+                  const renderedText = await item.innerText();
+                  try {
+                    const pageCapture = await item.evaluate<
+                      PageResponseCapture,
+                      {
+                        readonly renderedText: string;
+                        readonly descriptors: typeof RESPONSE_PROTOCOL_DESCRIPTORS;
+                        readonly maximumProtocolBytes: number;
                       }
-                      const languageIndicators = Array.from(
+                    >((node, input) => {
+                    if (!(node instanceof HTMLElement)) {
+                      return {
+                        renderedText: node.textContent ?? input.renderedText,
+                        codeBlockCount: 0,
+                        editorCount: 0,
+                        bannerCount: 0,
+                        unownedProtocolFenceCount: 0,
+                        legacyProtocolBlocks: [],
+                        protocolBlocks: [],
+                      };
+                    }
+                    const codeBlocks = Array.from(
+                      node.querySelectorAll<HTMLElement>(".scriptor-component-code-block"),
+                    );
+                    const allEditors = Array.from(
+                      node.querySelectorAll<HTMLElement>(
+                        '[role="textbox"][aria-readonly="true"][aria-label="Code editor"]',
+                      ),
+                    );
+                    const allBanners = Array.from(
+                      node.querySelectorAll<HTMLElement>(
+                        '[data-testid="message-bar-body-info"]',
+                      ),
+                    );
+                    const protocolBanner = (banner: HTMLElement): {
+                      readonly version: string;
+                      readonly value: string;
+                      readonly bannerContract:
+                        | "supported"
+                        | "unsupported_version"
+                        | "changed_supported_banner";
+                    } | undefined => {
+                      const value = banner.textContent?.trim() ?? "";
+                      const match =
+                        /(?:^|[^A-Za-z0-9._/-])((?:cba|cba-agent)\/[A-Za-z0-9._-]+)(?=$|[^A-Za-z0-9._/-])/u
+                          .exec(value);
+                      const version = match?.[1];
+                      if (version === undefined) return undefined;
+                      const descriptor = input.descriptors.find((entry) =>
+                        entry.version === version
+                      );
+                      return {
+                        version,
+                        value,
+                        bannerContract: descriptor === undefined
+                          ? "unsupported_version"
+                          : descriptor.banner === value
+                            ? "supported"
+                            : "changed_supported_banner",
+                      };
+                    };
+                    const familyBanners = allBanners
+                      .map(protocolBanner)
+                      .filter((value) => value !== undefined);
+                    const legacyDescriptor = input.descriptors.find((descriptor) =>
+                      descriptor.version === "cba/1"
+                    );
+                    const legacyProtocolBlocks: string[] = [];
+                    if (legacyDescriptor !== undefined) {
+                      for (const editor of allEditors) {
+                        const codeBlock = editor.closest<HTMLElement>(
+                          ".scriptor-component-code-block",
+                        );
+                        if (
+                          codeBlock === null ||
+                          !node.contains(codeBlock) ||
+                          codeBlock.querySelectorAll(
+                            '[role="textbox"][aria-readonly="true"][aria-label="Code editor"]',
+                          ).length !== 1
+                        ) {
+                          continue;
+                        }
+                        const exactLegacyBanners = Array.from(
+                          codeBlock.querySelectorAll<HTMLElement>(
+                            '[data-testid="message-bar-body-info"]',
+                          ),
+                        ).filter((banner) =>
+                          banner.textContent?.trim() === legacyDescriptor.banner
+                        );
+                        if (exactLegacyBanners.length !== 1) continue;
+                        const lines = Array.from(
+                          editor.querySelectorAll<HTMLElement>("[data-line-index]"),
+                        );
+                        const legacyCode = (
+                          lines.length > 0
+                            ? lines.map((line) => line.textContent ?? "").join("\n")
+                            : editor.textContent ?? ""
+                        ).trim();
+                        try {
+                          const decoded = JSON.parse(legacyCode) as unknown;
+                          if (
+                            decoded !== null &&
+                            typeof decoded === "object" &&
+                            !Array.isArray(decoded) &&
+                            (decoded as Readonly<Record<string, unknown>>).protocol ===
+                              "cba/1"
+                          ) {
+                            legacyProtocolBlocks.push(legacyCode);
+                          }
+                        } catch {
+                          // Preserve the exact v0.1.8 rendered-text fallback.
+                        }
+                      }
+                    }
+                    const protocolOwnedEditors = new Set<HTMLElement>();
+                    const protocolBlocks: PageProtocolBlockCapture[] = [];
+                    for (const codeBlock of codeBlocks) {
+                      const editors = Array.from(
+                        codeBlock.querySelectorAll<HTMLElement>(
+                          '[role="textbox"][aria-readonly="true"][aria-label="Code editor"]',
+                        ),
+                      );
+                      const banners = Array.from(
                         codeBlock.querySelectorAll<HTMLElement>(
                           '[data-testid="message-bar-body-info"]',
                         ),
-                      ).filter((indicator) =>
-                        indicator.textContent?.trim() ===
-                          "cba/1 isn’t fully supported. Syntax highlighting is based on Plain Text."
                       );
-                      // M365's current code-block widget preserves an
-                      // unsupported language tag in this exact, block-owned
-                      // information banner. JSON content alone is never enough:
-                      // an ordinary json/plain-text example can itself contain
-                      // protocol:"cba/1" and must remain inert.
-                      if (languageIndicators.length !== 1) continue;
-                      const lines = Array.from(
-                        editor.querySelectorAll<HTMLElement>("[data-line-index]"),
+                      const ownedProtocolBanners = banners
+                        .map(protocolBanner)
+                        .filter((value) => value !== undefined);
+                      if (ownedProtocolBanners.length === 0) continue;
+                      for (const editor of editors) protocolOwnedEditors.add(editor);
+                      const banner = ownedProtocolBanners[0]!;
+                      const editor = editors[0];
+                      const lines = editor === undefined
+                        ? []
+                        : Array.from(
+                            editor.querySelectorAll<HTMLElement>("[data-line-index]"),
+                          );
+                      const indexedLines = lines.map((line) => ({
+                        index: Number(line.getAttribute("data-line-index")),
+                        text: line.textContent ?? "",
+                      }));
+                      const sortedLines = [...indexedLines].sort(
+                        (left, right) => left.index - right.index,
                       );
-                      const code = (
-                        lines.length > 0
+                      const firstLineIndex = sortedLines[0]?.index;
+                      const lineIndicesValid =
+                        lines.length > 0 &&
+                        firstLineIndex !== undefined &&
+                        Number.isSafeInteger(firstLineIndex) &&
+                        (firstLineIndex === 0 || firstLineIndex === 1) &&
+                        sortedLines.every((line, lineOffset) =>
+                          Number.isSafeInteger(line.index) &&
+                          line.index === firstLineIndex + lineOffset
+                        );
+                      const rawCode = sortedLines.map((line) => line.text).join("\n");
+                      const contentBytes = new TextEncoder().encode(rawCode).byteLength;
+                      protocolBlocks.push({
+                        version: banner.version,
+                        bannerContract: banner.bannerContract,
+                        code: contentBytes <= input.maximumProtocolBytes ? rawCode : "",
+                        editorCount: editors.length,
+                        bannerCount: ownedProtocolBanners.length,
+                        lineCount: lines.length,
+                        lineIndicesValid,
+                        contentBytes,
+                        contentBoundExceeded:
+                          contentBytes > input.maximumProtocolBytes,
+                      });
+                    }
+                    const renderedProtocolFenceCount = input.renderedText
+                      .split(/\r\n|\n/u)
+                      .filter((line) =>
+                        /^\s*```(?:cba|cba-agent)\/[^\s`~]+\s*$/u.test(line)
+                      ).length;
+                    const unownedEditorProtocolFenceCount = allEditors
+                      .filter((editor) => !protocolOwnedEditors.has(editor))
+                      .reduce((count, editor) => {
+                        const lines = Array.from(
+                          editor.querySelectorAll<HTMLElement>("[data-line-index]"),
+                        );
+                        const editorText = lines.length > 0
                           ? lines.map((line) => line.textContent ?? "").join("\n")
-                          : editor.textContent ?? ""
-                      ).trim();
-                      try {
-                        const parsed: unknown = JSON.parse(code);
-                        if (
-                          typeof parsed === "object" &&
-                          parsed !== null &&
-                          !Array.isArray(parsed) &&
-                          (parsed as Record<string, unknown>).protocol === "cba/1"
-                        ) {
-                          protocolBlocks.push(code);
-                        }
-                      } catch {
-                        // Ordinary code blocks remain part of the rendered
-                        // fallback text. Only a syntactically complete CBA
-                        // object can restore the fence removed by M365.
-                      }
-                    }
-                    if (protocolBlocks.length > 0) {
-                      return protocolBlocks
-                        .map((code) => `\`\`\`cba/1\n${code}\n\`\`\``)
-                        .join("\n\n");
-                    }
-                    return fallbackText;
-                  }, renderedText);
-              },
-            ))
-          : "";
+                          : editor.textContent ?? "";
+                        return count + editorText.split(/\r\n|\n/u).filter((line) =>
+                          /^\s*```(?:cba|cba-agent)\/[^\s`~]+\s*$/u.test(line)
+                        ).length;
+                      }, 0);
+                    return {
+                      renderedText: input.renderedText,
+                      codeBlockCount: codeBlocks.length,
+                      editorCount: allEditors.length,
+                      bannerCount: familyBanners.length,
+                      unownedProtocolFenceCount:
+                        renderedProtocolFenceCount + unownedEditorProtocolFenceCount,
+                      legacyProtocolBlocks,
+                      protocolBlocks,
+                    };
+                    }, {
+                      renderedText,
+                      descriptors: RESPONSE_PROTOCOL_DESCRIPTORS,
+                      maximumProtocolBytes: DEFAULT_MAX_PROTOCOL_INPUT_BYTES,
+                    });
+                    return normalizeResponseCapture(pageCapture);
+                  } catch {
+                    return failedResponseCapture(renderedText);
+                  }
+                },
+              );
+            } catch (error) {
+              if (!(error instanceof AgentError)) {
+                normalized = failedResponseCapture("");
+              } else {
+              throw new AgentError(
+                "TRANSPORT_INDETERMINATE",
+                "The assistant response widget could not be captured safely",
+                {
+                  diagnosticCode: "PROTOCOL_WIDGET_CAPTURE_FAILED",
+                  diagnosticStage: "browser_response_capture",
+                  dispatchAttempted: false,
+                },
+                { cause: error },
+              );
+              }
+            }
+            text = normalized.text;
+            correlationText = normalized.correlationText;
+            responseCapture = normalized.evidence;
+          } else {
+            text = await safeString(() => traceOperation(
+              trace,
+              traceKey,
+              point("locator.innerText", index),
+              () => item.innerText(),
+            ));
+          }
+        }
         const accessibleLabel = captureText
           ? await safeString(async () => (await traceOperation(
               trace,
@@ -803,10 +1019,19 @@ export class PlaywrightSemanticPage implements SemanticPage {
                 () => item.inputValue(),
               ))
             : "";
-        snapshots.push({ visible, enabled, text, value, accessibleLabel });
+        snapshots.push({
+          visible,
+          enabled,
+          text,
+          ...(correlationText === undefined ? {} : { correlationText }),
+          ...(responseCapture === undefined ? {} : { responseCapture }),
+          value,
+          accessibleLabel,
+        });
       }
       return snapshots;
-    } catch {
+    } catch (error) {
+      if (error instanceof AgentError) throw error;
       // A stale candidate contributes no quorum. Other strategies can still
       // identify the surface; total quorum failure becomes changed-selector.
       return [];
@@ -1031,6 +1256,329 @@ function compareTracePoints(
   return (left.locatorCandidateIndex ?? 0) - (right.locatorCandidateIndex ?? 0) ||
     (left.elementIndex ?? 0) - (right.elementIndex ?? 0) ||
     left.operation.localeCompare(right.operation);
+}
+
+function failedResponseCapture(renderedText: string): NormalizedResponseCapture {
+  return {
+    text: renderedText,
+    correlationText: renderedText,
+    evidence: {
+      contractVersion: RESPONSE_CAPTURE_CONTRACT_VERSION,
+      status: "protocol_widget_capture_failed",
+      reasonCode: "PROTOCOL_WIDGET_CAPTURE_FAILED",
+      codeBlockCount: 0,
+      protocolBlockCount: 0,
+      editorCount: 0,
+      bannerCount: 0,
+      lineCount: 0,
+      contentBytes: Buffer.byteLength(renderedText, "utf8"),
+    },
+  };
+}
+
+/**
+ * Read-only doctor probe for the host-side executable-envelope boundary.
+ * This intentionally uses a fixed synthetic fixture: it neither opens a
+ * conversation nor reads or submits any live chat content.
+ */
+export function probeResponseCaptureNormalizer(): ResponseCaptureEvidence {
+  const code = JSON.stringify({
+    kind: "agent_progress",
+    phase: "discovering",
+    summary: "capture contract probe",
+  });
+  const normalized = normalizeResponseCapture({
+    renderedText: code,
+    codeBlockCount: 1,
+    editorCount: 1,
+    bannerCount: 1,
+    unownedProtocolFenceCount: 0,
+    legacyProtocolBlocks: [],
+    protocolBlocks: [{
+      version: "cba-agent/1",
+      bannerContract: "supported",
+      code,
+      editorCount: 1,
+      bannerCount: 1,
+      lineCount: 1,
+      lineIndicesValid: true,
+      contentBytes: Buffer.byteLength(code, "utf8"),
+      contentBoundExceeded: false,
+    }],
+  });
+  if (
+    normalized.evidence.status !== "protocol_reconstructed" ||
+    normalized.evidence.protocolVersion !== "cba-agent/1" ||
+    !normalized.text.startsWith("```cba-agent/1\n")
+  ) {
+    throw new Error("The response-capture normalizer failed its synthetic contract probe");
+  }
+  return normalized.evidence;
+}
+
+function normalizeResponseCapture(capture: PageResponseCapture): NormalizedResponseCapture {
+  const sharedEvidence = {
+    contractVersion: RESPONSE_CAPTURE_CONTRACT_VERSION,
+    codeBlockCount: capture.codeBlockCount,
+    protocolBlockCount: capture.protocolBlocks.length,
+    editorCount: capture.editorCount,
+    bannerCount: capture.bannerCount,
+  } as const;
+  const renderedContentBytes = Buffer.byteLength(capture.renderedText, "utf8");
+  const correlationText = v018ResponseCorrelationText(capture);
+  if (capture.unownedProtocolFenceCount > 0) {
+    return modelProtocolMalformed(
+      capture,
+      sharedEvidence,
+      "MISSING_ENVELOPE",
+      "MODEL_PROTOCOL_UNOWNED_FENCE",
+    );
+  }
+  if (capture.protocolBlocks.length === 0) {
+    if (capture.bannerCount > 0) {
+      return {
+        text: capture.renderedText,
+        correlationText,
+        evidence: {
+          ...sharedEvidence,
+          status: "unsupported_capture_contract",
+          reasonCode: "PROTOCOL_WIDGET_NOT_OWNED",
+          lineCount: 0,
+          contentBytes: renderedContentBytes,
+        },
+      };
+    }
+    return {
+      text: capture.renderedText,
+      correlationText,
+      evidence: {
+        ...sharedEvidence,
+        status: "rendered_text",
+        lineCount: 0,
+        contentBytes: renderedContentBytes,
+      },
+    };
+  }
+
+  const changedBanner = capture.protocolBlocks.find((block) =>
+    block.bannerContract === "changed_supported_banner"
+  );
+  if (changedBanner !== undefined) {
+    return {
+      text: capture.renderedText,
+      correlationText,
+      evidence: {
+        ...sharedEvidence,
+        status: "unsupported_capture_contract",
+        protocolVersion: changedBanner.version,
+        reasonCode: "PROTOCOL_WIDGET_BANNER_CONTRACT_CHANGED",
+        lineCount: changedBanner.lineCount,
+        contentBytes: changedBanner.contentBytes,
+      },
+    };
+  }
+
+  const incompleteBlock = capture.protocolBlocks.find((block) =>
+    block.editorCount === 0 || block.lineCount === 0
+  );
+  if (incompleteBlock !== undefined) {
+    return {
+      text: capture.renderedText,
+      correlationText,
+      evidence: {
+        ...sharedEvidence,
+        status: "protocol_widget_incomplete",
+        protocolVersion: incompleteBlock.version,
+        reasonCode: incompleteBlock.editorCount === 0
+          ? "PROTOCOL_WIDGET_EDITOR_PENDING"
+          : "PROTOCOL_WIDGET_LINES_PENDING",
+        lineCount: incompleteBlock.lineCount,
+        contentBytes: incompleteBlock.contentBytes,
+      },
+    };
+  }
+
+  const ambiguousBannerBlock = capture.protocolBlocks.find((block) =>
+    block.bannerCount !== 1
+  );
+  if (ambiguousBannerBlock !== undefined) {
+    return {
+      text: capture.renderedText,
+      correlationText,
+      evidence: {
+        ...sharedEvidence,
+        status: "protocol_widget_ambiguous",
+        protocolVersion: ambiguousBannerBlock.version,
+        reasonCode: "PROTOCOL_WIDGET_BANNER_COUNT",
+        lineCount: ambiguousBannerBlock.lineCount,
+        contentBytes: ambiguousBannerBlock.contentBytes,
+      },
+    };
+  }
+
+  const unsafeBlock = capture.protocolBlocks.find((block) =>
+    block.editorCount !== 1 ||
+    !block.lineIndicesValid ||
+    block.contentBoundExceeded ||
+    block.contentBytes > DEFAULT_MAX_PROTOCOL_INPUT_BYTES ||
+    Buffer.byteLength(block.code, "utf8") !== block.contentBytes
+  );
+  if (unsafeBlock !== undefined) {
+    const reasonCode = unsafeBlock.editorCount !== 1
+      ? "PROTOCOL_WIDGET_EDITOR_COUNT"
+      : !unsafeBlock.lineIndicesValid
+        ? "PROTOCOL_WIDGET_LINE_INDEX_INVALID"
+        : unsafeBlock.contentBoundExceeded ||
+            unsafeBlock.contentBytes > DEFAULT_MAX_PROTOCOL_INPUT_BYTES
+          ? "PROTOCOL_WIDGET_CONTENT_BOUND"
+          : "PROTOCOL_WIDGET_BYTE_COUNT_MISMATCH";
+    return {
+      text: capture.renderedText,
+      correlationText,
+      evidence: {
+        ...sharedEvidence,
+        status: "protocol_widget_ambiguous",
+        protocolVersion: unsafeBlock.version,
+        reasonCode,
+        lineCount: unsafeBlock.lineCount,
+        contentBytes: unsafeBlock.contentBytes,
+      },
+    };
+  }
+
+  if (capture.protocolBlocks.length !== 1) {
+    return modelProtocolMalformed(
+      capture,
+      sharedEvidence,
+      "MULTIPLE_ENVELOPES",
+      "MODEL_PROTOCOL_MULTIPLE_ENVELOPES",
+    );
+  }
+
+  const block = capture.protocolBlocks[0]!;
+  if (block.bannerContract === "unsupported_version") {
+    return modelProtocolMalformed(
+      capture,
+      sharedEvidence,
+      "UNSUPPORTED_VERSION",
+      "MODEL_PROTOCOL_UNSUPPORTED_VERSION",
+      block,
+    );
+  }
+  if (block.contentBytes === 0) {
+    return modelProtocolMalformed(
+      capture,
+      sharedEvidence,
+      "EMPTY_ENVELOPE",
+      "MODEL_PROTOCOL_EMPTY_ENVELOPE",
+      block,
+    );
+  }
+  const contentBytes = block.contentBytes;
+  const normalizedText = `\`\`\`${block.version}\n${block.code}\n\`\`\``;
+  try {
+    const verified = extractCbaEnvelope(normalizedText, block.version);
+    if (verified.json !== block.code) {
+      throw new Error("Reconstructed protocol bytes changed during host verification");
+    }
+  } catch {
+    return {
+      text: capture.renderedText,
+      correlationText,
+      evidence: {
+        ...sharedEvidence,
+        status: "protocol_widget_ambiguous",
+        protocolVersion: block.version,
+        reasonCode: "PROTOCOL_WIDGET_HOST_VERIFICATION_FAILED",
+        lineCount: block.lineCount,
+        contentBytes,
+      },
+    };
+  }
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(block.code) as unknown;
+  } catch {
+    return modelProtocolMalformed(
+      capture,
+      sharedEvidence,
+      "INVALID_JSON",
+      "MODEL_PROTOCOL_INVALID_JSON",
+      block,
+    );
+  }
+  if (!bodyMatchesDialect(decoded, block.version)) {
+    return modelProtocolMalformed(
+      capture,
+      sharedEvidence,
+      "SCHEMA_INVALID",
+      "MODEL_PROTOCOL_DIALECT_MISMATCH",
+      block,
+    );
+  }
+
+  return {
+    text: normalizedText,
+    correlationText,
+    evidence: {
+      ...sharedEvidence,
+      status: "protocol_reconstructed",
+      protocolVersion: block.version,
+      lineCount: block.lineCount,
+      contentBytes,
+    },
+  };
+}
+
+function modelProtocolMalformed(
+  capture: PageResponseCapture,
+  sharedEvidence: Pick<
+    ResponseCaptureEvidence,
+    | "contractVersion"
+    | "codeBlockCount"
+    | "protocolBlockCount"
+    | "editorCount"
+    | "bannerCount"
+  >,
+  protocolErrorCode: string,
+  reasonCode: string,
+  block = capture.protocolBlocks[0],
+): NormalizedResponseCapture {
+  return {
+    text: capture.renderedText,
+    correlationText: v018ResponseCorrelationText(capture),
+    evidence: {
+      ...sharedEvidence,
+      status: "model_protocol_malformed",
+      ...(block === undefined ? {} : { protocolVersion: block.version }),
+      reasonCode,
+      protocolErrorCode,
+      lineCount: block?.lineCount ?? 0,
+      contentBytes: block?.contentBytes ??
+        Buffer.byteLength(capture.renderedText, "utf8"),
+    },
+  };
+}
+
+function bodyMatchesDialect(value: unknown, version: string): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const object = value as Readonly<Record<string, unknown>>;
+  if (version === "cba/1") return object.protocol === "cba/1";
+  if (version !== "cba-agent/1") return false;
+  return (
+    object.kind === "agent_intent" ||
+    object.kind === "agent_answer" ||
+    object.kind === "agent_blocked" ||
+    object.kind === "agent_progress"
+  );
+}
+
+function v018ResponseCorrelationText(capture: PageResponseCapture): string {
+  return capture.legacyProtocolBlocks.length > 0
+    ? capture.legacyProtocolBlocks
+      .map((code) => `\`\`\`cba/1\n${code}\n\`\`\``)
+      .join("\n\n")
+    : capture.renderedText;
 }
 
 async function safeBoolean(operation: () => Promise<boolean>): Promise<boolean> {

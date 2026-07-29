@@ -9,11 +9,13 @@ import {
 } from "../../src/browser/config.js";
 import type {
   CopilotSignal,
+  ElementSnapshot,
   GroupSnapshot,
   LocatorGroup,
   SemanticPage,
 } from "../../src/browser/contracts.js";
 import { MutableBrowserKillSwitch } from "../../src/browser/kill-switch.js";
+import { CbaProtocolAdapter } from "../../src/orchestrator/cba-protocol-adapter.js";
 import { sha256 } from "../../src/shared/crypto.js";
 import { AgentError } from "../../src/shared/errors.js";
 
@@ -26,6 +28,7 @@ class DynamicFakePage implements SemanticPage {
   public composer = "";
   public readonly userMessages: string[] = [];
   public readonly responses: string[] = ["prior response"];
+  public readonly responseSnapshots: Array<Partial<ElementSnapshot> | undefined> = [];
   public streaming = false;
   public sendEnabled = true;
   public userMessagesVisible = true;
@@ -36,6 +39,7 @@ class DynamicFakePage implements SemanticPage {
   public currentUrlCalls = 0;
   public snapshotCalls = 0;
   public stallSnapshots = false;
+  public failResponseCapture = false;
   public onCurrentUrl: (() => void) | undefined = undefined;
   public onActivation: (() => void) | undefined = undefined;
 
@@ -48,6 +52,17 @@ class DynamicFakePage implements SemanticPage {
   public async snapshot(group: LocatorGroup): Promise<GroupSnapshot> {
     this.snapshotCalls += 1;
     if (this.stallSnapshots) return new Promise<GroupSnapshot>(() => {});
+    if (group.signal === "responses" && this.failResponseCapture) {
+      throw new AgentError(
+        "TRANSPORT_INDETERMINATE",
+        "Synthetic response capture failure",
+        {
+          diagnosticCode: "PROTOCOL_WIDGET_CAPTURE_FAILED",
+          diagnosticStage: "browser_response_capture",
+          dispatchAttempted: false,
+        },
+      );
+    }
     const elements = this.#elements(group.signal);
     return {
       signal: group.signal,
@@ -98,8 +113,8 @@ class DynamicFakePage implements SemanticPage {
     throw new Error("synthetic activation failure before submission");
   }
 
-  #elements(signal: CopilotSignal) {
-    const element = (text: string, value = "", enabled = true) => ({
+  #elements(signal: CopilotSignal): ElementSnapshot[] {
+    const element = (text: string, value = "", enabled = true): ElementSnapshot => ({
       visible: true,
       enabled,
       text,
@@ -119,7 +134,10 @@ class DynamicFakePage implements SemanticPage {
       case "protection":
         return this.protection ? [element("enterprise data protection")] : [];
       case "responses":
-        return this.responses.map((response) => element(response));
+        return this.responses.map((response, index) => ({
+          ...element(response),
+          ...this.responseSnapshots[index],
+        }));
       case "user-messages":
         return this.userMessagesVisible
           ? this.userMessages.map((message) => element(message))
@@ -193,6 +211,173 @@ test("adapter submits once, confirms its task marker, and captures a stable resp
   const duplicate = await adapter.submit(request);
   assert.equal(duplicate.status, "submitted");
   assert.equal(page.activationCalls, 1, "same idempotency key must never activate twice");
+
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "completed");
+  if (response.status === "completed") {
+    assert.equal(response.content, "completed response envelope");
+  }
+});
+
+test("an ambiguous protocol widget is non-repairable transport evidence", async () => {
+  const page = new DynamicFakePage();
+  page.onActivation = () => {
+    page.responseSnapshots[page.responses.length - 1] = {
+      responseCapture: {
+        contractVersion: "response-capture/v2",
+        status: "protocol_widget_ambiguous",
+        protocolVersion: "cba-agent/1",
+        reasonCode: "PROTOCOL_WIDGET_LINE_INDEX_INVALID",
+        codeBlockCount: 1,
+        protocolBlockCount: 1,
+        editorCount: 1,
+        bannerCount: 1,
+        lineCount: 2,
+        contentBytes: 128,
+      },
+    };
+  };
+  const { adapter } = makeHarness(page);
+  assert.equal((await adapter.submit(request)).status, "submitted");
+
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "indeterminate");
+  if (response.status === "indeterminate") {
+    assert.equal(response.diagnosticCode, "PROTOCOL_WIDGET_LINE_INDEX_INVALID");
+    assert.equal(response.diagnostic?.stage, "browser_response_capture");
+    assert.equal(response.diagnostic?.repairable, false);
+    assert.equal(response.diagnostic?.actual?.capture_status, "protocol_widget_ambiguous");
+    assert.equal(response.diagnostic?.actual?.protocol_version, "cba-agent/1");
+  }
+});
+
+test("an incomplete streaming protocol widget waits for the normal stability quorum", async () => {
+  const page = new DynamicFakePage();
+  let receiving = false;
+  let receiveSleeps = 0;
+  page.onActivation = () => {
+    page.streaming = true;
+    page.responseSnapshots[page.responses.length - 1] = {
+      responseCapture: {
+        contractVersion: "response-capture/v2",
+        status: "protocol_widget_incomplete",
+        protocolVersion: "cba-agent/1",
+        reasonCode: "PROTOCOL_WIDGET_LINES_PENDING",
+        codeBlockCount: 1,
+        protocolBlockCount: 1,
+        editorCount: 1,
+        bannerCount: 1,
+        lineCount: 0,
+        contentBytes: 0,
+      },
+    };
+  };
+  const { adapter } = makeHarness(
+    page,
+    new MutableBrowserKillSwitch(),
+    () => {
+      if (!receiving) return;
+      receiveSleeps += 1;
+      if (receiveSleeps !== 1) return;
+      page.streaming = false;
+      page.responses[page.responses.length - 1] =
+        "```cba-agent/1\n{\"kind\":\"agent_progress\",\"phase\":\"implementation\",\"summary\":\"ready\"}\n```";
+      page.responseSnapshots[page.responses.length - 1] = {
+        correlationText: "completed response envelope",
+        responseCapture: {
+          contractVersion: "response-capture/v2",
+          status: "protocol_reconstructed",
+          protocolVersion: "cba-agent/1",
+          codeBlockCount: 1,
+          protocolBlockCount: 1,
+          editorCount: 1,
+          bannerCount: 1,
+          lineCount: 1,
+          contentBytes: 85,
+        },
+      };
+    },
+  );
+  assert.equal((await adapter.submit(request)).status, "submitted");
+  receiving = true;
+
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "completed");
+  assert.ok(receiveSleeps >= 1);
+  if (response.status === "completed") {
+    assert.equal(response.captureEvidence?.status, "protocol_reconstructed");
+    assert.match(response.content, /agent_progress/u);
+  }
+});
+
+test("a capture issue that never leaves streaming retains its typed diagnostic at timeout", async () => {
+  const page = new DynamicFakePage();
+  page.onActivation = () => {
+    page.streaming = true;
+    page.responseSnapshots[page.responses.length - 1] = {
+      responseCapture: {
+        contractVersion: "response-capture/v2",
+        status: "protocol_widget_incomplete",
+        protocolVersion: "cba-agent/1",
+        reasonCode: "PROTOCOL_WIDGET_LINES_PENDING",
+        codeBlockCount: 1,
+        protocolBlockCount: 1,
+        editorCount: 1,
+        bannerCount: 1,
+        lineCount: 0,
+        contentBytes: 0,
+      },
+    };
+  };
+  const { adapter } = makeHarness(page);
+  assert.equal((await adapter.submit(request)).status, "submitted");
+
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "indeterminate");
+  if (response.status === "indeterminate") {
+    assert.equal(response.diagnosticCode, "PROTOCOL_WIDGET_LINES_PENDING");
+    assert.equal(response.diagnostic?.actual?.capture_status, "protocol_widget_incomplete");
+    assert.equal(response.diagnostic?.repairable, false);
+  }
+});
+
+test("response-widget capture exceptions retain their typed non-repairable diagnostic", async () => {
+  const page = new DynamicFakePage();
+  const { adapter } = makeHarness(page);
+  assert.equal((await adapter.submit(request)).status, "submitted");
+  page.failResponseCapture = true;
+
+  const response = await adapter.receive(request);
+  assert.equal(response.status, "indeterminate");
+  if (response.status === "indeterminate") {
+    assert.equal(response.diagnosticCode, "PROTOCOL_WIDGET_CAPTURE_FAILED");
+    assert.equal(response.diagnostic?.stage, "browser_response_capture");
+    assert.equal(response.diagnostic?.repairable, false);
+  }
+});
+
+test("response correlation preserves a pre-normalization cba-agent/1 baseline", async () => {
+  const page = new DynamicFakePage();
+  page.responses[0] = "raw pre-normalization response";
+  page.onActivation = () => {
+    page.responseSnapshots[0] = {
+      text: "```cba-agent/1\n{\"kind\":\"agent_progress\",\"phase\":\"implementation\",\"summary\":\"prior\"}\n```",
+      correlationText: "raw pre-normalization response",
+      responseCapture: {
+        contractVersion: "response-capture/v2",
+        status: "protocol_reconstructed",
+        protocolVersion: "cba-agent/1",
+        codeBlockCount: 1,
+        protocolBlockCount: 1,
+        editorCount: 1,
+        bannerCount: 1,
+        lineCount: 1,
+        contentBytes: 76,
+      },
+    };
+  };
+  const { adapter } = makeHarness(page);
+  assert.equal((await adapter.submit(request)).status, "submitted");
 
   const response = await adapter.receive(request);
   assert.equal(response.status, "completed");
@@ -371,14 +556,43 @@ test("response correlation rejects more than one appended assistant envelope", a
 test("response correlation accepts one proven M365 rolling-window shift", async () => {
   const page = new DynamicFakePage();
   page.responses.push("prior response 2", "prior response 3", "prior response 4");
+  const modelResponse =
+    "```cba-agent/1\n" +
+    '{"kind":"agent_progress","phase":"discovering","summary":"rolling window"}' +
+    "\n```";
+  page.onActivation = () => {
+    const responseIndex = page.responses.length - 1;
+    page.responses[responseIndex] = modelResponse;
+    page.responseSnapshots[responseIndex] = {
+      correlationText: "completed response envelope",
+      responseCapture: {
+        contractVersion: "response-capture/v2",
+        status: "protocol_reconstructed",
+        protocolVersion: "cba-agent/1",
+        codeBlockCount: 1,
+        protocolBlockCount: 1,
+        editorCount: 1,
+        bannerCount: 1,
+        lineCount: 1,
+        contentBytes: Buffer.byteLength(modelResponse, "utf8"),
+      },
+    };
+  };
   const { adapter } = makeHarness(page);
   assert.equal((await adapter.submit(request)).status, "submitted");
   page.responses.shift();
+  page.responseSnapshots.shift();
 
   const response = await adapter.receive(request);
   assert.equal(response.status, "completed");
   if (response.status === "completed") {
-    assert.equal(response.content, "completed response envelope");
+    assert.equal(response.content, modelResponse);
+    assert.equal(response.captureEvidence?.status, "protocol_reconstructed");
+    const parsed = new CbaProtocolAdapter().parseModelTurn(response.content, {
+      taskId: request.taskId,
+      turnId: "turn_0001",
+    });
+    assert.equal(parsed.messages[0]?.type, "progress");
   }
 });
 
@@ -425,6 +639,8 @@ test("unprovable response-baseline truncation includes actionable bounded diagno
     assert.deepEqual(response.diagnostic?.actual, {
       observed_response_count: 3,
       per_response_digests_available: true,
+      response_baseline_version: "response-sequence/v2",
+      capture_contract_versions: [],
     });
   }
 });

@@ -1,6 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 
-import { sha256 } from "../shared/crypto.js";
+import { sha256, stableJson } from "../shared/crypto.js";
 import { AgentError } from "../shared/errors.js";
 import { isoNow, systemClock, type Clock } from "../shared/time.js";
 import {
@@ -32,6 +32,8 @@ import {
 import type {
   CopilotPageObservation,
   CopilotSignal,
+  ElementSnapshot,
+  ResponseCaptureEvidence,
   SemanticPage,
 } from "./contracts.js";
 import { minimalBrowserDiagnostic, type MinimalBrowserDiagnostic } from "./diagnostics.js";
@@ -586,6 +588,15 @@ export class CopilotBrowserAdapter implements ModelTransport {
     let stableSince = this.#monotonicNow();
     let sawCandidate = false;
     let markerCurrentlyProven = true;
+    let lastCaptureIssueSha: string | undefined;
+    let lastCaptureIssue:
+      | Extract<ReturnType<typeof associatedResponse>, { readonly status: "capture_issue" }>
+      | undefined;
+    let captureIssueSamples = 0;
+    let captureIssueSince = this.#monotonicNow();
+    let lastObservationCaptureFailure:
+      | ReturnType<typeof browserResponseCaptureFailure>
+      | undefined;
 
     while (this.#monotonicNow() < deadline) {
       if (isAborted(options.signal)) return this.#cancelled(request, "ABORTED");
@@ -595,9 +606,19 @@ export class CopilotBrowserAdapter implements ModelTransport {
       let state: ObservedPageState;
       try {
         state = await this.#observe();
-      } catch {
+      } catch (error) {
         if (this.#stopped || !this.#killSwitch.status().enabled) {
           return this.#cancelled(request, "KILL_SWITCH");
+        }
+        const captureFailure = browserResponseCaptureFailure(error);
+        if (captureFailure !== undefined) {
+          lastObservationCaptureFailure = captureFailure;
+          try {
+            await this.#boundedSleep(deadline, options.signal);
+          } catch {
+            return this.#cancelled(request, "ABORTED");
+          }
+          continue;
         }
         return this.#receiveBase(request, {
           status: "indeterminate",
@@ -658,8 +679,43 @@ export class CopilotBrowserAdapter implements ModelTransport {
             : { diagnostic: correlation.diagnostic }),
         }, conversationId);
       }
+      if (correlation.status === "capture_issue") {
+        lastCaptureIssue = correlation;
+        sawCandidate = true;
+        lastCandidateSha = undefined;
+        stableSamples = 0;
+        stableSince = this.#monotonicNow();
+        const issueSha = sha256(stableJson({
+          diagnosticCode: correlation.diagnosticCode,
+          diagnostic: correlation.diagnostic,
+        }));
+        if (issueSha === lastCaptureIssueSha) {
+          captureIssueSamples += 1;
+        } else {
+          lastCaptureIssueSha = issueSha;
+          captureIssueSamples = 1;
+          captureIssueSince = this.#monotonicNow();
+        }
+        const captureIssueStable =
+          captureIssueSamples >= this.#config.waits.stableSamples &&
+          this.#monotonicNow() - captureIssueSince >=
+            this.#config.waits.minimumStableMs;
+        const notStreaming = state.observation.streaming.visibleElements === 0;
+        const composerAvailable = state.observation.composer.enabledElements > 0;
+        if (captureIssueStable && notStreaming && composerAvailable) {
+          return this.#receiveBase(request, {
+            status: "indeterminate",
+            diagnosticCode: correlation.diagnosticCode,
+            diagnostic: correlation.diagnostic,
+          }, conversationId);
+        }
+      }
       if (correlation.status === "candidate") {
         const candidate = correlation.content;
+        lastCaptureIssueSha = undefined;
+        lastCaptureIssue = undefined;
+        captureIssueSamples = 0;
+        lastObservationCaptureFailure = undefined;
         sawCandidate = true;
         if (candidate.length > this.#config.maxResponseChars) {
           return this.#receiveBase(request, {
@@ -687,6 +743,9 @@ export class CopilotBrowserAdapter implements ModelTransport {
             status: "completed",
             responseId: `copilot-response:${sha256(`${request.submissionId}:${candidate}`).slice(0, 24)}`,
             content: candidate,
+            ...(correlation.captureEvidence === undefined
+              ? {}
+              : { captureEvidence: correlation.captureEvidence }),
           }, conversationId);
         }
       }
@@ -700,6 +759,20 @@ export class CopilotBrowserAdapter implements ModelTransport {
       return this.#receiveBase(request, {
         status: "indeterminate",
         diagnosticCode: "TASK_MARKER_NOT_OBSERVED",
+      }, activeRecord.conversationId);
+    }
+    if (lastObservationCaptureFailure !== undefined) {
+      return this.#receiveBase(request, {
+        status: "indeterminate",
+        diagnosticCode: lastObservationCaptureFailure.diagnosticCode,
+        diagnostic: lastObservationCaptureFailure.diagnostic,
+      }, activeRecord.conversationId);
+    }
+    if (lastCaptureIssue !== undefined) {
+      return this.#receiveBase(request, {
+        status: "indeterminate",
+        diagnosticCode: lastCaptureIssue.diagnosticCode,
+        diagnostic: lastCaptureIssue.diagnostic,
       }, activeRecord.conversationId);
     }
     return this.#receiveBase(request, {
@@ -1250,7 +1323,7 @@ function knownPreActivationDiagnostic(error: unknown): string | undefined {
 
 function responseEnvelopeTexts(observation: CopilotPageObservation): readonly string[] {
   return observation.responses.elements
-    .map((element) => element.text.trim());
+    .map((element) => (element.correlationText ?? element.text).trim());
 }
 
 function responseSequenceSha256(responses: readonly string[]): string {
@@ -1262,12 +1335,22 @@ function associatedResponse(
   record: SubmissionRecord,
 ):
   | { readonly status: "pending" }
-  | { readonly status: "candidate"; readonly content: string }
+  | {
+      readonly status: "candidate";
+      readonly content: string;
+      readonly captureEvidence?: Readonly<Record<string, unknown>>;
+    }
   | {
       readonly status: "indeterminate";
       readonly diagnosticCode: string;
       readonly diagnostic?: import("../transport/model-transport.js").TransportDiagnostic;
+    }
+  | {
+      readonly status: "capture_issue";
+      readonly diagnosticCode: string;
+      readonly diagnostic: import("../transport/model-transport.js").TransportDiagnostic;
     } {
+  const responseElements = observation.responses.elements;
   const responses = responseEnvelopeTexts(observation);
   const baselinePrefixMatches =
     responses.length >= record.baselineResponseCount &&
@@ -1280,10 +1363,19 @@ function associatedResponse(
     if (responses.length !== record.baselineResponseCount + 1) {
       return { status: "indeterminate", diagnosticCode: "RESPONSE_SEQUENCE_AMBIGUOUS" };
     }
-    const content = responses[record.baselineResponseCount]!;
+    const candidate = responseElements[record.baselineResponseCount]!;
+    const captureIssue = responseCaptureIssue(candidate);
+    if (captureIssue !== undefined) return captureIssue;
+    const content = candidate.text.trim();
     return content.length === 0
       ? { status: "pending" }
-      : { status: "candidate", content };
+      : {
+          status: "candidate",
+          content,
+          ...(candidate.responseCapture === undefined
+            ? {}
+            : { captureEvidence: { ...candidate.responseCapture } }),
+        };
   }
 
   // M365 may virtualize multiple oldest assistant envelopes once its bounded
@@ -1318,14 +1410,24 @@ function associatedResponse(
           "The virtualized response history matched more than one safe alignment.",
           record,
           responses.length,
+          responseElements,
         ),
       };
     }
     if (candidateMatches) {
-      const content = responses.at(-1)!;
+      const candidate = responseElements.at(-1)!;
+      const captureIssue = responseCaptureIssue(candidate);
+      if (captureIssue !== undefined) return captureIssue;
+      const content = candidate.text.trim();
       return content.length === 0
         ? { status: "pending" }
-        : { status: "candidate", content };
+        : {
+            status: "candidate",
+            content,
+            ...(candidate.responseCapture === undefined
+              ? {}
+              : { captureEvidence: { ...candidate.responseCapture } }),
+          };
     }
     if (pendingMatches) return { status: "pending" };
   }
@@ -1342,7 +1444,105 @@ function associatedResponse(
         : "The visible response history no longer matches the recorded baseline.",
       record,
       responses.length,
+      responseElements,
     ),
+  };
+}
+
+function responseCaptureIssue(
+  element: ElementSnapshot,
+):
+  | {
+      readonly status: "capture_issue";
+      readonly diagnosticCode: string;
+      readonly diagnostic: import("../transport/model-transport.js").TransportDiagnostic;
+    }
+  | undefined {
+  const evidence = element.responseCapture;
+  if (
+    evidence === undefined ||
+    evidence.status === "rendered_text" ||
+    evidence.status === "protocol_reconstructed" ||
+    evidence.status === "model_protocol_malformed"
+  ) {
+    return undefined;
+  }
+  const diagnosticCode = evidence.reasonCode ?? responseCaptureStatusCode(evidence);
+  return {
+    status: "capture_issue",
+    diagnosticCode,
+    diagnostic: {
+      stage: "browser_response_capture",
+      summary:
+        "Cope could not safely read the protocol widget at browser_response_capture. " +
+        "Retrying the same model turn cannot repair this capture condition; the session is preserved.",
+      repairable: false,
+      suggestedAction: "preserve_session_and_inspect_browser_transcript",
+      expected: {
+        capture_contract_version: evidence.contractVersion,
+        protocol_block_count: 1,
+        editor_count: 1,
+        banner_count: 1,
+      },
+      actual: {
+        capture_status: evidence.status,
+        protocol_version: evidence.protocolVersion ?? "unrecognized",
+        reason_code: diagnosticCode,
+        code_block_count: evidence.codeBlockCount,
+        protocol_block_count: evidence.protocolBlockCount,
+        editor_count: evidence.editorCount,
+        banner_count: evidence.bannerCount,
+        line_count: evidence.lineCount,
+        content_bytes: evidence.contentBytes,
+      },
+    },
+  };
+}
+
+function responseCaptureStatusCode(evidence: ResponseCaptureEvidence): string {
+  switch (evidence.status) {
+    case "protocol_widget_ambiguous":
+      return "PROTOCOL_WIDGET_AMBIGUOUS";
+    case "protocol_widget_capture_failed":
+      return "PROTOCOL_WIDGET_CAPTURE_FAILED";
+    case "unsupported_capture_contract":
+      return "UNSUPPORTED_CAPTURE_CONTRACT";
+    case "protocol_widget_incomplete":
+      return "PROTOCOL_WIDGET_INCOMPLETE";
+    case "model_protocol_malformed":
+    case "protocol_reconstructed":
+    case "rendered_text":
+      return "RESPONSE_CAPTURE_OK";
+  }
+}
+
+function browserResponseCaptureFailure(error: unknown):
+  | {
+      readonly diagnosticCode: string;
+      readonly diagnostic: import("../transport/model-transport.js").TransportDiagnostic;
+    }
+  | undefined {
+  if (!(error instanceof AgentError)) return undefined;
+  const diagnosticCode = error.details.diagnosticCode;
+  if (
+    diagnosticCode !== "PROTOCOL_WIDGET_CAPTURE_FAILED" ||
+    error.details.diagnosticStage !== "browser_response_capture"
+  ) {
+    return undefined;
+  }
+  return {
+    diagnosticCode,
+    diagnostic: {
+      stage: "browser_response_capture",
+      summary:
+        "Cope could not safely read the protocol widget at browser_response_capture. " +
+        "Retrying the same model turn cannot repair this capture condition; the session is preserved.",
+      repairable: false,
+      suggestedAction: "preserve_session_and_inspect_browser_transcript",
+      actual: {
+        failure_code: diagnosticCode,
+      },
+    },
   };
 }
 
@@ -1350,7 +1550,17 @@ function responseBaselineDiagnostic(
   summary: string,
   record: SubmissionRecord,
   observedResponseCount: number,
+  responseElements: readonly ElementSnapshot[] = [],
 ): import("../transport/model-transport.js").TransportDiagnostic {
+  const captureContractVersions = [
+    ...new Set(
+      responseElements.flatMap((element) =>
+        element.responseCapture === undefined
+          ? []
+          : [element.responseCapture.contractVersion]
+      ),
+    ),
+  ];
   return {
     stage: "browser_response_capture",
     summary,
@@ -1363,6 +1573,8 @@ function responseBaselineDiagnostic(
     actual: {
       observed_response_count: observedResponseCount,
       per_response_digests_available: record.baselineResponseSha256s !== undefined,
+      response_baseline_version: RESPONSE_BASELINE_VERSION,
+      capture_contract_versions: captureContractVersions,
     },
   };
 }

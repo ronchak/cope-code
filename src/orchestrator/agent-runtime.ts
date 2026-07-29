@@ -42,6 +42,7 @@ import {
   toolRequiresContext,
   type BudgetMetric,
 } from "../protocol/types.js";
+import { ProtocolParseError } from "../protocol/parser.js";
 import {
   verifyCompletion,
   type CompletionClaim,
@@ -270,16 +271,40 @@ export class AgentRuntime {
           type: "model.response",
           taskId: this.state.taskId,
           turnId,
-          data: { responseId: response.responseId, bytes: Buffer.byteLength(response.content), sha256: sha256(response.content) },
+          data: {
+            responseId: response.responseId,
+            bytes: Buffer.byteLength(response.content),
+            sha256: sha256(response.content),
+            ...(sanitizedCaptureEvidence(response.captureEvidence) === undefined
+              ? {}
+              : { captureEvidence: sanitizedCaptureEvidence(response.captureEvidence) }),
+          },
         });
         if (this.interruption !== undefined) return await this.finishInterruption();
 
+        const captureIssue = completedResponseCaptureIssue(response);
+        if (captureIssue !== undefined) {
+          const terminal = await this.handleTransportResult(captureIssue);
+          if (terminal !== undefined) return terminal;
+          throw new AgentError(
+            "TRANSPORT_INDETERMINATE",
+            "A non-executable response-capture classification was not handled",
+          );
+        }
+
         let messages: readonly NormalizedModelMessage[];
         try {
+          const captureProtocolError = modelProtocolCaptureError(
+            response.captureEvidence,
+          );
+          if (captureProtocolError !== undefined) throw captureProtocolError;
           const parsedTurn = this.dependencies.protocol.parseModelTurn(response.content, {
             taskId: this.state.taskId,
             turnId,
             ...(recoveryReplay ? { recoveryReplay: true } : {}),
+            ...(response.captureEvidence === undefined
+              ? {}
+              : { captureEvidence: response.captureEvidence }),
           });
           messages = parsedTurn.messages;
           for (const normalization of parsedTurn.normalizations ?? []) {
@@ -293,6 +318,7 @@ export class AgentRuntime {
           this.state.protocolRepairStreak = 0;
         } catch (error) {
           const repairable = this.dependencies.protocol.isRepairableParseError(error);
+          const protocolCode = protocolFailureCode(error);
           const repairAttempt = repairable ? this.state.protocolRepairStreak + 1 : undefined;
           const repairBudgetAvailable =
             repairAttempt !== undefined &&
@@ -303,6 +329,7 @@ export class AgentRuntime {
             actionType: "protocol_repair",
             repairable,
             repairBudgetAvailable,
+            protocolCode,
             ...(repairAttempt === undefined ? {} : { repairAttempt }),
           }, { turnId });
           await this.dependencies.audit.append({
@@ -311,8 +338,12 @@ export class AgentRuntime {
             turnId,
             data: {
               error: errorMessage(error),
+              protocolCode,
               repairable,
               stage: "model_response_normalization",
+              ...(sanitizedCaptureEvidence(response.captureEvidence) === undefined
+                ? {}
+                : { captureEvidence: sanitizedCaptureEvidence(response.captureEvidence) }),
               ...(error instanceof AgentError ? { details: error.details } : {}),
               ...(repairAttempt === undefined
                 ? {}
@@ -337,11 +368,19 @@ export class AgentRuntime {
             );
           }
           if (!repairBudgetAvailable || repairAttempt === undefined) {
-            throw new AgentError("PROTOCOL_INVALID", "Copilot exhausted the protocol-repair budget", {
-              repairAttempt,
-              used: this.state.budgetUsage.protocolRepairs,
-              limit: this.state.budgetLimits.maxProtocolRepairs,
-            });
+            throw new AgentError(
+              "PROTOCOL_INVALID",
+              `Copilot exhausted the protocol-repair budget after ${protocolCode}`,
+              {
+                stage: "model_response_normalization",
+                protocolCode,
+                lastError: errorMessage(error),
+                repairAttempt,
+                used: this.state.budgetUsage.protocolRepairs,
+                limit: this.state.budgetLimits.maxProtocolRepairs,
+              },
+              { cause: error },
+            );
           }
           this.meter.consume("protocolRepairs");
           this.state.protocolRepairStreak = repairAttempt;
@@ -349,7 +388,7 @@ export class AgentRuntime {
             this.dependencies.protocol.renderProtocolError({
               taskId: this.state.taskId,
               priorTurnId: turnId,
-              code: "INVALID_ENVELOPE",
+              code: protocolCode,
               message: errorMessage(error),
               repairAttempt: this.state.protocolRepairStreak,
               details: {
@@ -360,7 +399,7 @@ export class AgentRuntime {
             "repair",
           );
           await this.queueOutbound(outbound, nextTurnId(this.state.turnSequence));
-          await this.dependencies.artifacts?.remove("response", turnId);
+          await this.removeResponseArtifacts(turnId);
           this.activeModelTurnId = undefined;
           continue;
         }
@@ -371,7 +410,7 @@ export class AgentRuntime {
         const next = await this.handleAction(action, turnId);
         if (next.terminal) {
           if (["completed", "rolled_back", "blocked", "aborted", "failed"].includes(this.state.status)) {
-            await this.dependencies.artifacts?.remove("response", turnId);
+            await this.removeResponseArtifacts(turnId);
           }
           return next.result;
         }
@@ -398,7 +437,7 @@ export class AgentRuntime {
           this.state.budgetPauseStreak = 0;
           await this.persist();
         }
-        await this.dependencies.artifacts?.remove("response", turnId);
+        await this.removeResponseArtifacts(turnId);
         this.activeModelTurnId = undefined;
         if (this.disclosureBudgetPauseReason !== undefined) {
           const budgetError = this.disclosureBudgetPauseError;
@@ -763,8 +802,28 @@ export class AgentRuntime {
     );
     this.assertTransportCorrelation(result, request, "receive result");
     if (result.status === "completed") {
+      const captureEvidence = sanitizedCaptureEvidence(result.captureEvidence);
+      if (result.captureEvidence !== undefined && captureEvidence === undefined) {
+        throw new AgentError(
+          "PROTOCOL_INVALID",
+          "Completed response capture evidence failed strict validation",
+          {
+            stage: "model_response_capture",
+            protocol_code: "INVALID_MESSAGE",
+          },
+        );
+      }
       this.bindConversation(result);
       await this.dependencies.artifacts?.put("response", turnId, result.content);
+      if (captureEvidence === undefined) {
+        await this.dependencies.artifacts?.remove("response-capture", turnId);
+      } else {
+        await this.dependencies.artifacts?.put(
+          "response-capture",
+          turnId,
+          stableJson(captureEvidence),
+        );
+      }
       if (this.state.submission?.submissionId === submissionId) {
         this.state.submission = {
           ...this.state.submission,
@@ -788,6 +847,13 @@ export class AgentRuntime {
     }
     if (submission.state === "answered") {
       const content = await this.requireArtifacts().get("response", submission.turnId);
+      const captureArtifact = await this.requireArtifacts().getOptional(
+        "response-capture",
+        submission.turnId,
+      );
+      const captureEvidence = captureArtifact === undefined
+        ? undefined
+        : parseCaptureEvidenceArtifact(captureArtifact);
       return {
         recoveryReplay: true,
         result: {
@@ -802,6 +868,7 @@ export class AgentRuntime {
           status: "completed",
           responseId: `recovered_${submission.turnId}`,
           content,
+          ...(captureEvidence === undefined ? {} : { captureEvidence }),
         },
       };
     }
@@ -924,6 +991,13 @@ export class AgentRuntime {
       });
     }
     this.state.transportConversationId = value.conversationId;
+  }
+
+  private async removeResponseArtifacts(turnId: string): Promise<void> {
+    await Promise.all([
+      this.dependencies.artifacts?.remove("response", turnId),
+      this.dependencies.artifacts?.remove("response-capture", turnId),
+    ]);
   }
 
   private async readQueuedOutbound(): Promise<string> {
@@ -1371,7 +1445,7 @@ export class AgentRuntime {
           "repair",
         );
         await this.queueOutbound(outbound, nextTurnId(this.state.turnSequence));
-        await this.dependencies.artifacts?.remove("response", turnId);
+        await this.removeResponseArtifacts(turnId);
         return {
           terminal: true,
           result: await this.pauseWithInterruptionPriority(reason),
@@ -1838,7 +1912,7 @@ export class AgentRuntime {
         disclosureKind: "decision",
       },
     );
-    await this.dependencies.artifacts?.remove("response", priorTurnId);
+    await this.removeResponseArtifacts(priorTurnId);
     this.activeModelTurnId = undefined;
     return true;
   }
@@ -2688,6 +2762,26 @@ export class AgentRuntime {
       );
     }
     if (result.status === "indeterminate") {
+      if (result.diagnostic?.stage === "browser_response_capture") {
+        await this.dependencies.audit.append({
+          type: "transport.state",
+          taskId: this.state.taskId,
+          turnId: result.turnId,
+          data: {
+            status: result.status,
+            diagnosticCode: result.diagnosticCode,
+            stage: result.diagnostic.stage,
+            repairable: result.diagnostic.repairable,
+            suggestedAction: result.diagnostic.suggestedAction,
+            ...(result.diagnostic.expected === undefined
+              ? {}
+              : { expected: result.diagnostic.expected }),
+            ...(result.diagnostic.actual === undefined
+              ? {}
+              : { actual: result.diagnostic.actual }),
+          },
+        });
+      }
       throw new AgentError(
         "TRANSPORT_INDETERMINATE",
         transportResultReason(result),
@@ -3412,6 +3506,209 @@ function mapValidationOutcome(
 
 function nextTurnId(currentSequence: number): string {
   return `turn_${String(currentSequence + 1).padStart(4, "0")}`;
+}
+
+function protocolFailureCode(error: unknown): string {
+  if (error instanceof ProtocolParseError) return error.protocolCode;
+  if (error instanceof AgentError) {
+    const protocolCode = error.details.protocol_code;
+    if (typeof protocolCode === "string" && protocolCode.length > 0) return protocolCode;
+  }
+  return "INVALID_MESSAGE";
+}
+
+function modelProtocolCaptureError(
+  evidence: Readonly<Record<string, unknown>> | undefined,
+): ProtocolParseError | undefined {
+  const capture = sanitizedCaptureEvidence(evidence);
+  if (capture === undefined) {
+    if (evidence === undefined) return undefined;
+    return new ProtocolParseError(
+      "INVALID_MESSAGE",
+      "Response capture evidence failed strict validation.",
+      {
+        stage: "model_response_capture",
+        capture_evidence_invalid: true,
+      },
+      false,
+    );
+  }
+  if (capture.status !== "model_protocol_malformed") return undefined;
+  const code = capture.protocolErrorCode;
+  const messages = {
+    MISSING_ENVELOPE: "The model response quoted a protocol fence outside an owned protocol widget.",
+    MULTIPLE_ENVELOPES: "The captured model response contains more than one protocol envelope.",
+    UNSUPPORTED_VERSION: "The captured model response used an unsupported protocol version.",
+    EMPTY_ENVELOPE: "The captured model response contains an empty protocol envelope.",
+    INVALID_JSON: "The captured model response does not contain complete, valid JSON.",
+    SCHEMA_INVALID: "The captured model response body does not match its declared protocol dialect.",
+  } as const;
+  if (typeof code !== "string" || !Object.hasOwn(messages, code)) return undefined;
+  return new ProtocolParseError(
+    code as keyof typeof messages,
+    messages[code as keyof typeof messages],
+    {
+      stage: "model_response_capture",
+      capture_evidence: capture,
+    },
+    true,
+  );
+}
+
+function sanitizedCaptureEvidence(
+  evidence: Readonly<Record<string, unknown>> | undefined,
+): Readonly<Record<string, unknown>> | undefined {
+  if (
+    evidence?.contractVersion !== "response-capture/v2" ||
+    typeof evidence.status !== "string" ||
+    ![
+      "rendered_text",
+      "protocol_reconstructed",
+      "model_protocol_malformed",
+      "protocol_widget_incomplete",
+      "protocol_widget_ambiguous",
+      "protocol_widget_capture_failed",
+      "unsupported_capture_contract",
+    ].includes(evidence.status)
+  ) {
+    return undefined;
+  }
+  const capture: Record<string, unknown> = {
+    contractVersion: evidence.contractVersion,
+    status: evidence.status,
+  };
+  if (
+    typeof evidence.protocolVersion === "string" &&
+    /^(?:cba|cba-agent)\/[A-Za-z0-9._-]{1,32}$/u.test(evidence.protocolVersion)
+  ) {
+    capture.protocolVersion = evidence.protocolVersion;
+  }
+  for (const key of ["reasonCode", "protocolErrorCode"] as const) {
+    const value = evidence[key];
+    if (typeof value === "string" && /^[A-Z][A-Z0-9_]{0,63}$/u.test(value)) {
+      capture[key] = value;
+    }
+  }
+  if (
+    evidence.status === "model_protocol_malformed" &&
+    (
+      capture.protocolErrorCode !== "MISSING_ENVELOPE" &&
+      capture.protocolErrorCode !== "MULTIPLE_ENVELOPES" &&
+      capture.protocolErrorCode !== "UNSUPPORTED_VERSION" &&
+      capture.protocolErrorCode !== "EMPTY_ENVELOPE" &&
+      capture.protocolErrorCode !== "INVALID_JSON" &&
+      capture.protocolErrorCode !== "SCHEMA_INVALID"
+    )
+  ) {
+    return undefined;
+  }
+  for (
+    const key of [
+      "codeBlockCount",
+      "protocolBlockCount",
+      "editorCount",
+      "bannerCount",
+      "lineCount",
+      "contentBytes",
+    ] as const
+  ) {
+    const value = evidence[key];
+    if (
+      typeof value !== "number" ||
+      !Number.isSafeInteger(value) ||
+      value < 0 ||
+      value > Number.MAX_SAFE_INTEGER
+    ) {
+      return undefined;
+    }
+    capture[key] = value;
+  }
+  return capture;
+}
+
+function completedResponseCaptureIssue(
+  result: CompletedReceiveResult,
+): Exclude<ReceiveResult, { status: "completed" }> | undefined {
+  const evidence = sanitizedCaptureEvidence(result.captureEvidence);
+  const status = evidence?.status;
+  if (
+    evidence === undefined ||
+    typeof status !== "string" ||
+    status === "rendered_text" ||
+    status === "protocol_reconstructed" ||
+    status === "model_protocol_malformed"
+  ) {
+    return undefined;
+  }
+  const diagnosticCode = typeof evidence.reasonCode === "string"
+    ? evidence.reasonCode
+    : status.toUpperCase();
+  return {
+    contractVersion: result.contractVersion,
+    taskId: result.taskId,
+    turnId: result.turnId,
+    submissionId: result.submissionId,
+    observedAt: result.observedAt,
+    ...(result.conversationId === undefined
+      ? {}
+      : { conversationId: result.conversationId }),
+    status: "indeterminate",
+    diagnosticCode,
+    diagnostic: {
+      stage: "browser_response_capture",
+      summary:
+        "Cope could not safely read the protocol widget at browser_response_capture. " +
+        "Retrying the same model turn cannot repair this capture condition; the session is preserved.",
+      repairable: false,
+      suggestedAction: "preserve_session_and_inspect_browser_transcript",
+      expected: {
+        capture_contract_version: evidence.contractVersion,
+        protocol_block_count: 1,
+        editor_count: 1,
+        banner_count: 1,
+      },
+      actual: {
+        capture_status: status,
+        protocol_version: evidence.protocolVersion ?? "unrecognized",
+        reason_code: diagnosticCode,
+        code_block_count: evidence.codeBlockCount,
+        protocol_block_count: evidence.protocolBlockCount,
+        editor_count: evidence.editorCount,
+        banner_count: evidence.bannerCount,
+        line_count: evidence.lineCount,
+        content_bytes: evidence.contentBytes,
+      },
+    },
+  };
+}
+
+function parseCaptureEvidenceArtifact(raw: string): Readonly<Record<string, unknown>> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch (error) {
+    throw new AgentError(
+      "RECOVERY_REQUIRED",
+      "Response-capture recovery evidence is invalid JSON",
+      {},
+      { cause: error },
+    );
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new AgentError(
+      "RECOVERY_REQUIRED",
+      "Response-capture recovery evidence has an invalid shape",
+    );
+  }
+  const evidence = parsed as Readonly<Record<string, unknown>>;
+  const sanitized = sanitizedCaptureEvidence(evidence);
+  if (sanitized === undefined || stableJson(sanitized) !== stableJson(evidence)) {
+    throw new AgentError(
+      "RECOVERY_REQUIRED",
+      "Response-capture recovery evidence failed strict validation",
+    );
+  }
+  return sanitized;
 }
 
 function parseDecisionArtifact(raw: string): Readonly<Record<string, unknown>> {

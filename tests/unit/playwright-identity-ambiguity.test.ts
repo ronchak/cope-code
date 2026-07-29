@@ -21,6 +21,7 @@ import {
   ProtocolParseError,
   parseProtocolEnvelope,
 } from "../../src/protocol/index.js";
+import { CbaProtocolAdapter } from "../../src/orchestrator/cba-protocol-adapter.js";
 
 const chromiumExecutable = process.env["COPE_TEST_CHROMIUM_EXECUTABLE"] ??
   chromium.executablePath();
@@ -146,7 +147,7 @@ test("the current M365 message envelopes expose submission and response evidence
   assert.match(observation.responses.elements[0]?.text ?? "", /response/u);
 });
 
-test("the live adapter submits with a trusted click, adopts the URL, and restores CBA fences", {
+test("the live adapter submits, reconstructs cba-agent/1, and parses the model turn", {
   skip: !existsSync(chromiumExecutable),
 }, async (t) => {
   const browser = await chromium.launch({ headless: true, executablePath: chromiumExecutable });
@@ -198,28 +199,52 @@ test("the live adapter submits with a trusted click, adopts the URL, and restore
             codeBlock.className = "scriptor-component-code-block";
             const languageIndicator = document.createElement("div");
             languageIndicator.dataset.testid = "message-bar-body-info";
-            languageIndicator.textContent =
-              "cba/1 isn’t fully supported. Syntax highlighting is based on Plain Text.";
             const editor = document.createElement("div");
             editor.setAttribute("role", "textbox");
             editor.setAttribute("aria-readonly", "true");
             editor.setAttribute("aria-label", "Code editor");
-            const line = document.createElement("div");
-            line.dataset.lineIndex = "0";
-            line.textContent = JSON.stringify({
-              protocol: "cba/1",
-              message_type: "complete_task",
-              summary: "trusted adapter flow",
-            });
-            editor.append(line);
+            const quotedProtocol = composer.value.includes("quoted protocol");
+            const serialized = JSON.stringify({
+                kind: "agent_intent",
+                intent: "git_status",
+                arguments: {},
+                reason: "Need repository state.",
+              });
+            if (quotedProtocol) {
+              languageIndicator.textContent =
+                "markdown isn’t fully supported. Syntax highlighting is based on Plain Text.";
+              const opening = document.createElement("div");
+              opening.dataset.lineIndex = "0";
+              opening.textContent = "\`\`\`cba-agent/1";
+              const body = document.createElement("div");
+              body.dataset.lineIndex = "1";
+              body.textContent = serialized;
+              const closing = document.createElement("div");
+              closing.dataset.lineIndex = "2";
+              closing.textContent = "\`\`\`";
+              editor.append(opening, body, closing);
+            } else {
+              languageIndicator.textContent =
+                "cba-agent/1 isn’t fully supported. Syntax highlighting is based on Plain Text.";
+              const splitAt = serialized.indexOf('"intent"');
+              const lineOne = document.createElement("div");
+              lineOne.dataset.lineIndex = "1";
+              lineOne.textContent = serialized.slice(0, splitAt);
+              const lineTwo = document.createElement("div");
+              lineTwo.dataset.lineIndex = "2";
+              lineTwo.textContent = serialized.slice(splitAt);
+              editor.append(lineTwo, lineOne);
+            }
             codeBlock.append(languageIndicator, editor);
             markdown.append(codeBlock);
             response.append(markdown);
             transcript.append(question, response);
             composer.value = "";
-            setTimeout(() => {
-              history.replaceState({}, "", "/chat/conversation/materialized");
-            }, 25);
+            if (!location.pathname.endsWith("/conversation/materialized")) {
+              setTimeout(() => {
+                history.replaceState({}, "", "/chat/conversation/materialized");
+              }, 25);
+            }
           });
         </script>
       `,
@@ -250,7 +275,7 @@ test("the live adapter submits with a trusted click, adopts the URL, and restore
   const adapter = new CopilotBrowserAdapter(semanticPage, config);
   const request = {
     taskId: "task-live-composition",
-    turnId: "turn-live-composition",
+    turnId: "turn_0001",
     submissionId: "submission-live-composition",
     content: "Use the tool contract.",
   } as const;
@@ -268,13 +293,177 @@ test("the live adapter submits with a trusted click, adopts the URL, and restore
   const response = await adapter.receive(request);
   assert.equal(response.status, "completed");
   if (response.status === "completed") {
+    assert.equal(response.captureEvidence?.status, "protocol_reconstructed");
+    assert.equal(response.captureEvidence?.protocolVersion, "cba-agent/1");
     assert.equal(
       response.content,
-      "```cba/1\n" +
-        '{"protocol":"cba/1","message_type":"complete_task","summary":"trusted adapter flow"}' +
+      "```cba-agent/1\n" +
+        '{"kind":"agent_intent",\n"intent":"git_status","arguments":{},"reason":"Need repository state."}' +
         "\n```",
     );
+    const parsed = new CbaProtocolAdapter().parseModelTurn(response.content, {
+      taskId: request.taskId,
+      turnId: request.turnId,
+    });
+    assert.equal(parsed.messages[0]?.type, "tool_request");
+    assert.equal(
+      parsed.messages[0]?.type === "tool_request"
+        ? parsed.messages[0].calls[0]?.name
+        : undefined,
+      "git_status",
+    );
   }
+
+  const quotedRequest = {
+    taskId: "task-live-composition",
+    turnId: "turn_0002",
+    submissionId: "submission-quoted-protocol",
+    content: "Return a quoted protocol example.",
+  } as const;
+  const quotedReceipt = await adapter.submit(quotedRequest);
+  assert.equal(quotedReceipt.status, "submitted", JSON.stringify(quotedReceipt));
+  const quotedResponse = await adapter.receive(quotedRequest);
+  assert.equal(quotedResponse.status, "completed");
+  if (quotedResponse.status === "completed") {
+    assert.equal(quotedResponse.captureEvidence?.status, "model_protocol_malformed");
+    assert.equal(quotedResponse.captureEvidence?.reasonCode, "MODEL_PROTOCOL_UNOWNED_FENCE");
+    assert.equal(quotedResponse.captureEvidence?.protocolErrorCode, "MISSING_ENVELOPE");
+  }
+
+  const legacyPayload = {
+    protocol: "cba/1",
+    message_type: "tool_request",
+    message_id: "msg_legacy_capture",
+    task_id: "task_legacy_capture",
+    turn_id: 1,
+    operations: [{
+      operation_id: "op_legacy_capture",
+      tool: "git_status",
+      arguments: {},
+    }],
+  };
+  await page.evaluate((payload) => {
+    const response = document.createElement("div");
+    response.dataset.testid = "copilot-message-reply-div";
+    const markdown = document.createElement("div");
+    markdown.dataset.testid = "markdown-reply";
+    const codeBlock = document.createElement("div");
+    codeBlock.className = "scriptor-component-code-block";
+    const languageIndicator = document.createElement("div");
+    languageIndicator.dataset.testid = "message-bar-body-info";
+    languageIndicator.textContent =
+      "cba/1 isn’t fully supported. Syntax highlighting is based on Plain Text.";
+    const editor = document.createElement("div");
+    editor.setAttribute("role", "textbox");
+    editor.setAttribute("aria-readonly", "true");
+    editor.setAttribute("aria-label", "Code editor");
+    const serialized = JSON.stringify(payload);
+    const lineOne = document.createElement("div");
+    lineOne.dataset.lineIndex = "1";
+    lineOne.textContent = serialized;
+    const lineTwo = document.createElement("div");
+    lineTwo.dataset.lineIndex = "2";
+    lineTwo.textContent = "";
+    editor.append(lineOne, lineTwo);
+    codeBlock.append(languageIndicator, editor);
+    markdown.append(codeBlock);
+    response.append(markdown);
+    document.querySelector("#transcript")?.append(response);
+  }, legacyPayload);
+  const observation = await observeCopilotPage(new PlaywrightSemanticPage(page), contract);
+  const capturedLegacy = observation.responses.elements.at(-1);
+  assert.equal(capturedLegacy?.responseCapture?.status, "protocol_reconstructed");
+  assert.equal(capturedLegacy?.responseCapture?.protocolVersion, "cba/1");
+  assert.equal(capturedLegacy?.responseCapture?.lineCount, 2);
+  assert.equal(
+    capturedLegacy?.correlationText,
+    `\`\`\`cba/1\n${JSON.stringify(legacyPayload)}\n\`\`\``,
+  );
+  assert.notEqual(
+    capturedLegacy?.correlationText,
+    capturedLegacy?.text,
+    "0.1.8 correlation trims the trailing editor line while normalized content preserves it",
+  );
+  const legacyTurn = new CbaProtocolAdapter({
+    allowLegacyCorrelationRebind: true,
+  }).parseModelTurn(capturedLegacy?.text ?? "", {
+    taskId: "task_legacy_capture",
+    turnId: "turn_0001",
+  });
+  assert.equal(legacyTurn.messages[0]?.type, "tool_request");
+  await page.evaluate(() => {
+    const legacyBlock = document.querySelector(
+      '[data-testid="copilot-message-reply-div"]:last-child .scriptor-component-code-block',
+    );
+    const extraBanner = document.createElement("div");
+    extraBanner.dataset.testid = "message-bar-body-info";
+    extraBanner.textContent =
+      "cba-agent/1 isn’t fully supported. Syntax highlighting is based on Plain Text.";
+    legacyBlock?.prepend(extraBanner);
+  });
+  const mixedBannerObservation = await observeCopilotPage(
+    new PlaywrightSemanticPage(page),
+    contract,
+  );
+  assert.equal(
+    mixedBannerObservation.responses.elements.at(-1)?.correlationText,
+    `\`\`\`cba/1\n${JSON.stringify(legacyPayload)}\n\`\`\``,
+    "legacy baseline identity must reproduce v0.1.8's exact cba/1 banner predicate",
+  );
+
+  await page.evaluate((payload) => {
+    const response = document.createElement("div");
+    response.dataset.testid = "copilot-message-reply-div";
+    const markdown = document.createElement("div");
+    markdown.dataset.testid = "markdown-reply";
+    const codeBlock = document.createElement("div");
+    codeBlock.className = "scriptor-component-code-block";
+    const banner = document.createElement("div");
+    banner.dataset.testid = "message-bar-body-info";
+    banner.textContent =
+      "cba/1 isn’t fully supported. Syntax highlighting is based on Plain Text.";
+    const editor = document.createElement("div");
+    editor.setAttribute("role", "textbox");
+    editor.setAttribute("aria-readonly", "true");
+    editor.setAttribute("aria-label", "Code editor");
+    const serialized = JSON.stringify(payload);
+    const splitAt = serialized.indexOf('"turn_id"');
+    const lineOne = document.createElement("div");
+    lineOne.dataset.lineIndex = "1";
+    lineOne.textContent = serialized.slice(0, splitAt);
+    const lineTwo = document.createElement("div");
+    lineTwo.dataset.lineIndex = "2";
+    lineTwo.textContent = serialized.slice(splitAt);
+    editor.append(lineTwo, lineOne);
+    codeBlock.append(banner, editor);
+    markdown.append(codeBlock);
+    response.append(markdown);
+    document.querySelector("#transcript")?.append(response);
+  }, legacyPayload);
+  const reversedLegacyObservation = await observeCopilotPage(
+    new PlaywrightSemanticPage(page),
+    contract,
+  );
+  const reversedLegacy = reversedLegacyObservation.responses.elements.at(-1);
+  assert.equal(reversedLegacy?.responseCapture?.status, "protocol_reconstructed");
+  assert.notEqual(
+    reversedLegacy?.correlationText,
+    `\`\`\`cba/1\n${JSON.stringify(legacyPayload)}\n\`\`\``,
+    "v0.1.8 correlation must retain DOM order instead of normalized index order",
+  );
+  assert.ok(
+    (reversedLegacy?.correlationText?.indexOf('"turn_id"') ?? -1) <
+      (reversedLegacy?.correlationText?.indexOf('{"protocol"') ?? -1),
+  );
+  assert.equal(
+    new CbaProtocolAdapter({
+      allowLegacyCorrelationRebind: true,
+    }).parseModelTurn(reversedLegacy?.text ?? "", {
+      taskId: "task_legacy_capture",
+      turnId: "turn_0001",
+    }).messages[0]?.type,
+    "tool_request",
+  );
 });
 
 test("a late Chromium overlay cannot receive or redirect trusted send activation", {
@@ -433,6 +622,255 @@ for (const variant of ["json", "unlabeled"] as const) {
     );
   });
 }
+
+test("Chromium protocol widgets distinguish safe data, repairable format, and capture failures", {
+  skip: !existsSync(chromiumExecutable),
+}, async (t) => {
+  const browser = await chromium.launch({ headless: true, executablePath: chromiumExecutable });
+  t.after(async () => browser.close().catch(() => undefined));
+  const context = await browser.newContext();
+  const modelIntent = JSON.stringify({
+    kind: "agent_intent",
+    intent: "git_status",
+    arguments: {},
+    reason: "Need repository state.",
+  });
+  const fenceCollision = JSON.stringify({
+    kind: "agent_progress",
+    phase: "discovering",
+    summary: "quoted ``` delimiter",
+  });
+  const standaloneFencePrefix =
+    '{"kind":"agent_progress","phase":"discovering","summary":"before collision"';
+  await context.route("**/*", async (route) => {
+    await route.fulfill({
+      contentType: "text/html",
+      body: `
+        <meta charset="utf-8">
+        <main aria-label="Microsoft 365 Copilot Chat">
+          <div data-testid="copilot-message-reply-div" id="unsupported">
+            <div data-testid="markdown-reply">
+              <div class="scriptor-component-code-block">
+                <div data-testid="message-bar-body-info">cba-agent/2 isn’t fully supported. Syntax highlighting is based on Plain Text.</div>
+                <div role="textbox" aria-readonly="true" aria-label="Code editor">
+                  <div data-line-index="0">${modelIntent}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div data-testid="copilot-message-reply-div" id="duplicate-editor">
+            <div data-testid="markdown-reply">
+              <div class="scriptor-component-code-block">
+                <div data-testid="message-bar-body-info">cba-agent/1 isn’t fully supported. Syntax highlighting is based on Plain Text.</div>
+                <div role="textbox" aria-readonly="true" aria-label="Code editor">
+                  <div data-line-index="0">${modelIntent}</div>
+                </div>
+                <div role="textbox" aria-readonly="true" aria-label="Code editor">
+                  <div data-line-index="0">${modelIntent}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div data-testid="copilot-message-reply-div" id="duplicate-block">
+            <div data-testid="markdown-reply">
+              <div class="scriptor-component-code-block">
+                <div data-testid="message-bar-body-info">cba-agent/1 isn’t fully supported. Syntax highlighting is based on Plain Text.</div>
+                <div role="textbox" aria-readonly="true" aria-label="Code editor">
+                  <div data-line-index="0">${modelIntent}</div>
+                </div>
+              </div>
+              <div class="scriptor-component-code-block">
+                <div data-testid="message-bar-body-info">cba-agent/1 isn’t fully supported. Syntax highlighting is based on Plain Text.</div>
+                <div role="textbox" aria-readonly="true" aria-label="Code editor">
+                  <div data-line-index="0">${modelIntent}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div data-testid="copilot-message-reply-div" id="orphaned-banner">
+            <div data-testid="markdown-reply">
+              <div data-testid="message-bar-body-info">cba-agent/1 isn’t fully supported. Syntax highlighting is based on Plain Text.</div>
+              <p>The protocol banner is not owned by a code block.</p>
+            </div>
+          </div>
+          <div data-testid="copilot-message-reply-div" id="changed-banner">
+            <div data-testid="markdown-reply">
+              <div class="scriptor-component-code-block">
+                <div data-testid="message-bar-body-info">Die Sprache cba-agent/1 wird nicht vollständig unterstützt.</div>
+                <div role="textbox" aria-readonly="true" aria-label="Code editor">
+                  <div data-line-index="0">${modelIntent}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div data-testid="copilot-message-reply-div" id="dialect-mismatch">
+            <div data-testid="markdown-reply">
+              <div class="scriptor-component-code-block">
+                <div data-testid="message-bar-body-info">cba/1 isn’t fully supported. Syntax highlighting is based on Plain Text.</div>
+                <div role="textbox" aria-readonly="true" aria-label="Code editor">
+                  <div data-line-index="0">${modelIntent}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div data-testid="copilot-message-reply-div" id="quoted-protocol">
+            <div data-testid="markdown-reply">
+              <div class="scriptor-component-code-block">
+                <div data-testid="message-bar-body-info">markdown isn’t fully supported. Syntax highlighting is based on Plain Text.</div>
+                <div role="textbox" aria-readonly="true" aria-label="Code editor">
+                  <div data-line-index="0">\`\`\`cba-agent/1</div>
+                  <div data-line-index="1">${modelIntent}</div>
+                  <div data-line-index="2">\`\`\`</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div data-testid="copilot-message-reply-div" id="plain-quoted-protocol">
+            <div data-testid="markdown-reply">
+              <div>\`\`\`cba-agent/1<br>${modelIntent}<br>\`\`\`</div>
+            </div>
+          </div>
+          <div data-testid="copilot-message-reply-div" id="fence-collision">
+            <div data-testid="markdown-reply">
+              <div class="scriptor-component-code-block">
+                <div data-testid="message-bar-body-info">cba-agent/1 isn’t fully supported. Syntax highlighting is based on Plain Text.</div>
+                <div role="textbox" aria-readonly="true" aria-label="Code editor">
+                  <div data-line-index="0">${fenceCollision}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div data-testid="copilot-message-reply-div" id="standalone-fence-collision">
+            <div data-testid="markdown-reply">
+              <div class="scriptor-component-code-block">
+                <div data-testid="message-bar-body-info">cba-agent/1 isn’t fully supported. Syntax highlighting is based on Plain Text.</div>
+                <div role="textbox" aria-readonly="true" aria-label="Code editor">
+                  <div data-line-index="0">${standaloneFencePrefix}</div>
+                  <div data-line-index="1">\`\`\`</div>
+                  <div data-line-index="2">}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div data-testid="copilot-message-reply-div" id="virtualized-suffix">
+            <div data-testid="markdown-reply">
+              <div class="scriptor-component-code-block">
+                <div data-testid="message-bar-body-info">cba-agent/1 isn’t fully supported. Syntax highlighting is based on Plain Text.</div>
+                <div role="textbox" aria-readonly="true" aria-label="Code editor">
+                  <div data-line-index="42">{"kind":"agent_progress",</div>
+                  <div data-line-index="43">"phase":"discovering",</div>
+                  <div data-line-index="44">"summary":"partial mounted suffix"}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div data-testid="copilot-message-reply-div" id="late-mount">
+            <div data-testid="markdown-reply">
+              <div class="scriptor-component-code-block">
+                <div data-testid="message-bar-body-info">cba-agent/1 isn’t fully supported. Syntax highlighting is based on Plain Text.</div>
+              </div>
+            </div>
+          </div>
+          <div data-testid="copilot-message-reply-div" id="duplicate-banner">
+            <div data-testid="markdown-reply">
+              <div class="scriptor-component-code-block">
+                <div data-testid="message-bar-body-info">cba-agent/1 isn’t fully supported. Syntax highlighting is based on Plain Text.</div>
+                <div data-testid="message-bar-body-info">cba-agent/1 isn’t fully supported. Syntax highlighting is based on Plain Text.</div>
+                <div role="textbox" aria-readonly="true" aria-label="Code editor">
+                  <div data-line-index="0">${modelIntent}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </main>
+      `,
+    });
+  });
+  const page = await context.newPage();
+  await page.goto(`${entryUrl}/conversation/unsafe-protocol-widgets`);
+  const contract = createBaselineCopilotUiContract("Chakraborty, Ronak");
+  const observation = await observeCopilotPage(new PlaywrightSemanticPage(page), contract);
+  const evidence = observation.responses.elements.map((element) => element.responseCapture);
+
+  assert.equal(evidence[0]?.status, "model_protocol_malformed");
+  assert.equal(evidence[0]?.protocolErrorCode, "UNSUPPORTED_VERSION");
+  assert.equal(evidence[1]?.status, "protocol_widget_ambiguous");
+  assert.equal(evidence[1]?.reasonCode, "PROTOCOL_WIDGET_EDITOR_COUNT");
+  assert.equal(evidence[2]?.status, "model_protocol_malformed");
+  assert.equal(evidence[2]?.protocolErrorCode, "MULTIPLE_ENVELOPES");
+  assert.equal(evidence[3]?.status, "unsupported_capture_contract");
+  assert.equal(evidence[3]?.reasonCode, "PROTOCOL_WIDGET_NOT_OWNED");
+  assert.equal(evidence[4]?.status, "unsupported_capture_contract");
+  assert.equal(evidence[4]?.reasonCode, "PROTOCOL_WIDGET_BANNER_CONTRACT_CHANGED");
+  assert.equal(evidence[5]?.status, "model_protocol_malformed");
+  assert.equal(evidence[5]?.reasonCode, "MODEL_PROTOCOL_DIALECT_MISMATCH");
+  assert.equal(evidence[6]?.status, "model_protocol_malformed");
+  assert.equal(evidence[6]?.reasonCode, "MODEL_PROTOCOL_UNOWNED_FENCE");
+  assert.equal(evidence[6]?.protocolErrorCode, "MISSING_ENVELOPE");
+  assert.equal(evidence[7]?.status, "model_protocol_malformed");
+  assert.equal(evidence[7]?.reasonCode, "MODEL_PROTOCOL_UNOWNED_FENCE");
+  assert.equal(evidence[7]?.protocolErrorCode, "MISSING_ENVELOPE");
+  assert.equal(evidence[8]?.status, "protocol_reconstructed");
+  assert.equal(evidence[9]?.status, "protocol_widget_ambiguous");
+  assert.equal(evidence[9]?.reasonCode, "PROTOCOL_WIDGET_HOST_VERIFICATION_FAILED");
+  assert.equal(evidence[10]?.status, "protocol_widget_ambiguous");
+  assert.equal(evidence[10]?.reasonCode, "PROTOCOL_WIDGET_LINE_INDEX_INVALID");
+  assert.equal(evidence[11]?.status, "protocol_widget_incomplete");
+  assert.equal(evidence[11]?.reasonCode, "PROTOCOL_WIDGET_EDITOR_PENDING");
+  assert.equal(evidence[12]?.status, "protocol_widget_ambiguous");
+  assert.equal(evidence[12]?.reasonCode, "PROTOCOL_WIDGET_BANNER_COUNT");
+  assert.equal(evidence[12]?.protocolBlockCount, 1);
+  const inlineFenceTurn = new CbaProtocolAdapter().parseModelTurn(
+    observation.responses.elements[8]?.text ?? "",
+    {
+      taskId: "task_inline_fence",
+      turnId: "turn_0001",
+    },
+  );
+  assert.equal(inlineFenceTurn.messages[0]?.type, "progress");
+  assert.equal(
+    observation.responses.elements.filter((element) =>
+      element.responseCapture?.status === "protocol_reconstructed"
+    ).length,
+    1,
+  );
+
+  await page.evaluate((intent) => {
+    const codeBlock = document.querySelector("#late-mount .scriptor-component-code-block");
+    const editor = document.createElement("div");
+    editor.setAttribute("role", "textbox");
+    editor.setAttribute("aria-readonly", "true");
+    editor.setAttribute("aria-label", "Code editor");
+    const line = document.createElement("div");
+    line.dataset.lineIndex = "0";
+    line.textContent = intent;
+    editor.append(line);
+    codeBlock?.append(editor);
+  }, modelIntent);
+  const completedObservation = await observeCopilotPage(
+    new PlaywrightSemanticPage(page),
+    contract,
+  );
+  assert.equal(
+    completedObservation.responses.elements[11]?.responseCapture?.status,
+    "protocol_reconstructed",
+  );
+
+  await page.evaluate(() => {
+    Object.defineProperty(window, "TextEncoder", {
+      configurable: true,
+      value: undefined,
+    });
+  });
+  const failedCaptureObservation = await observeCopilotPage(
+    new PlaywrightSemanticPage(page),
+    contract,
+  );
+  assert.equal(
+    failedCaptureObservation.responses.elements[0]?.responseCapture?.status,
+    "protocol_widget_capture_failed",
+  );
+});
 
 test("a Microsoft account-manager display name reaches ready state in Chromium", {
   skip: !existsSync(chromiumExecutable),

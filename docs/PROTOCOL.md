@@ -1,6 +1,6 @@
 # Model-facing `cba-agent/1` and internal `cba/1`
 
-Cope 0.1.8 separates model intent from transport mechanics. Copilot emits the
+Cope 0.1.9 separates model intent from transport mechanics. Copilot emits the
 small `cba-agent/1` model-facing contract. The deterministic harness owns
 session correlation, generates identifiers, decides safe batching, and
 normalizes the request into internal `cba/1`.
@@ -20,6 +20,41 @@ and closing lines are exact:
 ````
 
 Prose may appear outside the fence. The parser does not execute a protocol-looking fence nested inside another Markdown fence. It rejects missing, multiple, empty, truncated, oversized, unsupported-version, invalid-JSON, and schema-invalid envelopes.
+
+### Visible-browser capture
+
+M365 may render a fenced response as a read-only code-editor widget whose
+`innerText()` omits the Markdown fence. Cope reconstructs that presentation
+only when the correlated assistant response owns exactly one supported
+protocol widget with one exact `cba-agent/1` or legacy `cba/1` information
+banner and one eligible editor. Page evaluation returns bounded structural
+facts; trusted host code validates numeric contiguous line indices, sorts them
+by index (from either zero or one), rejects ambiguity and standalone lines that
+could collide with the outer protocol wrapper, requires the fence label and
+body dialect to agree, constructs the wrapper, and verifies the exact version
+and body bytes before protocol parsing. Triple backticks inside a valid JSON
+string remain ordinary data and are preserved. A
+partially mounted editor/banner/line set remains pending until the normal
+streaming and response-stability quorum completes.
+
+JSON shape is never capture authority. JSON, plain-text, unlabeled,
+wrong-version, multiple-editor, multiple-block, malformed-line, or otherwise
+ambiguous widgets remain inert. An exact protocol fence quoted inside an
+ordinary code editor or rendered prose is rejected before parser entry.
+Model-authored wrong-version, invalid-JSON, multiple-envelope, empty-body,
+dialect, and quoted-but-unowned-fence errors receive bounded protocol repair;
+unsafe ownership, capture, banner-contract, and response-selection conditions
+produce a source-free, non-repairable browser-capture diagnostic without
+consuming that budget.
+
+The `response-capture/v2` evidence contains only stable enums, versions,
+counts, line count, and byte length. It follows a completed response through
+audit and integrity-checked crash recovery. Separate correlation text
+reproduces the exact 0.1.8 legacy trimming and editor-order predicate so old
+response baselines do not silently rebind when normalized protocol content has
+a different display representation. `cope doctor` runs the same host
+normalizer against a fixed source-free fixture; it does not read or mutate a
+live conversation.
 
 The model-facing root is one of:
 
@@ -155,7 +190,14 @@ An `ask` response is not permission. For an exact waiting tool operation, `allow
 
 ## Protocol repair
 
-The harness returns a `protocol_error` containing a stable error code, a concise repair message, whether the condition is repairable, and the active task/turn. It never repairs a materially different request on Copilot's behalf. A reminder reinforces exact fencing, correlation, and unique IDs. Consecutive repair attempts consume a budget; exhaustion stops or pauses the session.
+The harness returns a `protocol_error` containing the parser's exact stable
+error code, a concise repair message, whether the condition is repairable, and
+the active task/turn. The same code appears in progress, audit, repair, and
+terminal exhaustion diagnostics. It never repairs a materially different
+request on Copilot's behalf. A reminder reinforces exact fencing, correlation,
+and unique IDs. Consecutive model-formatting repair attempts consume a budget;
+browser capture and response-selection failures stop or pause without charging
+that budget.
 
 Important errors include:
 
