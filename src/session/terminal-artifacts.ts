@@ -15,6 +15,7 @@ import {
   type WorkspaceObservation,
   type WorkspacePostObservationControl,
 } from "../repository/workspace-observer.js";
+import { normalizeRepositoryPath } from "../repository/boundary.js";
 import type { CheckpointFileSnapshot } from "../repository/checkpoint.js";
 import type {
   TerminalBeforeImageResolution,
@@ -1362,21 +1363,43 @@ async function resolveBeforeImage(
   signal: AbortSignal | undefined,
 ): Promise<TerminalBeforeImageResolution> {
   const observation = evidence.preObservation.observation;
+  const result = evidence.artifact.result;
   const key = options.pathKey ?? ((value: string) => value);
-  const requestedKey = safePathKey(
-    key,
+  const normalizedRequestedPath = normalizeTerminalEvidencePath(
     repositoryRelativePath,
     mutation.operationId,
     evidence.artifact.request_hash,
   );
+  const requestedKey = safePathKey(
+    key,
+    normalizedRequestedPath,
+    mutation.operationId,
+    evidence.artifact.request_hash,
+  );
+  const aliasRole = resolveAliasRenameRole(
+    result,
+    normalizedRequestedPath,
+    requestedKey,
+    key,
+    mutation.operationId,
+    evidence.artifact.request_hash,
+  );
   const matchingImages = (observation.beforeImages ?? []).filter(
-    (image) =>
-      safePathKey(
-        key,
+    (image) => {
+      const imagePath = normalizeTerminalEvidencePath(
         beforeImagePath(image),
         mutation.operationId,
         evidence.artifact.request_hash,
-      ) === requestedKey,
+      );
+      return aliasRole === undefined
+        ? safePathKey(
+            key,
+            imagePath,
+            mutation.operationId,
+            evidence.artifact.request_hash,
+          ) === requestedKey
+        : imagePath === normalizedRequestedPath;
+    },
   );
   if (matchingImages.length > 1) {
     throw recoveryError(
@@ -1388,20 +1411,99 @@ async function resolveBeforeImage(
     );
   }
   const image = matchingImages[0];
+  const matchingEntries = (observation.entries ?? []).filter(
+    (entry) => {
+      const entryPath = normalizeTerminalEvidencePath(
+        entry.path,
+        mutation.operationId,
+        evidence.artifact.request_hash,
+      );
+      const originalPath =
+        entry.originalPath === undefined
+          ? undefined
+          : normalizeTerminalEvidencePath(
+              entry.originalPath,
+              mutation.operationId,
+              evidence.artifact.request_hash,
+            );
+      return aliasRole === undefined
+        ? safePathKey(
+            key,
+            entryPath,
+            mutation.operationId,
+            evidence.artifact.request_hash,
+          ) === requestedKey ||
+            (
+              originalPath !== undefined &&
+              safePathKey(
+                key,
+                originalPath,
+                mutation.operationId,
+                evidence.artifact.request_hash,
+              ) === requestedKey
+            )
+        : entryPath === normalizedRequestedPath ||
+            originalPath === normalizedRequestedPath;
+    },
+  );
+  if (matchingEntries.length > 1) {
+    throw recoveryError(
+      "Terminal pre-observation contains ambiguous path entries",
+      {
+        operationId: mutation.operationId,
+        requestHash: evidence.artifact.request_hash,
+      },
+    );
+  }
+  if (aliasRole?.kind === "destination") {
+    if (
+      (image !== undefined && image.kind !== "absent") ||
+      matchingEntries.length > 0
+    ) {
+      throw recoveryError(
+        "Alias rename destination conflicts with persisted pre-state",
+        {
+          operationId: mutation.operationId,
+          requestHash: evidence.artifact.request_hash,
+        },
+      );
+    }
+    return {
+      available: true,
+      baselineId: `terminal:${mutation.operationId}:pre`,
+      entry: {
+        path: normalizedRequestedPath,
+        existed: false,
+        bytes: null,
+        mode: null,
+        sha256: null,
+      },
+    };
+  }
+  if (aliasRole?.kind === "origin" && image?.kind === "absent") {
+    throw recoveryError(
+      "Alias rename origin conflicts with an absent persisted pre-state",
+      {
+        operationId: mutation.operationId,
+        requestHash: evidence.artifact.request_hash,
+      },
+    );
+  }
   const prior = await options.resolvePriorBaseline?.(
     mutation,
-    repositoryRelativePath,
+    normalizedRequestedPath,
     signal,
   );
   throwIfAborted(signal);
   if (prior !== undefined) {
     assertVerifiedPriorBaseline(
       prior,
-      repositoryRelativePath,
+      normalizedRequestedPath,
       image,
       key,
       mutation.operationId,
       evidence.artifact.request_hash,
+      aliasRole?.kind === "origin",
     );
     return { available: true, ...prior };
   }
@@ -1417,34 +1519,6 @@ async function resolveBeforeImage(
   if (observation.state === "unknown") {
     return { available: false, reason: "unknown_observation" };
   }
-
-  const matchingEntries = (observation.entries ?? []).filter(
-    (entry) =>
-      safePathKey(
-        key,
-        entry.path,
-        mutation.operationId,
-        evidence.artifact.request_hash,
-      ) === requestedKey ||
-      (
-        entry.originalPath !== undefined &&
-        safePathKey(
-          key,
-          entry.originalPath,
-          mutation.operationId,
-          evidence.artifact.request_hash,
-        ) === requestedKey
-      ),
-  );
-  if (matchingEntries.length > 1) {
-    throw recoveryError(
-      "Terminal pre-observation contains ambiguous path entries",
-      {
-        operationId: mutation.operationId,
-        requestHash: evidence.artifact.request_hash,
-      },
-    );
-  }
   if (matchingEntries.length > 0) {
     // Dirty, staged, untracked, and rename-origin paths require an explicit
     // before-image. Falling back to HEAD would erase the user's actual
@@ -1458,8 +1532,8 @@ async function resolveBeforeImage(
     };
   }
 
-  const result = evidence.artifact.result;
   const isCreated =
+    aliasRole === undefined &&
     result.mutation.outcome === "observed" &&
     (
       includesPath(
@@ -1493,27 +1567,33 @@ async function resolveBeforeImage(
   }
 
   const wasTracked =
-    includesPath(
-      result.mutation.updated,
-      requestedKey,
-      key,
-      mutation.operationId,
-      evidence.artifact.request_hash,
-    ) ||
-    includesPath(
-      result.mutation.deleted,
-      requestedKey,
-      key,
-      mutation.operationId,
-      evidence.artifact.request_hash,
-    ) ||
-    result.mutation.renamed.some(
-      (rename) => safePathKey(
-        key,
-        rename.from,
-        mutation.operationId,
-        evidence.artifact.request_hash,
-      ) === requestedKey,
+    aliasRole?.kind === "origin" ||
+    (
+      aliasRole === undefined &&
+      (
+        includesPath(
+          result.mutation.updated,
+          requestedKey,
+          key,
+          mutation.operationId,
+          evidence.artifact.request_hash,
+        ) ||
+        includesPath(
+          result.mutation.deleted,
+          requestedKey,
+          key,
+          mutation.operationId,
+          evidence.artifact.request_hash,
+        ) ||
+        result.mutation.renamed.some(
+          (rename) => safePathKey(
+            key,
+            rename.from,
+            mutation.operationId,
+            evidence.artifact.request_hash,
+          ) === requestedKey,
+        )
+      )
     );
   if (wasTracked && typeof observation.head === "string") {
     if (options.readHeadPath === undefined) {
@@ -1521,7 +1601,7 @@ async function resolveBeforeImage(
     }
     const resolved = await options.readHeadPath(
       observation.head,
-      repositoryRelativePath,
+      normalizedRequestedPath,
       signal,
     );
     throwIfAborted(signal);
@@ -1538,7 +1618,7 @@ async function resolveBeforeImage(
       baselineId:
         `terminal:${mutation.operationId}:head:${resolved.objectId}`,
       entry: checkpointEntry(
-        repositoryRelativePath,
+        normalizedRequestedPath,
         resolved.bytes,
         resolved.mode,
       ),
@@ -1629,10 +1709,22 @@ function assertVerifiedPriorBaseline(
   pathKey: (repositoryRelativePath: string) => string,
   operationId: string,
   requestHash: string,
+  requireExactPath = false,
 ): void {
+  let normalizedPriorPath: string;
+  try {
+    normalizedPriorPath = normalizeRepositoryPath(prior.entry.path);
+  } catch (error) {
+    throw new AgentError(
+      "RECOVERY_REQUIRED",
+      "Verified prior terminal baseline has an invalid path",
+      { operationId, requestHash },
+      { cause: error },
+    );
+  }
   const priorKey = safePathKey(
     pathKey,
-    prior.entry.path,
+    normalizedPriorPath,
     operationId,
     requestHash,
   );
@@ -1642,18 +1734,31 @@ function assertVerifiedPriorBaseline(
     operationId,
     requestHash,
   );
+  const absentIsValid =
+    prior.entry.existed === false &&
+    prior.entry.bytes === null &&
+    prior.entry.sha256 === null &&
+    prior.entry.mode === null;
+  const presentIsValid =
+    prior.entry.existed === true &&
+    Buffer.isBuffer(prior.entry.bytes) &&
+    typeof prior.entry.sha256 === "string" &&
+    HASH_PATTERN.test(prior.entry.sha256) &&
+    sha256(prior.entry.bytes) === prior.entry.sha256 &&
+    validNonnegativeInteger(prior.entry.mode) &&
+    prior.entry.mode <= 0o177777;
   if (
+    typeof prior.baselineId !== "string" ||
     prior.baselineId.length === 0 ||
+    prior.baselineId.includes("\0") ||
+    Buffer.byteLength(prior.baselineId) > 4_096 ||
+    normalizedPriorPath !== prior.entry.path ||
     priorKey !== requestedKey ||
     (
-      prior.entry.bytes === null
-        ? prior.entry.existed ||
-          prior.entry.sha256 !== null ||
-          prior.entry.mode !== null
-        : !prior.entry.existed ||
-          prior.entry.sha256 !== sha256(prior.entry.bytes) ||
-          !validNonnegativeInteger(prior.entry.mode)
-    )
+      requireExactPath &&
+      normalizedPriorPath !== repositoryRelativePath
+    ) ||
+    (!absentIsValid && !presentIsValid)
   ) {
     throw recoveryError(
       "Verified prior terminal baseline is malformed or mismatched",
@@ -1696,6 +1801,7 @@ function assertImmutableHeadPath(
   if (
     !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/u.test(value.objectId) ||
     !validNonnegativeInteger(value.mode) ||
+    value.mode > 0o177777 ||
     !Buffer.isBuffer(value.bytes) ||
     gitBlobObjectId(value.bytes, value.objectId.length) !== value.objectId
   ) {
@@ -1741,6 +1847,86 @@ function includesPath(
     (path) =>
       safePathKey(pathKey, path, operationId, requestHash) === requestedKey,
   );
+}
+
+interface AliasRenameRole {
+  readonly kind: "origin" | "destination";
+  readonly from: string;
+  readonly to: string;
+}
+
+function normalizeTerminalEvidencePath(
+  repositoryRelativePath: string,
+  operationId: string,
+  requestHash: string,
+): string {
+  try {
+    return normalizeRepositoryPath(repositoryRelativePath);
+  } catch (error) {
+    throw new AgentError(
+      "RECOVERY_REQUIRED",
+      "Terminal before-image path is invalid",
+      { operationId, requestHash },
+      { cause: error },
+    );
+  }
+}
+
+function resolveAliasRenameRole(
+  result: TerminalExecResult,
+  normalizedRequestedPath: string,
+  requestedKey: string,
+  pathKey: (repositoryRelativePath: string) => string,
+  operationId: string,
+  requestHash: string,
+): AliasRenameRole | undefined {
+  const matchingRoles: AliasRenameRole[] = [];
+  let matchingAliasCount = 0;
+  for (const rename of result.mutation.renamed) {
+    const from = normalizeTerminalEvidencePath(
+      rename.from,
+      operationId,
+      requestHash,
+    );
+    const to = normalizeTerminalEvidencePath(
+      rename.to,
+      operationId,
+      requestHash,
+    );
+    if (from === to) continue;
+    const fromKey = safePathKey(
+      pathKey,
+      from,
+      operationId,
+      requestHash,
+    );
+    const toKey = safePathKey(
+      pathKey,
+      to,
+      operationId,
+      requestHash,
+    );
+    if (fromKey !== toKey || fromKey !== requestedKey) continue;
+    matchingAliasCount += 1;
+    if (normalizedRequestedPath === from) {
+      matchingRoles.push({ kind: "origin", from, to });
+    }
+    if (normalizedRequestedPath === to) {
+      matchingRoles.push({ kind: "destination", from, to });
+    }
+  }
+  if (matchingAliasCount === 0) return undefined;
+  if (
+    result.mutation.outcome !== "observed" ||
+    matchingAliasCount !== 1 ||
+    matchingRoles.length !== 1
+  ) {
+    throw recoveryError(
+      "Alias rename direction cannot be proven from persisted evidence",
+      { operationId, requestHash },
+    );
+  }
+  return matchingRoles[0];
 }
 
 function safePathKey(
