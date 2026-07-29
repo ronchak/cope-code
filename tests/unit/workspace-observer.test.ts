@@ -18,6 +18,8 @@ import { TERMINAL_EXEC_CONTRACT } from "../../src/protocol/terminal-exec.js";
 import {
   LiveWorkspaceObserver,
   WORKSPACE_OBSERVATION_CONTRACT,
+  WORKSPACE_OBSERVATION_MAX_IMAGES,
+  WORKSPACE_OBSERVATION_MAX_RETAINED_BYTES,
   createWorkspacePathFacts,
   isWorkspaceObservation,
   type SessionPreExistingBaseline,
@@ -638,6 +640,275 @@ test("baseline content reads skip an unretainable large sample and refresh an ag
   );
 });
 
+test("required baseline images cannot be starved by the optional image-count budget", async (context) => {
+  const fixture = await createRepositoryFixture(context);
+  const optionalPaths = Array.from(
+    { length: WORKSPACE_OBSERVATION_MAX_IMAGES },
+    (_, index) => `a-optional-${String(index).padStart(3, "0")}.txt`,
+  );
+  await Promise.all(
+    optionalPaths.map((repositoryRelativePath) =>
+      writeFile(
+        path.join(fixture.root, repositoryRelativePath),
+        `${repositoryRelativePath}\n`,
+      )),
+  );
+  await writeFile(
+    path.join(fixture.root, "z-user-baseline.txt"),
+    "required session-start work\n",
+  );
+
+  const pre = await fixture.observer.capturePre({
+    paths: ["z-user-baseline.txt"],
+    hasReconstructibleBaseline: async () => false,
+  });
+  assert.equal(pre.state, "complete");
+  assert.equal(pre.beforeImages.length, WORKSPACE_OBSERVATION_MAX_IMAGES);
+  const imagePaths = pre.beforeImages.map((image) =>
+    image.kind === "absent" ? image.path : image.identity.path);
+  assert.deepEqual(
+    imagePaths,
+    [...imagePaths].sort((left, right) =>
+      Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"))),
+  );
+  assert.equal(imagePaths.at(-1), "z-user-baseline.txt");
+  const baselineImage = pre.beforeImages.at(-1);
+  assert.equal(baselineImage?.kind, "retained");
+  assert.equal(
+    baselineImage?.kind === "retained"
+      ? Buffer.from(baselineImage.contentBase64, "base64").toString("utf8")
+      : undefined,
+    "required session-start work\n",
+  );
+  assert.equal(isWorkspaceObservation(pre), true);
+});
+
+test("required baseline bytes cannot be starved by optional retained content", async (context) => {
+  const fixture = await createRepositoryFixture(context);
+  for (let index = 0; index < 3; index += 1) {
+    await writeFile(
+      path.join(fixture.root, `a-byte-budget-${String(index)}.bin`),
+      Buffer.alloc(1024 * 1024, index + 1),
+    );
+  }
+  await writeFile(
+    path.join(fixture.root, "z-user-baseline.txt"),
+    "required byte-budget baseline\n",
+  );
+  const boundary = await RepositoryBoundary.create(fixture.root);
+  let baselineContentReads = 0;
+  const observer = new LiveWorkspaceObserver(boundary, fixture.git, {
+    testObserveWorktreeContentRead: (repositoryRelativePath) => {
+      if (repositoryRelativePath === "z-user-baseline.txt") {
+        baselineContentReads += 1;
+      }
+    },
+  });
+
+  const pre = await observer.capturePre({
+    paths: ["z-user-baseline.txt"],
+    hasReconstructibleBaseline: async () => false,
+  });
+  assert.equal(pre.state, "complete");
+  assert.equal(baselineContentReads, 3);
+  const baselineImage = pre.beforeImages.find(
+    (image) =>
+      image.kind === "retained" &&
+      image.identity.path === "z-user-baseline.txt",
+  );
+  assert.equal(baselineImage?.kind, "retained");
+  const retainedBytes = pre.beforeImages.reduce(
+    (total, image) =>
+      total +
+      (image.kind === "retained"
+        ? Buffer.from(image.contentBase64, "base64").length
+        : 0),
+    0,
+  );
+  assert.equal(retainedBytes <= WORKSPACE_OBSERVATION_MAX_RETAINED_BYTES, true);
+  assert.equal(
+    pre.beforeImages.filter(
+      (image) =>
+        image.kind === "retained" &&
+        image.identity.path.startsWith("a-byte-budget-"),
+    ).length,
+    2,
+  );
+  assert.equal(isWorkspaceObservation(pre), true);
+});
+
+test("nonreconstructible baseline images precede reconstructible baseline images", async (context) => {
+  const fixture = await createRepositoryFixture(context);
+  const reconstructiblePaths = Array.from(
+    { length: WORKSPACE_OBSERVATION_MAX_IMAGES },
+    (_, index) => `a-reconstructible-${String(index).padStart(3, "0")}.txt`,
+  );
+  await Promise.all(
+    reconstructiblePaths.map((repositoryRelativePath) =>
+      writeFile(
+        path.join(fixture.root, repositoryRelativePath),
+        `${repositoryRelativePath}\n`,
+      )),
+  );
+  const requiredPath = "z-required-baseline.txt";
+  await writeFile(
+    path.join(fixture.root, requiredPath),
+    "nonreconstructible session-start work\n",
+  );
+  const checks = new Map<string, number>();
+
+  const pre = await fixture.observer.capturePre({
+    paths: [...reconstructiblePaths, requiredPath, requiredPath],
+    hasReconstructibleBaseline: async (repositoryRelativePath) => {
+      checks.set(
+        repositoryRelativePath,
+        (checks.get(repositoryRelativePath) ?? 0) + 1,
+      );
+      return repositoryRelativePath !== requiredPath;
+    },
+  });
+  assert.equal(pre.state, "complete");
+  assert.equal(pre.beforeImages.length, WORKSPACE_OBSERVATION_MAX_IMAGES);
+  assert.equal(
+    pre.beforeImages.some(
+      (image) =>
+        image.kind === "retained" &&
+        image.identity.path === requiredPath,
+    ),
+    true,
+  );
+  assert.equal(checks.size, WORKSPACE_OBSERVATION_MAX_IMAGES + 1);
+  assert.equal([...checks.values()].every((count) => count === 1), true);
+  assert.equal(isWorkspaceObservation(pre), true);
+});
+
+test("nonreconstructible baseline bytes precede reconstructible baseline bytes", async (context) => {
+  const fixture = await createRepositoryFixture(context);
+  const reconstructiblePaths = Array.from(
+    { length: 3 },
+    (_, index) => `a-reconstructible-byte-${String(index)}.bin`,
+  );
+  await Promise.all(
+    reconstructiblePaths.map((repositoryRelativePath, index) =>
+      writeFile(
+        path.join(fixture.root, repositoryRelativePath),
+        Buffer.alloc(1024 * 1024, index + 1),
+      )),
+  );
+  const requiredPath = "z-required-baseline.txt";
+  await writeFile(
+    path.join(fixture.root, requiredPath),
+    "nonreconstructible byte-budget baseline\n",
+  );
+  const checks = new Map<string, number>();
+
+  const pre = await fixture.observer.capturePre({
+    paths: [...reconstructiblePaths, requiredPath, requiredPath],
+    hasReconstructibleBaseline: async (repositoryRelativePath) => {
+      checks.set(
+        repositoryRelativePath,
+        (checks.get(repositoryRelativePath) ?? 0) + 1,
+      );
+      return repositoryRelativePath !== requiredPath;
+    },
+  });
+  assert.equal(pre.state, "complete");
+  assert.equal(
+    pre.beforeImages.some(
+      (image) =>
+        image.kind === "retained" &&
+        image.identity.path === requiredPath,
+    ),
+    true,
+  );
+  assert.equal(
+    pre.beforeImages.filter(
+      (image) =>
+        image.kind === "retained" &&
+        image.identity.path.startsWith("a-reconstructible-byte-"),
+    ).length,
+    2,
+  );
+  assert.equal(checks.size, reconstructiblePaths.length + 1);
+  assert.equal([...checks.values()].every((count) => count === 1), true);
+  assert.equal(isWorkspaceObservation(pre), true);
+});
+
+test("unavoidable nonreconstructible baseline overflow fails after one classification per path", async (context) => {
+  const fixture = await createRepositoryFixture(context);
+  const requiredPaths = Array.from(
+    { length: WORKSPACE_OBSERVATION_MAX_IMAGES + 1 },
+    (_, index) => `required-${String(index).padStart(3, "0")}.txt`,
+  );
+  await Promise.all(
+    requiredPaths.map((repositoryRelativePath) =>
+      writeFile(path.join(fixture.root, repositoryRelativePath), "")),
+  );
+  const checks = new Map<string, number>();
+
+  await assert.rejects(
+    fixture.observer.capturePre({
+      paths: [...requiredPaths, requiredPaths[0] ?? ""],
+      hasReconstructibleBaseline: async (repositoryRelativePath) => {
+        checks.set(
+          repositoryRelativePath,
+          (checks.get(repositoryRelativePath) ?? 0) + 1,
+        );
+        return false;
+      },
+    }),
+    (error: {
+      readonly code?: string;
+      readonly details?: {
+        readonly diagnosticCode?: string;
+        readonly path?: string;
+      };
+    }) =>
+      error.code === "RECOVERY_REQUIRED" &&
+      error.details?.diagnosticCode ===
+        "PREEXISTING_BASELINE_NOT_RECONSTRUCTIBLE" &&
+      error.details.path === requiredPaths.at(-1),
+  );
+  assert.equal(checks.size, requiredPaths.length);
+  assert.equal([...checks.values()].every((count) => count === 1), true);
+});
+
+test("baseline classification stops immediately when its caller aborts", async (context) => {
+  const fixture = await createRepositoryFixture(context);
+  const controller = new AbortController();
+  const paths = Array.from(
+    { length: 20 },
+    (_, index) => `baseline-${String(index).padStart(2, "0")}.txt`,
+  );
+  let checks = 0;
+
+  await assert.rejects(
+    fixture.observer.capturePre({
+      paths,
+      hasReconstructibleBaseline: async () => {
+        checks += 1;
+        controller.abort();
+        return true;
+      },
+    }, controller.signal),
+    (error: {
+      readonly code?: string;
+      readonly message?: string;
+      readonly cause?: {
+        readonly code?: string;
+        readonly message?: string;
+      };
+    }) =>
+      error.code === "COMMAND_CANCELLED" &&
+      error.message ===
+        "Prelaunch repository observation exceeded its bounded deadline" &&
+      error.cause?.code === "COMMAND_CANCELLED" &&
+      error.cause.message ===
+        "Baseline reconstructibility observation was cancelled",
+  );
+  assert.equal(checks, 1);
+});
+
 test("an enumerated nested marker wins at the scan boundary while an unvisited marker remains bounded", async (context) => {
   const fixture = await createRepositoryFixture(context);
   const boundary = await RepositoryBoundary.create(fixture.root);
@@ -861,7 +1132,7 @@ test("live pre-observation refuses a disappeared session-start path unless its b
     fixture.observer.capturePre(unavailable),
     /reconstructible prelaunch baseline/iu,
   );
-  assert.equal(checks > 0, true);
+  assert.equal(checks, 1);
 
   const reconstructible: SessionPreExistingBaseline = {
     paths: ["disappeared-user-work.txt"],

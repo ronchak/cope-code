@@ -960,20 +960,56 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
     baseline: SessionPreExistingBaseline,
     signal: AbortSignal,
   ): Promise<readonly WorkspaceBeforeImage[]> {
-    const candidates = uniqueSorted([
-      ...entryEndpoints(boundary.entries),
-      ...baseline.paths,
-    ]);
-    const baselineKeys = new Set(baseline.paths.map((value) => this.boundary.pathKey(value)));
+    const baselineKeys = new Set<string>();
+    const baselineCandidates = uniqueSorted(baseline.paths).filter((value) => {
+      const key = this.boundary.pathKey(value);
+      if (baselineKeys.has(key)) return false;
+      baselineKeys.add(key);
+      return true;
+    });
+    const reconstructibleBaselines = new Map<string, boolean>();
+    for (const candidate of baselineCandidates) {
+      if (signal.aborted) {
+        throw new AgentError(
+          "COMMAND_CANCELLED",
+          "Baseline reconstructibility observation was cancelled",
+        );
+      }
+      const reconstructible =
+        await baseline.hasReconstructibleBaseline(candidate);
+      if (signal.aborted) {
+        throw new AgentError(
+          "COMMAND_CANCELLED",
+          "Baseline reconstructibility observation was cancelled",
+        );
+      }
+      reconstructibleBaselines.set(
+        this.boundary.pathKey(candidate),
+        reconstructible,
+      );
+    }
+    const candidates = [
+      ...baselineCandidates.filter(
+        (value) =>
+          reconstructibleBaselines.get(this.boundary.pathKey(value)) === false,
+      ),
+      ...baselineCandidates.filter(
+        (value) =>
+          reconstructibleBaselines.get(this.boundary.pathKey(value)) === true,
+      ),
+      ...uniqueSorted(entryEndpoints(boundary.entries)).filter(
+        (value) => !baselineKeys.has(this.boundary.pathKey(value)),
+      ),
+    ];
     const images: WorkspaceBeforeImage[] = [];
     let retainedBytes = 0;
     for (const candidate of candidates) {
-      const isBaseline = baselineKeys.has(this.boundary.pathKey(candidate));
+      const candidateKey = this.boundary.pathKey(candidate);
+      const isBaseline = baselineKeys.has(candidateKey);
+      const hasReconstructibleBaseline =
+        reconstructibleBaselines.get(candidateKey) === true;
       if (images.length >= WORKSPACE_OBSERVATION_MAX_IMAGES) {
-        if (
-          isBaseline &&
-          !(await baseline.hasReconstructibleBaseline(candidate))
-        ) {
+        if (isBaseline && !hasReconstructibleBaseline) {
           throw unreconstructible(candidate);
         }
         continue;
@@ -1008,7 +1044,7 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
           ? await this.readWorktree(candidate, true, signal)
           : cachedSample;
       if (!sample.exists) {
-        if (isBaseline && !(await baseline.hasReconstructibleBaseline(candidate))) {
+        if (isBaseline && !hasReconstructibleBaseline) {
           throw unreconstructible(candidate);
         }
         images.push({ kind: "absent", exists: false, path: candidate });
@@ -1020,7 +1056,7 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
         sample.sha256 === undefined ||
         sample.binary === undefined
       ) {
-        if (isBaseline && !(await baseline.hasReconstructibleBaseline(candidate))) {
+        if (isBaseline && !hasReconstructibleBaseline) {
           throw unreconstructible(candidate);
         }
         continue;
@@ -1065,11 +1101,12 @@ export class LiveWorkspaceObserver implements WorkspaceObserver {
         sha256: sample.sha256,
         binary: sample.binary,
       });
-      if (isBaseline && !(await baseline.hasReconstructibleBaseline(candidate))) {
+      if (isBaseline && !hasReconstructibleBaseline) {
         throw unreconstructible(candidate);
       }
     }
-    return images;
+    return images.sort((left, right) =>
+      compareGitPathBytes(beforeImagePath(left), beforeImagePath(right)));
   }
 
   private async matchingBlob(
