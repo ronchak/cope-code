@@ -92,9 +92,11 @@ Two current behaviors need explicit terminal branches:
 
 Adding a local registry member also makes existing exhaustive switches and default
 `TOOL_NAMES` projections significant. The shared-contract gate must compile with a
-source-free ToolHost denial stub and must explicitly exclude `terminal_exec` from
-default organization, repository, and session tool lists. Registration alone never
-grants or advertises the new authority.
+source-free ToolHost denial stub and must explicitly deny `terminal_exec` in default
+organization, repository, and session tool rules. A pre-terminal allowlist is not
+enough because the current upper layers have `default_decision: "allow"` and unmatched
+tools fall through to that decision. Registration alone never grants or advertises the
+new authority.
 
 ## Additive contract
 
@@ -281,10 +283,13 @@ to distinguish that harmless window.
 
 `AgentRuntime.findUncertainMutation` checks for a matching complete result artifact
 while the journal record is still `executing`, before `OperationJournal.register`
-would convert it to indeterminate. It calls an additive
-`ToolExecutor.recoverCompleted(call)` seam, marks the existing executing record
-complete, and then uses normal replay. Recovery after re-registration is too late
-because the current journal correctly refuses to complete an indeterminate record.
+would convert it to indeterminate. Restart state does not retain the original
+`NormalizedToolCall.arguments`, so it calls an additive
+`ToolExecutor.recoverCompleted({ operationId, tool, requestHash })` seam. That seam
+loads the terminal-request artifact, verifies its operation ID and exact request hash,
+then verifies the bound result artifact. Runtime marks the existing executing record
+complete and uses normal replay. Recovery after re-registration is too late because
+the current journal correctly refuses to complete an indeterminate record.
 
 | Durable evidence | Recovery action |
 | --- | --- |
@@ -424,8 +429,11 @@ Grant behavior:
 | config v1, old preference, old grant/session, or denying managed policy | terminal absent; hardened-compatible behavior retained |
 
 Grant creation passes a filtered tool list rather than blindly using the expanded
-`TOOL_NAMES`. New quick setup writes config v2 and explicit policy allowlist entries.
-Existing configs and live sessions are never rewritten automatically.
+`TOOL_NAMES`. New quick setup writes config v2 and new organization, repository, and
+session projections that explicitly allow `terminal_exec` and remove the C0 default
+deny at those new v2 layers. A lower-layer allow never overrides an inherited
+organization or repository deny. Existing config-v1 policies and live sessions are
+never rewritten automatically.
 
 The one concise Developer grant states:
 
@@ -460,14 +468,16 @@ C0 is the first commit of Slice 1 and the branching gate for dependent work:
 - `src/tools/process-runner.ts`: public terminal request/outcome/output-sink signatures.
 - `src/tools/tool-host.ts`: an exhaustive, source-free terminal denial stub so the
   registry addition compiles without execution authority;
-- `src/policy/defaults.ts`: explicit pre-terminal tool lists for default organization,
-  repository, and session grants.
+- `src/policy/defaults.ts`: explicit `terminal_exec` deny rules for default
+  organization, repository, and session policy projections; pre-terminal allowlists
+  alone are not authoritative denial.
 
 C0 contains no process execution logic. Its checks audit every `ToolName`-keyed schema,
-switch, bootstrap projection, policy list, and test fixture. The default-deny lists
+switch, bootstrap projection, policy list, and test fixture. The explicit denies
 ensure that no new inspect, edit, or auto session grants or advertises the tool before
-Slice 3. Claude reviews its exact SHA before specialist branches start. After review,
-contract changes are stop-the-line integration changes.
+Slice 3, even when an upper layer's unmatched default is allow. Claude reviews its
+exact SHA before specialist branches start. After review, contract changes are
+stop-the-line integration changes.
 
 ### Slice 1 PR — terminal execution and exact recovery
 
@@ -547,7 +557,8 @@ authority.
 Production surface:
 
 - config v2 and strict compatibility loader;
-- explicit policy/grant capability and filtered tool list;
+- explicit v2 organization/repository/session policy capability that replaces the C0
+  deny only for new Developer grants, plus a filtered tool list;
 - setup, preference, CLI, presentation, and doctor behavior;
 - compact active terminal capability projection;
 - reduced repeated terminal schema prose after bootstrap;
