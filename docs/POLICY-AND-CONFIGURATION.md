@@ -11,7 +11,10 @@ Cope's target has two practical policy profiles:
 
 Inspect mode remains a read-only option.
 
-Cope 0.1.9 implements the current layered organization, repository, and session policy system. The developer-mode defaults described here are a target and require code and schema changes.
+Cope 0.1.10 implements the first Developer-mode policy vertical on the existing
+layered organization, repository, and session policy system. New quick setups
+are Developer-ready. Existing valid configurations and managed policies keep
+their exact meaning and are not automatically migrated.
 
 ## Policy precedence
 
@@ -29,7 +32,7 @@ Inspect mode authorizes project-local reads and safe diagnostics. It denies file
 
 ### Developer
 
-Developer mode should be the recommended default. Its initial session grant authorizes:
+Developer mode is the recommended new-project profile. Its initial session grant authorizes:
 
 - read, create, update, delete, move, and rename through typed repository tools inside the selected workspace;
 - direct argv and shell execution as the current user;
@@ -40,7 +43,9 @@ Developer mode should be the recommended default. Its initial session grant auth
 - bounded command output, diffs, and mutation records;
 - all normal repository and lifecycle tools.
 
-The grant should be task-scoped and presented once in a concise human-readable summary. It must state that general child processes are not sandboxed to the selected project.
+The grant is task-scoped and presented once in a concise human-readable
+summary. It states that general child processes run as the current user and are
+not sandboxed to the selected project.
 
 ### Hardened
 
@@ -100,9 +105,11 @@ Cope state and browser profile roots are always excluded from typed workspace co
 
 The current command catalog remains valid for hardened commands and deterministic required validation.
 
-Developer mode requires a separate `terminal_exec` capability with a required tool contract such as `terminal-exec/1`. It should be additive to the established model-facing envelope and should not widen `run_command`.
+Developer mode uses the separate `terminal_exec` capability with required
+contract `terminal-exec/1`. It is additive to the established model-facing
+envelope and does not widen `run_command`.
 
-Terminal policy authorizes:
+The current one-shot terminal policy authorizes:
 
 - direct argv execution;
 - explicit shell execution;
@@ -111,20 +118,29 @@ Terminal policy authorizes:
 - network use;
 - maximum runtime and model-visible output;
 - local output streaming;
-- later persistent process creation;
-- known high-consequence classes that still require confirmation.
+- bounded process lifetime and output; and
+- local Git and ordinary network-dependent behavior through the approved
+  current-user command.
 
-The policy should authorize the capability class rather than requiring every exact command to be predeclared. The runtime still records each exact command and result.
+The policy authorizes the terminal capability class rather than requiring
+every exact command to be predeclared. The runtime still records each exact
+command and result. PTYs, stdin, persistent processes, additional roots, and
+typed remote-action classification remain later work.
 
 Shell mode may carry a higher risk label than direct argv mode, but it should not require a prompt for every invocation after the user has approved developer mode.
 
 ## Command-generated mutations
 
-Developer policy must permit terminal commands to create, update, delete, and rename project files.
+Developer policy permits terminal commands to create, update, delete, and
+rename project files.
 
 Authorization occurs against the active terminal capability before launch. The exact mutation set is observed after execution and added to session state. A command is not denied merely because its future changed paths cannot be enumerated perfectly in advance.
 
-Changed-file and changed-line budgets for `terminal_exec` should be metered from observed post-command effects. They cannot be exact preconditions for launching an arbitrary command. If actual usage exceeds a configured developer-mode limit, Cope records the effects truthfully and pauses or blocks later work rather than pretending the command did not run.
+Changed-file and changed-line budgets for `terminal_exec` are metered from
+observed post-command effects. They cannot be exact preconditions for launching
+an arbitrary command. If actual usage exceeds the effective limit, Cope
+records the effects truthfully and pauses later work rather than pretending the
+command did not run.
 
 The runtime should stop or ask when it observes an effect outside the intended project or against protected Cope state. It must acknowledge that an unrestricted host process can produce external effects that application-level inspection cannot detect.
 
@@ -132,7 +148,9 @@ Hardened mode may require declared write scopes, isolated worktrees, or no comma
 
 ## Network policy
 
-Developer mode should permit normal network use by local developer commands after the initial grant.
+Developer mode permits normal network use by local developer commands after
+the initial grant. This is conveyed as current-user process authority, not as a
+claim that Cope can classify or firewall every child connection.
 
 Application-level network metadata is authorization and reporting, not enforceable egress isolation. Exact host allowlists are suitable only when the command's behavior is actually predictable or when an external network control enforces them.
 
@@ -140,15 +158,17 @@ Hardened deployments may deny network, permit selected hosts, or run commands in
 
 ## Environment policy
 
-The current minimal inherited environment is suitable for hardened validation but insufficient for a normal developer terminal.
-
-Developer mode should begin from the current user's ordinary process environment and remove only Cope-internal control variables or values that are specifically unsafe to forward. The exact inherited variable names should be visible in diagnostics without exposing secret values.
+Catalog validation retains the minimal hardened environment. Developer
+terminal execution begins from the current user's ordinary process environment
+and removes Cope-internal control variables and malformed entries. Durable
+metadata records hashes and key names rather than secret values.
 
 Secret environment values may be consumed by child processes. They must not be copied into browser messages unless the outbound content scanner explicitly permits the resulting text.
 
 ## Git and remote actions
 
-Local Git operations should be part of developer mode. The runtime may expose them through terminal execution initially and typed tools later.
+Local Git operations are part of Developer authority through terminal
+execution. Typed Git mutation tools remain later work.
 
 Remote Git and publication actions should be separately visible where Cope can classify them. Suggested target classes are:
 
@@ -214,7 +234,7 @@ The exact format is versioned tool-contract work. Stable implementation details,
 
 ## Current configuration compatibility
 
-Cope 0.1.9 repository configuration includes:
+Cope 0.1.10 repository configuration includes:
 
 - repository classification;
 - embedded repository policy;
@@ -224,11 +244,35 @@ Cope 0.1.9 repository configuration includes:
 - repository and patch limits;
 - retention settings.
 
-Those files remain valid for the released implementation. A developer-mode schema should either migrate them explicitly or introduce a new version. Existing documents must not be silently widened to grant shell access.
+Strict `cba-repository-config/2` contains all of those fields plus exactly:
 
-The current quick setup can continue producing a hardened-compatible catalog for known validation commands after developer mode is added. Those commands remain useful as named completion checks.
+```json
+{
+  "developer_terminal": {
+    "enabled": true
+  }
+}
+```
 
-For the minimum pivot, the existing internal `auto` session mode may be presented as developer mode for newly created sessions while old persisted sessions retain their current meaning. A later schema migration can rename the internal mode without blocking terminal capability.
+The v2 bit is necessary but not sufficient: the session must be newly created
+in internal `auto` mode and every policy layer must allow `terminal_exec`.
+
+Strict `cba-repository-config/1` remains readable, normalizes to terminal
+disabled in memory, and retains its raw document hash for resume pinning.
+Existing documents and valid machine policies are not automatically rewritten
+or widened. A resumed session keeps the original config, policy, and grant
+hashes.
+
+Quick setup writes config v2. Its standard profile enables Developer terminal
+and writes a Developer-capable repository ceiling; inspect and manual profiles
+write v2 with terminal disabled. Fresh machine setup writes a
+Developer-capable organization ceiling. Existing machine policies continue to
+win unchanged.
+
+The existing internal `auto` session mode is presented as Developer for newly
+created sessions. `edit`, `inspect`, old grants, and old persisted sessions
+retain their current meaning. Catalog commands remain useful as named
+completion checks even in Developer projects.
 
 ## Configuration principles
 

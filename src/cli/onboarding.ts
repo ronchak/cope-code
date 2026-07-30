@@ -30,7 +30,8 @@ import {
   type BrowserCopilotTransport,
 } from "../browser/index.js";
 import {
-  DEFAULT_ORGANIZATION_POLICY,
+  DEFAULT_DEVELOPER_ORGANIZATION_POLICY,
+  DEFAULT_DEVELOPER_REPOSITORY_POLICY,
   DEFAULT_REPOSITORY_POLICY,
   assertValidPolicyDocument,
   type PolicyDocument,
@@ -201,14 +202,18 @@ export async function ensureRepositoryConfiguration(options: {
   let profile = options.preferredProfile;
   if (profile === undefined && options.interactive) {
     profile = await selectPrompt("How much access should Cope start with?", [
-      { value: "standard", label: "Edit this project", description: "Recommended. Read and change project files, with prompts for protected actions" },
+      {
+        value: "standard",
+        label: "Developer",
+        description: "Recommended. Read, edit, and enable current-user terminal work when Developer mode is selected",
+      },
       { value: "inspect", label: "Inspect only", description: "Read the project without changing files" },
     ] as const);
   }
   profile ??= "standard";
   const result = await writeRepositoryConfiguration({ repositoryRoot: options.repositoryRoot, profile, force: true });
   section("Project ready", output);
-  keyValue("Access", profile === "inspect" ? "inspect only" : "edit", output);
+  keyValue("Access", profile === "inspect" ? "inspect only" : "Developer ready", output);
   keyValue("Validation commands", result.commandCount, output);
   if (result.commandCount > 0) info(`Detected ${result.commandCount} package validation command${result.commandCount === 1 ? "" : "s"}.`, output);
   else warning(
@@ -575,9 +580,8 @@ async function policyForSetup(filename: string): Promise<PolicyDocument | undefi
     }
   }
   const policy: PolicyDocument = {
-    ...DEFAULT_ORGANIZATION_POLICY,
+    ...DEFAULT_DEVELOPER_ORGANIZATION_POLICY,
     policy_id: "cope-local-user",
-    revision: "1",
   };
   assertValidPolicyDocument(policy);
   return policy;
@@ -848,11 +852,13 @@ async function createQuickRepositoryConfig(
   const preferred = preferredRequiredCommand(commands);
   return {
     schema_version: REPOSITORY_CONFIG_VERSION,
+    developer_terminal: { enabled: profile === "standard" },
     classification: "internal",
     policy: {
-      ...DEFAULT_REPOSITORY_POLICY,
+      ...(profile === "standard"
+        ? DEFAULT_DEVELOPER_REPOSITORY_POLICY
+        : DEFAULT_REPOSITORY_POLICY),
       policy_id: "cope-project",
-      revision: "1",
     },
     grant_defaults: {
       readable_paths: ["**"],
@@ -872,6 +878,7 @@ async function createQuickRepositoryConfig(
 function createManualRepositoryConfig(): RepositoryAgentConfig {
   return {
     schema_version: REPOSITORY_CONFIG_VERSION,
+    developer_terminal: { enabled: false },
     classification: "internal",
     policy: { ...DEFAULT_REPOSITORY_POLICY, policy_id: "cope-project", revision: "1" },
     grant_defaults: {

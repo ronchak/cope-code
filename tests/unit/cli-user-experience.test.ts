@@ -213,6 +213,41 @@ test("task access renders one effective capability summary", async () => {
   assert.doesNotMatch(rendered, /Mode:\s+edit, approvals as needed/u);
 });
 
+test("Developer grant states current-user terminal, network, Git, and observation limits once", async () => {
+  const output = new MemoryOutput();
+  const user = new TerminalUserInteraction({ output });
+  assert.equal(await user.approveInitialGrant(JSON.stringify({
+    schema_version: "cba-effective-grant/1",
+    mode: "auto",
+    requested_mode: "auto",
+    effective_mode: "developer",
+    can_read: true,
+    can_write: true,
+    can_run_commands: true,
+    repository_root: "/project",
+    readable_paths: ["**"],
+    writable_paths: ["**"],
+    creatable_paths: ["**"],
+    deletable_paths: ["**"],
+    command_ids: [],
+    command_categories: [],
+    disclosure_classifications: ["internal"],
+    network: { session_access: "deny" },
+    terminal: {
+      active: true,
+      runs_as: "current-user",
+    },
+  }), true), true);
+  const rendered = stripAnsi(output.value);
+  assert.match(rendered, /Effective mode:\s+Developer/u);
+  assert.match(rendered, /Terminal:\s+Developer terminal enabled/u);
+  assert.match(rendered, /Network:\s+ordinary child access is not restricted by Cope/u);
+  assert.match(rendered, /current user/u);
+  assert.match(rendered, /not an OS sandbox/u);
+  assert.match(rendered, /local Git state/u);
+  assert.equal((rendered.match(/not an OS sandbox/gu) ?? []).length, 1);
+});
+
 test("completion output classifies file provenance and reports absent project validation", () => {
   const rendered = stripAnsi(renderHumanResult({
     status: "completed",

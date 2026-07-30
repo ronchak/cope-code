@@ -309,7 +309,11 @@ async function selectMode(current: AutonomyMode): Promise<AutonomyMode> {
   const choices = [
     { value: "inspect", label: "Inspect", description: "Read only" },
     { value: "edit", label: "Edit", description: "Change files and ask for consequential permissions" },
-    { value: "auto", label: "Auto", description: "Fewer prompts inside the configured project policy" },
+    {
+      value: "auto",
+      label: "Developer",
+      description: "Terminal, ordinary network-dependent commands, and local Git when project policy enables them",
+    },
   ] as const;
   return selectPrompt("Choose session mode", choices, {
     defaultIndex: Math.max(0, choices.findIndex((choice) => choice.value === current)),
@@ -331,7 +335,7 @@ export async function configuredBrowserLabel(filename: string): Promise<string> 
 
 function showSlashHelp(output: Writable): void {
   section("Interactive commands", output);
-  commandHint("/mode", "Switch between inspect, edit, and auto", output);
+  commandHint("/mode", "Switch between inspect, edit, and Developer", output);
   commandHint("/resume", "Resume a paused or interrupted session", output);
   commandHint("/sessions", "Show recent work for this project", output);
   commandHint("/repo PATH", "Open another project or standalone file", output);

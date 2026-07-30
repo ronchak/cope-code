@@ -1,6 +1,6 @@
 # Model-facing `cba-agent/1` and internal `cba/1`
 
-Cope 0.1.9 separates model intent from transport mechanics. Copilot emits the
+Cope 0.1.10 separates model intent from transport mechanics. Copilot emits the
 small `cba-agent/1` model-facing contract. The deterministic harness owns
 session correlation, generates identifiers, decides safe batching, and
 normalizes the request into internal `cba/1`.
@@ -8,9 +8,9 @@ normalizes the request into internal `cba/1`.
 This preserves strict, auditable tool execution without asking the model to act
 as the session-state manager or wire serializer.
 
-Everything through the completion section below describes the shipped 0.1.9
-contract. The later developer-mode section is a target, not a claim that
-general terminal execution already ships.
+The established envelopes remain version 1. Tool authority evolves through
+strict additive contracts and the durable session grant; 0.1.10 adds
+`terminal_exec` without an envelope-wide migration.
 
 ## Model-facing envelope
 
@@ -89,8 +89,8 @@ Independent reads can be expressed without model-authored batching metadata:
 The harness accepts `observe` only for `list_files`, `search_text`,
 `read_file`, `git_status`, and `git_diff`. It rejects dependent, mutating, or
 command intents in an observation set. `edit_text`, `apply_patch`,
-`run_command`, `request_user_input`, `request_capability`, and `complete_task`
-remain single-action intents.
+`run_command`, `terminal_exec`, `request_user_input`, `request_capability`, and
+`complete_task` remain single-action intents.
 
 Harness results are authoritative `cba-agent/1` data blocks with stable
 `operation_ref` values. Denials include retryability and whether a capability
@@ -119,7 +119,7 @@ the hard per-operation ceiling with the cumulative disclosure budget.
 The repository-wide read pattern `**` includes the repository root (`.`), so the
 bootstrap inventory call does not require a redundant path approval.
 
-## V1 tools
+## Current tools
 
 | Tool | Purpose | Consequential behavior |
 | --- | --- | --- |
@@ -131,6 +131,7 @@ bootstrap inventory call does not require a redundant path approval.
 | `edit_text` | exact old-to-new replacement in one existing text file | base hash, occurrence count, policy, checkpoint, rollback, and post-state verification |
 | `apply_patch` | one atomic create/update/delete transaction | exact hashes, policy, checkpoint, rollback, and post-state verification |
 | `run_command` | invoke one catalog ID with typed parameters | no shell; controlled cwd, environment, time, output, cancellation; repository integrity is checked before and after every command |
+| `terminal_exec` | run one `terminal-exec/1` shell or argv invocation | Developer grant only; current-user process, project-relative cwd, live local output, durable bounded result, pre/post effect observation, and no blind replay |
 | `request_user_input` | ask for unavailable information or judgment | pauses; not routine confirmation |
 | `request_capability` | request a bounded session-grant expansion | organization/repository denies remain non-overridable |
 | `complete_task` | submit an advisory completion report | local verifier decides acceptance |
@@ -178,7 +179,13 @@ The local catalog resolves the fixed executable/arguments, typed parameters, wor
 
 The current `cba/1` definition exposes `sideEffects: boolean`. In `edit`/`auto`, an explicitly granted `sideEffects: true` command may run and may create ordinary Git-ignored build products. Those products are excluded from the completion source fingerprint. Every command is bracketed by nested-Git plus Git-visible, nonignored policy-hidden, protected-path, and Git-control integrity checks. A definition marked `sideEffects: false` additionally inventories ordinary Git-ignored files under fixed entry and byte bounds. Tracked/nonignored, protected, control, or nested-boundary drift—or an unverifiable inventory—raises `RECOVERY_REQUIRED` with reason `COMMAND_UNDECLARED_REPOSITORY_MUTATION` where applicable, and the command outcome is not accepted as trusted validation.
 
-This is a detection boundary, not a command-write transaction or an OS sandbox. Intentional source-mutating commands remain unsupported until a future versioned write-scope/checkpoint contract can authorize, capture, and restore their exact effects; small literal edits to existing text files use `edit_text`, while creates, deletes, whole-file replacements, and multi-file transactions use `apply_patch`. Approved executables and transitive scripts remain trusted computing base, and filesystem writes outside the repository cannot be comprehensively prevented or observed by this runtime.
+This is a detection boundary, not a command-write transaction or an OS
+sandbox. Intentional source mutation remains unsupported through
+`run_command`; use `terminal_exec` in an authorized Developer session, or use
+`edit_text`/`apply_patch` for stronger typed checkpoint and rollback
+guarantees. Approved executables and transitive scripts remain trusted
+computing base, and filesystem writes outside the repository cannot be
+comprehensively prevented or observed by this runtime.
 
 ## Result and denial
 
@@ -242,18 +249,17 @@ and is accepted only when the task has not mutated project files.
 
 The runtime rejects completion when repository state is unknown, a path is out of scope, an operation remains unresolved, delivery is indeterminate, required validation is missing/failed/stale, or the report is structurally incomplete. The rejection is another tool result, allowing Copilot to request the needed inspection or validation.
 
-## Developer-mode target: additive terminal contract
+## Developer mode: additive terminal contract
 
-The first developer-mode milestone should keep the proven `cba-agent/1`
-envelope, browser response capture, task correlation, and repair behavior. It
-should add `terminal_exec` to the active tool catalog with a required,
-independently versioned tool-contract discriminator such as
-`terminal-exec/1`.
+Cope 0.1.10 keeps the proven `cba-agent/1` envelope, browser response capture,
+task correlation, and repair behavior and adds `terminal_exec` with required,
+independently versioned discriminator `terminal-exec/1`.
 
-This is an additive target. It does not reinterpret the current catalog-backed
-`run_command` tool, and it does not require an envelope-wide `cba-agent/2`
-migration. Existing sessions gain only the tools present in their durable
-grant and bootstrap catalog.
+The addition does not reinterpret catalog-backed `run_command` and does not
+require `cba-agent/2`. A terminal request is executable only when it appears in
+the strict top-level intent and the durable session grant contains the tool.
+Existing sessions gain nothing merely because the installed binary knows the
+schema.
 
 Representative shell request:
 
@@ -267,27 +273,31 @@ Representative direct-argument request:
 {"kind":"agent_intent","intent":"terminal_exec","arguments":{"contract":"terminal-exec/1","mode":"argv","executable":"node","arguments":["scripts/check.mjs"],"cwd":".","timeout_ms":300000,"max_output_bytes":524288},"reason":"Run the repository check directly without shell syntax."}
 ```
 
-The exact field names remain an implementation-plan decision, but the contract
-must distinguish shell text from an executable plus argument vector and retain:
+The strict `oneOf` contract distinguishes shell text from an executable plus
+argument vector. Both variants accept optional validated project-relative
+`cwd`, `timeout_ms`, and `max_output_bytes`, which are clamped by the effective
+policy. It retains:
 
 - exact working directory and usable developer-environment behavior;
 - timeout, cancellation, and process-tree cleanup semantics;
 - local live-output streaming separate from bounded model-visible output;
 - harness-owned operation identity;
-- developer, inspect, or hardened-mode authorization; and
+- Developer, inspect, edit, or managed-policy authorization; and
 - a durable result or output-page reference that can be replayed without
   rerunning the command.
 
-The terminal result must report command outcome separately from mutation
-outcome. A failed, timed-out, or cancelled command may still have changed the
-project. Cope should observe pre-command and post-command repository state,
-attribute the observed effects to the operation, meter actual changed files and
-lines after execution, preserve pre-existing user work, and make completion
-validation stale when command-generated changes require revalidation.
+The durable `terminal-exec-result/1` reports process outcome separately from
+mutation outcome. A failed, timed-out, or cancelled command may still have
+changed the project. Cope observes bounded pre-command and post-command
+repository state, attributes known effects to the operation, meters actual
+changed files and lines after execution, preserves pre-existing user work, and
+makes completion validation stale after command-generated mutation.
 
-The bounded terminal result must become durable before the operation journal
-marks the tool complete. Recovery may resend that result or a stable output
-reference, but must never blindly replay an uncertain command.
+The bounded terminal result becomes durable before the operation journal marks
+the tool complete. Recovery may resend that exact verified result, but never
+blindly replays an uncertain command. Unknown, hidden/protected, or incomplete
+effect evidence blocks later work or completion instead of manufacturing a
+clean result.
 
 `run_command` remains the catalog-backed tool for hardened mode and named
 completion validation. A developer-mode project may use both: `terminal_exec`
@@ -299,10 +309,10 @@ later additions. They may remain under `cba-agent/1` while their tool contracts
 are additive; an envelope successor is needed only when top-level message,
 correlation, batching, or compatibility semantics change incompatibly.
 
-For context efficiency, Cope should send stable schemas at bootstrap, project a
-compact active-capability manifest, return concise authoritative results, and
-repeat full protocol instructions only after a real repair condition or
-material contract change.
+For context efficiency, Cope sends the stable schemas at bootstrap, filters the
+tool catalog to the durable grant, projects compact active terminal facts, and
+omits argument schemas on later contract refreshes. Full repair guidance is
+reserved for an actual protocol error.
 
 ## Data is never authority
 

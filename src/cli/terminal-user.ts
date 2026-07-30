@@ -96,6 +96,8 @@ export class TerminalUserInteraction implements UserInteraction {
       .map((category) => `category:${category}`);
     const disclosure = stringArray(parsed.disclosure_classifications);
     const network = recordValue(parsed.network);
+    const terminal = recordValue(parsed.terminal);
+    const terminalActive = terminal?.active === true;
 
     this.output.write("\n");
     keyValue("Read", compactList(readable, "none"), this.output);
@@ -109,10 +111,23 @@ export class TerminalUserInteraction implements UserInteraction {
       canRunCommands ? compactList([...commands, ...commandCategories], "granted by policy") : "none, inspect-only task",
       this.output,
     );
+    if (terminalActive) {
+      keyValue("Terminal", "Developer terminal enabled", this.output);
+    }
     if (disclosure.length > 0) keyValue("Copilot data", compactList(disclosure, "none"), this.output);
-    keyValue("Network", stringValue(network?.session_access) ?? "deny", this.output);
+    keyValue(
+      "Network",
+      terminalActive
+        ? "ordinary child access is not restricted by Cope"
+        : stringValue(network?.session_access) ?? "deny",
+      this.output,
+    );
 
-    if (canWrite) {
+    if (terminalActive) {
+      this.output.write(
+        `\n${dim("Commands run as your current user from this project as a starting directory, not an OS sandbox. They may use your normal environment and network access, and may change local Git state. Cope observes local repository effects after execution; retained output and results stay bounded.")}\n`,
+      );
+    } else if (canWrite) {
       this.output.write(`\n${dim("Cope checkpoints file edits before applying them and asks again when policy requires more access.")}\n`);
     } else {
       this.output.write(`\n${dim("This session cannot modify project files.")}\n`);
@@ -219,11 +234,12 @@ function compactObject(value: Readonly<Record<string, unknown>>): string {
 }
 
 function humanMode(mode: string): string {
+  if (mode === "developer") return "Developer";
   if (mode === "inspect-only") return "inspect-only";
   if (mode === "edit-capable") return "edit-capable";
   if (mode === "policy-auto") return "policy-auto";
   if (mode === "inspect") return "inspect, read-only";
   if (mode === "edit") return "edit, approvals as needed";
-  if (mode === "auto") return "auto, within project policy";
+  if (mode === "auto") return "Developer, within project policy";
   return mode;
 }

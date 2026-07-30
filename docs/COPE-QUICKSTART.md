@@ -25,7 +25,11 @@ A path may be a Git project, a normal folder, or a standalone file. Non-Git fold
 
 ## Modes
 
-`edit` is the default and can change project files within the configured policy. `inspect` is read-only. `auto` reduces prompts only inside the same project policy. It is not unrestricted mode.
+The interface presents internal `auto` mode as **Developer**. A new quick
+setup is Developer-ready, but terminal authority is granted only for a new
+Developer session whose config-v2 enable bit and all policy layers allow it.
+`edit` uses typed file tools and catalog commands without general terminal
+authority. `inspect` is read-only.
 
 ```powershell
 cope --inspect
@@ -35,9 +39,26 @@ cope --auto
 
 Change modes inside the interface with `/mode`.
 
+Developer terminal commands run as the current user with the selected project
+as their starting directory. Cope does not provide an OS sandbox or egress
+firewall: child processes may use the ordinary environment and network and may
+change local Git state. Cope records bounded output and observes local project
+effects after execution.
+
+Existing `cba-repository-config/1` projects, old durable grants, and a managed
+organization or repository policy that denies `terminal_exec` remain
+terminal-free. `cope doctor` reports the project schema and enable bit; start a
+new session after a deliberate configuration change because resume requires
+the original hashes.
+
 ## Task permissions
 
-Before a task begins, Cope shows a compact access screen with the project, mode, paths, command IDs, Copilot data classes, and network setting. Permission expansions use a three-choice prompt: allow once, allow for the session, or deny.
+Before a task begins, Cope shows a compact access screen with the project,
+effective mode, paths, command IDs, Copilot data classes, and network setting.
+A Developer grant also states current-user execution, lack of OS sandboxing,
+ordinary environment/network access, local Git effects, and observation/output
+limits. Permission expansions use a three-choice prompt: allow once, allow for
+the session, or deny.
 
 ## Recovery
 

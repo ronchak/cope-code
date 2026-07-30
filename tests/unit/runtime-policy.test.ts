@@ -4,12 +4,13 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  DEFAULT_DEVELOPER_ORGANIZATION_POLICY,
+  DEFAULT_DEVELOPER_REPOSITORY_POLICY,
   DEFAULT_ORGANIZATION_POLICY,
   DEFAULT_REPOSITORY_POLICY,
   PolicyEngine,
   createDefaultSessionGrant,
   type BudgetUsage as PolicyBudgetUsage,
-  type RuleSet,
   zeroPolicyBudgetUsage,
 } from "../../src/policy/index.js";
 import {
@@ -70,27 +71,23 @@ async function harness(
     command_ids: ["test"],
     ...(options.budgets === undefined ? {} : { budgets: options.budgets }),
     ...(options.tools === undefined ? {} : { tools: options.tools }),
+    enable_terminal_exec: options.terminalEnabled === true,
   });
-  const session = options.terminalEnabled === true
-    ? {
-        ...baseSession,
-        capabilities: {
-          ...baseSession.capabilities,
-          tools: allowTerminalTool(baseSession.capabilities.tools),
-        },
-      }
-    : baseSession;
+  const session = baseSession;
+  const defaultOrganization = options.terminalEnabled === true
+    ? DEFAULT_DEVELOPER_ORGANIZATION_POLICY
+    : DEFAULT_ORGANIZATION_POLICY;
   const baseOrganization =
     options.maxDisclosureFiles === undefined &&
     options.maxDisclosureBytes === undefined &&
     options.higherDisclosedBytes === undefined
-    ? DEFAULT_ORGANIZATION_POLICY
+    ? defaultOrganization
     : {
-        ...DEFAULT_ORGANIZATION_POLICY,
+        ...defaultOrganization,
         capabilities: {
-          ...DEFAULT_ORGANIZATION_POLICY.capabilities,
+          ...defaultOrganization.capabilities,
           disclosure: {
-            ...DEFAULT_ORGANIZATION_POLICY.capabilities.disclosure,
+            ...defaultOrganization.capabilities.disclosure,
             ...(options.maxDisclosureFiles === undefined
               ? {}
               : { max_files_per_operation: options.maxDisclosureFiles }),
@@ -102,31 +99,15 @@ async function harness(
             ? {}
             : {
                 budgets: {
-                  ...DEFAULT_ORGANIZATION_POLICY.capabilities.budgets,
+                  ...defaultOrganization.capabilities.budgets,
                   disclosed_bytes: options.higherDisclosedBytes,
                 },
               }),
         },
       };
-  const organization = options.terminalEnabled === true
-    ? {
-        ...baseOrganization,
-        capabilities: {
-          ...baseOrganization.capabilities,
-          tools: allowTerminalTool(baseOrganization.capabilities.tools),
-        },
-      }
-    : baseOrganization;
+  const organization = baseOrganization;
   const repository = options.terminalEnabled === true
-    ? {
-        ...DEFAULT_REPOSITORY_POLICY,
-        capabilities: {
-          ...DEFAULT_REPOSITORY_POLICY.capabilities,
-          tools: allowTerminalTool(
-            DEFAULT_REPOSITORY_POLICY.capabilities.tools,
-          ),
-        },
-      }
+    ? DEFAULT_DEVELOPER_REPOSITORY_POLICY
     : DEFAULT_REPOSITORY_POLICY;
   const policy = new LayeredRuntimePolicy({
     engine: new PolicyEngine({
@@ -143,20 +124,6 @@ async function harness(
     ...(options.maxPatchBytes === undefined ? {} : { maxPatchBytes: options.maxPatchBytes }),
   });
   return { root, policy, boundary, catalog };
-}
-
-function allowTerminalTool(
-  rules: RuleSet<ToolName> | undefined,
-): RuleSet<ToolName> {
-  const { deny: _deny, ...rest } = rules ?? {};
-  const allow = [...(rules?.allow ?? [])];
-  if (!allow.includes("terminal_exec")) allow.push("terminal_exec");
-  const deny = rules?.deny?.filter((tool) => tool !== "terminal_exec") ?? [];
-  return {
-    ...rest,
-    allow,
-    ...(deny.length === 0 ? {} : { deny }),
-  };
 }
 
 test("layered runtime policy allows in-scope reads, patches, and catalog commands", async () => {
@@ -272,6 +239,12 @@ test("default grants never advertise terminal execution in any existing mode", a
 
 test("an explicit terminal grant receives clamped execution and disclosure bounds", async () => {
   const { policy } = await harness("auto", { terminalEnabled: true });
+  const summary = policy.summarize();
+  assert.equal(summary.network, "allow");
+  assert.match(
+    (summary.notes as readonly string[]).join("\n"),
+    /ordinary environment and network access and local Git may be used/u,
+  );
   const decision = await policy.authorize({
     operationId: "op_terminal_bounds",
     name: "terminal_exec",

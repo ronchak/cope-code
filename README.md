@@ -8,16 +8,15 @@ Cope's local runtime owns repository access, terminal and process execution, use
 
 ## Current release and target
 
-The current package version is **0.1.9**.
+The current package version is **0.1.10**.
 
-Version 0.1.9 implements the visible-browser transport, typed
-`cba-agent/1` intent protocol, repository inspection and patching, catalog
-command execution, durable recovery, and completion foundations. It also fixes
-the live response-ingestion failure by reconstructing only response-owned
-protocol widgets, carrying source-free capture evidence through recovery, and
-preserving exact protocol diagnostics. It is still a hardened precursor rather
-than the full developer-mode product: it does not expose a general shell or
-permit commands to intentionally modify tracked project files.
+Version 0.1.10 ships the first complete Developer-mode terminal vertical:
+additive shell and argv execution, usable current-user environment inheritance,
+bounded live output, durable no-replay results, pre/post repository observation,
+command-mutation attribution, post-hoc accounting, and completion freshness.
+New quick setups are Developer-ready. A new session receives terminal authority
+only when the user selects Developer mode, repository config v2 enables it, and
+every organization, repository, and session policy layer allows it.
 
 Microsoft Edge Stable remains the established live compatibility target.
 Google Chrome Stable remains a **Chrome preview candidate / offline evidence
@@ -35,18 +34,23 @@ The architecture pivot is documented in:
 - [Requirements traceability](docs/REQUIREMENTS-TRACEABILITY.md)
 
 Current release behavior is documented in the
-[Cope 0.1.9 release notes](docs/RELEASE-NOTES-0.1.9.md) and the [0.1.9 protocol-ingestion
-PRD](docs/PRD-0.1.9-PROTOCOL-INGESTION.md). Earlier behavior remains in the
-[0.1.8 release notes](docs/RELEASE-NOTES-0.1.8.md).
+[Cope 0.1.10 release notes](docs/RELEASE-NOTES-0.1.10.md). The prior
+response-ingestion work remains documented in the [0.1.9 protocol-ingestion
+PRD](docs/PRD-0.1.9-PROTOCOL-INGESTION.md) and
+[0.1.9 release notes](docs/RELEASE-NOTES-0.1.9.md).
 
 ## Product direction
 
-Developer mode will become the recommended default. One concise project-scoped grant will authorize ordinary repository and terminal work, including shell and argv execution, command-generated project changes, normal network-dependent development tools, and local Git operations.
+Developer mode is the recommended profile for new personal projects. One
+concise task-scoped grant authorizes ordinary repository and terminal work,
+including shell and argv execution, command-generated project changes, normal
+network-dependent development tools, and local Git operations.
 
 Inspect mode will remain read-only. The existing fixed command-catalog model will remain available as an optional hardened profile for managed environments.
 
-The target documents describe where Cope is going. They do not claim the 0.1.9
-code already implements developer mode.
+The first Developer terminal vertical now ships. PTYs, stdin, persistent
+process handles, typed Git mutation tools, multiple workspace roots, and
+isolated execution profiles remain later work.
 
 ## Install on Windows
 
@@ -130,7 +134,10 @@ Continue the newest resumable session:
 cope -c
 ```
 
-The current 0.1.9 release starts in its existing edit-capable policy model. The future developer mode described in the architecture docs is not yet available merely because the documentation names it.
+New quick project setup writes repository config v2 and makes the project
+Developer-ready. Select Developer in `/mode` or start with `cope --auto`.
+Existing config-v1 projects and existing managed policies remain terminal-free
+until deliberately replaced; resume never widens an old session.
 
 ## Standalone files
 
@@ -189,7 +196,11 @@ cope help advanced
 
 Credentials, MFA, CAPTCHA, consent, and ordinary-profile import are never automated.
 
-Per-project setup creates `.cba\repository.json`. The current release detects selected npm validation scripts such as `test`, `check`, `build`, `typecheck`, and `lint`. Those catalog commands remain useful, but they are not the target terminal architecture.
+Per-project setup creates `.cba\repository.json`. Quick Developer setup writes
+strict `cba-repository-config/2` with one explicit
+`developer_terminal.enabled` bit and detects selected npm validation scripts
+such as `test`, `check`, `build`, `typecheck`, and `lint`. Catalog commands
+remain the authoritative path for named completion checks.
 
 Run diagnostics at any time:
 
@@ -216,7 +227,10 @@ npm test
 
 The suite builds the project and runs deterministic tests serially. Browser classifier tests use synthetic page states, and agent-loop tests use local fixtures. They do not contact Copilot.
 
-A developer-mode implementation must preserve offline full-loop testing while adding shell execution, command-generated mutation handling, and process recovery coverage.
+The deterministic suites cover shell and argv execution, interruption and
+no-replay recovery, command-generated mutations, completion freshness, legacy
+configuration compatibility, and policy-denied fallbacks without contacting
+Copilot.
 
 ## Configuration locations
 

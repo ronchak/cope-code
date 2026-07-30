@@ -13,7 +13,10 @@ import path from "node:path";
 import { AuditLog } from "../audit/audit-log.js";
 import { browserProductPresentation, launchBrowserCopilotTransport } from "../browser/index.js";
 import { loadRuntimeConfiguration } from "../config/loader.js";
-import type { LoadedRuntimeConfiguration } from "../config/types.js";
+import {
+  REPOSITORY_CONFIG_VERSION,
+  type LoadedRuntimeConfiguration,
+} from "../config/types.js";
 import type { RuntimeProgressEvent } from "../orchestrator/agent-runtime.js";
 import { LayeredRuntimePolicy } from "../orchestrator/runtime-policy.js";
 import {
@@ -208,7 +211,7 @@ async function initializeRepository(
     validationCommands: result.commandCount,
     next: command.quick
       ? "Run cope in this project."
-      : "Review writable paths and commands, or rerun with cope init --quick for the guided editing profile.",
+      : "Review writable paths and commands, or rerun with cope init --quick for the guided Developer profile.",
   });
   return 0;
 }
@@ -269,12 +272,12 @@ async function runNewSession(
       fingerprintKey: bootstrapFingerprintKey,
       isPathAllowed: () => false,
     }).status();
-    const grant = createGrant(configuration, {
+    const grant = createInitialGrant(configuration, {
       taskId,
       repositoryRoot: boundary.root,
       ...(identityStatus.branch === null ? {} : { branch: identityStatus.branch }),
       mode: command.mode,
-    });
+    }, boundary.pathKey.bind(boundary));
     const engine = new PolicyEngine({
       organization: configuration.organizationPolicy,
       repository: configuration.repository.policy,
@@ -1015,7 +1018,7 @@ function isWithinPath(root: string, candidate: string): boolean {
     (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
-function createGrant(
+export function createInitialGrant(
   configuration: LoadedRuntimeConfiguration,
   input: {
     readonly taskId: string;
@@ -1023,8 +1026,9 @@ function createGrant(
     readonly branch?: string;
     readonly mode: SessionState["mode"];
   },
+  pathKey: (value: string) => string,
 ): SessionGrant {
-  return createDefaultSessionGrant({
+  const shared = {
     grant_id: newId("grant"),
     task_id: input.taskId,
     repository_root: input.repositoryRoot,
@@ -1034,7 +1038,25 @@ function createGrant(
     writable_paths: configuration.repository.grant_defaults.writable_paths,
     command_ids: configuration.repository.commands.map((command) => command.id),
     disclosure_classifications: configuration.repository.grant_defaults.disclosure_classifications,
+  };
+  const terminalRequested =
+    input.mode === "auto" &&
+    configuration.repository.schema_version === REPOSITORY_CONFIG_VERSION &&
+    configuration.repository.developer_terminal.enabled;
+  const candidate = createDefaultSessionGrant({
+    ...shared,
+    enable_terminal_exec: terminalRequested,
   });
+  if (!terminalRequested) return candidate;
+  const engine = new PolicyEngine({
+    organization: configuration.organizationPolicy,
+    repository: configuration.repository.policy,
+    session: candidate,
+    pathKey,
+  });
+  return completionAuthorityForEffectivePolicy(engine) === "observed"
+    ? candidate
+    : createDefaultSessionGrant(shared);
 }
 
 async function prepareTransport(
@@ -1624,7 +1646,7 @@ Start
 
 Useful controls
   cope --inspect               Start read-only
-  cope --auto                  Use the configured project policy with fewer prompts
+  cope --auto                  Use Developer mode when the project and machine policies enable it
   cope setup                   Run or change guided browser setup
   cope update                  Rebuild and reinstall from your local Cope checkout
   cope doctor                  Check Node, Git, browser, and configuration

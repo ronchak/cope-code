@@ -132,7 +132,7 @@ async function selectMode(current: AutonomyMode): Promise<AutonomyMode> {
   const choices = [
     { value: "inspect", label: "Inspect", description: "Read only" },
     { value: "edit", label: "Edit", description: "Change files and ask for consequential permissions" },
-    { value: "auto", label: "Auto", description: "Fewer prompts inside the configured project policy" },
+    { value: "auto", label: "Developer", description: "Terminal and local developer workflows when project policy enables them" },
   ] as const;
   return selectPrompt("Choose session mode", choices, {
     defaultIndex: Math.max(0, choices.findIndex((choice) => choice.value === current)),
@@ -141,7 +141,7 @@ async function selectMode(current: AutonomyMode): Promise<AutonomyMode> {
 
 function showSlashHelp(output: Writable): void {
   section("Interactive commands", output);
-  commandHint("/mode", "Preview inspect, edit, and auto modes", output);
+  commandHint("/mode", "Preview inspect, edit, and Developer modes", output);
   commandHint("/repo PATH", "Display another project path without opening it", output);
   commandHint("/doctor", "Show the demo environment check", output);
   commandHint("/config", "Explain live configuration status", output);

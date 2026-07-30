@@ -26,7 +26,9 @@ Use a synthetic repository first after any upgrade or configuration change.
 
 - Use `inspect` for orientation, diagnosis, and read-only smoke tests.
 - Use `edit` for bounded source/test changes and approved validation.
-- Use `auto` only after representative edit-mode tasks pass and the full grant is appropriate.
+- Use Developer (internal `auto`) when current-user shell/argv execution,
+  ordinary child network access, local Git effects, and the complete displayed
+  grant are appropriate.
 
 Do not widen paths or add commands preemptively. A bounded capability can be granted later if organization and repository policy permit it.
 
@@ -40,13 +42,41 @@ cope -C C:\work\eligible-repo "Fix the parser regression and add a focused test"
   --accept "The approved validation suite passes"
 ```
 
-Running `cope` without a task opens the guided interface. Use `/mode` to choose inspect, edit, or auto, and `/help` for the short interactive command list. The complete operational command set remains under `cope help advanced`.
+Running `cope` without a task opens the guided interface. Use `/mode` to choose
+Inspect, Edit, or Developer, and `/help` for the short interactive command
+list. `cope --auto` selects the same internal Developer mode. The complete
+operational command set remains under `cope help advanced`.
 
-Before work begins, review the compact task-access screen and explicitly approve it. It summarizes the repository, mode, allowed paths, commands, disclosure classes, and network setting. The underlying persisted grant still contains the complete versioned policy envelope. `--approve-grant` is suitable only when that exact computed envelope has already been reviewed through a controlled wrapper or scripted pilot procedure. It does not bypass policy.
+Before work begins, review the compact task-access screen and explicitly
+approve it. It summarizes the repository, effective mode, allowed paths,
+commands, disclosure classes, and network setting. For Developer, it also
+states that commands run as the current user, start in the project without an
+OS sandbox, may use the ordinary environment/network and local Git, and have
+bounded observed results. The underlying persisted grant still contains the
+complete versioned policy envelope. `--approve-grant` is suitable only when
+that exact computed envelope has already been reviewed through a controlled
+wrapper or scripted pilot procedure. It does not bypass policy.
 
-In `edit`/`auto`, commands marked `sideEffects: true`—including the example `npm.test`/`npm.build` entries—may run when the combined policy and session grant explicitly allow them. Every command is checked before and after for nested Git plus Git-visible/nonignored, keyed policy-hidden protected, and Git-control drift. A command marked `sideEffects: false` additionally inventories ordinary Git-ignored files under fixed entry/byte bounds; a side-effecting command may create ordinary ignored build artifacts, which are excluded from the completion source fingerprint. Tracked/nonignored, protected, control, nested, or unverifiable drift makes the session recovery-required and the command cannot satisfy validation. Intentional source-mutating commands remain unsupported until a future versioned write-scope/checkpoint contract; direct source changes use `edit_text` for small literal edits to existing text files or `apply_patch` for creates, deletes, whole-file replacements, and multi-file transactions.
+Catalog-backed `run_command` retains its established boundary. In
+`edit`/Developer, entries marked `sideEffects: true`—including example
+`npm.test`/`npm.build` definitions—may run when the combined policy and session
+grant explicitly allow them. Catalog validation still treats tracked,
+nonignored, protected, control, nested, or unverifiable drift as recovery
+required and does not satisfy validation from that run.
 
-Command checks are not an OS filesystem, network, or resource sandbox. Approved executables and their transitive scripts are trusted computing base, and external writes cannot be comprehensively prevented or observed. Do not start a live pilot until the endpoint owner approves the exact catalog/scripts and the required application-control, egress, filesystem, and resource containment; this live gate does not prevent fixture/replay autonomous-loop testing.
+Developer-only `terminal_exec` is the intentional command-mutation path. It
+runs one shell or argv request, observes the project before and after,
+attributes known in-scope changes even after nonzero/timeout/cancellation,
+meters actual effects, and makes prior validation stale. Named required
+validation still uses `run_command`; a terminal invocation does not satisfy a
+configured command ID.
+
+Command checks are not an OS filesystem, network, or resource sandbox.
+Developer child processes have the current user's ordinary authority, and
+external writes or connections cannot be comprehensively prevented or
+observed. Do not start a live pilot until the endpoint owner accepts that
+authority or supplies the required external application-control, egress,
+filesystem, and resource containment.
 
 Record the session ID. The CLI acquires one canonical-workspace lock, records Git/pre-existing state, creates an append-only audit chain, and binds the session to policy hashes and one transport.
 
@@ -99,7 +129,12 @@ Choose:
 
 ## Pause and stop controls
 
-In the active terminal, `Ctrl+C` or `SIGTERM` requests a safe, resumable pause. The runtime stops new actions, cancels its current wait/tool through the runtime signal, stops the browser transport, and persists `paused`. A run that ends paused returns exit code 2. Confirm the CLI reports `paused` before closing the terminal.
+In the active terminal, `Ctrl+C` or `SIGTERM` requests a safe, resumable pause.
+The runtime stops new actions, cancels its current wait/tool—including the
+active terminal process tree—stops the browser transport, persists all
+available command/effect truth, and then persists `paused`. A run that ends
+paused returns exit code 2. Confirm the CLI reports `paused` before closing the
+terminal.
 
 From another terminal, request a resumable pause:
 
@@ -115,7 +150,12 @@ To make the session terminal, use explicit abort:
 cope abort <session-id> --reason "operator stop"
 ```
 
-Abort uses the same active-owner control channel and cannot be downgraded by a later pause request. An inactive nonterminal session is moved directly to `aborted`; an existing terminal state is not altered. It reads session state directly and does not require valid browser or project configuration, so it remains available when those files are missing or stale.
+Abort is the emergency kill switch. It uses the same active-owner control
+channel, stops new terminal requests, cancels the active process tree, and
+cannot be downgraded by a later pause request. An inactive nonterminal session
+is moved directly to `aborted`; an existing terminal state is not altered. It
+reads session state directly and does not require valid browser or project
+configuration, so it remains available when those files are missing or stale.
 
 Run `cope sessions --all` before recovery. A `*` identifies a resume candidate whose static browser pins still match. A `!` identifies a blocked session and includes the reason plus an exact abort or reconciliation instruction. `cope abort --all` is deliberately rejected: bulk abort could erase the distinction between a clean startup interruption and a session with pending or recorded mutation evidence. If the process is unresponsive and the request is not acknowledged, follow the incident procedure: isolate the endpoint if necessary, terminate the known agent/child/agent-owned browser processes through approved endpoint tooling, preserve non-source evidence, and reconcile repository/session state before any resume.
 
@@ -136,7 +176,11 @@ Review:
 - disclosure classifications, byte counts, paths, and redaction counts; and
 - any policy denial, escalation, protocol repair, browser recovery, or indeterminate event.
 
-Perform normal human code review and delivery using standard repository tooling. V1 does not push, merge, deploy, publish, or release.
+Perform normal human code review and delivery using standard repository
+tooling. The typed tool surface does not provide push, merge, deploy, publish,
+or release operations. Developer shell code can conceal such remote effects,
+so the operator must not assume Cope classified or separately approved every
+remote action.
 
 The final status/diff printed by an immediately successful `run` or `resume` is a fresh, workspace-locked, consistency-checked handoff whose fingerprint matches the verifier snapshot. A later standalone `status` is only the integrity-checked persisted snapshot; use trusted Git tooling for current repository truth.
 
