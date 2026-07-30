@@ -59,6 +59,7 @@ export interface ReviewPackageBody {
     readonly taskId: string;
     readonly status: SessionState["status"];
     readonly mode: SessionState["mode"];
+    readonly completionAuthority: "frozen" | "observed";
     readonly createdAt: string;
     readonly startedAt: string;
     readonly updatedAt: string;
@@ -80,7 +81,10 @@ export interface ReviewPackageBody {
     readonly completedOperations: number;
     readonly pendingOperations: number;
     readonly mutations: number;
+    readonly patchMutations: number;
+    readonly terminalMutations: number;
     readonly validations: number;
+    readonly pendingTerminalEffects: number;
   };
   readonly mutations: readonly {
     readonly operationId: string;
@@ -93,6 +97,35 @@ export interface ReviewPackageBody {
       | "unknown";
     readonly changedFileCount: number;
     readonly changedLines: number;
+    readonly terminal?: {
+      readonly processOutcome:
+        | "completed"
+        | "completed_nonzero"
+        | "spawn_failed"
+        | "timed_out"
+        | "cancelled"
+        | "persistence_failed"
+        | "indeterminate"
+        | "unavailable";
+      readonly createdCount: number;
+      readonly updatedCount: number;
+      readonly deletedCount: number;
+      readonly renamedCount: number;
+      readonly preExistingTouchedCount: number;
+      readonly changedPathCount: number;
+      readonly pathEndpointCount: number;
+      readonly omittedPathEndpointCount: number;
+      readonly unavailableBaselineCount: number;
+      readonly pathFactsTruncated: boolean;
+      readonly legacyEvidence: boolean;
+      readonly limitationCodes: readonly (
+        | "legacy_evidence"
+        | "non_clean_observation"
+        | "path_facts_truncated"
+        | "unavailable_baselines"
+        | "process_outcome_unavailable"
+      )[];
+    };
   }[];
   readonly validations: readonly {
     readonly operationId: string;
@@ -185,6 +218,7 @@ export function createReviewPackage(input: ReviewPackageInput): ReviewPackage {
       taskId: state.taskId,
       status: state.status,
       mode: state.mode,
+      completionAuthority: state.completionAuthority ?? "frozen",
       createdAt: state.createdAt,
       startedAt: state.startedAt,
       updatedAt: state.updatedAt,
@@ -211,20 +245,41 @@ export function createReviewPackage(input: ReviewPackageInput): ReviewPackage {
       completedOperations: state.completedOperationIds.length,
       pendingOperations: state.pendingOperations.length,
       mutations: state.mutations.length,
+      patchMutations: state.mutations.filter(
+        (mutation) => mutation.kind !== "terminal",
+      ).length,
+      terminalMutations: state.mutations.filter(
+        (mutation) => mutation.kind === "terminal",
+      ).length,
       validations: state.validations.length,
+      pendingTerminalEffects:
+        state.pendingTerminalEffectOperationIds?.length ?? 0,
     },
-    mutations: state.mutations.map((mutation) => ({
-      operationId: mutation.operationId,
-      kind: mutation.kind ?? "patch",
-      ...(mutation.checkpointId === undefined
-        ? {}
-        : { checkpointId: mutation.checkpointId }),
-      ...(mutation.kind === "terminal"
-        ? { observationOutcome: mutation.observationOutcome }
-        : {}),
-      changedFileCount: new Set(mutation.changedPaths).size,
-      changedLines: mutation.changedLines,
-    })),
+    mutations: state.mutations.map((mutation) => {
+      const terminal =
+        mutation.kind === "terminal"
+          ? terminalReviewFacts(mutation)
+          : undefined;
+      return {
+        operationId: mutation.operationId,
+        kind: mutation.kind ?? "patch",
+        ...(mutation.checkpointId === undefined
+          ? {}
+          : { checkpointId: mutation.checkpointId }),
+        ...(mutation.kind === "terminal"
+          ? { observationOutcome: mutation.observationOutcome }
+          : {}),
+        changedFileCount:
+          terminal === undefined
+            ? new Set(mutation.changedPaths).size
+            : terminal.createdCount +
+              terminal.updatedCount +
+              terminal.deletedCount +
+              terminal.renamedCount,
+        changedLines: mutation.changedLines,
+        ...(terminal === undefined ? {} : { terminal }),
+      };
+    }),
     validations: state.validations.map((validation) => ({
       operationId: validation.operationId,
       commandId: validation.commandId,
@@ -265,6 +320,93 @@ export function createReviewPackage(input: ReviewPackageInput): ReviewPackage {
       algorithm: "sha256",
       bodySha256: sha256(stableJson(body)),
     },
+  };
+}
+
+function terminalReviewFacts(
+  mutation: Extract<
+    SessionState["mutations"][number],
+    { readonly kind: "terminal" }
+  >,
+): NonNullable<ReviewPackageBody["mutations"][number]["terminal"]> {
+  const full =
+    "recordContract" in mutation &&
+    mutation.recordContract === "terminal-mutation/2"
+      ? mutation
+      : undefined;
+  const processOutcome = full?.processOutcome ?? "unavailable";
+  const createdCount = full?.createdTotal ?? mutation.createdPaths.length;
+  const updatedCount = full?.updatedTotal ?? mutation.updatedPaths.length;
+  const deletedCount = full?.deletedTotal ?? mutation.deletedPaths.length;
+  const renamedCount = full?.renamedTotal ?? mutation.renamedPaths.length;
+  const preExistingTouchedCount =
+    full?.preExistingTouchedTotal ??
+    mutation.preExistingTouchedPaths.length;
+  const changedPathCount =
+    full?.changedPathCount ?? new Set(mutation.changedPaths).size;
+  const pathEndpointCount =
+    full?.pathEndpointTotal ??
+    createdCount +
+      updatedCount +
+      deletedCount +
+      renamedCount * 2 +
+      preExistingTouchedCount;
+  const omittedPathEndpointCount =
+    full?.omittedPathEndpointTotal ?? 0;
+  const unavailableBaselineCount =
+    full?.unavailableBaselineCount ?? 0;
+  const pathFactsTruncated = full?.pathFactsTruncated ?? false;
+  const legacyEvidence = full === undefined;
+  const counts = [
+    createdCount,
+    updatedCount,
+    deletedCount,
+    renamedCount,
+    preExistingTouchedCount,
+    changedPathCount,
+    pathEndpointCount,
+    omittedPathEndpointCount,
+    unavailableBaselineCount,
+  ];
+  if (!counts.every(isNonNegativeInteger)) {
+    throw new AgentError(
+      "RECOVERY_REQUIRED",
+      "Review-package terminal totals are unsafe",
+    );
+  }
+  const limitationCodes: NonNullable<
+    ReviewPackageBody["mutations"][number]["terminal"]
+  >["limitationCodes"][number][] = [];
+  if (legacyEvidence) limitationCodes.push("legacy_evidence");
+  if (
+    mutation.observationOutcome === "unknown" ||
+    mutation.observationOutcome === "protected_or_hidden_changed"
+  ) {
+    limitationCodes.push("non_clean_observation");
+  }
+  if (pathFactsTruncated) {
+    limitationCodes.push("path_facts_truncated");
+  }
+  if (unavailableBaselineCount > 0) {
+    limitationCodes.push("unavailable_baselines");
+  }
+  if (processOutcome === "unavailable") {
+    limitationCodes.push("process_outcome_unavailable");
+  }
+  return {
+    processOutcome,
+    createdCount,
+    updatedCount,
+    deletedCount,
+    renamedCount,
+    preExistingTouchedCount,
+    changedPathCount,
+    pathEndpointCount,
+    omittedPathEndpointCount,
+    unavailableBaselineCount,
+    pathFactsTruncated,
+    legacyEvidence,
+    limitationCodes,
   };
 }
 

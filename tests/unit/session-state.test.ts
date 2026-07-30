@@ -465,6 +465,86 @@ test("0.1.7-shaped completion handoffs remain readable without new optional clai
   assert.equal(record.claim.basis, undefined);
 });
 
+test("completion handoff separates patch, terminal, process, limitation, validation, and skipped-check facts", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-session-terminal-handoff-"));
+  const handoffs = new CompletionHandoffStore(
+    path.join(root, "handoff"),
+    "session_12345678",
+    new SecretScanner(Buffer.alloc(32, 29)),
+    false,
+  );
+  const reference = await handoffs.save({
+    summary: "Terminal completion facts",
+    acceptanceCriteria: [],
+    validation: [{
+      commandId: "test",
+      status: "passed",
+      summary: "passed",
+    }],
+    skippedValidation: ["browser smoke"],
+    remainingRisks: ["power loss"],
+    recommendedFollowUp: [],
+  }, {
+    accepted: true,
+    reasons: [],
+    actual: {
+      changedPaths: ["src/patch.ts", "src/terminal.ts"],
+      agentChangedPaths: ["src/patch.ts", "src/terminal.ts"],
+      preExistingPaths: ["notes/user.txt"],
+      successfulCommands: ["test"],
+      failedCommands: [],
+      gitStatusSummary: "dirty",
+      repositoryFingerprint: "f".repeat(64),
+      work: {
+        patchChangedPaths: ["src/patch.ts"],
+        terminalChangedPaths: ["src/terminal.ts"],
+        terminalPreExistingTouchedPaths: ["notes/user.txt"],
+      },
+      terminal: {
+        processOutcomes: [{
+          operationId: "op_terminal_1",
+          outcome: "timed_out",
+        }],
+        limitations: [{
+          operationId: "op_terminal_1",
+          observationOutcome: "unknown",
+          unavailableBaselineCount: 2,
+          omittedPathEndpointTotal: 3,
+          pathFactsTruncated: true,
+          legacyEvidence: false,
+        }],
+      },
+    },
+  }, "2026-01-01T00:00:02.000Z");
+
+  const record = await handoffs.read(reference);
+  assert.deepEqual(record.verification.actual.work, {
+    patchChangedPaths: ["src/patch.ts"],
+    terminalChangedPaths: ["src/terminal.ts"],
+    terminalPreExistingTouchedPaths: ["notes/user.txt"],
+  });
+  assert.deepEqual(record.verification.actual.terminal, {
+    processOutcomes: [{
+      operationId: "op_terminal_1",
+      outcome: "timed_out",
+    }],
+    limitations: [{
+      operationId: "op_terminal_1",
+      observationOutcome: "unknown",
+      unavailableBaselineCount: 2,
+      omittedPathEndpointTotal: 3,
+      pathFactsTruncated: true,
+      legacyEvidence: false,
+    }],
+  });
+  assert.deepEqual(record.claim.validation, [{
+    commandId: "test",
+    status: "passed",
+    summary: "passed",
+  }]);
+  assert.deepEqual(record.claim.skippedValidation, ["browser smoke"]);
+});
+
 test("file-backed handoff creation flushes its parent before publishing the file", async () => {
   const operations: string[] = [];
   const directory = path.join("/state", "sessions", "session_12345678", "handoff");

@@ -1,5 +1,10 @@
-import type { SessionState, ValidationRecord } from "../session/types.js";
-import type { CompletionAuthority } from "../session/types.js";
+import type {
+  CompletionAuthority,
+  FullTerminalMutationRecord,
+  SessionState,
+  TerminalMutationRecord,
+  ValidationRecord,
+} from "../session/types.js";
 
 export interface CompletionClaim {
   readonly kind?: "work" | "answer";
@@ -56,6 +61,27 @@ export interface CompletionVerification {
     readonly checkpointId?: string;
     readonly gitStatusSummary: string;
     readonly repositoryFingerprint: string;
+    readonly work?: {
+      readonly patchChangedPaths: readonly string[];
+      readonly terminalChangedPaths: readonly string[];
+      readonly terminalPreExistingTouchedPaths: readonly string[];
+    };
+    readonly terminal?: {
+      readonly processOutcomes: readonly {
+        readonly operationId: string;
+        readonly outcome:
+          | NonNullable<FullTerminalMutationRecord["processOutcome"]>
+          | "unavailable";
+      }[];
+      readonly limitations: readonly {
+        readonly operationId: string;
+        readonly observationOutcome: TerminalMutationRecord["observationOutcome"];
+        readonly unavailableBaselineCount: number;
+        readonly omittedPathEndpointTotal: number;
+        readonly pathFactsTruncated: boolean;
+        readonly legacyEvidence: boolean;
+      }[];
+    };
   };
 }
 
@@ -73,16 +99,80 @@ export function verifyCompletion(
 ): CompletionVerification {
   const reasons: string[] = [];
   const pathKey = repository.pathKey;
+  const authority = effectiveCompletionAuthority(state);
+  const terminalMutations = state.mutations.filter(
+    (mutation): mutation is TerminalMutationRecord =>
+      mutation.kind === "terminal",
+  );
+  const latestTerminal = terminalMutations.at(-1);
   if (!repository.known) reasons.push("Repository state could not be established.");
   if (repository.hasConflicts) reasons.push("Repository contains unresolved merge conflicts.");
-  if (repository.excludedStateFingerprint !== state.repositoryExcludedStateAtStart) {
-    reasons.push("Policy-hidden repository state changed after the session grant was established.");
+  const nonCleanTerminalMutations = terminalMutations.filter(
+    (mutation) =>
+      mutation.observationOutcome === "unknown" ||
+      mutation.observationOutcome === "protected_or_hidden_changed",
+  );
+  if (nonCleanTerminalMutations.length > 0) {
+    reasons.push(
+      `${nonCleanTerminalMutations.length} terminal operation(s) have non-clean project-effect observations.`,
+    );
   }
-  if (state.repositoryBranchAtStart !== undefined && repository.branch !== state.repositoryBranchAtStart) {
-    reasons.push("Repository branch changed after the session grant was established.");
+  if (
+    latestTerminal !== undefined &&
+    !isAuthoritativeRepositoryFingerprint(latestTerminal.repositoryFingerprint)
+  ) {
+    reasons.push(
+      "The latest terminal mutation lacks an authoritative repository fingerprint.",
+    );
   }
-  if (state.repositoryHeadAtStart !== undefined && repository.head !== state.repositoryHeadAtStart) {
-    reasons.push("Repository HEAD changed after the session grant was established.");
+
+  const latestObservedTerminal = [...terminalMutations]
+    .reverse()
+    .find((mutation) => mutation.observationOutcome === "observed");
+  const observedControl =
+    authority === "observed" &&
+      latestObservedTerminal !== undefined &&
+      hasAuthoritativeTerminalControl(latestObservedTerminal)
+      ? latestObservedTerminal.postObservationControl
+      : undefined;
+  if (
+    authority === "observed" &&
+    latestObservedTerminal !== undefined &&
+    observedControl === undefined
+  ) {
+    reasons.push(
+      "The latest observed terminal mutation lacks a complete authoritative control anchor.",
+    );
+  }
+  if (observedControl === undefined) {
+    if (repository.excludedStateFingerprint !== state.repositoryExcludedStateAtStart) {
+      reasons.push("Policy-hidden repository state changed after the session grant was established.");
+    }
+    if (state.repositoryBranchAtStart !== undefined && repository.branch !== state.repositoryBranchAtStart) {
+      reasons.push("Repository branch changed after the session grant was established.");
+    }
+    if (state.repositoryHeadAtStart !== undefined && repository.head !== state.repositoryHeadAtStart) {
+      reasons.push("Repository HEAD changed after the session grant was established.");
+    }
+  } else {
+    if (
+      repository.excludedStateFingerprint !==
+      observedControl.excludedStateFingerprint
+    ) {
+      reasons.push(
+        "Policy-hidden repository state changed after the latest observed terminal effect.",
+      );
+    }
+    if (repository.branch !== observedControl.branch) {
+      reasons.push(
+        "Repository branch changed after the latest observed terminal effect.",
+      );
+    }
+    if (repository.head !== observedControl.head) {
+      reasons.push(
+        "Repository HEAD changed after the latest observed terminal effect.",
+      );
+    }
   }
   const preExisting = new Set(state.preExistingChanges.map(pathKey));
   const newOutOfScopePaths = repository.outOfScopePaths.filter((candidate) => !preExisting.has(pathKey(candidate)));
@@ -101,7 +191,10 @@ export function verifyCompletion(
       `Pre-existing out-of-scope changes were modified during the session: ${changedPreExistingOutOfScopePaths.join(", ")}.`,
     );
   }
-  if (requirements.requireCleanPendingOperations && state.pendingOperations.length > 0) {
+  if (
+    (requirements.requireCleanPendingOperations || authority === "observed") &&
+    state.pendingOperations.length > 0
+  ) {
     reasons.push(`${state.pendingOperations.length} tool operation(s) remain unresolved.`);
   }
   const pendingTerminalEffects =
@@ -194,7 +287,12 @@ export function verifyCompletion(
     if (record.outcome !== "success") {
       reasons.push(`Required validation '${commandId}' most recently ended with ${record.outcome}.`);
     }
-    if (requirements.requireValidationAfterLastMutation && record.mutationSequence < state.mutationSequence) {
+    const validationSequenceIsStale =
+      authority === "observed"
+        ? record.mutationSequence !== state.mutationSequence
+        : requirements.requireValidationAfterLastMutation &&
+          record.mutationSequence < state.mutationSequence;
+    if (validationSequenceIsStale) {
       reasons.push(`Required validation '${commandId}' is stale relative to the latest mutation.`);
     }
     if (record.repositoryFingerprint !== repository.fingerprint) {
@@ -230,6 +328,62 @@ export function verifyCompletion(
     .map(([commandId]) => commandId);
 
   const agentChangedPaths = [...new Set(state.mutations.flatMap((mutation) => mutation.changedPaths))];
+  const patchChangedPaths = uniquePaths(
+    state.mutations
+      .filter((mutation) => mutation.kind !== "terminal")
+      .flatMap((mutation) => mutation.changedPaths),
+    pathKey,
+  );
+  const terminalChangedPaths = uniquePaths(
+    terminalMutations.flatMap((mutation) => mutation.changedPaths),
+    pathKey,
+  );
+  const terminalPreExistingTouchedPaths = uniquePaths(
+    terminalMutations.flatMap(
+      (mutation) => mutation.preExistingTouchedPaths,
+    ),
+    pathKey,
+  );
+  const processOutcomes: NonNullable<
+    CompletionVerification["actual"]["terminal"]
+  >["processOutcomes"] = terminalMutations.map((mutation) => ({
+    operationId: mutation.operationId,
+    outcome:
+      "recordContract" in mutation &&
+      mutation.recordContract === "terminal-mutation/2"
+        ? mutation.processOutcome ?? "unavailable"
+        : "unavailable",
+  }));
+  const limitations = terminalMutations.flatMap((mutation) => {
+    const full =
+      "recordContract" in mutation &&
+      mutation.recordContract === "terminal-mutation/2"
+        ? mutation
+        : undefined;
+    const unavailableBaselineCount =
+      full?.unavailableBaselineCount ?? 0;
+    const omittedPathEndpointTotal =
+      full?.omittedPathEndpointTotal ?? 0;
+    const pathFactsTruncated = full?.pathFactsTruncated ?? false;
+    const legacyEvidence = full === undefined;
+    if (
+      mutation.observationOutcome === "observed" &&
+      unavailableBaselineCount === 0 &&
+      omittedPathEndpointTotal === 0 &&
+      !pathFactsTruncated &&
+      !legacyEvidence
+    ) {
+      return [];
+    }
+    return [{
+      operationId: mutation.operationId,
+      observationOutcome: mutation.observationOutcome,
+      unavailableBaselineCount,
+      omittedPathEndpointTotal,
+      pathFactsTruncated,
+      legacyEvidence,
+    }];
+  });
 
   return {
     accepted: reasons.length === 0,
@@ -243,8 +397,78 @@ export function verifyCompletion(
       ...(state.lastCheckpointId === undefined ? {} : { checkpointId: state.lastCheckpointId }),
       gitStatusSummary: repository.gitStatusSummary,
       repositoryFingerprint: repository.fingerprint,
+      ...(terminalMutations.length === 0
+        ? {}
+        : {
+            work: {
+              patchChangedPaths,
+              terminalChangedPaths,
+              terminalPreExistingTouchedPaths,
+            },
+            terminal: {
+              processOutcomes,
+              limitations,
+            },
+          }),
     },
   };
+}
+
+function isAuthoritativeRepositoryFingerprint(
+  value: string | undefined,
+): value is string {
+  return value !== undefined && /^[a-f0-9]{64}$/u.test(value);
+}
+
+function hasAuthoritativeTerminalControl(
+  mutation: TerminalMutationRecord,
+): mutation is FullTerminalMutationRecord & {
+  readonly observationOutcome: "observed";
+} {
+  if (
+    !("recordContract" in mutation) ||
+    mutation.recordContract !== "terminal-mutation/2" ||
+    mutation.observationOutcome !== "observed" ||
+    !isAuthoritativeRepositoryFingerprint(mutation.repositoryFingerprint)
+  ) {
+    return false;
+  }
+  const control = (
+    mutation as {
+      readonly postObservationControl?: unknown;
+    }
+  ).postObservationControl;
+  if (
+    control === null ||
+    typeof control !== "object" ||
+    Array.isArray(control)
+  ) {
+    return false;
+  }
+  const candidate = control as {
+    readonly branch?: unknown;
+    readonly head?: unknown;
+    readonly excludedStateFingerprint?: unknown;
+  };
+  return (
+    (candidate.branch === null || typeof candidate.branch === "string") &&
+    (candidate.head === null || typeof candidate.head === "string") &&
+    typeof candidate.excludedStateFingerprint === "string" &&
+    /^[a-f0-9]{64}$/u.test(candidate.excludedStateFingerprint)
+  );
+}
+
+function uniquePaths(
+  paths: readonly string[],
+  pathKey: (value: string) => string,
+): readonly string[] {
+  const seen = new Set<string>();
+  return paths.filter((candidate) => {
+    const key = pathKey(candidate);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function newestValidationByCommand(records: readonly ValidationRecord[]): ReadonlyMap<string, ValidationRecord> {

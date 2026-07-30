@@ -969,6 +969,7 @@ function runtimeForTest(input: {
   readonly signal?: AbortSignal;
   readonly recoveryContext?: AgentRuntimeDependencies["recoveryContext"];
   readonly onProgress?: AgentRuntimeDependencies["onProgress"];
+  readonly completionRequirements?: AgentRuntimeDependencies["completionRequirements"];
 }): AgentRuntime {
   return new AgentRuntime({
     state: input.state,
@@ -1015,7 +1016,7 @@ function runtimeForTest(input: {
       requestInput: async () => ({}),
       requestCapability: async () => ({ decision: "deny" }),
     },
-    completionRequirements: {
+    completionRequirements: input.completionRequirements ?? {
       requiredCommandIds: [],
       requireValidationAfterLastMutation: true,
       requireCleanPendingOperations: true,
@@ -1124,6 +1125,144 @@ test("runtime completes a multi-turn autonomous tool loop", async () => {
   const durableHandoff = await completionHandoffs.read(localState.completionHandoff);
   assert.equal(durableHandoff.claim.summary, "Repository inspected.");
   assert.equal(durableHandoff.verification.accepted, true);
+});
+
+test("runtime completes observed terminal then patch state only against its anchored control and fresh named validation", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-observed-completion-"));
+  const localState: SessionState = {
+    ...state(root),
+    completionAuthority: "observed",
+  };
+  localState.repositoryBranchAtStart = "main";
+  localState.repositoryHeadAtStart = "0".repeat(40);
+  localState.mutationSequence = 2;
+  const terminalOperationId = "op_terminal_observed_completion";
+  localState.mutations = [{
+    kind: "terminal",
+    recordContract: "terminal-mutation/2",
+    operationId: terminalOperationId,
+    changedPaths: ["src/terminal.ts"],
+    changedLines: 2,
+    createdPaths: [],
+    updatedPaths: ["src/terminal.ts"],
+    deletedPaths: [],
+    renamedPaths: [],
+    preExistingTouchedPaths: ["notes/user.txt"],
+    processOutcome: "completed",
+    createdTotal: 0,
+    updatedTotal: 1,
+    deletedTotal: 0,
+    renamedTotal: 0,
+    preExistingTouchedTotal: 1,
+    changedPathCount: 1,
+    pathEndpointTotal: 2,
+    omittedPathEndpointTotal: 0,
+    pathFactsTruncated: false,
+    pathFactsSha256: "9".repeat(64),
+    unavailableBaselineCount: 0,
+    completedAt: "2026-01-01T00:00:20.000Z",
+    preObservation: {
+      kind: "terminal-pre-observation",
+      id: terminalOperationId,
+      bytes: 10,
+      sha256: "1".repeat(64),
+    },
+    postObservation: {
+      kind: "terminal-post-observation",
+      id: terminalOperationId,
+      bytes: 10,
+      sha256: "2".repeat(64),
+    },
+    terminalResult: {
+      kind: "terminal-result",
+      id: terminalOperationId,
+      bytes: 10,
+      sha256: "3".repeat(64),
+    },
+    observationOutcome: "observed",
+    repositoryFingerprint: "c".repeat(64),
+    postObservationControl: {
+      branch: "feature",
+      head: "a".repeat(40),
+      excludedStateFingerprint: "1".repeat(64),
+    },
+  }, {
+    operationId: "op_patch_after_terminal",
+    checkpointId: "checkpoint_after_terminal",
+    changedPaths: ["src/patch.ts"],
+    changedLines: 1,
+    completedAt: "2026-01-01T00:00:30.000Z",
+    repositoryFingerprint: "d".repeat(64),
+  }];
+  localState.validations = [{
+    operationId: "op_validation_after_terminal",
+    commandId: "test",
+    outcome: "success",
+    exitCode: 0,
+    completedAt: "2026-01-01T00:00:40.000Z",
+    mutationSequence: 2,
+    repositoryFingerprint: "d".repeat(64),
+  }];
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const completionHandoffs = new CompletionHandoffStore(
+    path.join(store.sessionDirectory(localState.sessionId), "handoff"),
+    localState.sessionId,
+    new SecretScanner(Buffer.alloc(32, 31)),
+  );
+  const transport = new QueueTransport([JSON.stringify([{
+    type: "complete_task",
+    operationId: "op_complete_observed",
+    claim: {
+      summary: "Observed terminal and patch work completed.",
+      acceptanceCriteria: [],
+      validation: [{
+        commandId: "test",
+        status: "passed",
+        summary: "passed",
+      }],
+      skippedValidation: [],
+      remainingRisks: [],
+      recommendedFollowUp: [],
+    },
+  }])]);
+
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    completionHandoffs,
+    completionRequirements: {
+      requiredCommandIds: ["test"],
+      requireValidationAfterLastMutation: true,
+      requireCleanPendingOperations: true,
+    },
+    inspectCompletionState: async () => ({
+      pathKey: completionPathKey,
+      known: true,
+      fingerprint: "d".repeat(64),
+      excludedStateFingerprint: "1".repeat(64),
+      hasConflicts: false,
+      branch: "feature",
+      head: "a".repeat(40),
+      changedPaths: ["src/terminal.ts", "src/patch.ts"],
+      outOfScopePaths: [],
+      gitStatusSummary: "dirty",
+    }),
+  }).run();
+
+  assert.equal(result.status, "completed", result.reason);
+  const handoff = await completionHandoffs.read(localState.completionHandoff);
+  assert.deepEqual(handoff.verification.actual.work, {
+    patchChangedPaths: ["src/patch.ts"],
+    terminalChangedPaths: ["src/terminal.ts"],
+    terminalPreExistingTouchedPaths: ["notes/user.txt"],
+  });
+  assert.deepEqual(handoff.verification.actual.terminal?.processOutcomes, [{
+    operationId: terminalOperationId,
+    outcome: "completed",
+  }]);
 });
 
 test("runtime passes terminal bounds without changing the journaled request", async () => {

@@ -8,6 +8,7 @@ import {
 import {
   DEFAULT_BUDGET_LIMITS,
   SESSION_SCHEMA_VERSION,
+  type FullTerminalMutationRecord,
   type SessionState,
   zeroBudgetUsage,
 } from "../../src/session/types.js";
@@ -25,6 +26,131 @@ const currentFingerprint = "d".repeat(64);
 const driftFingerprint = "e".repeat(64);
 const excludedFingerprint = "0".repeat(64);
 const completionPathKey = (value: string): string => value.replaceAll("\\", "/");
+
+function fullTerminalMutation(
+  overrides: Partial<FullTerminalMutationRecord> = {},
+): FullTerminalMutationRecord {
+  const operationId = overrides.operationId ?? "op_terminal_observed";
+  const changedPaths = overrides.changedPaths ?? ["src/terminal.ts"];
+  const createdPaths = overrides.createdPaths ?? [];
+  const updatedPaths = overrides.updatedPaths ?? changedPaths;
+  const deletedPaths = overrides.deletedPaths ?? [];
+  const renamedPaths = overrides.renamedPaths ?? [];
+  const preExistingTouchedPaths =
+    overrides.preExistingTouchedPaths ?? [];
+  const createdTotal = overrides.createdTotal ?? createdPaths.length;
+  const updatedTotal = overrides.updatedTotal ?? updatedPaths.length;
+  const deletedTotal = overrides.deletedTotal ?? deletedPaths.length;
+  const renamedTotal = overrides.renamedTotal ?? renamedPaths.length;
+  const preExistingTouchedTotal =
+    overrides.preExistingTouchedTotal ?? preExistingTouchedPaths.length;
+  const pathEndpointTotal =
+    overrides.pathEndpointTotal ??
+    createdTotal +
+      updatedTotal +
+      deletedTotal +
+      renamedTotal * 2 +
+      preExistingTouchedTotal;
+  const retainedEndpointTotal =
+    createdPaths.length +
+    updatedPaths.length +
+    deletedPaths.length +
+    renamedPaths.length * 2 +
+    preExistingTouchedPaths.length;
+  const observationOutcome =
+    overrides.observationOutcome ?? "observed";
+  const common = {
+    kind: "terminal" as const,
+    recordContract: "terminal-mutation/2" as const,
+    operationId,
+    changedPaths,
+    changedLines: overrides.changedLines ?? 3,
+    createdPaths,
+    updatedPaths,
+    deletedPaths,
+    renamedPaths,
+    preExistingTouchedPaths,
+    processOutcome: overrides.processOutcome ?? "completed",
+    createdTotal,
+    updatedTotal,
+    deletedTotal,
+    renamedTotal,
+    preExistingTouchedTotal,
+    changedPathCount:
+      overrides.changedPathCount ?? changedPaths.length,
+    pathEndpointTotal,
+    omittedPathEndpointTotal:
+      overrides.omittedPathEndpointTotal ??
+      pathEndpointTotal - retainedEndpointTotal,
+    pathFactsTruncated:
+      overrides.pathFactsTruncated ??
+      pathEndpointTotal > retainedEndpointTotal,
+    pathFactsSha256: overrides.pathFactsSha256 ?? "4".repeat(64),
+    unavailableBaselineCount:
+      overrides.unavailableBaselineCount ?? 0,
+    completedAt:
+      overrides.completedAt ?? "2026-01-01T00:00:30.000Z",
+    preObservation: overrides.preObservation ?? {
+      kind: "terminal-pre-observation" as const,
+      id: operationId,
+      bytes: 10,
+      sha256: "1".repeat(64),
+    },
+    postObservation: overrides.postObservation ?? {
+      kind: "terminal-post-observation" as const,
+      id: operationId,
+      bytes: 10,
+      sha256: "2".repeat(64),
+    },
+    terminalResult: overrides.terminalResult ?? {
+      kind: "terminal-result" as const,
+      id: operationId,
+      bytes: 10,
+      sha256: "3".repeat(64),
+    },
+  };
+  if (observationOutcome === "observed") {
+    return {
+      ...common,
+      observationOutcome,
+      repositoryFingerprint:
+        overrides.repositoryFingerprint ?? currentFingerprint,
+      postObservationControl: overrides.postObservationControl ?? {
+        branch: "feature",
+        head: "a".repeat(40),
+        excludedStateFingerprint: excludedFingerprint,
+      },
+    };
+  }
+  return {
+    ...common,
+    observationOutcome,
+  };
+}
+
+function completionRepository(
+  overrides: Partial<Parameters<typeof verifyCompletion>[2]> = {},
+): Parameters<typeof verifyCompletion>[2] {
+  return {
+    pathKey: completionPathKey,
+    known: true,
+    fingerprint: currentFingerprint,
+    excludedStateFingerprint: excludedFingerprint,
+    hasConflicts: false,
+    branch: "feature",
+    head: "a".repeat(40),
+    changedPaths: ["src/a.ts"],
+    outOfScopePaths: [],
+    gitStatusSummary: "M src/a.ts",
+    ...overrides,
+  };
+}
+
+const completionRequirements = {
+  requiredCommandIds: ["test"],
+  requireValidationAfterLastMutation: true,
+  requireCleanPendingOperations: true,
+} as const;
 
 function state(): SessionState {
   return {
@@ -83,6 +209,8 @@ test("completion verifier accepts known, in-scope, freshly validated state", () 
   );
   assert.equal(result.accepted, true);
   assert.deepEqual(result.actual.successfulCommands, ["test"]);
+  assert.equal(result.actual.work, undefined);
+  assert.equal(result.actual.terminal, undefined);
 });
 
 test("informational answers complete only when the session has not mutated project files", () => {
@@ -444,4 +572,297 @@ test("completion verifier cannot bypass pre-existing state through case or Unico
     { requiredCommandIds: ["test"], requireValidationAfterLastMutation: true, requireCleanPendingOperations: true },
   );
   assert.equal(result.accepted, true);
+});
+
+test("observed authority completes terminal then patch after fresh validation against the terminal control anchor", () => {
+  const current: SessionState = {
+    ...state(),
+    completionAuthority: "observed",
+    repositoryBranchAtStart: "main",
+    repositoryHeadAtStart: "0".repeat(40),
+    mutationSequence: 2,
+    mutations: [
+      fullTerminalMutation({
+        preExistingTouchedPaths: ["notes/user.txt"],
+        preExistingTouchedTotal: 1,
+        pathEndpointTotal: 2,
+      }),
+      {
+        operationId: "op_patch_after_terminal",
+        checkpointId: "checkpoint_after_terminal",
+        changedPaths: ["src/a.ts"],
+        changedLines: 1,
+        completedAt: "2026-01-01T00:00:45.000Z",
+        repositoryFingerprint: currentFingerprint,
+      },
+    ],
+    validations: [{
+      ...state().validations[0]!,
+      mutationSequence: 2,
+      repositoryFingerprint: currentFingerprint,
+    }],
+  };
+
+  const result = verifyCompletion(
+    current,
+    claim,
+    completionRepository(),
+    completionRequirements,
+  );
+
+  assert.equal(result.accepted, true);
+  assert.deepEqual(result.actual.work, {
+    patchChangedPaths: ["src/a.ts"],
+    terminalChangedPaths: ["src/terminal.ts"],
+    terminalPreExistingTouchedPaths: ["notes/user.txt"],
+  });
+  assert.deepEqual(result.actual.terminal?.processOutcomes, [{
+    operationId: "op_terminal_observed",
+    outcome: "completed",
+  }]);
+  assert.deepEqual(result.actual.terminal?.limitations, []);
+});
+
+test("observed authority cannot launder terminal control drift through a later passing validation", () => {
+  const current: SessionState = {
+    ...state(),
+    completionAuthority: "observed",
+    mutationSequence: 1,
+    mutations: [fullTerminalMutation()],
+    validations: [{
+      ...state().validations[0]!,
+      mutationSequence: 1,
+      repositoryFingerprint: currentFingerprint,
+    }],
+  };
+  const result = verifyCompletion(
+    current,
+    claim,
+    completionRepository({
+      branch: "manual-branch",
+      head: "b".repeat(40),
+      excludedStateFingerprint: "9".repeat(64),
+    }),
+    completionRequirements,
+  );
+
+  assert.equal(result.accepted, false);
+  assert.match(result.reasons.join(" "), /branch changed.*latest observed/iu);
+  assert.match(result.reasons.join(" "), /HEAD changed.*latest observed/iu);
+  assert.match(
+    result.reasons.join(" "),
+    /Policy-hidden repository state changed.*latest observed/iu,
+  );
+});
+
+test("repeated observed terminals use the latest complete control anchor", () => {
+  const current: SessionState = {
+    ...state(),
+    completionAuthority: "observed",
+    mutationSequence: 2,
+    mutations: [
+      fullTerminalMutation({
+        operationId: "op_terminal_first",
+        postObservationControl: {
+          branch: "first",
+          head: "1".repeat(40),
+          excludedStateFingerprint: "1".repeat(64),
+        },
+      }),
+      fullTerminalMutation({
+        operationId: "op_terminal_latest",
+        repositoryFingerprint: currentFingerprint,
+        postObservationControl: {
+          branch: "latest",
+          head: "2".repeat(40),
+          excludedStateFingerprint: "2".repeat(64),
+        },
+      }),
+    ],
+    validations: [{
+      ...state().validations[0]!,
+      mutationSequence: 2,
+      repositoryFingerprint: currentFingerprint,
+    }],
+  };
+
+  const result = verifyCompletion(
+    current,
+    claim,
+    completionRepository({
+      branch: "latest",
+      head: "2".repeat(40),
+      excludedStateFingerprint: "2".repeat(64),
+    }),
+    completionRequirements,
+  );
+  assert.equal(result.accepted, true);
+});
+
+test("observed authority rejects legacy observed evidence without a control anchor", () => {
+  const current: SessionState = {
+    ...state(),
+    completionAuthority: "observed",
+    mutations: [{
+      kind: "terminal",
+      operationId: "op_terminal_legacy",
+      changedPaths: ["src/legacy.ts"],
+      changedLines: 1,
+      createdPaths: [],
+      updatedPaths: ["src/legacy.ts"],
+      deletedPaths: [],
+      renamedPaths: [],
+      preExistingTouchedPaths: [],
+      completedAt: "2026-01-01T00:00:30.000Z",
+      observationOutcome: "observed",
+      terminalResult: {
+        kind: "terminal-result",
+        id: "op_terminal_legacy",
+        bytes: 10,
+        sha256: "3".repeat(64),
+      },
+      repositoryFingerprint: currentFingerprint,
+    }],
+  };
+
+  const result = verifyCompletion(
+    current,
+    claim,
+    completionRepository(),
+    completionRequirements,
+  );
+  assert.equal(result.accepted, false);
+  assert.match(result.reasons.join(" "), /lacks a complete authoritative control anchor/iu);
+});
+
+test("observed authority fails closed on a partial terminal control anchor", () => {
+  const mutation = fullTerminalMutation() as unknown as {
+    postObservationControl: unknown;
+  };
+  mutation.postObservationControl = { branch: "feature" };
+  const current: SessionState = {
+    ...state(),
+    completionAuthority: "observed",
+    mutations: [
+      mutation as SessionState["mutations"][number],
+    ],
+  };
+
+  const result = verifyCompletion(
+    current,
+    claim,
+    completionRepository(),
+    completionRequirements,
+  );
+  assert.equal(result.accepted, false);
+  assert.match(result.reasons.join(" "), /lacks a complete authoritative control anchor/iu);
+});
+
+test("non-clean terminal evidence remains authority-independent and cannot fall back through a later patch", () => {
+  for (const completionAuthority of ["frozen", "observed"] as const) {
+    for (
+      const observationOutcome of [
+        "unknown",
+        "protected_or_hidden_changed",
+      ] as const
+    ) {
+      const current: SessionState = {
+        ...state(),
+        completionAuthority,
+        mutationSequence: 2,
+        mutations: [
+          fullTerminalMutation({
+            observationOutcome,
+            unavailableBaselineCount: 1,
+          }),
+          {
+            operationId: "op_patch_after_non_clean",
+            checkpointId: "checkpoint_after_non_clean",
+            changedPaths: ["src/a.ts"],
+            changedLines: 1,
+            completedAt: "2026-01-01T00:00:45.000Z",
+            repositoryFingerprint: currentFingerprint,
+          },
+        ],
+        validations: [{
+          ...state().validations[0]!,
+          mutationSequence: 2,
+          repositoryFingerprint: currentFingerprint,
+        }],
+      };
+
+      const result = verifyCompletion(
+        current,
+        claim,
+        completionRepository(),
+        completionRequirements,
+      );
+      assert.equal(
+        result.accepted,
+        false,
+        `${completionAuthority}:${observationOutcome}`,
+      );
+      assert.match(result.reasons.join(" "), /non-clean project-effect/iu);
+      assert.match(
+        result.reasons.join(" "),
+        /latest terminal mutation lacks an authoritative repository fingerprint/iu,
+      );
+    }
+  }
+});
+
+test("observed authority always requires clean journal state and fresh configured validation", () => {
+  const current: SessionState = {
+    ...state(),
+    completionAuthority: "observed",
+    mutationSequence: 1,
+    mutations: [fullTerminalMutation()],
+    pendingOperations: [{
+      operationId: "op_pending_observed",
+      tool: "read_file",
+      mutating: false,
+      requestHash: "a".repeat(64),
+      status: "accepted",
+      acceptedAt: "2026-01-01T00:00:40.000Z",
+    }],
+    validations: [{
+      ...state().validations[0]!,
+      mutationSequence: 0,
+      repositoryFingerprint: currentFingerprint,
+    }],
+  };
+
+  const result = verifyCompletion(
+    current,
+    claim,
+    completionRepository(),
+    {
+      ...completionRequirements,
+      requireValidationAfterLastMutation: false,
+      requireCleanPendingOperations: false,
+    },
+  );
+  assert.equal(result.accepted, false);
+  assert.match(result.reasons.join(" "), /remain unresolved/iu);
+  assert.match(result.reasons.join(" "), /stale relative to the latest mutation/iu);
+});
+
+test("observed terminal authority preserves the effective write-scope gate", () => {
+  const current: SessionState = {
+    ...state(),
+    completionAuthority: "observed",
+    mutationSequence: 1,
+    mutations: [fullTerminalMutation()],
+  };
+  const result = verifyCompletion(
+    current,
+    claim,
+    completionRepository({
+      changedPaths: ["src/terminal.ts"],
+      outOfScopePaths: ["src/terminal.ts"],
+    }),
+    completionRequirements,
+  );
+  assert.equal(result.accepted, false);
+  assert.match(result.reasons.join(" "), /outside the grant/iu);
 });
