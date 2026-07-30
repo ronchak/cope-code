@@ -2,7 +2,9 @@
 
 ## Purpose
 
-This matrix separates the target developer-mode requirements from the current 0.1.9 implementation. It is planning and traceability evidence, not a release or live-certification claim.
+This matrix separates remaining target requirements from the current 0.1.10
+implementation. It is code/release traceability, not live-certification
+evidence.
 
 Platform-specific implementation and live evidence remain in [WINDOWS-TARGET.md](WINDOWS-TARGET.md), [MACOS-TARGET.md](MACOS-TARGET.md), and [LIVE-PILOT-ACCEPTANCE.md](LIVE-PILOT-ACCEPTANCE.md).
 
@@ -21,9 +23,9 @@ implements it or the work belongs after the MVP.
 | ID | Requirement | Status | Current evidence or gap |
 | --- | --- | --- | --- |
 | DM-001 | Cope presents a local coding-agent experience through a visible Microsoft 365 Copilot Chat session. | implemented | Browser transport, CLI, agent loop, and typed model intents exist. |
-| DM-002 | Developer mode is the recommended default for ordinary project work. | planned | Current modes and generated policies remain hardened and catalog-oriented. |
-| DM-003 | One concise initial grant authorizes normal project work and accurately states that shell commands are not sandboxed. | partial | Initial grants exist, but current command and network authority is narrow and developer-mode risk presentation is absent. |
-| DM-004 | The agent should ask only for genuinely missing information or materially new authority. | partial | User and capability requests exist; current policy creates avoidable denials for normal developer actions. |
+| DM-002 | Developer mode is the recommended default for ordinary project work. | partial | Quick setup recommends and enables the Developer profile; session mode still requires an explicit Developer/`--auto` selection. |
+| DM-003 | One concise initial grant authorizes normal project work and accurately states that shell commands are not sandboxed. | implemented | The Developer access screen states current-user execution, project starting directory, ordinary environment/network and local Git authority, observation, and bounded results. |
+| DM-004 | The agent should ask only for genuinely missing information or materially new authority. | implemented for MVP | A Developer terminal grant authorizes ordinary one-shot commands once; higher-layer denies and genuinely new typed authority still stop or ask. |
 | DM-005 | Progress and completion distinguish model claims from observed local facts. | implemented | Runtime progress, operation results, completion verification, and handoff records exist. |
 
 ## Repository capability
@@ -42,35 +44,35 @@ implements it or the work belongs after the MVP.
 
 | ID | Requirement | Status | Current evidence or gap |
 | --- | --- | --- | --- |
-| DM-020 | Execute ordinary developer commands through explicit shell mode. | planned | Shells and command shims are currently prohibited. |
-| DM-021 | Execute commands through direct executable and argv mode. | partial | `ProcessRunner` supports direct execution, but only through cataloged definitions and typed parameters. |
-| DM-022 | Use the selected project as the default working directory. | implemented foundation | Catalog commands support validated repository working directories. |
-| DM-023 | Stream command output locally while bounding the result sent to Copilot. | planned | Current output is buffered until process completion. |
+| DM-020 | Execute ordinary developer commands through explicit shell mode. | implemented | `terminal_exec` supports strict `terminal-exec/1` shell requests. |
+| DM-021 | Execute commands through direct executable and argv mode. | implemented | `terminal_exec` supports a separate strict executable/argument-vector variant. |
+| DM-022 | Use the selected project as the default working directory. | implemented | Terminal cwd defaults to the selected project and accepts only validated project-relative directories. |
+| DM-023 | Stream command output locally while bounding the result sent to Copilot. | implemented | Output streams through the local progress sink while retained/model-visible head/tail results are bounded and scanned. |
 | DM-024 | Support stdin and PTY-backed interactive processes. | planned after MVP | Current child stdin is ignored and no PTY exists. |
 | DM-025 | Start, inspect, write to, and stop persistent processes. | planned after MVP | Current runner supports only one-shot process lifetime. |
-| DM-026 | Cancel child process trees on pause and abort. | partial | Process-tree cancellation and macOS supervision exist; persistent process recovery is not implemented. |
-| DM-027 | Permit normal network-dependent developer commands. | planned | Default policy denies network. |
+| DM-026 | Cancel child process trees on pause and abort. | implemented for one-shot processes | Pause, abort, timeout, and `cancelAll` supervise the active process tree; persistent processes remain later work. |
+| DM-027 | Permit normal network-dependent developer commands. | implemented | Developer terminal children use ordinary current-user network access; the UI explicitly says Cope is not an egress firewall. |
 | DM-028 | Preserve timeouts, output limits, and truthful exit or signal state. | retained | Current process runner provides these controls. |
-| DM-029 | Inherit a usable developer environment without copying Cope-internal control state. | planned | Current runner inherits a small hardened environment that omits many normal developer variables. |
+| DM-029 | Inherit a usable developer environment without copying Cope-internal control state. | implemented | Developer terminal inherits the ordinary environment after removing Cope control/malformed entries; catalog commands remain hardened. |
 
 ## Command-generated mutations
 
 | ID | Requirement | Status | Current evidence or gap |
 | --- | --- | --- | --- |
-| DM-030 | Commands may intentionally create, update, delete, and rename project files. | planned | Current command boundary converts Git-visible mutation into recovery-required state. |
-| DM-031 | Capture project state before and after a command. | partial | Current command boundary captures integrity state, but uses it to prohibit source changes. |
-| DM-032 | Attribute observed command-generated changes to the operation. | planned | No mutation record is produced for command effects. |
-| DM-033 | Integrate observed command changes with session diffs, mutation sequence, and completion freshness. | planned | Current mutation accounting covers patch tools only. |
-| DM-034 | Record command outcome separately from mutation outcome. | planned | Current result does not model a failed command that also changed project files as two independent facts. |
-| DM-035 | Preserve recovery truth after timeout, cancellation, crash, or partial mutation without blindly replaying the command. | partial | Durable operations exist, but intentional command mutation reconciliation and durable terminal results do not. |
-| DM-036 | Keep automatic rollback guarantees scoped to operations whose before-images were actually captured. | partial | Patch tools satisfy this; arbitrary command rollback must not be implied. |
+| DM-030 | Commands may intentionally create, update, delete, and rename project files. | implemented | Developer terminal observations represent and attribute these effects without converting known in-scope change into a catalog integrity violation. |
+| DM-031 | Capture project state before and after a command. | implemented | Bounded observations are persisted on both sides of every launched terminal command. |
+| DM-032 | Attribute observed command-generated changes to the operation. | implemented | One idempotent terminal mutation record binds verified effects to the operation ID. |
+| DM-033 | Integrate observed command changes with session diffs, mutation sequence, and completion freshness. | implemented | Terminal before-images, mutation records, accounting, session diff, and completion authority share the same verified effect. |
+| DM-034 | Record command outcome separately from mutation outcome. | implemented | `terminal-exec-result/1` has independent process and mutation outcomes. |
+| DM-035 | Preserve recovery truth after timeout, cancellation, crash, or partial mutation without blindly replaying the command. | implemented | Ordered integrity artifacts, receipts, result promotion, and indeterminate reconciliation prohibit blind relaunch. |
+| DM-036 | Keep automatic rollback guarantees scoped to operations whose before-images were actually captured. | implemented | Terminal result/diff evidence identifies unavailable baselines and does not claim arbitrary-command atomic rollback. |
 
 ## Git and remote work
 
 | ID | Requirement | Status | Current evidence or gap |
 | --- | --- | --- | --- |
 | DM-040 | Permit local Git inspection. | implemented | Status and diff tools exist. |
-| DM-041 | Permit local Git mutation in developer mode. | planned | Staging, restoration, branch creation, and local commits are unavailable through typed tools. |
+| DM-041 | Permit local Git mutation in developer mode. | implemented through terminal | Developer terminal authorizes local Git and records observed branch/HEAD/index/worktree effects; typed Git mutation tools remain later work. |
 | DM-042 | Keep known remote writes and publication separately authorizable where Cope can classify them. | planned | No target action classes or tools exist, and arbitrary shell scripts can conceal effects. |
 | DM-043 | Never blindly replay an uncertain remote action. | retained | Existing exactly-once and indeterminate-state principles should extend to remote tools. |
 
@@ -84,33 +86,33 @@ implements it or the work belongs after the MVP.
 | DM-053 | Resolve before retrying an uncertain browser submission. | implemented | Runtime performs resolution before permitted retry. |
 | DM-054 | Do not expose generic browser automation to the coding model. | retained | Browser remains a model transport rather than a general tool. |
 | DM-055 | Keep browser product and UI contracts independently versioned. | implemented | Browser configuration and UI contract versions exist. |
-| DM-056 | Add terminal capability without making an envelope-wide response-capture migration a prerequisite. | planned | The first terminal tool should remain inside the established `cba-agent/1` envelope. |
+| DM-056 | Add terminal capability without making an envelope-wide response-capture migration a prerequisite. | implemented | `terminal-exec/1` is additive inside the established `cba-agent/1` envelope and capture path. |
 
 ## Protocol and context
 
 | ID | Requirement | Status | Current evidence or gap |
 | --- | --- | --- | --- |
 | DM-060 | Copilot emits small typed intents while Cope owns transport identity. | implemented | `cba-agent/1` normalizes into internal `cba/1`. |
-| DM-061 | Stable contract and schemas are not repeated unnecessarily. | partial | Bootstrap exists, but every harness result currently carries a protocol reminder. |
-| DM-062 | Active authority is presented as a compact capability manifest. | planned | Current policy summaries expose more hardened detail than the target needs. |
+| DM-061 | Stable contract and schemas are not repeated unnecessarily. | implemented for bootstrap refresh | Full schemas are delivered on bootstrap; later refreshes omit argument schemas and repairs remain event-driven. |
+| DM-062 | Active authority is presented as a compact capability manifest. | implemented for terminal MVP | The grant-filtered bootstrap and effective summary include compact terminal, network, Git, observation, and bound facts. |
 | DM-063 | Independent observations may be batched. | implemented | `observe` supports bounded read-only batches. |
 | DM-064 | Deterministic operation sequences may be batched when no intermediate reasoning is required. | planned after MVP | Current non-read operations are one-per-turn. |
-| DM-065 | `terminal_exec` uses a required independently versioned tool contract while existing `run_command` meaning remains unchanged. | planned | Current tool surface is catalog-only. |
-| DM-066 | Large output and diffs can be paged or summarized without losing truthful truncation state. | partial | Bounded truncation exists; general paging and terminal output references do not. |
-| DM-067 | A complete bounded terminal result or stable artifact reference becomes durable before journal completion. | planned | Current completed-operation replay stores only safe metadata, not full terminal output. |
+| DM-065 | `terminal_exec` uses a required independently versioned tool contract while existing `run_command` meaning remains unchanged. | implemented | Strict `terminal-exec/1` is additive; catalog `run_command` semantics and required-validation role are unchanged. |
+| DM-066 | Large output and diffs can be paged or summarized without losing truthful truncation state. | partial | Terminal head/tail, retained byte counts, disclosure state, and truncation are truthful; general paging remains later work. |
+| DM-067 | A complete bounded terminal result or stable artifact reference becomes durable before journal completion. | implemented | The integrity-verified terminal result is persisted before journal completion and is replayable without execution. |
 
 ## Policy and safety
 
 | ID | Requirement | Status | Current evidence or gap |
 | --- | --- | --- | --- |
-| DM-070 | Developer mode permits broad local capability after one grant. | planned | Current generated policy denies network and limits commands to configured IDs. |
+| DM-070 | Developer mode permits broad local capability after one grant. | implemented for one project/one-shot terminal | Fresh Developer-capable ceilings plus config-v2 opt-in allow arbitrary shell/argv and local Git/network authority after one grant. |
 | DM-071 | Inspect mode remains read-only. | implemented | Mode checks deny mutation and side-effecting commands. |
 | DM-072 | Hardened command catalogs remain an optional profile. | partial | Catalog implementation exists; profile separation does not. |
 | DM-073 | Cope never automates privilege elevation. | retained | Current live preflight refuses elevated operation. |
 | DM-074 | Cope private state and browser profiles remain excluded from typed workspace tools. | retained | State and profile roots are separate; arbitrary child-process containment is explicitly not claimed. |
 | DM-075 | Additional typed-tool filesystem roots require explicit authority. | planned | Capability model supports paths, but external-root architecture is absent. |
 | DM-076 | Known destructive remote or publishing actions require separate authority where identifiable. | planned | No such action classification is implemented. |
-| DM-077 | Cope does not claim sandbox, egress, rollback, or resource enforcement it does not provide. | partial | Current limitations acknowledge residual risk; developer-mode messaging must be updated in code and CLI. |
+| DM-077 | Cope does not claim sandbox, egress, rollback, or resource enforcement it does not provide. | implemented | CLI grant, doctor, bootstrap projection, release notes, limitations, and operator docs state the current-user and observation boundary. |
 | DM-078 | Secret scanning and final outbound inspection remain active. | implemented | Content security and disclosure ledger exist. |
 
 ## State, recovery, and completion
@@ -119,15 +121,18 @@ implements it or the work belongs after the MVP.
 | --- | --- | --- | --- |
 | DM-080 | Record durable intent before consequential local or browser actions. | implemented | Outbox, operation journal, session state, and audit events exist. |
 | DM-081 | Completed operations are not executed twice. | implemented | Operation identity and journal replay exist. |
-| DM-082 | Unknown mutation outcomes require reconciliation rather than blind replay. | implemented for patch tools | General terminal mutation reconciliation remains planned. |
+| DM-082 | Unknown mutation outcomes require reconciliation rather than blind replay. | implemented | Patch and terminal recovery both fail closed; launched terminal commands are never blindly relaunched. |
 | DM-083 | Pause, resume, and abort preserve truthful state. | implemented | Cooperative cancellation and persisted lifecycle states exist. |
 | DM-084 | Completion requires known local and transport state. | implemented | Completion verifier checks repository, pending operations, submission state, and validation. |
-| DM-085 | Required validation must occur after the latest relevant mutation. | implemented for recorded mutations | Command-generated mutation integration remains planned. |
-| DM-086 | The final handoff distinguishes task changes, pre-existing changes, terminal results, skipped validation, and risks. | partial | Most categories exist; general terminal and command-mutation categories do not. |
+| DM-085 | Required validation must occur after the latest relevant mutation. | implemented | Verified terminal effects advance mutation sequence; required catalog validation must be fresh at the current fingerprint. |
+| DM-086 | The final handoff distinguishes task changes, pre-existing changes, terminal results, skipped validation, and risks. | implemented | Completion and review packages bind verified terminal effect/result provenance and preserve pre-existing/evidence limitations. |
 
 ## MVP release gate
 
-The first developer-mode release is not complete until DM-020, DM-023, DM-027, DM-029 through DM-036, DM-056, DM-065 through DM-067, and DM-070 are implemented and covered by offline end-to-end tests.
+The 0.1.10 code implements the one-shot MVP requirements DM-020, DM-023,
+DM-027, DM-029 through DM-036, DM-056, DM-065 through DM-067, and DM-070 with
+deterministic unit, end-to-end, recovery, and reliability coverage. Platform
+live-certification remains a separate release-evidence gate.
 
 The highest-value functional proof is a real fixture and live pilot in which Cope starts from a normal repository with no hand-authored command catalog, runs a shell command that intentionally changes tracked files, streams bounded output locally, captures and attributes those changes, validates the result, survives an interruption test without replaying the command, and completes with an accurate final diff and report.
 

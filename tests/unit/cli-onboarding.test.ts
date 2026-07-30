@@ -58,10 +58,17 @@ test("guided project setup detects useful package scripts and chooses one comple
   assert.equal(result.commandCount, 3);
 
   const config = JSON.parse(await readFile(result.filename, "utf8")) as {
+    schema_version: string;
+    developer_terminal: { enabled: boolean };
+    policy: { capabilities: { tools: { allow?: string[]; deny?: string[] } } };
     grant_defaults: { writable_paths: string[] };
     commands: Array<{ id: string; executable: string; fixedArguments: string[] }>;
     completion: { required_command_ids: string[]; require_validation_after_last_mutation: boolean };
   };
+  assert.equal(config.schema_version, "cba-repository-config/2");
+  assert.deepEqual(config.developer_terminal, { enabled: true });
+  assert.equal(config.policy.capabilities.tools.allow?.includes("terminal_exec"), true);
+  assert.equal(config.policy.capabilities.tools.deny?.includes("terminal_exec") ?? false, false);
   assert.deepEqual(config.grant_defaults.writable_paths, ["**"]);
   assert.deepEqual(config.commands.map((command) => command.id), ["npm.test", "npm.build", "npm.lint"]);
   assert.ok(config.commands.every((command) => command.executable === process.execPath));
@@ -87,10 +94,17 @@ test("placeholder npm tests are ignored and inspect setup stays read-only", asyn
 
   const result = await writeRepositoryConfiguration({ repositoryRoot: root, profile: "inspect", force: true });
   const config = JSON.parse(await readFile(result.filename, "utf8")) as {
+    schema_version: string;
+    developer_terminal: { enabled: boolean };
+    policy: { capabilities: { tools: { allow?: string[]; deny?: string[] } } };
     grant_defaults: { writable_paths: string[] };
     commands: unknown[];
     completion: { required_command_ids: string[] };
   };
+  assert.equal(config.schema_version, "cba-repository-config/2");
+  assert.deepEqual(config.developer_terminal, { enabled: false });
+  assert.equal(config.policy.capabilities.tools.allow?.includes("terminal_exec"), false);
+  assert.deepEqual(config.policy.capabilities.tools.deny, ["terminal_exec"]);
   assert.deepEqual(config.grant_defaults.writable_paths, []);
   assert.deepEqual(config.commands, []);
   assert.deepEqual(config.completion.required_command_ids, []);
@@ -175,7 +189,12 @@ test("guided machine setup preselects the only detected browser and commits only
   assert.equal(persisted.product, "chrome");
   assert.equal(persisted.browser_executable, chrome.executablePath);
   assert.equal(path.basename(String(persisted.profile_directory)), "CopilotBrowserAgentChromeProfile");
-  assert.ok(await readFile(paths.organizationPolicy, "utf8"));
+  const organizationPolicy = JSON.parse(
+    await readFile(paths.organizationPolicy, "utf8"),
+  ) as { revision: string; capabilities: { tools: { allow?: string[]; deny?: string[] } } };
+  assert.equal(organizationPolicy.revision, "2");
+  assert.equal(organizationPolicy.capabilities.tools.allow?.includes("terminal_exec"), true);
+  assert.equal(organizationPolicy.capabilities.tools.deny?.includes("terminal_exec") ?? false, false);
 });
 
 test("final setup readiness preserves identity diagnostics and commits nothing", async (context) => {

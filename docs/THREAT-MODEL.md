@@ -4,8 +4,8 @@
 
 Cope's primary target is a powerful local developer agent, not a portable application sandbox.
 
-Cope 0.1.9 does not yet implement developer mode; current limits are recorded
-in [LIMITATIONS.md](LIMITATIONS.md).
+Cope 0.1.10 implements the first Developer-mode terminal vertical; current
+limits are recorded in [LIMITATIONS.md](LIMITATIONS.md).
 
 In developer mode, security means:
 
@@ -123,17 +123,26 @@ The model proposes completion. Cope checks local operation, repository, validati
 
 Shell support is required for the target product. It enables pipes, redirects, chained commands, platform-native scripts, package managers, build systems, formatters, codemods, and other normal developer workflows.
 
-The terminal boundary must distinguish executable requests from data. It should preserve exact command text, working directory, environment choices, process identity, output, exit state, and observed workspace changes. It should not attempt to prove that an arbitrary command had no external effect.
+The terminal boundary distinguishes executable requests from data. It
+preserves the exact invocation, working directory, environment-key evidence,
+bounded output, exit state, and observed workspace changes. It does not claim
+that an arbitrary command had no external effect.
 
-Developer mode may allow shell execution after the initial grant. Hardened mode may require reviewed executable and argument definitions.
+Developer mode allows shell or argv execution only after its initial grant.
+Hardened or managed policy may continue to deny the terminal and require
+reviewed catalog definitions.
 
 ## Command-generated mutations
 
 A command that changes project files is not automatically a security incident. It is an ordinary mutation source.
 
-Cope should record the before state, run the command, capture the after state, attribute observed in-scope changes, preserve pre-existing changes separately, and integrate recoverable files with checkpoints and the session mutation history.
+Cope records bounded before state, runs the command, captures bounded after
+state, attributes observed in-scope changes, preserves pre-existing changes
+separately, and integrates available before-images with session diffs and
+mutation history.
 
-A failed, timed-out, or cancelled command may still have changed files. Outcome and mutation state must be recorded independently.
+A failed, timed-out, or cancelled command may still have changed files.
+Process and mutation outcomes are recorded independently.
 
 Changes outside the workspace should stop the task when observed. Developer mode accepts that portable Node-level inspection cannot reliably detect all external writes.
 

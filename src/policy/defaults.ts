@@ -12,6 +12,9 @@ import {
 export const DEFAULT_ENABLED_TOOL_NAMES: readonly ToolName[] = Object.freeze(
   TOOL_NAMES.filter((tool) => tool !== "terminal_exec"),
 );
+export const DEFAULT_DEVELOPER_TOOL_NAMES: readonly ToolName[] = Object.freeze(
+  [...TOOL_NAMES],
+);
 
 const PROTECTED_MUTATION_PATHS = [
   ".git",
@@ -152,6 +155,31 @@ export const DEFAULT_REPOSITORY_POLICY: PolicyDocument = {
   },
 };
 
+/**
+ * Fresh Developer onboarding uses permissive tool ceilings while retaining
+ * every existing typed-network, disclosure, path, change, and budget rule.
+ * Persisted or managed v1 policies are never rewritten to these variants.
+ */
+export const DEFAULT_DEVELOPER_ORGANIZATION_POLICY: PolicyDocument = {
+  ...DEFAULT_ORGANIZATION_POLICY,
+  policy_id: "default-developer-organization",
+  revision: "2",
+  capabilities: {
+    ...DEFAULT_ORGANIZATION_POLICY.capabilities,
+    tools: { allow: DEFAULT_DEVELOPER_TOOL_NAMES },
+  },
+};
+
+export const DEFAULT_DEVELOPER_REPOSITORY_POLICY: PolicyDocument = {
+  ...DEFAULT_REPOSITORY_POLICY,
+  policy_id: "default-developer-repository",
+  revision: "2",
+  capabilities: {
+    ...DEFAULT_REPOSITORY_POLICY.capabilities,
+    tools: { allow: DEFAULT_DEVELOPER_TOOL_NAMES },
+  },
+};
+
 export interface DefaultSessionGrantOptions {
   readonly grant_id: string;
   readonly task_id: string;
@@ -163,14 +191,19 @@ export interface DefaultSessionGrantOptions {
   readonly command_ids?: readonly string[];
   readonly disclosure_classifications?: readonly string[];
   readonly tools?: readonly ToolName[];
+  /** Defaults false so every existing and legacy caller stays terminal-free. */
+  readonly enable_terminal_exec?: boolean;
   readonly budgets?: BudgetLimits;
 }
 
 export function createDefaultSessionGrant(options: DefaultSessionGrantOptions): SessionGrant {
   const branch = options.branch === undefined ? {} : { branch: options.branch };
-  const allowedTools = (options.tools ?? DEFAULT_ENABLED_TOOL_NAMES).filter(
-    (tool) => tool !== "terminal_exec",
-  );
+  const terminalEnabled = options.enable_terminal_exec === true;
+  const allowedTools = (options.tools ?? (
+    terminalEnabled
+      ? DEFAULT_DEVELOPER_TOOL_NAMES
+      : DEFAULT_ENABLED_TOOL_NAMES
+  )).filter((tool) => terminalEnabled || tool !== "terminal_exec");
   return {
     schema_version: SESSION_GRANT_SCHEMA_VERSION,
     grant_id: options.grant_id,
@@ -180,7 +213,11 @@ export function createDefaultSessionGrant(options: DefaultSessionGrantOptions): 
     mode: options.mode,
     default_decision: "ask",
     capabilities: {
-      tools: { allow: allowedTools, deny: ["terminal_exec"], unmatched: "ask" },
+      tools: {
+        allow: allowedTools,
+        ...(terminalEnabled ? {} : { deny: ["terminal_exec"] }),
+        unmatched: "ask",
+      },
       paths: {
         read: { allow: options.readable_paths ?? ["**"], unmatched: "ask" },
         write: { allow: options.writable_paths ?? [], unmatched: "ask" },

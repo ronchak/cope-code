@@ -16,6 +16,7 @@ The Windows default state root is `%LOCALAPPDATA%\CopilotBrowserAgent`. The expe
 | audit JSONL | hash-chained event metadata/outcomes | no raw file bodies by design; may contain paths/reasons |
 | disclosure JSONL | hash-chained classification, byte/hash/path/redaction metadata | no disclosed content; paths/findings are sensitive |
 | operation journal | request hash, lifecycle, safe outcome metadata | no raw file bodies by design; operationally sensitive |
+| terminal artifacts | exact request, bounded pre/post observations, launch/exit receipts, and final result | command text, paths, output excerpts, and local effect evidence may be sensitive |
 | `artifacts/outbox` | exact pending message needed for send recovery | source/model/task-bearing |
 | `artifacts/response` | exact received model response needed for parse recovery | source/model/task-bearing |
 | `artifacts/decision` | exact user input or capability decision needed for replay | may contain free-form source/task-sensitive text |
@@ -58,6 +59,25 @@ If the process stops at any boundary, persisted state and artifacts determine th
 
 If execution began but final state is unavailable, the operation becomes indeterminate.
 
+### Developer terminal execution
+
+1. Validate the strict tool contract and effective terminal grant.
+2. Journal accepted intent and persist the exact terminal request.
+3. Capture and persist the bounded pre-command project observation.
+4. Mark execution and persist the launch receipt before process effects may occur.
+5. Stream bounded output locally while retaining bounded stdout/stderr evidence.
+6. Persist the exit receipt when process outcome is known.
+7. Capture and persist the bounded post-command observation.
+8. Persist the complete `terminal-exec-result/1`, including independent process
+   and mutation outcomes.
+9. Attribute and budget verified effects once, update mutation freshness once,
+   then mark the journal operation complete.
+
+Recovery may promote or replay an integrity-verified durable result. It never
+relaunches a command once launch might have occurred. Missing exit or
+post-observation evidence remains indeterminate; unknown or protected/hidden
+effects require reconciliation.
+
 ### Operator control
 
 `pause` and `abort` first try to acquire the workspace lock. If the active owner holds it, the control CLI atomically writes a session-bound request under the session directory. The active process polls at 250 ms, verifies the request schema/session identity, and invokes pause or emergency stop. The requesting CLI waits up to 15 seconds for the persisted state transition. Abort has priority and cannot be overwritten by a later pause.
@@ -79,6 +99,10 @@ Before a user answer or capability decision can be replayed after a crash, the r
 | browser delivery indeterminate | pause; never blindly send again |
 | completed operation journal record | return/reuse recorded result metadata, do not execute |
 | interrupted read-only operation | retry only under current policy and budget |
+| terminal request accepted, no launch receipt and launch proven absent | recover as not executed under the terminal recovery contract |
+| terminal launch may have occurred, no complete verified result | reconcile durable receipts/observations; never relaunch blindly |
+| complete verified terminal result | promote/replay the exact result and apply verified effects idempotently |
+| terminal mutation outcome unknown or protected/hidden changed | pause or block for reconciliation; do not report clean completion |
 | command changed tracked/nonignored, protected, Git-control, or nested-repository state, or a declared-side-effect-free command changed ordinary ignored state | stop with recovery required; the outcome is not trusted validation and the repository must be reconciled before any new session |
 | accepted but never executing mutation | may reconcile as not started according to journal evidence |
 | executing/indeterminate mutation | pause for repository reconciliation or rollback |
@@ -231,7 +255,9 @@ After an interrupted setup, inspect `cope doctor --json`, the browser config has
 3. Preserve non-source evidence first. Preserve source-bearing artifacts only when approved and necessary.
 4. Record session ID, safe timestamps, policy revisions/hashes, diagnostic codes, affected repository/path classifications, and operator actions.
 5. Verify audit/disclosure/checkpoint integrity without modifying originals.
-6. Reconcile repository and remote delivery state. V1 should have no autonomous push/deploy/publish.
+6. Reconcile repository and remote delivery state. Developer terminal commands
+   can conceal remote push/deploy/publish effects even though no dedicated
+   typed operation exists.
 7. Rotate/revoke browser sessions and credentials according to the identity incident plan if profile material may be exposed.
 8. Notify repository data owner, security/privacy, service owner, and records owner as applicable.
 9. Do not resume until the cause and trust boundary are restored; recertify the adapter after any UI incident.

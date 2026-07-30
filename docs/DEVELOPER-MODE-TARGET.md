@@ -6,7 +6,10 @@ Developer mode is Cope's primary product target.
 
 The intended experience is a local coding agent that feels materially similar to Claude Code while using Microsoft 365 Copilot Chat through a visible browser as the reasoning backend. Cope should maximize useful repository and terminal capability, minimize repeated permission friction, and preserve only the guardrails needed to keep the user in control of the selected workspace and to recover from ordinary failures.
 
-Cope 0.1.9 is not yet this product. It is the hardened foundation from which developer mode will be built.
+Cope 0.1.10 ships the first complete Developer-mode terminal vertical on the
+hardened foundation. It satisfies the one-shot terminal, project-effect,
+completion, and compatible-grant milestone; the later capabilities named
+below remain target work.
 
 ## MVP outcome
 
@@ -97,7 +100,10 @@ The current repository and lifecycle tools remain useful:
 
 ### New one-shot terminal tool
 
-The first implementation milestone should add one broad `terminal_exec` operation under the existing `cba-agent/1` envelope. The new authority is versioned through a required tool contract such as `terminal-exec/1`; the current catalog-only `run_command` semantics remain unchanged.
+Cope 0.1.10 adds one broad `terminal_exec` operation under the existing
+`cba-agent/1` envelope. The authority is versioned through required tool
+contract `terminal-exec/1`; catalog-only `run_command` semantics remain
+unchanged.
 
 A representative request shape is:
 
@@ -112,7 +118,7 @@ A representative request shape is:
 }
 ```
 
-Direct argv mode should also be supported:
+Direct argv mode is also supported:
 
 ```json
 {
@@ -130,9 +136,13 @@ Keeping the established envelope avoids coupling the first terminal milestone to
 
 ### Output behavior
 
-One-shot terminal execution should stream stdout and stderr to the local terminal while the process runs. Copilot receives a bounded result, concise head or tail excerpts, and stable references for any retained pages.
+One-shot terminal execution streams stdout and stderr to the local terminal
+while the process runs. Copilot receives a bounded result and concise head/tail
+excerpts with exact truncation and disclosure state.
 
-The complete bounded result must become durable before the operation journal marks the tool complete. Crash recovery must resend the same result or reference rather than rerun the command.
+The complete bounded result becomes durable before the operation journal marks
+the tool complete. Crash recovery resends the same verified result rather than
+rerunning the command.
 
 ### Process sessions
 
@@ -148,11 +158,14 @@ This unlocks development servers, watch modes, interactive installers, REPLs, de
 
 ### Git operations
 
-The MVP may use the terminal for Git writes. Typed local Git tools can follow where they improve recovery and presentation. Remote Git actions should remain separately visible and authorizable where practical.
+The MVP uses the terminal for Git writes. Typed local Git tools can follow
+where they improve recovery and presentation. Remote Git actions should remain
+separately visible and authorizable where practical.
 
 ## Command mutation handling
 
-The existing rule that a command must not change Git-visible project state must be removed for developer mode.
+Developer terminal commands are allowed to change Git-visible project state;
+catalog-backed `run_command` retains its established validation boundary.
 
 A developer-mode command operation should:
 

@@ -646,11 +646,16 @@ export function effectiveGrantSummary(
   const deletablePaths = grant.capabilities.paths?.delete?.allow ?? [];
   const commandIds = grant.capabilities.commands?.ids?.allow ?? [];
   const commandCategories = grant.capabilities.commands?.categories?.allow ?? [];
+  const terminalActive =
+    grant.mode === "auto" &&
+    (grant.capabilities.tools?.allow ?? []).includes("terminal_exec");
   const canWrite = grant.mode !== "inspect" &&
     writablePaths.length + creatablePaths.length + deletablePaths.length > 0;
   const canRunCommands = grant.mode !== "inspect" &&
-    commandIds.length + commandCategories.length > 0;
-  const effectiveMode = canWrite || canRunCommands
+    (commandIds.length + commandCategories.length > 0 || terminalActive);
+  const effectiveMode = terminalActive
+    ? "developer"
+    : canWrite || canRunCommands
     ? grant.mode === "auto" ? "policy-auto" : "edit-capable"
     : "inspect-only";
   return JSON.stringify({
@@ -692,6 +697,20 @@ export function effectiveGrantSummary(
       repository: configuration.repository.policy.capabilities.commands ?? {},
       session: grant.capabilities.commands ?? {},
     },
+    ...(terminalActive
+      ? {
+          terminal: {
+            active: true,
+            runs_as: "current-user",
+            cwd_scope: "project-relative-starting-directory",
+            isolation: "not-an-os-sandbox",
+            network: "ordinary-child-access-not-restricted-by-cope",
+            local_git: "allowed-and-observed-after-execution",
+            effects: "bounded-local-repository-observation",
+            output: "bounded-local-and-model-visible-results",
+          },
+        }
+      : {}),
     disclosure_classifications: grant.capabilities.disclosure?.classifications?.allow ?? [],
     disclosure_constraints_by_layer: {
       organization: configuration.organizationPolicy.capabilities.disclosure ?? {},
@@ -717,7 +736,9 @@ export function effectiveGrantSummary(
     effective_budgets: engine.getEffectiveBudgetLimits(),
     checkpoint_and_rollback: {
       patch_checkpoint: "durable before-image is written before every edit_text or apply_patch mutation and sealed with verified post-state",
-      commands: "granted sideEffects=true validation commands may create ordinary Git-ignored artifacts; every command must preserve Git-visible, protected, Git-control, and nested-repository state, and sideEffects=false commands additionally preserve bounded ignored-worktree state; intentional source-writing commands require a future versioned checkpointable write-scope contract",
+      commands: terminalActive
+        ? "terminal commands run as the current user and are bracketed by durable bounded repository observations; arbitrary commands are not atomic and may have effects outside observable local repository state"
+        : "granted sideEffects=true validation commands may create ordinary Git-ignored artifacts; every catalog command must preserve Git-visible, protected, Git-control, and nested-repository state",
       storage: "outside the repository in the protected session state directory",
       rollback: "sealed checkpoints use compare-and-restore; interrupted unsealed checkpoints require explicit --force",
       stale_guard: "rollback refuses to overwrite files changed after the recorded agent mutation unless explicitly forced",

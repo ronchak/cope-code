@@ -22,6 +22,7 @@ import { CURRENT_HOST_PLATFORM, type HostPlatform } from "../platform/index.js";
 import { CommandCatalog } from "../tools/index.js";
 import {
   BROWSER_CONFIG_VERSION,
+  LEGACY_REPOSITORY_CONFIG_VERSION,
   LEGACY_BROWSER_CONFIG_VERSION,
   REPOSITORY_CONFIG_VERSION,
   type AnyBrowserFileConfig,
@@ -181,7 +182,7 @@ export function verifiedBrowserIdentityHashes(
 
 export function parseRepositoryConfig(value: unknown): RepositoryAgentConfig {
   const object = record(value, "repository configuration");
-  exactKeys(object, [
+  const sharedKeys = [
     "schema_version",
     "classification",
     "policy",
@@ -190,9 +191,16 @@ export function parseRepositoryConfig(value: unknown): RepositoryAgentConfig {
     "completion",
     "limits",
     "retention",
-  ], "repository configuration");
-  if (object.schema_version !== REPOSITORY_CONFIG_VERSION) {
-    throw new AgentError("CONFIG_INVALID", `Expected repository schema ${REPOSITORY_CONFIG_VERSION}`);
+  ] as const;
+  if (object.schema_version === LEGACY_REPOSITORY_CONFIG_VERSION) {
+    exactKeys(object, sharedKeys, "repository configuration");
+  } else if (object.schema_version === REPOSITORY_CONFIG_VERSION) {
+    exactKeys(object, [...sharedKeys, "developer_terminal"], "repository configuration");
+  } else {
+    throw new AgentError(
+      "CONFIG_INVALID",
+      `Expected repository schema ${LEGACY_REPOSITORY_CONFIG_VERSION} or ${REPOSITORY_CONFIG_VERSION}`,
+    );
   }
   const classification = nonEmptyString(object.classification, "classification");
   assertValidPolicyDocument(object.policy);
@@ -214,11 +222,22 @@ export function parseRepositoryConfig(value: unknown): RepositoryAgentConfig {
   ], "limits");
   const retention = record(object.retention, "retention");
   exactKeys(retention, ["retain_source_artifacts_on_completion"], "retention");
+  const developerTerminal = object.schema_version === REPOSITORY_CONFIG_VERSION
+    ? record(object.developer_terminal, "developer_terminal")
+    : undefined;
+  if (developerTerminal !== undefined) {
+    exactKeys(developerTerminal, ["enabled"], "developer_terminal");
+  }
   if (!Array.isArray(object.commands)) throw new AgentError("CONFIG_INVALID", "commands must be an array");
   // Constructor performs strict per-definition validation and duplicate checks.
   void new CommandCatalog(object.commands as never);
   const config: RepositoryAgentConfig = {
-    schema_version: REPOSITORY_CONFIG_VERSION,
+    schema_version: object.schema_version,
+    developer_terminal: {
+      enabled: developerTerminal === undefined
+        ? false
+        : booleanValue(developerTerminal.enabled, "developer_terminal.enabled"),
+    },
     classification,
     policy: object.policy,
     grant_defaults: {

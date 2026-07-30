@@ -10,7 +10,12 @@ Developer usefulness is the primary product objective. Security controls exist t
 
 ## Status
 
-This document describes the target architecture. Cope 0.1.9 implements the browser transport, state machine, strict protocol, repository tools, atomic patching, command catalog, recovery, and completion foundations, but it does not yet implement the full developer-mode terminal surface described here.
+This document describes the target architecture. Cope 0.1.10 implements the
+first complete Developer-mode terminal vertical: shell/argv execution,
+current-user environment and network authority, durable no-replay results,
+pre/post project observation, mutation attribution, completion freshness, and
+strict compatible grants. PTY/stdin, persistent processes, additional roots,
+typed Git mutation tools, and isolated execution profiles remain target work.
 
 The current implementation gap is summarized in [LIMITATIONS.md](LIMITATIONS.md). The minimum viable developer-mode target is defined in [DEVELOPER-MODE-TARGET.md](DEVELOPER-MODE-TARGET.md).
 
@@ -269,8 +274,15 @@ Completion verification does not prove semantic correctness. The final handoff m
 
 ## Current implementation gap
 
-Cope 0.1.9 already provides a strong base: browser correlation, durable sessions, typed model intents, policy evaluation, bounded repository inspection, atomic patching, one-shot process execution, cancellation, checkpoints, audit records, and independent completion verification.
+Cope 0.1.10 provides browser correlation, durable sessions, typed model
+intents, policy evaluation, bounded repository inspection, atomic patching,
+shell/argv terminal execution, live bounded output, durable terminal results,
+pre/post command observation, mutation attribution, local Git authority,
+cancellation, audit, and independent completion verification.
 
-It remains materially short of the target because commands are catalog-only, shells are prohibited, standard setup discovers only a few npm validation scripts, command-generated source changes are rejected, network access is denied by default, output is buffered rather than presented as a developer terminal stream, process interaction is non-PTY, terminal results are not durable replay artifacts, and local Git writes are unavailable through typed tools.
-
-The pivot is substantial but evolutionary. It does not require replacing the browser transport or agent loop. It requires broadening local execution, adding post-command mutation attribution and durable terminal results, adjusting recovery and completion accounting, and changing the trust posture from maximum application-level containment to explicit developer authority with observable effects.
+The remaining gap is parity beyond one-shot work: stdin and PTY processes,
+durable servers/watchers, multiple explicit workspace roots, typed Git and
+remote-action surfaces, richer large-result paging, and optional isolated
+execution profiles. New quick setups are Developer-ready, while explicit mode
+selection and strict compatibility prevent old or managed configurations from
+being widened.

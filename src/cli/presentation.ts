@@ -240,7 +240,7 @@ function renderCompactStartup(
 function modePresentation(mode: AutonomyMode): string {
   if (mode === "inspect") return "inspect-only";
   if (mode === "edit") return "edit-capable";
-  return "policy-auto";
+  return "Developer";
 }
 
 function framedLine(

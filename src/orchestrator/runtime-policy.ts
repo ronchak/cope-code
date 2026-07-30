@@ -88,6 +88,9 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
 
   public summarize(): Readonly<Record<string, unknown>> {
     const grant = this.engineValue.session;
+    const terminalActive =
+      grant.mode === "auto" &&
+      (grant.capabilities.tools?.allow ?? []).includes("terminal_exec");
     const disclosureLimits = this.engineValue.getEffectiveDisclosureLimits();
     const listBounds = listFilesRuntimeBounds(this.engineValue);
     const budgetRecovery = budgetRecoveryHeadroom(this.engineValue);
@@ -110,7 +113,9 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
       ]),
       command_ids: grant.capabilities.commands?.ids?.allow ?? [],
       disclosure_classifications: grant.capabilities.disclosure?.classifications?.allow ?? [],
-      network: grant.capabilities.network?.access ?? "deny",
+      network: terminalActive
+        ? "allow"
+        : grant.capabilities.network?.access ?? "deny",
       operation_limits: {
         list_files: {
           default_max_results:
@@ -138,6 +143,11 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
       notes: [
         "Organization, repository, and session rules are combined using the most restrictive decision.",
         "Detected secrets are blocked again on the fully serialized browser submission.",
+        ...(terminalActive
+          ? [
+              "Developer terminal commands run as the current user from the project as a starting directory, not an OS sandbox; ordinary environment and network access and local Git may be used, and local repository effects are observed after execution. Catalog-command network policy remains separately enforced.",
+            ]
+          : []),
         ...(disclosureLimitParts.length === 0
           ? []
           : [

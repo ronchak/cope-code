@@ -2,12 +2,22 @@ import type { BrowserLaunchConfig, BrowserProduct, CopilotUiContract } from "../
 import type { PolicyDocument } from "../policy/index.js";
 import type { CommandDefinition } from "../tools/index.js";
 
-export const REPOSITORY_CONFIG_VERSION = "cba-repository-config/1" as const;
+export const LEGACY_REPOSITORY_CONFIG_VERSION = "cba-repository-config/1" as const;
+export const REPOSITORY_CONFIG_VERSION = "cba-repository-config/2" as const;
 export const LEGACY_BROWSER_CONFIG_VERSION = "cba-browser-config/1" as const;
 export const BROWSER_CONFIG_VERSION = "cba-browser-config/2" as const;
 
 export interface RepositoryAgentConfig {
-  readonly schema_version: typeof REPOSITORY_CONFIG_VERSION;
+  readonly schema_version:
+    | typeof LEGACY_REPOSITORY_CONFIG_VERSION
+    | typeof REPOSITORY_CONFIG_VERSION;
+  /**
+   * Normalized product authority. Legacy config v1 always loads with this
+   * disabled even though the source document does not contain the block.
+   */
+  readonly developer_terminal: {
+    readonly enabled: boolean;
+  };
   readonly classification: string;
   readonly policy: PolicyDocument;
   readonly grant_defaults: {

@@ -8,6 +8,8 @@ import { completionAuthorityForEffectivePolicy } from "../../src/cli/commands.js
 import { DEFAULT_MAX_CHECKPOINT_FILES } from "../../src/repository/checkpoint.js";
 import {
   DEFAULT_ORGANIZATION_POLICY,
+  DEFAULT_DEVELOPER_ORGANIZATION_POLICY,
+  DEFAULT_DEVELOPER_REPOSITORY_POLICY,
   DEFAULT_HIGHER_LAYER_BUDGETS,
   DEFAULT_POLICY_BUDGETS,
   DEFAULT_REPOSITORY_POLICY,
@@ -49,7 +51,30 @@ function operation(overrides: Partial<PolicyOperation> = {}): PolicyOperation {
 test("default policy documents and generated session grant validate", () => {
   assert.equal(validatePolicyDocument(DEFAULT_ORGANIZATION_POLICY).valid, true);
   assert.equal(validatePolicyDocument(DEFAULT_REPOSITORY_POLICY).valid, true);
+  assert.equal(validatePolicyDocument(DEFAULT_DEVELOPER_ORGANIZATION_POLICY).valid, true);
+  assert.equal(validatePolicyDocument(DEFAULT_DEVELOPER_REPOSITORY_POLICY).valid, true);
   assert.equal(validateSessionGrant(session()).valid, true);
+});
+
+test("Developer policy ceilings still require an explicit terminal-capable session grant", () => {
+  const disabled = session("auto");
+  assert.equal(
+    engine(
+      disabled,
+      DEFAULT_DEVELOPER_ORGANIZATION_POLICY,
+      DEFAULT_DEVELOPER_REPOSITORY_POLICY,
+    ).evaluate(operation({ tool: "terminal_exec" })).decision,
+    "deny",
+  );
+  const enabled = session("auto", { enable_terminal_exec: true });
+  const result = engine(
+    enabled,
+    DEFAULT_DEVELOPER_ORGANIZATION_POLICY,
+    DEFAULT_DEVELOPER_REPOSITORY_POLICY,
+  ).evaluate(operation({ tool: "terminal_exec" }));
+  assert.equal(result.decision, "allow");
+  assert.equal(enabled.capabilities.tools?.allow?.filter((tool) => tool === "terminal_exec").length, 1);
+  assert.equal(enabled.capabilities.tools?.deny?.includes("terminal_exec") ?? false, false);
 });
 
 test("all default policy projections explicitly deny terminal execution", () => {

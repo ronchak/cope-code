@@ -278,8 +278,23 @@ export async function executeDoctorCommand(
     });
     try {
       const configFile = path.join(boundary.root, ".cba", "repository.json");
-      parseRepositoryConfig(JSON.parse(await readFile(configFile, "utf8")) as unknown);
-      checks.push({ name: "Project setup", ok: true, detail: configFile, required: true });
+      const repositoryConfig = parseRepositoryConfig(
+        JSON.parse(await readFile(configFile, "utf8")) as unknown,
+      );
+      const developerTerminal = repositoryConfig.developer_terminal.enabled;
+      checks.push({
+        name: "Project setup",
+        ok: true,
+        detail: `${configFile}; Developer terminal ${developerTerminal ? "enabled by project config (managed policy still applies)" : "disabled"}`,
+        summary: developerTerminal
+          ? "configured for Developer terminal; managed policy still applies"
+          : "configured; Developer terminal disabled",
+        evidence: {
+          schema_version: repositoryConfig.schema_version,
+          developer_terminal_enabled: developerTerminal,
+        },
+        required: true,
+      });
     } catch (error) {
       checks.push({ name: "Project setup", ok: false, detail: `Run cope in the project to create it. ${errorMessage(error)}`, required: true });
     }

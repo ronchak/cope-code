@@ -4,37 +4,49 @@
 
 Cope's target architecture is the developer mode described in [ARCHITECTURE.md](ARCHITECTURE.md) and [DEVELOPER-MODE-TARGET.md](DEVELOPER-MODE-TARGET.md).
 
-The current 0.1.9 release is a hardened precursor. It proves important browser, protocol, repository, recovery, and verification foundations, but it does not yet provide the broad terminal capability required for the intended Claude Code-like experience.
+The current 0.1.10 release ships the first complete Developer-mode terminal
+vertical on the hardened browser, protocol, repository, recovery, and
+verification foundations.
 
 This document separates current implementation limits from limitations that remain part of the target product.
 
-## Current 0.1.9 implementation limits
+## Current 0.1.10 implementation limits
 
 ### Terminal capability
 
-Cope 0.1.9 does not expose a general terminal.
+Developer sessions may use additive `terminal_exec` in explicit shell or argv
+mode. Output streams locally while a bounded result is retained for Copilot
+and recovery. The selected project is a validated starting directory, not an
+OS sandbox.
 
-- `run_command` can invoke only commands defined in the repository command catalog.
-- Shells and platform command-script shims are rejected.
-- Standard setup discovers only selected npm validation scripts such as `test`, `check`, `build`, `typecheck`, and `lint`.
-- Commands receive typed predeclared parameters rather than arbitrary arguments.
+- Terminal authority requires a new Developer session, config v2 enabled, and
+  an allow decision from every policy layer.
+- `run_command` remains a separate catalog-backed tool for hardened commands
+  and named completion validation.
 - Standard input is unavailable.
-- Output is returned after process completion rather than streamed through a persistent process handle.
 - There is no PTY, REPL, watch-mode, development-server, debugger, or interactive installer workflow.
+- There are no durable persistent process handles.
 
-These are current implementation constraints, not the target developer-mode design.
+Existing config-v1 projects, durable grants, and denying managed policies
+remain terminal-free.
 
 ### Command-generated source changes
 
-The current command boundary permits ordinary ignored build artifacts from side-effecting validation commands, but rejects changes to Git-visible project state. That means normal formatters, codemods, generators, package installation, lockfile updates, migrations, and scaffolding commands cannot be used as intended.
+Developer terminal commands may intentionally change Git-visible project
+state. Cope records bounded pre/post observations, attributes known in-scope
+effects, preserves pre-existing work separately, meters actual changes, and
+invalidates stale completion evidence.
 
-Developer mode will replace this prohibition with pre/post observation, mutation attribution, checkpoint integration, and truthful recovery state.
+Observation is not an atomic command-write transaction. Before-images are
+captured where supported, but arbitrary command effects are not guaranteed to
+be reversible and external effects may be unobservable.
 
 ### Network
 
-The default current policy denies command network access. Application policy is not an operating-system egress sandbox, so the current declaration should not be confused with enforceable network containment.
-
-Developer mode will permit normal network-dependent development commands after the initial task grant. Hardened deployments may retain explicit network restrictions.
+Developer terminal commands may use the current user's ordinary network access
+after the initial task grant. Application policy is not an operating-system
+egress sandbox and does not classify every connection. Hardened deployments
+may retain a terminal denial and catalog network restrictions.
 
 ### Files and repositories
 
@@ -44,9 +56,11 @@ Atomic patching and rollback also depend on host filesystem capabilities. These 
 
 ### Git and delivery
 
-The current tool surface can inspect status and bounded diffs, but it cannot stage files, create local commits, push, open pull requests, merge, deploy, publish packages, or release software.
-
-The developer-mode target permits local Git operations and leaves remote publication or destructive actions separately authorizable.
+Developer terminal commands can perform local Git operations. Cope observes
+the resulting local repository facts; it does not yet expose typed Git
+mutation tools. Arbitrary shell code may also perform remote writes that Cope
+cannot reliably classify in advance. Push, merge, deploy, publication, and
+release activation have no dedicated typed authorization surface in this MVP.
 
 ### Browser and platform status
 
@@ -100,9 +114,14 @@ Cope can impose timeouts, output bounds, cancellation, and process-tree terminat
 
 ## Compatibility direction
 
-The current catalog command path should remain available for hardened mode and for deterministic required validation. Developer-mode terminal tools require a versioned protocol and configuration change rather than silently widening current `run_command` semantics.
+The catalog command path remains available for hardened mode and deterministic
+required validation. Developer terminal authority uses its own versioned tool
+contract and config-v2 bit rather than silently widening `run_command` or old
+configuration.
 
-Historical release notes continue to describe the behavior of their released versions. Target documents describe where the product is going; they do not retroactively change 0.1.9 or any earlier release.
+Historical release notes continue to describe the behavior of their released
+versions. Target documents describe remaining work; they do not retroactively
+change 0.1.9 or any earlier release.
 
 ## When Cope must still stop
 
