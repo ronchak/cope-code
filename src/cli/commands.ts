@@ -604,6 +604,9 @@ async function resumeSession(
       onProgress: progressReporter(command.json, io),
       onTerminalOutput: terminalOutputReporter(command.json, io),
       host,
+      ...(command.recoveryContext === undefined
+        ? {}
+        : { recoveryContext: command.recoveryContext }),
     });
     setupControl.bindRuntime(composed.runtime);
     const result = await composed.runtime.run();

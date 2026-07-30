@@ -23,7 +23,6 @@ export const LIST_FILES_RESULT_BYTES = 128 * 1024;
 export const LIST_FILES_ENTRY_BYTES = 2 * 1024;
 /** Maximum serialized data object returned by git_status. */
 export const GIT_STATUS_RESULT_BYTES = 64 * 1024;
-
 export function projectedListFilesResultBytes(maxResults: number): number {
   if (!Number.isSafeInteger(maxResults) || maxResults < 1) {
     throw new AgentError("PROTOCOL_INVALID", "list_files result count is invalid", {
@@ -36,19 +35,27 @@ export function projectedListFilesResultBytes(maxResults: number): number {
 export function plannedToolResultDisclosureBytes(
   sourceBytes = 0,
   pathBytes = 0,
+  additionalSerializedBytes = 0,
 ): number {
   if (
     !Number.isSafeInteger(sourceBytes) ||
     sourceBytes < 0 ||
     !Number.isSafeInteger(pathBytes) ||
-    pathBytes < 0
+    pathBytes < 0 ||
+    !Number.isSafeInteger(additionalSerializedBytes) ||
+    additionalSerializedBytes < 0
   ) {
     throw new AgentError("PROTOCOL_INVALID", "Tool-result disclosure size is invalid", {
       sourceBytes,
       pathBytes,
+      additionalSerializedBytes,
     });
   }
-  const planned = TOOL_RESULT_ENVELOPE_RESERVE_BYTES + (sourceBytes * 6) + (pathBytes * 6);
+  const planned =
+    TOOL_RESULT_ENVELOPE_RESERVE_BYTES +
+    (sourceBytes * 6) +
+    (pathBytes * 6) +
+    additionalSerializedBytes;
   if (!Number.isSafeInteger(planned)) {
     throw new AgentError("BUDGET_EXCEEDED", "Tool-result disclosure reservation is too large", {
       sourceBytes,

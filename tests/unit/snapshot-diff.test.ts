@@ -336,6 +336,129 @@ test("mixed session diff keeps the earliest trustworthy baseline across mutation
   assert.doesNotMatch(result.diff, /patch intermediate|terminal intermediate|repeat intermediate/u);
 });
 
+test("pathless non-clean terminal evidence prevents later patch baseline laundering", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-pathless-terminal-diff-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  await writeFile(path.join(root, "target.txt"), "after terminal\n");
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(
+    boundary,
+    path.join(temporary, "checkpoints"),
+  );
+  const laterPatch = await checkpoints.createCheckpoint(["target.txt"]);
+  await writeFile(path.join(root, "target.txt"), "after patch\n");
+
+  for (const outcome of [
+    "unknown",
+    "protected_or_hidden_changed",
+  ] as const) {
+    const operationId = `op_pathless_${outcome}`;
+    const resolverCalls: string[] = [];
+    const result = await new SnapshotDiffInspector(boundary, checkpoints, {
+      resolveTerminalBeforeImage: async (
+        mutation,
+        repositoryRelativePath,
+      ) => {
+        resolverCalls.push(
+          `${mutation.operationId}:${repositoryRelativePath}`,
+        );
+        return {
+          available: false,
+          reason: "unknown_observation",
+        };
+      },
+    }).diffSession([
+      {
+        kind: "terminal",
+        operationId,
+        changedPaths: [],
+        observationOutcome: outcome,
+        changedPathCount: 0,
+        pathFactsTruncated: false,
+      },
+      {
+        checkpointId: laterPatch.id,
+        changedPaths: ["target.txt"],
+      },
+    ]);
+
+    assert.deepEqual(resolverCalls, [`${operationId}:target.txt`]);
+    assert.equal(result.comparedFileCount, 0);
+    assert.equal(result.changedFileCount, 0);
+    assert.deepEqual(result.unavailableTerminalPaths, [{
+      path: "target.txt",
+      reason: "unknown_observation",
+    }]);
+    assert.equal(result.unavailableTerminalPathCount, 1);
+    assert.equal(result.omittedTerminalPathCount, 0);
+    assert.equal(result.diff, "");
+  }
+});
+
+test("omitted terminal path facts prevent later patch baseline laundering", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-omitted-terminal-diff-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  await writeFile(path.join(root, "target.txt"), "after terminal\n");
+  const boundary = await RepositoryBoundary.create(root);
+  const checkpoints = await CheckpointStore.create(
+    boundary,
+    path.join(temporary, "checkpoints"),
+  );
+  const laterPatch = await checkpoints.createCheckpoint(["target.txt"]);
+  await writeFile(path.join(root, "target.txt"), "after patch\n");
+
+  const resolverCalls: string[] = [];
+  const result = await new SnapshotDiffInspector(boundary, checkpoints, {
+    resolveTerminalBeforeImage: async (
+      mutation,
+      repositoryRelativePath,
+    ) => {
+      resolverCalls.push(
+        `${mutation.operationId}:${repositoryRelativePath}`,
+      );
+      return presentBaseline(
+        mutation.operationId,
+        repositoryRelativePath,
+        "unsafe post-terminal bytes\n",
+      );
+    },
+  }).diffSession(
+    [
+      {
+        kind: "terminal",
+        operationId: "op_terminal_omitted",
+        changedPaths: ["retained-other.txt"],
+        observationOutcome: "observed",
+        changedPathCount: 2,
+        pathFactsTruncated: true,
+      },
+      {
+        checkpointId: laterPatch.id,
+        changedPaths: ["target.txt"],
+      },
+    ],
+    { paths: ["target.txt"] },
+  );
+
+  assert.deepEqual(resolverCalls, [
+    "op_terminal_omitted:target.txt",
+  ]);
+  assert.equal(result.comparedFileCount, 0);
+  assert.equal(result.changedFileCount, 0);
+  assert.deepEqual(result.unavailableTerminalPaths, [{
+    path: "target.txt",
+    reason: "bounded_out",
+  }]);
+  assert.equal(result.unavailableTerminalPathCount, 2);
+  assert.equal(result.omittedTerminalPathCount, 1);
+  assert.equal(result.artifactOmittedTerminalPathCount, 1);
+  assert.equal(result.diff, "");
+});
+
 test("terminal rename endpoints are included even when changedPaths retains only one endpoint", async (context) => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-terminal-rename-diff-"));
   context.after(async () => rm(temporary, { recursive: true, force: true }));
@@ -443,6 +566,159 @@ test("case-only rename retains exact endpoints and cannot collapse to a clean al
     }]),
     (error: { code?: string }) => error.code === "RECOVERY_REQUIRED",
   );
+});
+
+test("pathless non-clean evidence forces later alias endpoints unavailable", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-pathless-alias-diff-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  await writeFile(path.join(root, "readme.md"), "same bytes\n");
+  const metadata = await stat(root);
+  const boundary = await RepositoryBoundary.create(
+    root,
+    createFilesystemIdentity({
+      device: metadata.dev,
+      caseSensitive: false,
+      unicodeNormalizationAliases: true,
+    }),
+  );
+  const checkpoints = await CheckpointStore.create(
+    boundary,
+    path.join(temporary, "checkpoints"),
+  );
+  const resolverCalls: string[] = [];
+  const result = await new SnapshotDiffInspector(boundary, checkpoints, {
+    resolveTerminalBeforeImage: async (
+      mutation,
+      repositoryRelativePath,
+    ) => {
+      assert.equal(
+        mutation.operationId,
+        "op_pathless_unknown",
+        "both alias endpoints must validate the earlier non-clean source",
+      );
+      resolverCalls.push(repositoryRelativePath);
+      return presentBaseline(
+        mutation.operationId,
+        repositoryRelativePath,
+        "same bytes\n",
+      );
+    },
+  }).diffSession([
+    {
+      kind: "terminal",
+      operationId: "op_pathless_unknown",
+      changedPaths: [],
+      observationOutcome: "unknown",
+      changedPathCount: 0,
+      pathFactsTruncated: false,
+    },
+    {
+      kind: "terminal",
+      operationId: "op_alias_after_pathless",
+      changedPaths: ["readme.md"],
+      observationOutcome: "observed",
+      renamedPaths: [{ from: "README.md", to: "readme.md" }],
+      changedPathCount: 2,
+      pathFactsTruncated: false,
+    },
+  ]);
+
+  assert.deepEqual(resolverCalls, ["README.md", "readme.md"]);
+  assert.equal(result.comparedFileCount, 0);
+  assert.equal(result.changedFileCount, 0);
+  assert.deepEqual(result.unavailableTerminalPaths, [
+    {
+      path: "README.md",
+      reason: "unknown_observation",
+    },
+    {
+      path: "readme.md",
+      reason: "unknown_observation",
+    },
+  ]);
+  assert.equal(result.unavailableTerminalPathCount, 2);
+  assert.equal(result.diff, "");
+});
+
+test("an earlier patch baseline survives pathless evidence before a later alias rename", async (context) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "cba-patch-pathless-alias-diff-"));
+  context.after(async () => rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "repo");
+  await mkdir(root);
+  await writeFile(path.join(root, "README.md"), "session base\n");
+  const metadata = await stat(root);
+  const boundary = await RepositoryBoundary.create(
+    root,
+    createFilesystemIdentity({
+      device: metadata.dev,
+      caseSensitive: false,
+      unicodeNormalizationAliases: true,
+    }),
+  );
+  const checkpoints = await CheckpointStore.create(
+    boundary,
+    path.join(temporary, "checkpoints"),
+  );
+  const earlierPatch = await checkpoints.createCheckpoint([
+    "README.md",
+  ]);
+  await rm(path.join(root, "README.md"));
+  await writeFile(path.join(root, "readme.md"), "rename final\n");
+
+  const resolverCalls: string[] = [];
+  const result = await new SnapshotDiffInspector(boundary, checkpoints, {
+    resolveTerminalBeforeImage: async (
+      mutation,
+      repositoryRelativePath,
+    ) => {
+      resolverCalls.push(
+        `${mutation.operationId}:${repositoryRelativePath}`,
+      );
+      assert.equal(mutation.operationId, "op_alias_after_patch");
+      assert.equal(repositoryRelativePath, "readme.md");
+      return absentBaseline(
+        mutation.operationId,
+        repositoryRelativePath,
+      );
+    },
+  }).diffSession([
+    {
+      checkpointId: earlierPatch.id,
+      changedPaths: ["README.md"],
+    },
+    {
+      kind: "terminal",
+      operationId: "op_pathless_after_patch",
+      changedPaths: [],
+      observationOutcome: "unknown",
+      changedPathCount: 0,
+      pathFactsTruncated: false,
+    },
+    {
+      kind: "terminal",
+      operationId: "op_alias_after_patch",
+      changedPaths: ["readme.md"],
+      observationOutcome: "observed",
+      renamedPaths: [{ from: "README.md", to: "readme.md" }],
+      changedPathCount: 2,
+      pathFactsTruncated: false,
+    },
+  ]);
+
+  assert.deepEqual(resolverCalls, [
+    "op_alias_after_patch:readme.md",
+  ]);
+  assert.equal(result.comparedFileCount, 2);
+  assert.equal(result.changedFileCount, 2);
+  assert.equal(result.unavailableTerminalPathCount, 0);
+  assert.match(result.diff, /diff --git a\/README\.md b\/README\.md/u);
+  assert.match(result.diff, /deleted file mode/u);
+  assert.match(result.diff, /-session base/u);
+  assert.match(result.diff, /diff --git a\/readme\.md b\/readme\.md/u);
+  assert.match(result.diff, /new file mode/u);
+  assert.match(result.diff, /\+rename final/u);
 });
 
 test("pathKey aliases preserve the first mutation and deterministic UTF-8 session ordering", async (context) => {

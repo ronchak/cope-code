@@ -9,6 +9,7 @@ import type {
 } from "../repository/patch-engine.js";
 import type { RepositoryTools } from "../repository/repository-tools.js";
 import type { RepositoryContext } from "../repository/context.js";
+import type { SessionPreExistingBaseline } from "../repository/workspace-observer.js";
 import type {
   SessionMutationDiffRecord,
   SnapshotDiffInspector,
@@ -19,7 +20,9 @@ import type { TerminalExecutor } from "./terminal-executor.js";
 import type {
   IncompleteTerminalEvidence,
   TerminalRecoveryContext,
+  VerifiedTerminalResultEvidence,
 } from "../session/terminal-artifacts.js";
+import type { ArtifactReference } from "../session/artifact-store.js";
 import { isLocalToolName, type LocalToolName } from "../protocol/types.js";
 import {
   GIT_STATUS_RESULT_BYTES,
@@ -77,6 +80,7 @@ interface ToolHostCommonDependencies {
   readonly completionPathScope?: CompletionPathScope;
   readonly snapshotDiff?: SnapshotDiffInspector;
   readonly sessionDiffState?: () => SessionDiffState;
+  readonly terminalBaseline?: () => SessionPreExistingBaseline;
 }
 
 export type ToolHostDependencies = ToolHostCommonDependencies &
@@ -141,7 +145,8 @@ export class ToolHost {
       this.repository = dependencies.context.tools;
       this.git = dependencies.context.git;
       this.patchEngine = dependencies.context.patchEngine;
-      this.snapshotDiff = dependencies.context.snapshotDiff;
+      this.snapshotDiff =
+        dependencies.snapshotDiff ?? dependencies.context.snapshotDiff;
     } else {
       this.repository = dependencies.repository;
       this.git = dependencies.git;
@@ -183,6 +188,21 @@ export class ToolHost {
       );
     }
     return executor.inspectRecoveryEvidence(input);
+  }
+
+  public async inspectCompletedTerminalEvidence(input: {
+    readonly operationId: string;
+    readonly requestHash: string;
+    readonly terminalResult: ArtifactReference;
+  }): Promise<VerifiedTerminalResultEvidence> {
+    const executor = this.dependencies.terminalExecutor;
+    if (executor === undefined) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Terminal result evidence reader is unavailable",
+      );
+    }
+    return executor.inspectCompletedEvidence(input);
   }
 
   public async dispatch(
@@ -413,6 +433,18 @@ export class ToolHost {
           maxBytes: rawResult.limitBytes,
           ...("comparedFileCount" in rawResult ? { comparedFileCount: rawResult.comparedFileCount } : {}),
           ...("changedFileCount" in rawResult ? { changedFileCount: rawResult.changedFileCount } : {}),
+          ...("unavailableTerminalPathCount" in rawResult
+            ? {
+                unavailableTerminalPaths:
+                  rawResult.unavailableTerminalPaths ?? [],
+                unavailableTerminalPathCount:
+                  rawResult.unavailableTerminalPathCount ?? 0,
+                omittedTerminalPathCount:
+                  rawResult.omittedTerminalPathCount ?? 0,
+                artifactOmittedTerminalPathCount:
+                  rawResult.artifactOmittedTerminalPathCount ?? 0,
+              }
+            : {}),
         };
         return successOutcome(call, asRecord(result), {
           scope,
@@ -421,6 +453,16 @@ export class ToolHost {
           truncated: result.truncated,
           excludedCount: result.excludedCount,
           redactionCount: processed?.redactionCount ?? 0,
+          ...("unavailableTerminalPathCount" in result
+            ? {
+                unavailableTerminalPathCount:
+                  result.unavailableTerminalPathCount,
+                omittedTerminalPathCount:
+                  result.omittedTerminalPathCount,
+                artifactOmittedTerminalPathCount:
+                  result.artifactOmittedTerminalPathCount,
+              }
+            : {}),
         });
       }
       case "apply_patch": {
@@ -566,7 +608,15 @@ export class ToolHost {
             name: call.name,
             arguments: call.arguments,
           },
-          context.terminal,
+          {
+            ...context.terminal,
+            ...(this.dependencies.terminalBaseline === undefined
+              ? {}
+              : {
+                  preExistingBaseline:
+                    this.dependencies.terminalBaseline(),
+                }),
+          },
           signal,
         );
       }

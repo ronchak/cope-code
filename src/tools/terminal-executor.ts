@@ -1,7 +1,13 @@
 import type { RepositoryBoundary } from "../repository/boundary.js";
 import type {
   SessionPreExistingBaseline,
+  WorkspaceEffect,
+  WorkspaceObservation,
   WorkspaceObserver,
+} from "../repository/workspace-observer.js";
+import {
+  WORKSPACE_OBSERVATION_CONTRACT,
+  createWorkspacePathFacts,
 } from "../repository/workspace-observer.js";
 import type { ContentProcessor } from "../repository/types.js";
 import {
@@ -28,7 +34,9 @@ import {
   type IncompleteTerminalEvidence,
   type TerminalRecoveryContext,
   type TerminalPrelaunchFailureMetadata,
+  type VerifiedTerminalResultEvidence,
 } from "../session/terminal-artifacts.js";
+import type { ArtifactReference } from "../session/artifact-store.js";
 import type {
   TerminalOutputSink,
   TerminalOutputStream,
@@ -145,13 +153,51 @@ export class TerminalExecutor {
         invocation: prepared.invocation,
         execution: prepared.execution,
       });
-      const preObservation =
-        await this.dependencies.persistence.persistObservation({
-          operation_id: call.operationId,
-          request_hash: context.requestHash,
-          phase: "pre",
-          observed_at: new Date().toISOString(),
-        });
+      const observer = this.dependencies.observer;
+      const baseline = context.preExistingBaseline;
+      if ((observer === undefined) !== (baseline === undefined)) {
+        return prelaunchFailure(
+          call.operationId,
+          "TERMINAL_PRELAUNCH_REJECTED",
+          "Terminal workspace observation is incompletely configured.",
+        );
+      }
+      let fullPreObservation: WorkspaceObservation | undefined;
+      let preObservation: ArtifactReference;
+      let launchReceipt: ArtifactReference | undefined;
+      if (observer === undefined || baseline === undefined) {
+        preObservation =
+          await this.dependencies.persistence.persistObservation({
+            operation_id: call.operationId,
+            request_hash: context.requestHash,
+            phase: "pre",
+            observed_at: new Date().toISOString(),
+          });
+      } else {
+        try {
+          fullPreObservation = await observer.capturePre(baseline, signal);
+          preObservation =
+            await this.dependencies.persistence.persistWorkspaceObservation({
+              operationId: call.operationId,
+              requestHash: context.requestHash,
+              observation: fullPreObservation,
+            });
+          launchReceipt =
+            await this.dependencies.persistence.persistLaunchReceipt({
+              operationId: call.operationId,
+              requestHash: context.requestHash,
+              request: requestReference,
+              preObservation,
+              recordedAt: new Date().toISOString(),
+            });
+        } catch (error) {
+          return prelaunchFailure(
+            call.operationId,
+            "TERMINAL_PRELAUNCH_REJECTED",
+            errorMessage(error),
+          );
+        }
+      }
 
       const captureLimit = Math.min(
         context.maxOutputBytes,
@@ -194,13 +240,49 @@ export class TerminalExecutor {
           stdout_bytes: processOutcome.stdoutBytes,
           stderr_bytes: processOutcome.stderrBytes,
         });
-      const postObservation =
-        await this.dependencies.persistence.persistObservation({
-          operation_id: call.operationId,
-          request_hash: context.requestHash,
-          phase: "post",
-          observed_at: new Date().toISOString(),
-        });
+      let effect: WorkspaceEffect | undefined;
+      let postObservation;
+      if (
+        observer === undefined ||
+        baseline === undefined ||
+        fullPreObservation === undefined ||
+        launchReceipt === undefined
+      ) {
+        postObservation =
+          await this.dependencies.persistence.persistObservation({
+            operation_id: call.operationId,
+            request_hash: context.requestHash,
+            phase: "post",
+            observed_at: new Date().toISOString(),
+          });
+      } else {
+        let fullPostObservation: WorkspaceObservation;
+        try {
+          fullPostObservation = await observer.capturePost(
+            fullPreObservation,
+            signal,
+          );
+        } catch {
+          fullPostObservation = unknownPostObservation(
+            "POST_OBSERVATION_FAILED",
+          );
+        }
+        postObservation =
+          await this.dependencies.persistence.persistWorkspaceObservation({
+            operationId: call.operationId,
+            requestHash: context.requestHash,
+            observation: fullPostObservation,
+          });
+        try {
+          effect = await observer.compare(
+            fullPreObservation,
+            fullPostObservation,
+            baseline,
+          );
+        } catch {
+          effect = unknownWorkspaceEffect("COMPARE_FAILED");
+        }
+      }
 
       const disclosed = await this.disclosedStreams(
         call.operationId,
@@ -225,18 +307,39 @@ export class TerminalExecutor {
         stderr: disclosed.stderr,
         redaction_count: disclosed.redactionCount,
         disclosure: disclosed.disclosure,
-        mutation: placeholderMutation(processOutcome),
+        mutation:
+          effect === undefined
+            ? placeholderMutation(processOutcome)
+            : mutationResult(effect),
         replayed: false,
       };
-      const persisted = await this.dependencies.persistence.persistResult({
-        operationId: call.operationId,
-        requestHash: context.requestHash,
-        request: requestReference,
-        preObservation,
-        exitReceipt,
-        postObservation,
-        result,
-      });
+      const persisted =
+        effect === undefined || launchReceipt === undefined
+          ? await this.dependencies.persistence.persistResult({
+              operationId: call.operationId,
+              requestHash: context.requestHash,
+              request: requestReference,
+              preObservation,
+              exitReceipt,
+              postObservation,
+              result,
+            })
+          : await this.dependencies.persistence.persistFullResult({
+              operationId: call.operationId,
+              requestHash: context.requestHash,
+              request: requestReference,
+              preObservation,
+              launchReceipt,
+              exitReceipt,
+              postObservation,
+              result,
+              ...(effect.postObservationControl === undefined
+                ? {}
+                : {
+                    postObservationControl:
+                      effect.postObservationControl,
+                  }),
+            });
       return {
         operationId: call.operationId,
         tool: "terminal_exec",
@@ -272,6 +375,18 @@ export class TerminalExecutor {
     readonly journalSafeResult?: unknown;
   }): Promise<IncompleteTerminalEvidence> {
     return this.dependencies.persistence.inspectIncompleteEvidence(input);
+  }
+
+  public async inspectCompletedEvidence(input: {
+    readonly operationId: string;
+    readonly requestHash: string;
+    readonly terminalResult: ArtifactReference;
+  }): Promise<VerifiedTerminalResultEvidence> {
+    return this.dependencies.persistence.readResultReference({
+      operationId: input.operationId,
+      requestHash: input.requestHash,
+      reference: input.terminalResult,
+    });
   }
 
   private async prepare(
@@ -608,6 +723,63 @@ function placeholderMutation(
       outcome.outcome === "spawn_failed"
         ? "The process did not launch."
         : "Project-effect attribution is deferred to the repository observation slice.",
+  };
+}
+
+function mutationResult(effect: WorkspaceEffect): TerminalExecMutationResult {
+  return {
+    outcome: effect.outcome,
+    created: effect.paths.created,
+    updated: effect.paths.updated,
+    deleted: effect.paths.deleted,
+    renamed: effect.paths.renamed,
+    pre_existing_touched: effect.paths.preExistingTouched,
+    changed_files: effect.changedFiles,
+    changed_lines: effect.changedLines,
+    binary_files: effect.binaryFiles,
+    ignored_summary: effect.limitationCodes.join(","),
+    ...(effect.repositoryFingerprint === undefined
+      ? {}
+      : { repository_fingerprint: effect.repositoryFingerprint }),
+    created_total: effect.paths.createdTotal,
+    updated_total: effect.paths.updatedTotal,
+    deleted_total: effect.paths.deletedTotal,
+    renamed_total: effect.paths.renamedTotal,
+    pre_existing_touched_total: effect.paths.preExistingTouchedTotal,
+    path_endpoint_total: effect.paths.endpointTotal,
+    path_endpoint_omitted: effect.paths.omittedEndpointTotal,
+    path_facts_truncated: effect.paths.truncated,
+    path_facts_sha256: effect.paths.completeFactsSha256,
+    unavailable_baseline_count: effect.unavailableBaselineCount,
+  };
+}
+
+function unknownPostObservation(code: string): WorkspaceObservation {
+  return {
+    contract: WORKSPACE_OBSERVATION_CONTRACT,
+    phase: "post",
+    observedAt: new Date().toISOString(),
+    durationMs: 0,
+    state: "unknown",
+    limitationCodes: [code],
+  };
+}
+
+function unknownWorkspaceEffect(code: string): WorkspaceEffect {
+  return {
+    outcome: "unknown",
+    paths: createWorkspacePathFacts({
+      created: [],
+      updated: [],
+      deleted: [],
+      renamed: [],
+      preExistingTouched: [],
+    }),
+    changedFiles: 0,
+    changedLines: 0,
+    binaryFiles: 0,
+    unavailableBaselineCount: 0,
+    limitationCodes: [code],
   };
 }
 
