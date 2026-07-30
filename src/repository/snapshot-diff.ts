@@ -1,5 +1,5 @@
 import { AgentError } from "../shared/errors.js";
-import { sha256 } from "../shared/crypto.js";
+import { sha256, stableJson } from "../shared/crypto.js";
 import type { RepositoryBoundary } from "./boundary.js";
 import { normalizeRepositoryPath } from "./boundary.js";
 import type {
@@ -21,6 +21,13 @@ export interface TerminalSessionMutationDiffRecord {
   readonly kind: "terminal";
   readonly operationId: string;
   readonly changedPaths: readonly string[];
+  /** Full Slice 2 records expose exact path-fact truncation to the diff seam. */
+  readonly changedPathCount?: number;
+  readonly pathFactsTruncated?: boolean;
+  readonly renamedPaths?: readonly {
+    readonly from: string;
+    readonly to: string;
+  }[];
 }
 
 export type SessionMutationDiffRecord =
@@ -73,8 +80,12 @@ export interface SnapshotDiffResult {
   /** Effective post-clamp output ceiling, used for a second disclosure bound. */
   readonly limitBytes: number;
   readonly unavailableTerminalPaths?: readonly TerminalUnavailableDiffFact[];
+  /** Exact unavailable total; the bounded sample may contain fewer entries. */
   readonly unavailableTerminalPathCount?: number;
+  /** Exact terminal path-fact total omitted by artifact or diff bounds. */
   readonly omittedTerminalPathCount?: number;
+  /** Exact per-mutation path-fact omissions already absent from durable records. */
+  readonly artifactOmittedTerminalPathCount?: number;
 }
 
 export interface SnapshotDiffInspectorOptions {
@@ -90,21 +101,49 @@ interface BaselineCandidate {
   readonly path: string;
   readonly checkpointId: string;
   readonly entry: CheckpointFileSnapshot;
+  readonly currentState?: "path" | "absent";
 }
 
-type SessionBaselineSource =
+interface SessionBaselineSourceBase {
+  readonly path: string;
+  /**
+   * A case/Unicode-only rename has two semantic Git endpoints even when the
+   * host filesystem aliases them. The old spelling is absent in the final
+   * session state and must not be re-read through its alias.
+   */
+  readonly currentState?: "path" | "absent";
+}
+
+type SessionBaselineSource = SessionBaselineSourceBase & (
   | {
       readonly kind: "patch";
-      readonly path: string;
       readonly checkpointId: string;
     }
   | {
       readonly kind: "terminal";
-      readonly path: string;
       readonly mutation: TerminalSessionMutationDiffRecord;
-    };
+    }
+);
+
+interface TerminalMutationPathFacts {
+  readonly paths: readonly string[];
+  readonly aliasRenames: readonly {
+    readonly from: string;
+    readonly to: string;
+    readonly pathKey: string;
+  }[];
+  readonly omitted: number;
+}
 
 const MAX_UNAVAILABLE_TERMINAL_PATH_SAMPLE = 256;
+const MAX_UNAVAILABLE_TERMINAL_PATH_SAMPLE_BYTES = 64 * 1024;
+
+interface TerminalUnavailableAccumulator {
+  readonly facts: TerminalUnavailableDiffFact[];
+  count: number;
+  omittedCount: number;
+  sampleBytes: number;
+}
 
 /**
  * Compares integrity-verified checkpoint before-images with current worktree
@@ -163,10 +202,29 @@ export class SnapshotDiffInspector {
     throwIfAborted(signal);
     const requested = await this.resolveRequestedPaths(request.paths ?? []);
     const earliest = new Map<string, SessionBaselineSource>();
+    const aliasCurrentSpellings = new Map<string, string>();
     let hasTerminalMutation = false;
+    let artifactOmittedTerminalPathCount = 0;
     for (const mutation of mutations) {
-      if (mutation.kind === "terminal") hasTerminalMutation = true;
-      for (const untrustedPath of mutation.changedPaths) {
+      const pathFacts =
+        mutation.kind === "terminal"
+          ? this.terminalMutationPathFacts(mutation)
+          : {
+              paths: mutation.changedPaths,
+              aliasRenames: [],
+              omitted: 0,
+            };
+      if (mutation.kind === "terminal") {
+        hasTerminalMutation = true;
+        artifactOmittedTerminalPathCount += pathFacts.omitted;
+        if (!Number.isSafeInteger(artifactOmittedTerminalPathCount)) {
+          throw new AgentError(
+            "RECOVERY_REQUIRED",
+            "Terminal session diff path totals exceed safe integer bounds",
+          );
+        }
+      }
+      for (const untrustedPath of pathFacts.paths) {
         const normalized = normalizeRepositoryPath(untrustedPath);
         const key = this.boundary.pathKey(normalized);
         if (earliest.has(key)) continue;
@@ -180,6 +238,55 @@ export class SnapshotDiffInspector {
                 checkpointId: mutation.checkpointId,
               },
         );
+      }
+      if (mutation.kind === "terminal") {
+        for (const rename of pathFacts.aliasRenames) {
+          const existing = earliest.get(rename.pathKey);
+          if (existing === undefined) {
+            earliest.set(rename.pathKey, {
+              kind: "terminal",
+              path: rename.from,
+              mutation,
+              currentState: "absent",
+            });
+          } else {
+            earliest.set(rename.pathKey, {
+              ...existing,
+              currentState: "absent",
+            });
+          }
+          const destinationKey = `${rename.pathKey}\0rename-destination`;
+          const priorSpelling = aliasCurrentSpellings.get(rename.pathKey);
+          if (priorSpelling !== undefined && priorSpelling !== rename.from) {
+            throw new AgentError(
+              "RECOVERY_REQUIRED",
+              "Case or Unicode alias rename endpoints form an inconsistent sequence",
+              { operationId: mutation.operationId },
+            );
+          }
+          aliasCurrentSpellings.set(rename.pathKey, rename.to);
+          const origin = earliest.get(rename.pathKey);
+          if (origin !== undefined && origin.path === rename.to) {
+            earliest.set(rename.pathKey, {
+              ...origin,
+              currentState: "path",
+            });
+            earliest.delete(destinationKey);
+          } else {
+            if (origin !== undefined) {
+              earliest.set(rename.pathKey, {
+                ...origin,
+                currentState: "absent",
+              });
+            }
+            earliest.set(destinationKey, {
+              kind: "terminal",
+              path: rename.to,
+              mutation,
+              currentState: "path",
+            });
+          }
+        }
       }
     }
 
@@ -200,9 +307,11 @@ export class SnapshotDiffInspector {
     allowedPatch.sort(compareSessionBaselineSources);
     allowedTerminal.sort(compareSessionBaselineSources);
     this.assertFileCount(allowedPatch.length);
-    const retainedTerminal = allowedTerminal.slice(0, this.maxFiles - allowedPatch.length);
-    const omittedTerminalPathCount = allowedTerminal.length - retainedTerminal.length;
-
+    const retainedTerminal = allowedTerminal.slice(
+      0,
+      Math.max(0, this.maxFiles - allowedPatch.length),
+    );
+    const boundedOutTerminal = allowedTerminal.slice(retainedTerminal.length);
     const byCheckpoint = new Map<string, typeof allowedPatch>();
     for (const candidate of allowedPatch) {
       const group = byCheckpoint.get(candidate.checkpointId) ?? [];
@@ -235,42 +344,57 @@ export class SnapshotDiffInspector {
       }
       return baseline;
     });
-    const unavailableTerminalPaths: TerminalUnavailableDiffFact[] = [];
-    let unavailableTerminalPathCount = 0;
+    const unavailable: TerminalUnavailableAccumulator = {
+      facts: [],
+      count: artifactOmittedTerminalPathCount,
+      omittedCount: artifactOmittedTerminalPathCount,
+      sampleBytes: 2,
+    };
+    for (const candidate of boundedOutTerminal) {
+      addUnavailableTerminalPath(
+        unavailable,
+        candidate.path,
+        "bounded_out",
+        true,
+      );
+    }
+    const terminalSelected: BaselineCandidate[] = [];
     for (const candidate of retainedTerminal) {
       throwIfAborted(signal);
       const resolution = await this.resolveTerminalBaseline(candidate, signal);
       if (!resolution.available) {
-        unavailableTerminalPathCount += 1;
-        if (unavailableTerminalPaths.length < MAX_UNAVAILABLE_TERMINAL_PATH_SAMPLE) {
-          unavailableTerminalPaths.push({
-            path: candidate.path,
-            reason: resolution.reason,
-          });
-        }
+        addUnavailableTerminalPath(
+          unavailable,
+          candidate.path,
+          resolution.reason,
+        );
         continue;
       }
-      selected.push({
+      terminalSelected.push({
         path: candidate.path,
         checkpointId: resolution.baselineId,
         entry: resolution.entry,
+        ...(candidate.currentState === undefined
+          ? {}
+          : { currentState: candidate.currentState }),
       });
     }
 
-    const result = await this.render(
-      "session",
-      "earliest-agent-checkpoint",
+    const result = await this.renderSession(
       selected,
+      terminalSelected,
       excludedCount,
       request.maxBytes,
       signal,
+      unavailable,
     );
     if (!hasTerminalMutation) return result;
     return {
       ...result,
-      unavailableTerminalPaths,
-      unavailableTerminalPathCount,
-      omittedTerminalPathCount,
+      unavailableTerminalPaths: unavailable.facts,
+      unavailableTerminalPathCount: unavailable.count,
+      omittedTerminalPathCount: unavailable.omittedCount,
+      artifactOmittedTerminalPathCount,
     };
   }
 
@@ -304,35 +428,219 @@ export class SnapshotDiffInspector {
       );
     }
     throwIfAborted(signal);
-    if (!resolution.available) return resolution;
-    let resolvedEntryPath: string;
-    try {
-      resolvedEntryPath = normalizeRepositoryPath(resolution.entry.path);
-    } catch (error) {
-      throw new AgentError(
-        "RECOVERY_REQUIRED",
-        "Terminal before-image resolver returned an invalid path",
-        {
-          operationId: candidate.mutation.operationId,
-          repositoryRelativePath: candidate.path,
-        },
-        { cause: error },
-      );
+    assertTerminalBeforeImageResolution(
+      resolution,
+      candidate.path,
+      this.boundary,
+      candidate.mutation.operationId,
+    );
+    return resolution;
+  }
+
+  private terminalMutationPathFacts(
+    mutation: TerminalSessionMutationDiffRecord,
+  ): TerminalMutationPathFacts {
+    const retained = new Map<string, string>();
+    const add = (untrustedPath: string): string => {
+      let normalized: string;
+      try {
+        normalized = normalizeRepositoryPath(untrustedPath);
+      } catch (error) {
+        throw new AgentError(
+          "RECOVERY_REQUIRED",
+          "Terminal session diff contains an invalid retained path fact",
+          { operationId: mutation.operationId },
+          { cause: error },
+        );
+      }
+      if (!retained.has(normalized)) retained.set(normalized, normalized);
+      return normalized;
+    };
+    for (const path of mutation.changedPaths) add(path);
+    const aliasRenames = new Map<
+      string,
+      TerminalMutationPathFacts["aliasRenames"][number]
+    >();
+    const aliasEndpointSpellings = new Set<string>();
+    for (const rename of mutation.renamedPaths ?? []) {
+      if (
+        rename === null ||
+        typeof rename !== "object" ||
+        typeof rename.from !== "string" ||
+        typeof rename.to !== "string"
+      ) {
+        throw new AgentError(
+          "RECOVERY_REQUIRED",
+          "Terminal session diff contains an invalid rename path fact",
+          { operationId: mutation.operationId },
+        );
+      }
+      const from = add(rename.from);
+      const to = add(rename.to);
+      const fromKey = this.boundary.pathKey(from);
+      const toKey = this.boundary.pathKey(to);
+      if (from !== to && fromKey === toKey) {
+        const existing = aliasRenames.get(fromKey);
+        if (
+          existing !== undefined &&
+          (existing.from !== from || existing.to !== to)
+        ) {
+          throw new AgentError(
+            "RECOVERY_REQUIRED",
+            "Terminal mutation contains ambiguous case or Unicode alias renames",
+            { operationId: mutation.operationId },
+          );
+        }
+        aliasRenames.set(fromKey, { from, to, pathKey: fromKey });
+        aliasEndpointSpellings.add(from);
+        aliasEndpointSpellings.add(to);
+      }
+    }
+    const retainedPaths = [...retained.values()];
+    const paths = retainedPaths.filter(
+      (path) => !aliasEndpointSpellings.has(path),
+    );
+    if (mutation.changedPathCount === undefined) {
+      if (mutation.pathFactsTruncated === true) {
+        throw new AgentError(
+          "RECOVERY_REQUIRED",
+          "Truncated terminal path facts lack an exact changed-path total",
+          { operationId: mutation.operationId },
+        );
+      }
+      return {
+        paths,
+        aliasRenames: [...aliasRenames.values()],
+        omitted: 0,
+      };
     }
     if (
-      resolution.baselineId.length === 0 ||
-      this.boundary.pathKey(resolvedEntryPath) !== this.boundary.pathKey(candidate.path)
+      !Number.isSafeInteger(mutation.changedPathCount) ||
+      mutation.changedPathCount < retainedPaths.length ||
+      (mutation.changedPathCount > retainedPaths.length &&
+        mutation.pathFactsTruncated !== true) ||
+      (mutation.pathFactsTruncated === false &&
+        mutation.changedPathCount !== retainedPaths.length)
     ) {
       throw new AgentError(
         "RECOVERY_REQUIRED",
-        "Terminal before-image resolver returned mismatched evidence",
-        {
-          operationId: candidate.mutation.operationId,
-          repositoryRelativePath: candidate.path,
-        },
+        "Terminal session diff path totals do not match retained facts",
+        { operationId: mutation.operationId },
       );
     }
-    return resolution;
+    return {
+      paths,
+      aliasRenames: [...aliasRenames.values()],
+      omitted: mutation.changedPathCount - retainedPaths.length,
+    };
+  }
+
+  private async renderSession(
+    patchSelected: readonly BaselineCandidate[],
+    terminalSelected: readonly BaselineCandidate[],
+    excludedCount: number,
+    requestedMaxBytes: number | undefined,
+    signal: AbortSignal | undefined,
+    unavailable: TerminalUnavailableAccumulator,
+  ): Promise<SnapshotDiffResult> {
+    const limitBytes = boundedLimit(requestedMaxBytes, this.maxDiffBytes);
+    const writer = new BoundedTextWriter(limitBytes);
+    let inputBytes = 0;
+    let comparedFileCount = 0;
+    let changedFileCount = 0;
+
+    for (const candidate of [...patchSelected].sort(compareBaselineCandidatesUtf8)) {
+      throwIfAborted(signal);
+      const before = candidate.entry.bytes;
+      if (before !== null && before.length > this.maxFileBytes) {
+        throw new AgentError("BUDGET_EXCEEDED", "Snapshot diff input exceeds the per-file limit");
+      }
+      const current =
+        candidate.currentState === "absent"
+          ? null
+          : await this.currentBytes(candidate.path);
+      inputBytes = checkedInputBytes(
+        inputBytes,
+        before?.length ?? 0,
+        current?.length ?? 0,
+        this.maxInputBytes,
+      );
+      comparedFileCount += 1;
+      if (sameOptionalBytes(before, current) && candidate.entry.existed === (current !== null)) {
+        continue;
+      }
+      changedFileCount += 1;
+      renderFileDiff(writer, candidate.path, before, current, candidate.entry.mode);
+    }
+
+    for (const candidate of [...terminalSelected].sort(compareBaselineCandidatesUtf8)) {
+      throwIfAborted(signal);
+      const before = candidate.entry.bytes;
+      if (before !== null && before.length > this.maxFileBytes) {
+        addUnavailableTerminalPath(
+          unavailable,
+          candidate.path,
+          "bounded_out",
+          true,
+        );
+        continue;
+      }
+      let current: Buffer | null;
+      try {
+        current =
+          candidate.currentState === "absent"
+            ? null
+            : await this.currentBytes(candidate.path);
+      } catch (error) {
+        throwIfAborted(signal);
+        if (error instanceof AgentError && error.code === "BUDGET_EXCEEDED") {
+          addUnavailableTerminalPath(
+            unavailable,
+            candidate.path,
+            "bounded_out",
+            true,
+          );
+          continue;
+        }
+        throw error;
+      }
+      const addition = (before?.length ?? 0) + (current?.length ?? 0);
+      if (
+        !Number.isSafeInteger(addition) ||
+        !Number.isSafeInteger(inputBytes + addition) ||
+        inputBytes + addition > this.maxInputBytes
+      ) {
+        addUnavailableTerminalPath(
+          unavailable,
+          candidate.path,
+          "bounded_out",
+          true,
+        );
+        continue;
+      }
+      inputBytes += addition;
+      comparedFileCount += 1;
+      if (sameOptionalBytes(before, current) && candidate.entry.existed === (current !== null)) {
+        continue;
+      }
+      changedFileCount += 1;
+      renderFileDiff(writer, candidate.path, before, current, candidate.entry.mode);
+    }
+
+    const bytes = writer.bytes();
+    return {
+      contractVersion: SNAPSHOT_DIFF_VERSION,
+      scope: "session",
+      baseline: "earliest-agent-checkpoint",
+      diff: bytes.toString("utf8"),
+      truncated: writer.truncated,
+      outputBytes: bytes.length,
+      sha256: sha256(bytes),
+      excludedCount,
+      comparedFileCount,
+      changedFileCount,
+      limitBytes,
+    };
   }
 
   private async render(
@@ -431,7 +739,160 @@ function compareSessionBaselineSources(
   left: SessionBaselineSource,
   right: SessionBaselineSource,
 ): number {
-  return left.path.localeCompare(right.path);
+  return compareUtf8(left.path, right.path);
+}
+
+function compareBaselineCandidatesUtf8(
+  left: BaselineCandidate,
+  right: BaselineCandidate,
+): number {
+  return compareUtf8(left.path, right.path);
+}
+
+function compareUtf8(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
+function checkedInputBytes(
+  current: number,
+  before: number,
+  after: number,
+  maximum: number,
+): number {
+  const next = current + before + after;
+  if (!Number.isSafeInteger(next) || next > maximum) {
+    throw new AgentError("BUDGET_EXCEEDED", "Snapshot diff input exceeds the aggregate limit", {
+      maxInputBytes: maximum,
+    });
+  }
+  return next;
+}
+
+function addUnavailableTerminalPath(
+  accumulator: TerminalUnavailableAccumulator,
+  repositoryRelativePath: string,
+  reason: TerminalUnavailableDiffFact["reason"],
+  omitted = false,
+): void {
+  accumulator.count += 1;
+  if (omitted) accumulator.omittedCount += 1;
+  if (!Number.isSafeInteger(accumulator.count) ||
+      !Number.isSafeInteger(accumulator.omittedCount)) {
+    throw new AgentError(
+      "RECOVERY_REQUIRED",
+      "Terminal session diff unavailable totals exceed safe integer bounds",
+    );
+  }
+  if (accumulator.facts.length >= MAX_UNAVAILABLE_TERMINAL_PATH_SAMPLE) return;
+  const fact = { path: repositoryRelativePath, reason };
+  const bytes =
+    Buffer.byteLength(stableJson(fact)) +
+    (accumulator.facts.length === 0 ? 0 : 1);
+  if (
+    !Number.isSafeInteger(accumulator.sampleBytes + bytes) ||
+    accumulator.sampleBytes + bytes > MAX_UNAVAILABLE_TERMINAL_PATH_SAMPLE_BYTES
+  ) {
+    return;
+  }
+  accumulator.facts.push(fact);
+  accumulator.sampleBytes += bytes;
+}
+
+function assertTerminalBeforeImageResolution(
+  value: unknown,
+  requestedPath: string,
+  boundary: RepositoryBoundary,
+  operationId: string,
+): asserts value is TerminalBeforeImageResolution {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw malformedTerminalResolution(operationId, requestedPath);
+  }
+  const resolution = value as Partial<TerminalBeforeImageResolution>;
+  if (resolution.available === false) {
+    if (
+      !hasExactKeys(resolution, ["available", "reason"]) ||
+      ![
+        "legacy_placeholder",
+        "missing_evidence",
+        "bounded_out",
+        "unknown_observation",
+      ].includes(resolution.reason ?? "")
+    ) {
+      throw malformedTerminalResolution(operationId, requestedPath);
+    }
+    return;
+  }
+  if (
+    resolution.available !== true ||
+    !hasExactKeys(resolution, ["available", "baselineId", "entry"]) ||
+    typeof resolution.baselineId !== "string" ||
+    resolution.baselineId.length === 0 ||
+    resolution.baselineId.includes("\0") ||
+    Buffer.byteLength(resolution.baselineId) > 4_096 ||
+    resolution.entry === null ||
+    typeof resolution.entry !== "object" ||
+    Array.isArray(resolution.entry) ||
+    !hasExactKeys(
+      resolution.entry,
+      ["path", "existed", "bytes", "mode", "sha256"],
+    )
+  ) {
+    throw malformedTerminalResolution(operationId, requestedPath);
+  }
+  const entry = resolution.entry as Partial<CheckpointFileSnapshot>;
+  let normalizedPath: string;
+  try {
+    normalizedPath = normalizeRepositoryPath(entry.path as string);
+  } catch (error) {
+    throw new AgentError(
+      "RECOVERY_REQUIRED",
+      "Terminal before-image resolver returned an invalid path",
+      { operationId, repositoryRelativePath: requestedPath },
+      { cause: error },
+    );
+  }
+  const pathMatches =
+    normalizedPath === entry.path &&
+    boundary.pathKey(normalizedPath) === boundary.pathKey(requestedPath);
+  const absentIsValid =
+    entry.existed === false &&
+    entry.bytes === null &&
+    entry.mode === null &&
+    entry.sha256 === null;
+  const presentIsValid =
+    entry.existed === true &&
+    Buffer.isBuffer(entry.bytes) &&
+    Number.isSafeInteger(entry.mode) &&
+    (entry.mode ?? -1) >= 0 &&
+    (entry.mode ?? 0o200000) <= 0o177777 &&
+    typeof entry.sha256 === "string" &&
+    /^[a-f0-9]{64}$/u.test(entry.sha256) &&
+    sha256(entry.bytes as Buffer) === entry.sha256;
+  if (!pathMatches || (!absentIsValid && !presentIsValid)) {
+    throw malformedTerminalResolution(operationId, requestedPath);
+  }
+}
+
+function malformedTerminalResolution(
+  operationId: string,
+  repositoryRelativePath: string,
+): AgentError {
+  return new AgentError(
+    "RECOVERY_REQUIRED",
+    "Terminal before-image resolver returned malformed or mismatched evidence",
+    { operationId, repositoryRelativePath },
+  );
+}
+
+function hasExactKeys(
+  value: object,
+  keys: readonly string[],
+): boolean {
+  const actual = Object.keys(value);
+  return (
+    actual.length === keys.length &&
+    actual.every((key) => keys.includes(key))
+  );
 }
 
 class BoundedTextWriter {

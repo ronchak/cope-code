@@ -657,8 +657,10 @@ test("bound before-image resolver validates the result chain and reconstructs ev
   const request = await persistRequest(persistence);
   const retainedBytes = Buffer.from("retained before\n");
   const blobBytes = Buffer.from("blob before\n");
+  const blob256Bytes = Buffer.from("sha256 blob before\n");
   const priorBytes = Buffer.from("prior before\n");
   const blobObjectId = gitBlobObjectId(blobBytes);
+  const blob256ObjectId = gitBlobObjectId(blob256Bytes, "sha256");
   const headBytes = Buffer.from("clean HEAD\n");
   const headObjectId = gitBlobObjectId(headBytes);
   const preObservation = {
@@ -688,6 +690,19 @@ test("bound before-image resolver validates the result chain and reconstructs ev
         binary: false,
         blob: blobObjectId,
         blobRole: "index" as const,
+      },
+      {
+        kind: "git_blob" as const,
+        exists: true as const,
+        identity: {
+          path: "blob256.txt",
+          mode: 0o100644,
+          size: blob256Bytes.length,
+        },
+        sha256: sha256(blob256Bytes),
+        binary: false,
+        blob: blob256ObjectId,
+        blobRole: "head" as const,
       },
       {
         kind: "identity_only" as const,
@@ -739,6 +754,7 @@ test("bound before-image resolver validates the result chain and reconstructs ev
   });
   const changed = [
     "blob.txt",
+    "blob256.txt",
     "bounded.txt",
     "clean.txt",
     "explicit-created.txt",
@@ -753,6 +769,7 @@ test("bound before-image resolver validates the result chain and reconstructs ev
       created: ["explicit-created.txt", "implicit-created.txt"],
       updated: [
         "blob.txt",
+        "blob256.txt",
         "bounded.txt",
         "clean.txt",
         "prior.txt",
@@ -767,11 +784,11 @@ test("bound before-image resolver validates the result chain and reconstructs ev
       ignored_summary: "",
       repository_fingerprint: repositoryFingerprint,
       created_total: 2,
-      updated_total: 5,
+      updated_total: 6,
       deleted_total: 0,
       renamed_total: 0,
       pre_existing_touched_total: 0,
-      path_endpoint_total: 7,
+      path_endpoint_total: 8,
       path_endpoint_omitted: 0,
       path_facts_truncated: false,
       path_facts_sha256: "e".repeat(64),
@@ -799,7 +816,11 @@ test("bound before-image resolver validates the result chain and reconstructs ev
       preObservation: pre,
     }),
     readGitBlob: async (objectId) =>
-      objectId === blobObjectId ? blobBytes : undefined,
+      objectId === blobObjectId
+        ? blobBytes
+        : objectId === blob256ObjectId
+          ? blob256Bytes
+          : undefined,
     readHeadPath: async (head, repositoryRelativePath) =>
       head === "b".repeat(40) && repositoryRelativePath === "clean.txt"
         ? {
@@ -833,6 +854,10 @@ test("bound before-image resolver validates the result chain and reconstructs ev
   );
   assert.deepEqual(
     (await resolver(mutation, "blob.txt"))?.available,
+    true,
+  );
+  assert.deepEqual(
+    (await resolver(mutation, "blob256.txt"))?.available,
     true,
   );
   assert.equal(
@@ -904,6 +929,50 @@ test("bound before-image resolver validates the result chain and reconstructs ev
     ),
     (error: { code?: string }) => error.code === "RECOVERY_REQUIRED",
   );
+  for (const invalidPrior of [
+    {
+      baselineId: "",
+      entry: {
+        path: "retained.txt",
+        existed: true,
+        bytes: retainedBytes,
+        mode: 0o100644,
+        sha256: sha256(retainedBytes),
+      },
+    },
+    {
+      baselineId: "verified:invalid-bytes",
+      entry: {
+        path: "retained.txt",
+        existed: true,
+        bytes: new Uint8Array(retainedBytes),
+        mode: 0o100644,
+        sha256: sha256(retainedBytes),
+      },
+    },
+    {
+      baselineId: "verified:invalid-mode",
+      entry: {
+        path: "retained.txt",
+        existed: true,
+        bytes: retainedBytes,
+        mode: 0o200000,
+        sha256: sha256(retainedBytes),
+      },
+    },
+  ]) {
+    const invalidPriorResolver = persistence.createBeforeImageResolver({
+      resolveReferences: async () => ({
+        terminalResult: persisted.reference,
+        preObservation: pre,
+      }),
+      resolvePriorBaseline: async () => invalidPrior as never,
+    });
+    await assert.rejects(
+      () => invalidPriorResolver(mutation, "retained.txt"),
+      (error: { code?: string }) => error.code === "RECOVERY_REQUIRED",
+    );
+  }
   const unauthenticatedHeadResolver = persistence.createBeforeImageResolver({
     resolveReferences: async () => ({
       terminalResult: persisted.reference,
@@ -971,6 +1040,259 @@ test("bound before-image resolver validates the result chain and reconstructs ev
   );
   await assert.rejects(
     () => perTupleResolver(secondRecordWithMismatch, "retained.txt"),
+    (error: { code?: string }) => error.code === "RECOVERY_REQUIRED",
+  );
+});
+
+test("persisted alias renames resolve origin and destination baselines by exact spelling", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "cope-terminal-alias-"));
+  const persistence = new TerminalArtifactPersistence(
+    new SessionArtifactStore(path.join(directory, "artifacts")),
+  );
+  const request = await persistRequest(persistence);
+  const dirtyBytes = Buffer.from("dirty origin\n");
+  const priorBytes = Buffer.from("prior origin\n");
+  const unicodeBytes = Buffer.from("unicode origin\n");
+  const cleanBytes = Buffer.from("clean origin\n");
+  const cleanObjectId = gitBlobObjectId(cleanBytes);
+  const unicodeOrigin = "Café.md";
+  const unicodeDestination = "Cafe\u0301.md";
+  const retainedImage = (repositoryRelativePath: string, bytes: Buffer) => ({
+    kind: "retained" as const,
+    exists: true as const,
+    identity: {
+      path: repositoryRelativePath,
+      mode: 0o100644,
+      size: bytes.length,
+    },
+    sha256: sha256(bytes),
+    binary: false,
+    contentBase64: bytes.toString("base64"),
+  });
+  const preObservation = {
+    ...workspaceObservation("pre", "a".repeat(64)),
+    entries: [{
+      path: "Dirty.md",
+      kind: "ordinary" as const,
+      indexStatus: ".",
+      worktreeStatus: "M",
+      stateSha256: "d".repeat(64),
+      headMode: "100644",
+      indexMode: "100644",
+      worktreeMode: "100644",
+      headObject: "1".repeat(40),
+      indexObject: "1".repeat(40),
+      worktreeIdentity: {
+        mode: 0o100644,
+        size: dirtyBytes.length,
+        contentSha256: sha256(dirtyBytes),
+      },
+    }],
+    beforeImages: [
+      retainedImage("Dirty.md", dirtyBytes),
+      {
+        kind: "identity_only" as const,
+        exists: true as const,
+        identity: {
+          path: "Prior.md",
+          mode: 0o100644,
+          size: priorBytes.length,
+        },
+        sha256: sha256(priorBytes),
+        binary: false,
+      },
+      retainedImage(unicodeOrigin, unicodeBytes),
+      {
+        kind: "identity_only" as const,
+        exists: true as const,
+        identity: {
+          path: "Bounded.md",
+          mode: 0o100644,
+          size: 2_000_000,
+        },
+        sha256: "2".repeat(64),
+        binary: false,
+      },
+    ],
+  } satisfies WorkspaceObservation;
+  const pre = await persistence.persistWorkspaceObservation({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    observation: preObservation,
+  });
+  const launch = await persistence.persistLaunchReceipt({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    request,
+    preObservation: pre,
+    recordedAt: "2026-07-29T00:00:00.500Z",
+  });
+  const exit = await persistence.persistExitReceipt(exitReceipt());
+  const repositoryFingerprint = "9".repeat(64);
+  const post = await persistence.persistWorkspaceObservation({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    observation: workspaceObservation("post", repositoryFingerprint),
+  });
+  const renamed = [
+    { from: "README.md", to: "readme.md" },
+    { from: "Dirty.md", to: "dirty.md" },
+    { from: "Prior.md", to: "prior.md" },
+    { from: unicodeOrigin, to: unicodeDestination },
+    { from: "Bounded.md", to: "bounded.md" },
+    { from: "Chain.md", to: "chain.md" },
+    { from: "chain.md", to: "CHAIN.md" },
+  ];
+  const result: TerminalExecResult = {
+    ...terminalResult(),
+    mutation: {
+      outcome: "observed",
+      created: [],
+      updated: [],
+      deleted: [],
+      renamed,
+      pre_existing_touched: [],
+      changed_files: renamed.length,
+      changed_lines: 1,
+      binary_files: 0,
+      ignored_summary: "",
+      repository_fingerprint: repositoryFingerprint,
+      created_total: 0,
+      updated_total: 0,
+      deleted_total: 0,
+      renamed_total: renamed.length,
+      pre_existing_touched_total: 0,
+      path_endpoint_total: renamed.length * 2,
+      path_endpoint_omitted: 0,
+      path_facts_truncated: false,
+      path_facts_sha256: "e".repeat(64),
+      unavailable_baseline_count: 1,
+    },
+  };
+  const persisted = await persistence.persistFullResult({
+    operationId: OPERATION_ID,
+    requestHash: REQUEST_HASH,
+    request,
+    preObservation: pre,
+    launchReceipt: launch,
+    exitReceipt: exit,
+    postObservation: post,
+    result,
+    postObservationControl: {
+      branch: "main",
+      head: "b".repeat(40),
+      excludedStateFingerprint: "3".repeat(64),
+    },
+  });
+  const headRequests: string[] = [];
+  const priorRequests: string[] = [];
+  const pathKey = (value: string) => value.normalize("NFC").toLowerCase();
+  const resolver = persistence.createBeforeImageResolver({
+    resolveReferences: async () => ({
+      terminalResult: persisted.reference,
+      preObservation: pre,
+    }),
+    pathKey,
+    readHeadPath: async (head, repositoryRelativePath) => {
+      headRequests.push(repositoryRelativePath);
+      return head === "b".repeat(40) &&
+        repositoryRelativePath === "README.md"
+        ? {
+            objectId: cleanObjectId,
+            mode: 0o100644,
+            bytes: cleanBytes,
+          }
+        : undefined;
+    },
+    resolvePriorBaseline: async (_mutation, repositoryRelativePath) => {
+      priorRequests.push(repositoryRelativePath);
+      return repositoryRelativePath === "Prior.md"
+        ? {
+            baselineId: "verified:prior-origin",
+            entry: {
+              path: "Prior.md",
+              existed: true,
+              bytes: priorBytes,
+              mode: 0o100644,
+              sha256: sha256(priorBytes),
+            },
+          }
+        : undefined;
+    },
+  });
+  const mutation = {
+    kind: "terminal" as const,
+    operationId: OPERATION_ID,
+    changedPaths: renamed.flatMap(({ from, to }) => [from, to]),
+  };
+  const assertPresent = async (
+    repositoryRelativePath: string,
+    expected: Buffer,
+  ) => {
+    const resolved = await resolver(mutation, repositoryRelativePath);
+    assert.equal(resolved.available, true);
+    if (resolved.available) {
+      assert.equal(resolved.entry.path, repositoryRelativePath);
+      assert.deepEqual(resolved.entry.bytes, expected);
+    }
+  };
+  const assertAbsent = async (repositoryRelativePath: string) => {
+    const resolved = await resolver(mutation, repositoryRelativePath);
+    assert.equal(resolved.available, true);
+    if (resolved.available) {
+      assert.deepEqual(resolved.entry, {
+        path: repositoryRelativePath,
+        existed: false,
+        bytes: null,
+        mode: null,
+        sha256: null,
+      });
+    }
+  };
+
+  await assertPresent("README.md", cleanBytes);
+  await assertAbsent("readme.md");
+  await assertPresent("Dirty.md", dirtyBytes);
+  await assertAbsent("dirty.md");
+  await assertPresent("Prior.md", priorBytes);
+  await assertAbsent("prior.md");
+  await assertPresent(unicodeOrigin, unicodeBytes);
+  await assertAbsent(unicodeDestination);
+  assert.deepEqual(await resolver(mutation, "Bounded.md"), {
+    available: false,
+    reason: "bounded_out",
+  });
+  await assertAbsent("bounded.md");
+  assert.deepEqual(headRequests, ["README.md"]);
+  assert.equal(priorRequests.includes("prior.md"), false);
+  assert.equal(priorRequests.includes(unicodeDestination), false);
+  const mismatchedPriorResolver = persistence.createBeforeImageResolver({
+    resolveReferences: async () => ({
+      terminalResult: persisted.reference,
+      preObservation: pre,
+    }),
+    pathKey,
+    resolvePriorBaseline: async () => ({
+      baselineId: "verified:wrong-alias-spelling",
+      entry: {
+        path: "prior.md",
+        existed: true,
+        bytes: priorBytes,
+        mode: 0o100644,
+        sha256: sha256(priorBytes),
+      },
+    }),
+  });
+  await assert.rejects(
+    () => mismatchedPriorResolver(mutation, "Prior.md"),
+    (error: { code?: string }) => error.code === "RECOVERY_REQUIRED",
+  );
+  await assert.rejects(
+    () => resolver(mutation, "ReAdMe.md"),
+    (error: { code?: string }) => error.code === "RECOVERY_REQUIRED",
+  );
+  await assert.rejects(
+    () => resolver(mutation, "chain.md"),
     (error: { code?: string }) => error.code === "RECOVERY_REQUIRED",
   );
 });
@@ -1292,8 +1614,11 @@ function workspaceObservation(
   };
 }
 
-function gitBlobObjectId(bytes: Buffer): string {
-  return createHash("sha1")
+function gitBlobObjectId(
+  bytes: Buffer,
+  algorithm: "sha1" | "sha256" = "sha1",
+): string {
+  return createHash(algorithm)
     .update(Buffer.from(`blob ${bytes.length}\0`, "utf8"))
     .update(bytes)
     .digest("hex");

@@ -19,6 +19,8 @@ import {
   type SupervisedCommandExit,
 } from "./process-supervisor.js";
 
+const WINDOWS_PROCESS_CLOSE_GRACE_MS = 1_000;
+
 export type TerminalOutputStream = "stdout" | "stderr";
 
 export interface TerminalOutputSink {
@@ -429,14 +431,36 @@ export class ProcessRunner implements TerminalProcessExecutor {
         child.stdout?.destroy();
         child.stderr?.destroy();
       };
+      const waitForClose = async (): Promise<void> => {
+        if (sawClose) return;
+        await new Promise<void>((resolveClose) => {
+          let done = false;
+          const finishCloseWait = (): void => {
+            if (done) return;
+            done = true;
+            clearTimeout(deadline);
+            child.removeListener("close", onClose);
+            resolveClose();
+          };
+          const onClose = (): void => finishCloseWait();
+          const closeGraceMs = this.host.platform === "win32"
+            ? Math.max(this.outputFlushGraceMs, WINDOWS_PROCESS_CLOSE_GRACE_MS)
+            : this.outputFlushGraceMs;
+          const deadline = setTimeout(finishCloseWait, closeGraceMs);
+          deadline.unref();
+          child.once("close", onClose);
+          if (sawClose) finishCloseWait();
+        });
+      };
       const terminate = (reason: "timed_out" | "cancelled"): void => {
         if (terminalReason !== undefined || actualExit !== undefined || settled) return;
         terminalReason = reason;
         void this.host.terminateProcessTree(child, this.terminationGraceMs)
           .catch(() => undefined)
-          .finally(() => {
-            terminationDone = true;
+          .finally(async () => {
             destroyOutput();
+            await waitForClose();
+            terminationDone = true;
             finish(reason);
           });
       };
@@ -457,8 +481,9 @@ export class ProcessRunner implements TerminalProcessExecutor {
         flushTimer = setTimeout(() => {
           void this.host.terminateProcessTree(child, this.terminationGraceMs)
             .catch(() => undefined)
-            .finally(() => {
+            .finally(async () => {
               destroyOutput();
+              await waitForClose();
               finish();
             });
         }, this.outputFlushGraceMs);
