@@ -4,6 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import {
+  CURRENT_HOST_PLATFORM,
+  type HostPlatform,
+} from "../../src/platform/index.js";
 import { RepositoryBoundary } from "../../src/repository/boundary.js";
 import { TERMINAL_EXEC_MAX_ARGUMENT_BYTES } from "../../src/protocol/terminal-exec.js";
 import { CommandCatalog } from "../../src/tools/command-catalog.js";
@@ -154,6 +158,40 @@ test("terminal process runner bounds timeout, caller cancellation, and cancelAll
     },
   });
   assert.equal(globallyCancelled.outcome, "cancelled");
+});
+
+test("terminal cancellation waits for the target process handle to close", async (context) => {
+  let targetClosed = false;
+  const host = new Proxy(CURRENT_HOST_PLATFORM, {
+    get(target, property, receiver) {
+      if (property === "platform") return "win32";
+      if (property === "terminateProcessTree") {
+        return async (child: import("node:child_process").ChildProcess): Promise<void> => {
+          child.once("close", () => {
+            targetClosed = true;
+          });
+          setTimeout(() => child.kill("SIGKILL"), 50).unref();
+        };
+      }
+      const value = Reflect.get(target, property, receiver) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as HostPlatform;
+  const fixture = await runnerFixture(context, {
+    host,
+    terminationGraceMs: 20,
+    outputFlushGraceMs: 20,
+  });
+  const outcome = await capture(fixture.runner, {
+    ...request(fixture.root, {
+      mode: "argv",
+      executable: process.execPath,
+      arguments: ["-e", "setInterval(()=>{},1000)"],
+    }),
+    timeoutMs: 20,
+  });
+  assert.equal(outcome.outcome.outcome, "timed_out");
+  assert.equal(targetClosed, true);
 });
 
 test("POSIX terminal process runner preserves signals and bounds inherited-pipe cleanup", async (context) => {
