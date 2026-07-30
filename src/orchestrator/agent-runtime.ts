@@ -13,7 +13,11 @@ import { AgentError, errorMessage } from "../shared/errors.js";
 import { INTERNAL_OPERATION_ID_PREFIX } from "../shared/operation-id.js";
 import type { Clock } from "../shared/time.js";
 import { systemClock } from "../shared/time.js";
-import { BudgetMeter } from "../session/budgets.js";
+import {
+  BudgetMeter,
+  type PostHocBudgetResult,
+  type PostHocBudgetExceeded,
+} from "../session/budgets.js";
 import type { SessionArtifactStore } from "../session/artifact-store.js";
 import type {
   CompletionHandoffReference,
@@ -21,10 +25,19 @@ import type {
 } from "../session/completion-handoff-store.js";
 import type { OperationJournal, OperationRecord } from "../session/operation-journal.js";
 import {
+  isTerminalPrelaunchFailureMetadata,
   isTerminalJournalResultMetadata,
+  terminalEvidenceProvesNoLaunch,
+  type TerminalRecoveryContext,
+  type TerminalPrelaunchFailureMetadata,
   type TerminalJournalResultMetadata,
+  type VerifiedTerminalResultEvidence,
 } from "../session/terminal-artifacts.js";
-import type { SessionStore } from "../session/store.js";
+import {
+  TERMINAL_SESSION_HEADROOM_BYTES,
+  preflightSessionStateWrite,
+  type SessionStore,
+} from "../session/store.js";
 import {
   isTerminal,
   restoreSessionLifecycle,
@@ -38,8 +51,14 @@ import {
 } from "../session/terminal-cleanup.js";
 import type {
   BudgetCounter,
+  FullTerminalMutationRecord,
   SessionState,
 } from "../session/types.js";
+import {
+  TERMINAL_SESSION_MAX_PATH_BYTES,
+  TERMINAL_SESSION_MAX_PATH_ENDPOINTS,
+} from "../repository/workspace-observer.js";
+import type { TerminalExecMutationResult } from "../protocol/terminal-exec.js";
 import {
   isBatchableToolName,
   isReadOnlyToolName,
@@ -88,6 +107,7 @@ export interface AgentRuntimeDependencies {
   readonly idFactory?: (prefix: string) => string;
   readonly artifacts?: SessionArtifactStore;
   readonly completionHandoffs?: CompletionHandoffStore;
+  readonly recoveryContext?: TerminalRecoveryContext;
   /** Deterministic, source-free operational events for an interactive CLI. */
   readonly onProgress?: (event: RuntimeProgressEvent) => void;
 }
@@ -536,8 +556,13 @@ export class AgentRuntime {
   }
 
   private async findUncertainMutation(): Promise<SessionState["pendingOperations"][number] | undefined> {
-    for (const pending of this.state.pendingOperations) {
-      const record = await this.dependencies.journal.read(pending.operationId);
+    for (const pendingSnapshot of [...this.state.pendingOperations]) {
+      const pending = this.state.pendingOperations.find(
+        (operation) =>
+          operation.operationId === pendingSnapshot.operationId,
+      );
+      if (pending === undefined) continue;
+      let record = await this.dependencies.journal.read(pending.operationId);
       if (isBudgetRecoveryOperation(pending.operationId, pending.tool)) {
         await this.reconcileBudgetRecoveryDecision(pending, record);
         continue;
@@ -599,12 +624,10 @@ export class AgentRuntime {
         }
         continue;
       }
-      if (
-        pending.tool === "terminal_exec" &&
-        pending.mutating &&
-        pending.status === "executing" &&
-        record.status === "executing"
-      ) {
+      if (pending.tool === "terminal_exec" && pending.mutating) {
+        if (pending.status === "indeterminate" || record.status === "indeterminate") {
+          return pending;
+        }
         const recovered = await this.dependencies.tools.recoverCompleted?.({
           operationId: pending.operationId,
           tool: "terminal_exec",
@@ -619,11 +642,28 @@ export class AgentRuntime {
               { operationId: pending.operationId },
             );
           }
-          await this.dependencies.journal.resolveTerminalCompleted(
-            pending.operationId,
-            record.requestHash,
-            this.now(),
-            recovered.safeMetadata,
+          if (record.status === "executing") {
+            record =
+              await this.dependencies.journal.resolveTerminalCompleted(
+                pending.operationId,
+                record.requestHash,
+                this.now(),
+                recovered.safeMetadata,
+              );
+          } else if (record.status !== "completed") {
+            throw new AgentError(
+              "RECOVERY_REQUIRED",
+              "A verified terminal result conflicts with its journal state",
+              {
+                operationId: pending.operationId,
+                journalStatus: record.status,
+              },
+            );
+          }
+          await this.applyTerminalResultEffects(
+            pending,
+            record,
+            storedRuntimeBudgetLimits(record.safeResult),
           );
           await this.dependencies.audit.append({
             type: "session.recovered",
@@ -638,6 +678,126 @@ export class AgentRuntime {
           });
           continue;
         }
+        const inspect =
+          this.dependencies.tools.inspectTerminalRecoveryEvidence;
+        if (inspect === undefined) {
+          throw new AgentError(
+            "RECOVERY_REQUIRED",
+            "Terminal recovery evidence reader is unavailable",
+            { operationId: pending.operationId },
+          );
+        }
+        const evidence = await inspect({
+          operationId: pending.operationId,
+          requestHash: record.requestHash,
+          recoveryContext:
+            this.dependencies.recoveryContext ??
+            "ordinary_process_crash",
+          ...(record.status === "executing" ||
+          record.status === "completed" ||
+          record.status === "failed"
+            ? { journalStatus: record.status }
+            : {}),
+          ...(record.safeResult === undefined
+            ? {}
+            : { journalSafeResult: record.safeResult }),
+        });
+        if (terminalEvidenceProvesNoLaunch(evidence)) {
+          let metadata: TerminalPrelaunchFailureMetadata;
+          if (
+            (record.status === "completed" ||
+              record.status === "failed") &&
+            isTerminalPrelaunchFailureMetadata(record.safeResult)
+          ) {
+            metadata = record.safeResult;
+          } else if (record.status === "executing") {
+            metadata = {
+              reasonCode: "TERMINAL_INTERRUPTED_PRELAUNCH",
+              outcome: "spawn_failed",
+              mutation_outcome: "none",
+              ...storedTerminalRuntimeMetadata(record.safeResult),
+            };
+            record = await this.dependencies.journal.markFailed(
+              record,
+              this.now(),
+              "failure",
+              { ...metadata },
+            );
+          } else {
+            throw new AgentError(
+              "RECOVERY_REQUIRED",
+              "No-launch terminal evidence conflicts with its journal state",
+              {
+                operationId: pending.operationId,
+                journalStatus: record.status,
+              },
+            );
+          }
+          await this.applyTerminalPrelaunchEffects(
+            pending,
+            metadata,
+          );
+          await this.dependencies.audit.append({
+            type: "session.recovered",
+            taskId: this.state.taskId,
+            operationId: pending.operationId,
+            data: {
+              decision: "reconcile_prelaunch",
+              reasonCode: metadata.reasonCode,
+              journalStatus: record.status,
+              sessionStatus: pending.status,
+            },
+          });
+          continue;
+        }
+        const sourceFreeEvidence =
+          evidence.state === "exit_without_result"
+            ? {
+                evidenceState: evidence.state,
+                processOutcome: evidence.advisory.outcome,
+                exitCode: evidence.advisory.exitCode,
+                signal: evidence.advisory.signal,
+                completedAt: evidence.advisory.completedAt,
+                durationMs: evidence.advisory.durationMs,
+                stdoutBytes: evidence.advisory.stdoutBytes,
+                stderrBytes: evidence.advisory.stderrBytes,
+              }
+            : { evidenceState: evidence.state };
+        if (record.status === "executing") {
+          record = await this.dependencies.journal.markIndeterminate(
+            record,
+            this.now(),
+            "indeterminate",
+            {
+              reasonCode: "TERMINAL_RESULT_INCOMPLETE",
+              recoveryRequired: true,
+              ...sourceFreeEvidence,
+            },
+          );
+        }
+        const indeterminate = {
+          ...pending,
+          status: "indeterminate" as const,
+        };
+        this.state.pendingOperations =
+          this.state.pendingOperations.map((operation) =>
+            operation.operationId === pending.operationId
+              ? indeterminate
+              : operation,
+          );
+        await this.persist();
+        await this.dependencies.audit.append({
+          type: "session.recovered",
+          taskId: this.state.taskId,
+          operationId: pending.operationId,
+          data: {
+            decision: "pause",
+            reasonCode: "INDETERMINATE_TERMINAL_EVIDENCE",
+            journalStatus: record.status,
+            ...sourceFreeEvidence,
+          },
+        });
+        return indeterminate;
       }
       if (!pending.mutating || record.status === "completed" || record.status === "failed") continue;
       const indeterminate = { ...pending, status: "indeterminate" as const };
@@ -2184,22 +2344,78 @@ export class AgentRuntime {
         registration.record.safeResult,
         outcome.data,
       );
+      if (
+        call.name === "terminal_exec" &&
+        wasUnreturned &&
+        !wasPending
+      ) {
+        await this.appendTerminalReplayAudit(
+          registration.record,
+          outcome,
+        );
+      }
       this.reserveToolResultDisclosure(
         replayPlannedDisclosureBytes,
         replayBudgetLimits,
       );
-      if (registration.record.status === "completed") {
+      if (
+        call.name === "terminal_exec" &&
+        wasPending
+      ) {
+        const pending = this.state.pendingOperations.find(
+          (operation) =>
+            operation.operationId === call.operationId,
+        );
+        if (pending === undefined) {
+          throw new AgentError(
+            "RECOVERY_REQUIRED",
+            "Terminal replay lost its durable application key",
+            { operationId: call.operationId },
+          );
+        }
+        if (
+          isTerminalPrelaunchFailureMetadata(
+            registration.record.safeResult,
+          )
+        ) {
+          await this.applyTerminalPrelaunchEffects(
+            pending,
+            registration.record.safeResult,
+          );
+        } else if (
+          registration.record.status === "completed" &&
+          terminalJournalMetadata(
+            registration.record.safeResult,
+          ) !== undefined
+        ) {
+          await this.applyTerminalResultEffects(
+            pending,
+            registration.record,
+            replayBudgetLimits,
+          );
+        } else {
+          throw new AgentError(
+            "RECOVERY_REQUIRED",
+            "Pending terminal replay has no verified completion evidence",
+            { operationId: call.operationId },
+          );
+        }
+      } else if (
+        call.name !== "terminal_exec" &&
+        registration.record.status === "completed"
+      ) {
         await this.recordToolEffects(
           call,
           outcome,
           turnId,
           replayBudgetLimits,
-          wasPending,
         );
       }
-      this.clearPending(call.operationId);
-      this.markOperationAwaitingReturn(call.operationId);
-      await this.persist();
+      if (call.name !== "terminal_exec") {
+        this.clearPending(call.operationId);
+        this.markOperationAwaitingReturn(call.operationId);
+        await this.persist();
+      }
       return outcome;
     }
     if (registration.kind === "indeterminate_mutation") {
@@ -2448,6 +2664,56 @@ export class AgentRuntime {
         };
       }
     }
+    if (
+      call.name === "terminal_exec" &&
+      !preflightSessionStateWrite(
+        this.state,
+        TERMINAL_SESSION_HEADROOM_BYTES,
+      ).fits
+    ) {
+      this.meter.refund("commands");
+      const metadata: TerminalPrelaunchFailureMetadata = {
+        reasonCode: "TERMINAL_SESSION_HEADROOM_EXHAUSTED",
+        outcome: "spawn_failed",
+        mutation_outcome: "none",
+        ...(Object.keys(oneTimeBudgetLimits).length === 0
+          ? {}
+          : {
+              runtimeBudgetLimits:
+                oneTimeBudgetLimits,
+            }),
+        plannedDisclosureBytes:
+          policy.outcome === "allow"
+            ? policy.plannedDisclosureBytes ??
+                TOOL_RESULT_ENVELOPE_RESERVE_BYTES
+            : TOOL_RESULT_ENVELOPE_RESERVE_BYTES,
+      };
+      const failed = await this.dependencies.journal.markFailed(
+        registration.record,
+        this.now(),
+        "failure",
+        { ...metadata },
+      );
+      this.clearPending(call.operationId);
+      this.markOperationAwaitingReturn(call.operationId);
+      await this.persist();
+      await this.appendTerminalPrelaunchAudit(
+        call.operationId,
+        metadata,
+      );
+      return {
+        operationId: call.operationId,
+        tool: call.name,
+        status: "failure",
+        data: {
+          code: "TERMINAL_SESSION_HEADROOM_EXHAUSTED",
+          message:
+            "The session cannot reserve durable terminal-effect recovery headroom.",
+          outcome: "spawn_failed",
+        },
+        safeMetadata: failed.safeResult ?? { ...metadata },
+      };
+    }
     this.throwIfInterrupted();
     let executing: OperationRecord;
     try {
@@ -2563,21 +2829,56 @@ export class AgentRuntime {
           ? policy.plannedDisclosureBytes ?? TOOL_RESULT_ENVELOPE_RESERVE_BYTES
           : TOOL_RESULT_ENVELOPE_RESERVE_BYTES,
       );
-      await this.dependencies.journal.markCompleted(
-        executing,
-        this.now(),
-        outcome.status,
-        completedSafeResult,
-      );
+      const completedRecord =
+        call.name === "terminal_exec" &&
+        isTerminalPrelaunchFailureMetadata(completedSafeResult)
+          ? await this.dependencies.journal.markFailed(
+              executing,
+              this.now(),
+              outcome.status,
+              completedSafeResult,
+            )
+          : await this.dependencies.journal.markCompleted(
+              executing,
+              this.now(),
+              outcome.status,
+              completedSafeResult,
+            );
       operationWasCommitted = true;
-      this.clearPending(call.operationId);
-      this.markOperationAwaitingReturn(call.operationId);
-      await this.recordToolEffects(
-        call,
-        outcome,
-        turnId,
-        oneTimeBudgetLimits,
-      );
+      if (call.name === "terminal_exec") {
+        const pending = this.state.pendingOperations.find(
+          (operation) =>
+            operation.operationId === call.operationId,
+        );
+        if (pending === undefined) {
+          throw new AgentError(
+            "RECOVERY_REQUIRED",
+            "Terminal completion lost its durable application key",
+            { operationId: call.operationId },
+          );
+        }
+        if (isTerminalPrelaunchFailureMetadata(completedSafeResult)) {
+          await this.applyTerminalPrelaunchEffects(
+            pending,
+            completedSafeResult,
+          );
+        } else {
+          await this.applyTerminalResultEffects(
+            pending,
+            completedRecord,
+            oneTimeBudgetLimits,
+          );
+        }
+      } else {
+        this.clearPending(call.operationId);
+        this.markOperationAwaitingReturn(call.operationId);
+        await this.recordToolEffects(
+          call,
+          outcome,
+          turnId,
+          oneTimeBudgetLimits,
+        );
+      }
       await this.dependencies.audit.append({
         type: "tool.completed",
         taskId: this.state.taskId,
@@ -2598,6 +2899,9 @@ export class AgentRuntime {
         throw error;
       }
       if (operationWasCommitted) {
+        if (call.name === "terminal_exec") {
+          throw error;
+        }
         this.clearPending(call.operationId);
         this.markOperationAwaitingReturn(call.operationId);
         await this.persist();
@@ -2667,12 +2971,477 @@ export class AgentRuntime {
     }
   }
 
+  private async applyTerminalResultEffects(
+    pending: SessionState["pendingOperations"][number],
+    record: OperationRecord,
+    oneTimeBudgetLimits: RuntimeBudgetLimits = {},
+  ): Promise<void> {
+    const journalMetadata = terminalJournalMetadata(record.safeResult);
+    if (
+      journalMetadata === undefined ||
+      journalMetadata.operation_id !== pending.operationId ||
+      journalMetadata.request_hash !== pending.requestHash
+    ) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Terminal journal metadata does not bind the pending operation",
+        { operationId: pending.operationId },
+      );
+    }
+    const recovered = await this.dependencies.tools.recoverCompleted?.({
+      operationId: pending.operationId,
+      tool: "terminal_exec",
+      requestHash: pending.requestHash,
+    });
+    if (recovered === undefined) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Completed terminal operation has no verified result artifact",
+        { operationId: pending.operationId },
+      );
+    }
+    assertRecoveredToolOutcome(
+      recovered,
+      pending.operationId,
+      "terminal_exec",
+    );
+    const recoveredMetadata =
+      terminalJournalMetadata(recovered.safeMetadata);
+    if (
+      recoveredMetadata === undefined ||
+      stableJson(recoveredMetadata) !== stableJson(journalMetadata)
+    ) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Verified terminal evidence does not match its journal metadata",
+        { operationId: pending.operationId },
+      );
+    }
+    const inspect =
+      this.dependencies.tools.inspectCompletedTerminalEvidence;
+    if (inspect === undefined) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Terminal result evidence reader is unavailable",
+        { operationId: pending.operationId },
+      );
+    }
+    const evidence = await inspect({
+      operationId: pending.operationId,
+      requestHash: pending.requestHash,
+      terminalResult: journalMetadata.terminal_result,
+    });
+    const mutation = terminalMutationRecord(evidence);
+    const currentPending = this.state.pendingOperations.find(
+      (operation) => operation.operationId === pending.operationId,
+    );
+    if (currentPending === undefined) {
+      if (
+        this.state.completedOperationIds.includes(
+          pending.operationId,
+        ) &&
+        (
+          this.state.unreturnedOperationIds?.includes(
+            pending.operationId,
+          ) ??
+          false
+        )
+      ) {
+        this.verifyAppliedTerminalEffect(
+          pending.operationId,
+          mutation,
+        );
+        await this.appendTerminalEffectAudit(evidence);
+        return;
+      }
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Terminal result has no durable application key",
+        { operationId: pending.operationId },
+      );
+    }
+    if (
+      currentPending.tool !== "terminal_exec" ||
+      !currentPending.mutating ||
+      currentPending.requestHash !== pending.requestHash
+    ) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Terminal application key does not match the verified result",
+        { operationId: pending.operationId },
+      );
+    }
+
+    const existingMutations = this.state.mutations.filter(
+      (candidate) =>
+        candidate.operationId === pending.operationId,
+    );
+    if (existingMutations.length > 0) {
+      this.verifyAppliedTerminalEffect(
+        pending.operationId,
+        mutation,
+      );
+    }
+    const existingMutation = existingMutations[0];
+
+    const snapshot = snapshotTerminalApplicationState(this.state);
+    let budgetResult: PostHocBudgetResult;
+    try {
+      if (mutation !== undefined && existingMutation === undefined) {
+        this.state.mutations.push(mutation);
+        this.state.mutationSequence += 1;
+      }
+      const isLegacy = !("launch_receipt" in evidence.artifact);
+      const pendingEffects =
+        this.state.pendingTerminalEffectOperationIds ?? [];
+      if (terminalAttributionRemainsPending(
+        isLegacy,
+        journalMetadata.mutation_outcome,
+      )) {
+        if (!pendingEffects.includes(pending.operationId)) {
+          this.state.pendingTerminalEffectOperationIds = [
+            ...pendingEffects,
+            pending.operationId,
+          ];
+        }
+      } else {
+        const retained = pendingEffects.filter(
+          (operationId) =>
+            operationId !== pending.operationId,
+        );
+        if (retained.length === 0) {
+          delete this.state.pendingTerminalEffectOperationIds;
+        } else {
+          this.state.pendingTerminalEffectOperationIds = retained;
+        }
+      }
+      budgetResult = this.meter.applyPostHoc(
+        {
+          changedFiles:
+            mutation === undefined
+              ? 0
+              : evidence.artifact.result.mutation.changed_files,
+          changedLines:
+            mutation === undefined
+              ? 0
+              : evidence.artifact.result.mutation.changed_lines,
+          commandOutputBytes:
+            journalMetadata.stdout_bytes +
+            journalMetadata.stderr_bytes,
+        },
+        terminalPostHocLimits(oneTimeBudgetLimits),
+      );
+      if (journalMetadata.outcome === "spawn_failed") {
+        this.meter.refund("commands");
+      }
+      this.clearPending(pending.operationId);
+      this.markOperationAwaitingReturn(pending.operationId);
+      if (!preflightSessionStateWrite(this.state).fits) {
+        if (mutation === undefined) {
+          throw new AgentError(
+            "BUDGET_EXCEEDED",
+            "Terminal effect state exceeds its durable storage bound",
+          );
+        }
+        const mutationIndex = this.state.mutations.findIndex(
+          (candidate) =>
+            candidate.operationId === pending.operationId,
+        );
+        if (mutationIndex < 0) {
+          throw new AgentError(
+            "RECOVERY_REQUIRED",
+            "Terminal effect disappeared during bounded-state fallback",
+          );
+        }
+        this.state.mutations[mutationIndex] =
+          countsOnlyTerminalMutation(mutation);
+        if (!preflightSessionStateWrite(this.state).fits) {
+          throw new AgentError(
+            "BUDGET_EXCEEDED",
+            "Counts-only terminal effect state exceeds its durable storage bound",
+          );
+        }
+      }
+      await this.persist();
+    } catch (error) {
+      restoreTerminalApplicationState(this.state, snapshot);
+      throw error;
+    }
+    await this.appendTerminalEffectAudit(evidence);
+    throwPostHocBudgetExceeded(budgetResult.exceeded);
+  }
+
+  private async applyTerminalPrelaunchEffects(
+    pending: SessionState["pendingOperations"][number],
+    metadata: TerminalPrelaunchFailureMetadata,
+  ): Promise<void> {
+    const currentPending = this.state.pendingOperations.find(
+      (operation) => operation.operationId === pending.operationId,
+    );
+    if (currentPending === undefined) {
+      if (
+        this.state.completedOperationIds.includes(
+          pending.operationId,
+        ) &&
+        (
+          this.state.unreturnedOperationIds?.includes(
+            pending.operationId,
+          ) ??
+          false
+        )
+      ) {
+        await this.appendTerminalPrelaunchAudit(
+          pending.operationId,
+          metadata,
+        );
+        return;
+      }
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Prelaunch terminal failure has no durable application key",
+        { operationId: pending.operationId },
+      );
+    }
+    if (
+      currentPending.tool !== "terminal_exec" ||
+      !currentPending.mutating ||
+      currentPending.requestHash !== pending.requestHash
+    ) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Prelaunch terminal application key is inconsistent",
+        { operationId: pending.operationId },
+      );
+    }
+    const snapshot = snapshotTerminalApplicationState(this.state);
+    try {
+      if (currentPending.status === "executing") {
+        this.meter.refund("commands");
+      }
+      const pendingEffects =
+        this.state.pendingTerminalEffectOperationIds?.filter(
+          (operationId) =>
+            operationId !== pending.operationId,
+        );
+      if (pendingEffects === undefined || pendingEffects.length === 0) {
+        delete this.state.pendingTerminalEffectOperationIds;
+      } else {
+        this.state.pendingTerminalEffectOperationIds = pendingEffects;
+      }
+      this.clearPending(pending.operationId);
+      this.markOperationAwaitingReturn(pending.operationId);
+      if (!preflightSessionStateWrite(this.state).fits) {
+        throw new AgentError(
+          "BUDGET_EXCEEDED",
+          "Prelaunch terminal recovery state exceeds its durable storage bound",
+        );
+      }
+      await this.persist();
+    } catch (error) {
+      restoreTerminalApplicationState(this.state, snapshot);
+      throw error;
+    }
+    await this.appendTerminalPrelaunchAudit(
+      pending.operationId,
+      metadata,
+    );
+  }
+
+  private async appendTerminalEffectAudit(
+    evidence: VerifiedTerminalResultEvidence,
+  ): Promise<void> {
+    const result = evidence.artifact.result;
+    await this.dependencies.audit.appendOnce(
+      {
+        type: "command.completed",
+        taskId: this.state.taskId,
+        operationId: result.operation_id,
+        data: {
+          tool: "terminal_exec",
+          outcome: result.outcome,
+          outputBytes:
+            result.stdout.bytes + result.stderr.bytes,
+          mutationOutcome: result.mutation.outcome,
+        },
+      },
+      `terminal-command:${result.operation_id}`,
+    );
+    const mutation = this.state.mutations.find(
+      (candidate) =>
+        candidate.kind === "terminal" &&
+        candidate.operationId === result.operation_id,
+    );
+    if (mutation !== undefined) {
+      await this.dependencies.audit.appendOnce(
+        {
+          type: "mutation.completed",
+          taskId: this.state.taskId,
+          operationId: result.operation_id,
+          data: {
+            kind: "terminal",
+            changedFileCount:
+              result.mutation.changed_files,
+            changedLines: result.mutation.changed_lines,
+            observationOutcome:
+              result.mutation.outcome,
+            ...(result.mutation.repository_fingerprint ===
+            undefined
+              ? {}
+              : {
+                  repositoryFingerprint:
+                    result.mutation.repository_fingerprint,
+                }),
+          },
+        },
+        `terminal-mutation:${result.operation_id}`,
+      );
+    }
+  }
+
+  private async appendTerminalPrelaunchAudit(
+    operationId: string,
+    metadata: TerminalPrelaunchFailureMetadata,
+  ): Promise<void> {
+    await this.dependencies.audit.appendOnce(
+      {
+        type: "command.completed",
+        taskId: this.state.taskId,
+        operationId,
+        data: {
+          tool: "terminal_exec",
+          outcome: metadata.outcome,
+          outputBytes: 0,
+          mutationOutcome: metadata.mutation_outcome,
+          reasonCode: metadata.reasonCode,
+        },
+      },
+      `terminal-command:${operationId}`,
+    );
+  }
+
+  private async appendTerminalReplayAudit(
+    record: OperationRecord,
+    outcome: ToolOutcome,
+  ): Promise<void> {
+    if (isTerminalPrelaunchFailureMetadata(record.safeResult)) {
+      await this.appendTerminalPrelaunchAudit(
+        record.operationId,
+        record.safeResult,
+      );
+      return;
+    }
+    const journalMetadata =
+      terminalJournalMetadata(record.safeResult);
+    const {
+      replayed: _replayed,
+      ...recoveredSafeMetadata
+    } = outcome.safeMetadata;
+    const recoveredMetadata =
+      terminalJournalMetadata(recoveredSafeMetadata);
+    if (
+      journalMetadata === undefined ||
+      recoveredMetadata === undefined ||
+      stableJson(journalMetadata) !==
+        stableJson(recoveredMetadata)
+    ) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Replayed terminal evidence does not match its journal metadata",
+        { operationId: record.operationId },
+      );
+    }
+    const inspect =
+      this.dependencies.tools.inspectCompletedTerminalEvidence;
+    if (inspect === undefined) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Terminal result evidence reader is unavailable",
+        { operationId: record.operationId },
+      );
+    }
+    const evidence = await inspect({
+      operationId: record.operationId,
+      requestHash: record.requestHash,
+      terminalResult: journalMetadata.terminal_result,
+    });
+    this.verifyAppliedTerminalEffect(
+      record.operationId,
+      terminalMutationRecord(evidence),
+    );
+    await this.appendTerminalEffectAudit(evidence);
+    await this.reconcileTerminalEffectAttribution(
+      record.operationId,
+      terminalAttributionRemainsPending(
+        !("launch_receipt" in evidence.artifact),
+        journalMetadata.mutation_outcome,
+      ),
+    );
+  }
+
+  private async reconcileTerminalEffectAttribution(
+    operationId: string,
+    required: boolean,
+  ): Promise<void> {
+    const pendingEffects =
+      this.state.pendingTerminalEffectOperationIds ?? [];
+    const present = pendingEffects.includes(operationId);
+    if (present === required) return;
+    const snapshot =
+      snapshotTerminalApplicationState(this.state);
+    if (required) {
+      this.state.pendingTerminalEffectOperationIds = [
+        ...pendingEffects,
+        operationId,
+      ];
+    } else {
+      const retained = pendingEffects.filter(
+        (candidate) => candidate !== operationId,
+      );
+      if (retained.length === 0) {
+        delete this.state.pendingTerminalEffectOperationIds;
+      } else {
+        this.state.pendingTerminalEffectOperationIds = retained;
+      }
+    }
+    try {
+      await this.persist();
+    } catch (error) {
+      restoreTerminalApplicationState(this.state, snapshot);
+      throw error;
+    }
+  }
+
+  private verifyAppliedTerminalEffect(
+    operationId: string,
+    expected: FullTerminalMutationRecord | undefined,
+  ): void {
+    const existing = this.state.mutations.filter(
+      (candidate) => candidate.operationId === operationId,
+    );
+    if (expected === undefined) {
+      if (existing.length === 0) return;
+    } else if (existing.length === 1) {
+      const actual = existing[0];
+      if (
+        stableJson(actual) === stableJson(expected) ||
+        stableJson(actual) ===
+          stableJson(countsOnlyTerminalMutation(expected))
+      ) {
+        return;
+      }
+    }
+    throw new AgentError(
+      "RECOVERY_REQUIRED",
+      "Applied terminal effect conflicts with verified result evidence",
+      { operationId },
+    );
+  }
+
   private async recordToolEffects(
     call: NormalizedToolCall,
     outcome: ToolOutcome,
     turnId: string,
     oneTimeBudgetLimits: RuntimeBudgetLimits = {},
-    terminalEffectsNeeded = true,
   ): Promise<void> {
     const metadata = outcome.safeMetadata;
     if (
@@ -2718,55 +3487,6 @@ export class AgentRuntime {
         turnId,
         operationId: call.operationId,
         data: { checkpointId, changedPaths, changedLines, repositoryFingerprint },
-      });
-    }
-
-    if (call.name === "terminal_exec" && terminalEffectsNeeded) {
-      const processOutcome = stringMetadata(
-        metadata,
-        "outcome",
-        outcome.status,
-      );
-      if (processOutcome === "spawn_failed") {
-        this.meter.refund("commands");
-      }
-      const mutationOutcome = terminalMutationOutcome(
-        metadata.mutation_outcome ?? metadata.mutationOutcome,
-      );
-      if (
-        mutationOutcome !== undefined &&
-        mutationOutcome !== "none"
-      ) {
-        const pending =
-          this.state.pendingTerminalEffectOperationIds ?? [];
-        if (!pending.includes(call.operationId)) {
-          this.state.pendingTerminalEffectOperationIds = [
-            ...pending,
-            call.operationId,
-          ];
-        }
-      }
-      const outputBytes = terminalOutputBytes(metadata, outcome.data);
-      if (outputBytes > 0) {
-        this.meter.consume(
-          "commandOutputBytes",
-          outputBytes,
-          oneTimeBudgetLimits.commandOutputBytes,
-        );
-      }
-      await this.dependencies.audit.append({
-        type: "command.completed",
-        taskId: this.state.taskId,
-        turnId,
-        operationId: call.operationId,
-        data: {
-          tool: call.name,
-          outcome: processOutcome,
-          outputBytes,
-          ...(mutationOutcome === undefined
-            ? {}
-            : { mutationOutcome }),
-        },
       });
     }
 
@@ -3075,6 +3795,422 @@ export class AgentRuntime {
       ...(reason === undefined ? {} : { reason }),
     };
   }
+}
+
+interface TerminalApplicationStateSnapshot {
+  readonly updatedAt: string;
+  readonly budgetUsage: SessionState["budgetUsage"];
+  readonly mutationSequence: number;
+  readonly mutations: SessionState["mutations"];
+  readonly pendingOperations: SessionState["pendingOperations"];
+  readonly completedOperationIds: SessionState["completedOperationIds"];
+  readonly unreturnedOperationIds?: readonly string[];
+  readonly pendingTerminalEffectOperationIds?: readonly string[];
+}
+
+function snapshotTerminalApplicationState(
+  state: SessionState,
+): TerminalApplicationStateSnapshot {
+  return {
+    updatedAt: state.updatedAt,
+    budgetUsage: { ...state.budgetUsage },
+    mutationSequence: state.mutationSequence,
+    mutations: [...state.mutations],
+    pendingOperations: [...state.pendingOperations],
+    completedOperationIds: [...state.completedOperationIds],
+    ...(state.unreturnedOperationIds === undefined
+      ? {}
+      : {
+          unreturnedOperationIds: [
+            ...state.unreturnedOperationIds,
+          ],
+        }),
+    ...(state.pendingTerminalEffectOperationIds === undefined
+      ? {}
+      : {
+          pendingTerminalEffectOperationIds: [
+            ...state.pendingTerminalEffectOperationIds,
+          ],
+        }),
+  };
+}
+
+function restoreTerminalApplicationState(
+  state: SessionState,
+  snapshot: TerminalApplicationStateSnapshot,
+): void {
+  state.updatedAt = snapshot.updatedAt;
+  state.budgetUsage = { ...snapshot.budgetUsage };
+  state.mutationSequence = snapshot.mutationSequence;
+  state.mutations = [...snapshot.mutations];
+  state.pendingOperations = [...snapshot.pendingOperations];
+  state.completedOperationIds = [
+    ...snapshot.completedOperationIds,
+  ];
+  if (snapshot.unreturnedOperationIds === undefined) {
+    delete state.unreturnedOperationIds;
+  } else {
+    state.unreturnedOperationIds = [
+      ...snapshot.unreturnedOperationIds,
+    ];
+  }
+  if (
+    snapshot.pendingTerminalEffectOperationIds === undefined
+  ) {
+    delete state.pendingTerminalEffectOperationIds;
+  } else {
+    state.pendingTerminalEffectOperationIds = [
+      ...snapshot.pendingTerminalEffectOperationIds,
+    ];
+  }
+}
+
+function terminalMutationRecord(
+  evidence: VerifiedTerminalResultEvidence,
+): FullTerminalMutationRecord | undefined {
+  if (!("launch_receipt" in evidence.artifact)) return undefined;
+  const result = evidence.artifact.result;
+  const mutation = result.mutation;
+  if (mutation.outcome === "none") return undefined;
+  const summary = requiredTerminalPathSummary(mutation);
+  const paths = boundedTerminalSessionPaths(
+    mutation,
+    summary.pathEndpointTotal,
+  );
+  const base = {
+    kind: "terminal" as const,
+    recordContract: "terminal-mutation/2" as const,
+    operationId: result.operation_id,
+    changedPaths: paths.changedPaths,
+    changedLines: mutation.changed_lines,
+    createdPaths: paths.createdPaths,
+    updatedPaths: paths.updatedPaths,
+    deletedPaths: paths.deletedPaths,
+    renamedPaths: paths.renamedPaths,
+    preExistingTouchedPaths:
+      paths.preExistingTouchedPaths,
+    processOutcome: result.outcome,
+    createdTotal: summary.createdTotal,
+    updatedTotal: summary.updatedTotal,
+    deletedTotal: summary.deletedTotal,
+    renamedTotal: summary.renamedTotal,
+    preExistingTouchedTotal:
+      summary.preExistingTouchedTotal,
+    changedPathCount:
+      summary.createdTotal +
+      summary.updatedTotal +
+      summary.deletedTotal +
+      summary.renamedTotal * 2,
+    pathEndpointTotal: summary.pathEndpointTotal,
+    omittedPathEndpointTotal:
+      summary.pathEndpointTotal -
+      paths.retainedEndpointCount,
+    pathFactsTruncated:
+      summary.pathEndpointTotal !==
+      paths.retainedEndpointCount,
+    pathFactsSha256: summary.pathFactsSha256,
+    unavailableBaselineCount:
+      summary.unavailableBaselineCount,
+    completedAt: result.completed_at,
+    preObservation: evidence.artifact.pre_observation,
+    postObservation: evidence.artifact.post_observation,
+    terminalResult: evidence.reference,
+  };
+  if (mutation.outcome === "observed") {
+    if (
+      mutation.repository_fingerprint === undefined ||
+      evidence.artifact.post_observation_control === undefined
+    ) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Observed terminal result lacks its control-freshness anchor",
+        { operationId: result.operation_id },
+      );
+    }
+    return {
+      ...base,
+      observationOutcome: "observed",
+      repositoryFingerprint:
+        mutation.repository_fingerprint,
+      postObservationControl:
+        evidence.artifact.post_observation_control,
+    };
+  }
+  if (
+    mutation.outcome !== "unknown" &&
+    mutation.outcome !== "protected_or_hidden_changed"
+  ) {
+    throw new AgentError(
+      "RECOVERY_REQUIRED",
+      "Terminal mutation outcome is not applicable",
+      {
+        operationId: result.operation_id,
+        mutationOutcome: mutation.outcome,
+      },
+    );
+  }
+  return {
+    ...base,
+    observationOutcome: mutation.outcome,
+  };
+}
+
+function terminalAttributionRemainsPending(
+  legacy: boolean,
+  outcome: TerminalExecMutationResult["outcome"],
+): boolean {
+  return (
+    outcome !== "none" &&
+    (legacy || outcome !== "observed")
+  );
+}
+
+interface RequiredTerminalPathSummary {
+  readonly createdTotal: number;
+  readonly updatedTotal: number;
+  readonly deletedTotal: number;
+  readonly renamedTotal: number;
+  readonly preExistingTouchedTotal: number;
+  readonly pathEndpointTotal: number;
+  readonly pathFactsSha256: string;
+  readonly unavailableBaselineCount: number;
+}
+
+function requiredTerminalPathSummary(
+  mutation: TerminalExecMutationResult,
+): RequiredTerminalPathSummary {
+  const values = {
+    createdTotal: mutation.created_total,
+    updatedTotal: mutation.updated_total,
+    deletedTotal: mutation.deleted_total,
+    renamedTotal: mutation.renamed_total,
+    preExistingTouchedTotal:
+      mutation.pre_existing_touched_total,
+    pathEndpointTotal: mutation.path_endpoint_total,
+    pathFactsSha256: mutation.path_facts_sha256,
+    unavailableBaselineCount:
+      mutation.unavailable_baseline_count,
+  };
+  if (
+    !nonnegativeSafeInteger(values.createdTotal) ||
+    !nonnegativeSafeInteger(values.updatedTotal) ||
+    !nonnegativeSafeInteger(values.deletedTotal) ||
+    !nonnegativeSafeInteger(values.renamedTotal) ||
+    !nonnegativeSafeInteger(
+      values.preExistingTouchedTotal,
+    ) ||
+    !nonnegativeSafeInteger(values.pathEndpointTotal) ||
+    typeof values.pathFactsSha256 !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(values.pathFactsSha256) ||
+    !nonnegativeSafeInteger(
+      values.unavailableBaselineCount,
+    )
+  ) {
+    throw new AgentError(
+      "RECOVERY_REQUIRED",
+      "Full terminal result lacks exact bounded path facts",
+    );
+  }
+  return values as RequiredTerminalPathSummary;
+}
+
+interface BoundedTerminalSessionPaths {
+  readonly changedPaths: readonly string[];
+  readonly createdPaths: readonly string[];
+  readonly updatedPaths: readonly string[];
+  readonly deletedPaths: readonly string[];
+  readonly renamedPaths: readonly {
+    readonly from: string;
+    readonly to: string;
+  }[];
+  readonly preExistingTouchedPaths: readonly string[];
+  readonly retainedEndpointCount: number;
+}
+
+function boundedTerminalSessionPaths(
+  mutation: TerminalExecMutationResult,
+  pathEndpointTotal: number,
+): BoundedTerminalSessionPaths {
+  const changedPaths: string[] = [];
+  const changed = new Set<string>();
+  const createdPaths: string[] = [];
+  const updatedPaths: string[] = [];
+  const deletedPaths: string[] = [];
+  const renamedPaths: Array<{
+    readonly from: string;
+    readonly to: string;
+  }> = [];
+  const preExistingTouchedPaths: string[] = [];
+  let retainedEndpointCount = 0;
+  let retainedBytes = 0;
+  const retainPath = (
+    value: string,
+    target: string[],
+  ): void => {
+    const changedBytes = changed.has(value)
+      ? 0
+      : Buffer.byteLength(value);
+    const addedBytes =
+      Buffer.byteLength(value) + changedBytes;
+    if (
+      retainedEndpointCount + 1 >
+        TERMINAL_SESSION_MAX_PATH_ENDPOINTS ||
+      retainedBytes + addedBytes >
+        TERMINAL_SESSION_MAX_PATH_BYTES
+    ) {
+      return;
+    }
+    target.push(value);
+    retainedEndpointCount += 1;
+    retainedBytes += addedBytes;
+    if (!changed.has(value)) {
+      changed.add(value);
+      changedPaths.push(value);
+    }
+  };
+  for (const value of mutation.created) {
+    retainPath(value, createdPaths);
+  }
+  for (const value of mutation.updated) {
+    retainPath(value, updatedPaths);
+  }
+  for (const value of mutation.deleted) {
+    retainPath(value, deletedPaths);
+  }
+  for (const rename of mutation.renamed) {
+    const newChanged = [rename.from, rename.to].filter(
+      (value) => !changed.has(value),
+    );
+    const addedBytes =
+      Buffer.byteLength(rename.from) +
+      Buffer.byteLength(rename.to) +
+      newChanged.reduce(
+        (total, value) =>
+          total + Buffer.byteLength(value),
+        0,
+      );
+    if (
+      retainedEndpointCount + 2 >
+        TERMINAL_SESSION_MAX_PATH_ENDPOINTS ||
+      retainedBytes + addedBytes >
+        TERMINAL_SESSION_MAX_PATH_BYTES
+    ) {
+      continue;
+    }
+    renamedPaths.push(rename);
+    retainedEndpointCount += 2;
+    retainedBytes += addedBytes;
+    for (const value of newChanged) {
+      changed.add(value);
+      changedPaths.push(value);
+    }
+  }
+  for (const value of mutation.pre_existing_touched) {
+    if (!changed.has(value)) continue;
+    const addedBytes = Buffer.byteLength(value);
+    if (
+      retainedEndpointCount + 1 >
+        TERMINAL_SESSION_MAX_PATH_ENDPOINTS ||
+      retainedBytes + addedBytes >
+        TERMINAL_SESSION_MAX_PATH_BYTES
+    ) {
+      continue;
+    }
+    preExistingTouchedPaths.push(value);
+    retainedEndpointCount += 1;
+    retainedBytes += addedBytes;
+  }
+  if (retainedEndpointCount > pathEndpointTotal) {
+    throw new AgentError(
+      "RECOVERY_REQUIRED",
+      "Retained terminal paths exceed their exact total",
+    );
+  }
+  return {
+    changedPaths,
+    createdPaths,
+    updatedPaths,
+    deletedPaths,
+    renamedPaths,
+    preExistingTouchedPaths,
+    retainedEndpointCount,
+  };
+}
+
+function countsOnlyTerminalMutation(
+  mutation: FullTerminalMutationRecord,
+): FullTerminalMutationRecord {
+  return {
+    ...mutation,
+    changedPaths: [],
+    createdPaths: [],
+    updatedPaths: [],
+    deletedPaths: [],
+    renamedPaths: [],
+    preExistingTouchedPaths: [],
+    omittedPathEndpointTotal:
+      mutation.pathEndpointTotal,
+    pathFactsTruncated:
+      mutation.pathEndpointTotal > 0,
+  };
+}
+
+function terminalPostHocLimits(
+  limits: RuntimeBudgetLimits,
+): Partial<
+  Record<
+    "changedFiles" | "changedLines" | "commandOutputBytes",
+    number
+  >
+> {
+  return {
+    ...(limits.changedFiles === undefined
+      ? {}
+      : { changedFiles: limits.changedFiles }),
+    ...(limits.changedLines === undefined
+      ? {}
+      : { changedLines: limits.changedLines }),
+    ...(limits.commandOutputBytes === undefined
+      ? {}
+      : {
+          commandOutputBytes:
+            limits.commandOutputBytes,
+        }),
+  };
+}
+
+function throwPostHocBudgetExceeded(
+  exceeded: readonly PostHocBudgetExceeded[],
+): void {
+  const first = exceeded[0];
+  if (first === undefined) return;
+  throw new AgentError(
+    "BUDGET_EXCEEDED",
+    `Post-hoc terminal usage exceeded ${first.counter}`,
+    {
+      counter: first.counter,
+      current: first.previous,
+      requested: first.charged,
+      actual: first.actual,
+      limit: first.effectiveLimit,
+      persistedLimit: first.persistedLimit,
+      exceeded: exceeded.map((entry) => ({
+        counter: entry.counter,
+        actual: entry.actual,
+        limit: entry.effectiveLimit,
+      })),
+    },
+  );
+}
+
+function nonnegativeSafeInteger(
+  value: unknown,
+): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0
+  );
 }
 
 function transportResultReason(
@@ -3556,6 +4692,27 @@ function storedRuntimeBudgetLimits(
   return limits;
 }
 
+function storedTerminalRuntimeMetadata(
+  safeMetadata: Readonly<Record<string, unknown>> | undefined,
+): Pick<
+  TerminalPrelaunchFailureMetadata,
+  "runtimeBudgetLimits" | "plannedDisclosureBytes"
+> {
+  const limits = storedRuntimeBudgetLimits(safeMetadata);
+  const plannedDisclosureBytes =
+    safeMetadata?.plannedDisclosureBytes;
+  return {
+    ...(Object.keys(limits).length === 0
+      ? {}
+      : { runtimeBudgetLimits: limits }),
+    ...(typeof plannedDisclosureBytes === "number" &&
+    Number.isSafeInteger(plannedDisclosureBytes) &&
+    plannedDisclosureBytes >= 0
+      ? { plannedDisclosureBytes }
+      : {}),
+  };
+}
+
 function storedPlannedDisclosureBytes(
   safeMetadata: Readonly<Record<string, unknown>> | undefined,
   terminalData?: Readonly<Record<string, unknown>>,
@@ -3712,35 +4869,6 @@ function hashMetadata(metadata: Readonly<Record<string, unknown>>, key: string):
 function stringArrayMetadata(metadata: Readonly<Record<string, unknown>>, key: string): string[] {
   const value = metadata[key];
   return Array.isArray(value) && value.every((entry) => typeof entry === "string") ? value : [];
-}
-
-function terminalMutationOutcome(
-  value: unknown,
-):
-  | "none"
-  | "observed"
-  | "protected_or_hidden_changed"
-  | "unknown"
-  | undefined {
-  return value === "none" ||
-    value === "observed" ||
-    value === "protected_or_hidden_changed" ||
-    value === "unknown"
-    ? value
-    : undefined;
-}
-
-function terminalOutputBytes(
-  metadata: Readonly<Record<string, unknown>>,
-  data: Readonly<Record<string, unknown>>,
-): number {
-  const retained = retainedTerminalOutputBytes(data);
-  if (retained !== undefined) return retained;
-  const combined = numericMetadata(metadata, "outputBytes");
-  if (combined > 0) return combined;
-  const stdout = numericMetadata(metadata, "stdout_bytes");
-  const stderr = numericMetadata(metadata, "stderr_bytes");
-  return Number.isSafeInteger(stdout + stderr) ? stdout + stderr : 0;
 }
 
 function retainedTerminalOutputBytes(

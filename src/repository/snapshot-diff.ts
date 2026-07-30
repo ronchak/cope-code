@@ -10,6 +10,11 @@ import type {
 import { looksBinary, readRegularFile } from "./text-file.js";
 
 export const SNAPSHOT_DIFF_VERSION = "snapshot-diff.v1" as const;
+/**
+ * Maximum serialized unavailable-terminal path sample attached to a session
+ * diff result. This sample is outside the caller's diff/max_bytes source bound.
+ */
+export const SESSION_DIFF_UNAVAILABLE_TERMINAL_PATH_SAMPLE_BYTES = 64 * 1024;
 
 export interface PatchSessionMutationDiffRecord {
   readonly kind?: "patch";
@@ -21,6 +26,15 @@ export interface TerminalSessionMutationDiffRecord {
   readonly kind: "terminal";
   readonly operationId: string;
   readonly changedPaths: readonly string[];
+  /**
+   * A pathless non-clean observation may have affected any later-known path,
+   * so a later checkpoint cannot establish that path's session baseline.
+   */
+  readonly observationOutcome?:
+    | "none"
+    | "observed"
+    | "protected_or_hidden_changed"
+    | "unknown";
   /** Full Slice 2 records expose exact path-fact truncation to the diff seam. */
   readonly changedPathCount?: number;
   readonly pathFactsTruncated?: boolean;
@@ -107,6 +121,13 @@ interface BaselineCandidate {
 interface SessionBaselineSourceBase {
   readonly path: string;
   /**
+   * A known later path may still lack a trustworthy session baseline because
+   * an earlier pathless non-clean turn could have touched it.
+   */
+  readonly forcedUnavailableReason?:
+    | "bounded_out"
+    | "unknown_observation";
+  /**
    * A case/Unicode-only rename has two semantic Git endpoints even when the
    * host filesystem aliases them. The old spelling is absent in the final
    * session state and must not be re-read through its alias.
@@ -136,7 +157,6 @@ interface TerminalMutationPathFacts {
 }
 
 const MAX_UNAVAILABLE_TERMINAL_PATH_SAMPLE = 256;
-const MAX_UNAVAILABLE_TERMINAL_PATH_SAMPLE_BYTES = 64 * 1024;
 
 interface TerminalUnavailableAccumulator {
   readonly facts: TerminalUnavailableDiffFact[];
@@ -203,6 +223,14 @@ export class SnapshotDiffInspector {
     const requested = await this.resolveRequestedPaths(request.paths ?? []);
     const earliest = new Map<string, SessionBaselineSource>();
     const aliasCurrentSpellings = new Map<string, string>();
+    let unlistedPriorTerminal:
+      | {
+          readonly mutation: TerminalSessionMutationDiffRecord;
+          readonly reason:
+            | "bounded_out"
+            | "unknown_observation";
+        }
+      | undefined;
     let hasTerminalMutation = false;
     let artifactOmittedTerminalPathCount = 0;
     for (const mutation of mutations) {
@@ -230,7 +258,15 @@ export class SnapshotDiffInspector {
         if (earliest.has(key)) continue;
         earliest.set(
           key,
-          mutation.kind === "terminal"
+          unlistedPriorTerminal !== undefined
+            ? {
+                kind: "terminal",
+                path: normalized,
+                mutation: unlistedPriorTerminal.mutation,
+                forcedUnavailableReason:
+                  unlistedPriorTerminal.reason,
+              }
+            : mutation.kind === "terminal"
             ? { kind: "terminal", path: normalized, mutation }
             : {
                 kind: "patch",
@@ -242,11 +278,31 @@ export class SnapshotDiffInspector {
       if (mutation.kind === "terminal") {
         for (const rename of pathFacts.aliasRenames) {
           const existing = earliest.get(rename.pathKey);
+          const forcedUnavailableReason =
+            existing?.forcedUnavailableReason ??
+            (
+              existing === undefined &&
+              unlistedPriorTerminal !== undefined
+                ? unlistedPriorTerminal.reason
+                : undefined
+            );
+          const forcedUnavailableMutation =
+            forcedUnavailableReason === undefined
+              ? undefined
+              : (
+                  existing?.kind === "terminal" &&
+                  existing.forcedUnavailableReason !== undefined
+                    ? existing.mutation
+                    : unlistedPriorTerminal?.mutation
+                );
           if (existing === undefined) {
             earliest.set(rename.pathKey, {
               kind: "terminal",
               path: rename.from,
-              mutation,
+              mutation: forcedUnavailableMutation ?? mutation,
+              ...(forcedUnavailableReason === undefined
+                ? {}
+                : { forcedUnavailableReason }),
               currentState: "absent",
             });
           } else {
@@ -282,9 +338,33 @@ export class SnapshotDiffInspector {
             earliest.set(destinationKey, {
               kind: "terminal",
               path: rename.to,
-              mutation,
+              mutation: forcedUnavailableMutation ?? mutation,
+              ...(forcedUnavailableReason === undefined
+                ? {}
+                : { forcedUnavailableReason }),
               currentState: "path",
             });
+          }
+        }
+        if (
+          unlistedPriorTerminal === undefined
+        ) {
+          const reason =
+            pathFacts.omitted > 0
+              ? "bounded_out"
+              : (
+                  pathFacts.paths.length === 0 &&
+                  pathFacts.aliasRenames.length === 0 &&
+                  (
+                    mutation.observationOutcome === "unknown" ||
+                    mutation.observationOutcome ===
+                      "protected_or_hidden_changed"
+                  )
+                    ? "unknown_observation"
+                    : undefined
+                );
+          if (reason !== undefined) {
+            unlistedPriorTerminal = { mutation, reason };
           }
         }
       }
@@ -362,6 +442,14 @@ export class SnapshotDiffInspector {
     for (const candidate of retainedTerminal) {
       throwIfAborted(signal);
       const resolution = await this.resolveTerminalBaseline(candidate, signal);
+      if (candidate.forcedUnavailableReason !== undefined) {
+        addUnavailableTerminalPath(
+          unavailable,
+          candidate.path,
+          candidate.forcedUnavailableReason,
+        );
+        continue;
+      }
       if (!resolution.available) {
         addUnavailableTerminalPath(
           unavailable,
@@ -790,7 +878,8 @@ function addUnavailableTerminalPath(
     (accumulator.facts.length === 0 ? 0 : 1);
   if (
     !Number.isSafeInteger(accumulator.sampleBytes + bytes) ||
-    accumulator.sampleBytes + bytes > MAX_UNAVAILABLE_TERMINAL_PATH_SAMPLE_BYTES
+    accumulator.sampleBytes + bytes >
+      SESSION_DIFF_UNAVAILABLE_TERMINAL_PATH_SAMPLE_BYTES
   ) {
     return;
   }

@@ -6,6 +6,11 @@ import test from "node:test";
 
 import { selectHostPlatform } from "../../src/platform/index.js";
 import { RepositoryBoundary } from "../../src/repository/boundary.js";
+import {
+  WORKSPACE_OBSERVATION_CONTRACT,
+  createWorkspacePathFacts,
+  type WorkspaceObservation,
+} from "../../src/repository/workspace-observer.js";
 import { SessionArtifactStore } from "../../src/session/artifact-store.js";
 import {
   TerminalArtifactPersistence,
@@ -194,3 +199,245 @@ test("terminal executor rejects invalid or host-unsafe calls before launch", asy
     undefined,
   );
 });
+
+test("terminal executor durably brackets launch with full workspace evidence", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cope-terminal-full-evidence-"));
+  const boundary = await RepositoryBoundary.create(root);
+  const persistence = new TerminalArtifactPersistence(
+    new SessionArtifactStore(path.join(root, ".state", "artifacts")),
+  );
+  const operationId = "op_terminal_full_evidence";
+  const requestHash = "c".repeat(64);
+  const pre = workspaceObservation("pre", "a".repeat(64));
+  const post = workspaceObservation("post", "b".repeat(64));
+  const paths = createWorkspacePathFacts({
+    created: ["src/new.ts"],
+    updated: [],
+    deleted: [],
+    renamed: [],
+    preExistingTouched: [],
+  });
+  let processLaunches = 0;
+  const executor = new TerminalExecutor({
+    boundary,
+    persistence,
+    host: selectHostPlatform("linux", "x64"),
+    observer: {
+      capturePre: async () => pre,
+      capturePost: async (observedPre) => {
+        assert.deepEqual(observedPre, pre);
+        return post;
+      },
+      compare: async (observedPre, observedPost) => {
+        assert.deepEqual(observedPre, pre);
+        assert.deepEqual(observedPost, post);
+        return {
+          outcome: "observed",
+          paths,
+          changedFiles: 1,
+          changedLines: 2,
+          binaryFiles: 0,
+          unavailableBaselineCount: 0,
+          repositoryFingerprint: post.repositoryFingerprint,
+          postObservationControl: {
+            branch: post.branch,
+            head: post.head,
+            excludedStateFingerprint:
+              post.components.excluded,
+          },
+          limitationCodes: [],
+        };
+      },
+    },
+    process: {
+      runTerminal: async () => {
+        processLaunches += 1;
+        const evidence = await persistence.inspectIncompleteEvidence({
+          operationId,
+          requestHash,
+          recoveryContext: "ordinary_process_crash",
+        });
+        assert.equal(
+          evidence.state,
+          "launch_without_exit",
+          "request, pre-observation, and launch receipt must be durable before process launch",
+        );
+        return {
+          outcome: "completed",
+          exitCode: 0,
+          signal: null,
+          startedAt: "2026-01-01T00:00:01.000Z",
+          completedAt: "2026-01-01T00:00:02.000Z",
+          durationMs: 1_000,
+          stdoutBytes: 0,
+          stderrBytes: 0,
+        };
+      },
+    },
+  });
+
+  const outcome = await executor.execute(
+    {
+      operationId,
+      name: "terminal_exec",
+      arguments: {
+        contract: "terminal-exec/1",
+        mode: "shell",
+        command: "true",
+      },
+    },
+    {
+      timeoutMs: 30_000,
+      maxOutputBytes: 8_192,
+      requestHash,
+      preExistingBaseline: {
+        paths: [],
+        hasReconstructibleBaseline: async () => false,
+      },
+    },
+  );
+
+  assert.equal(processLaunches, 1);
+  assert.equal(outcome.status, "success");
+  assert.equal(isTerminalJournalResultMetadata(outcome.safeMetadata), true);
+  if (!isTerminalJournalResultMetadata(outcome.safeMetadata)) {
+    assert.fail("expected full terminal journal metadata");
+  }
+  assert.equal(outcome.safeMetadata.mutation_outcome, "observed");
+  assert.equal(outcome.safeMetadata.changed_files, 1);
+  assert.equal(outcome.safeMetadata.changed_lines, 2);
+  const evidence = await executor.inspectCompletedEvidence({
+    operationId,
+    requestHash,
+    terminalResult: outcome.safeMetadata.terminal_result,
+  });
+  assert.equal("launch_receipt" in evidence.artifact, true);
+  assert.equal(evidence.artifact.result.mutation.outcome, "observed");
+  assert.deepEqual(
+    evidence.artifact.result.mutation.created,
+    ["src/new.ts"],
+  );
+  assert.equal(
+    evidence.artifact.result.mutation.path_facts_sha256,
+    paths.completeFactsSha256,
+  );
+});
+
+test("terminal executor preserves unknown attribution when post observation fails", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cope-terminal-unknown-effect-"));
+  const boundary = await RepositoryBoundary.create(root);
+  const persistence = new TerminalArtifactPersistence(
+    new SessionArtifactStore(path.join(root, ".state", "artifacts")),
+  );
+  const operationId = "op_terminal_unknown_effect";
+  const requestHash = "d".repeat(64);
+  const pre = workspaceObservation("pre", "a".repeat(64));
+  const executor = new TerminalExecutor({
+    boundary,
+    persistence,
+    host: selectHostPlatform("linux", "x64"),
+    observer: {
+      capturePre: async () => pre,
+      capturePost: async () => {
+        throw new Error("post observation unavailable");
+      },
+      compare: async () => {
+        throw new Error("comparison unavailable");
+      },
+    },
+    process: {
+      runTerminal: async () => ({
+        outcome: "completed",
+        exitCode: 0,
+        signal: null,
+        startedAt: "2026-01-01T00:00:01.000Z",
+        completedAt: "2026-01-01T00:00:02.000Z",
+        durationMs: 1_000,
+        stdoutBytes: 0,
+        stderrBytes: 0,
+      }),
+    },
+  });
+
+  const outcome = await executor.execute(
+    {
+      operationId,
+      name: "terminal_exec",
+      arguments: {
+        contract: "terminal-exec/1",
+        mode: "shell",
+        command: "true",
+      },
+    },
+    {
+      timeoutMs: 30_000,
+      maxOutputBytes: 8_192,
+      requestHash,
+      preExistingBaseline: {
+        paths: [],
+        hasReconstructibleBaseline: async () => false,
+      },
+    },
+  );
+
+  assert.equal(outcome.status, "success");
+  assert.equal(isTerminalJournalResultMetadata(outcome.safeMetadata), true);
+  if (!isTerminalJournalResultMetadata(outcome.safeMetadata)) {
+    assert.fail("expected full terminal journal metadata");
+  }
+  assert.equal(outcome.safeMetadata.mutation_outcome, "unknown");
+  assert.equal(outcome.safeMetadata.changed_files, 0);
+  assert.equal(outcome.safeMetadata.changed_lines, 0);
+  const evidence = await executor.inspectCompletedEvidence({
+    operationId,
+    requestHash,
+    terminalResult: outcome.safeMetadata.terminal_result,
+  });
+  assert.equal("launch_receipt" in evidence.artifact, true);
+  assert.equal(evidence.artifact.result.mutation.outcome, "unknown");
+  assert.match(
+    evidence.artifact.result.mutation.ignored_summary,
+    /COMPARE_FAILED/u,
+  );
+});
+
+function workspaceObservation(
+  phase: WorkspaceObservation["phase"],
+  repositoryFingerprint: string,
+): WorkspaceObservation & { readonly state: "complete" } {
+  return {
+    contract: WORKSPACE_OBSERVATION_CONTRACT,
+    phase,
+    observedAt:
+      phase === "pre"
+        ? "2026-01-01T00:00:00.000Z"
+        : "2026-01-01T00:00:02.000Z",
+    durationMs: 20,
+    state: "complete",
+    branch: "main",
+    head: "b".repeat(40),
+    repositoryFingerprint,
+    components: {
+      index: "1".repeat(64),
+      visible: "2".repeat(64),
+      excluded: "3".repeat(64),
+      protectedWorktree: "4".repeat(64),
+      gitTransitions: "5".repeat(64),
+      gitControls: "6".repeat(64),
+    },
+    entries: [],
+    beforeImages: [],
+    transitionPaths: {
+      paths: [],
+      total: 0,
+      omitted: 0,
+      truncated: false,
+      completeFactsSha256: "7".repeat(64),
+    },
+    ignoredCount: 0,
+    ignoredSummarySha256: "8".repeat(64),
+    ignoredSummaryTruncated: false,
+    nestedRepository: "none",
+    limitationCodes: [],
+  };
+}

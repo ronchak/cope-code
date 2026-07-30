@@ -21,6 +21,9 @@ import {
   type BudgetMetric,
 } from "../protocol/index.js";
 import type { RepositoryBoundary } from "../repository/boundary.js";
+import {
+  SESSION_DIFF_UNAVAILABLE_TERMINAL_PATH_SAMPLE_BYTES,
+} from "../repository/snapshot-diff.js";
 import { countChangedLines, planExactTextEdit } from "../repository/exact-text-edit.js";
 import type { RepositoryReadOperation } from "../repository/repository-tools.js";
 import { readTextFile } from "../repository/text-file.js";
@@ -222,7 +225,37 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
           },
         };
       }
-      const effectiveCall = effectiveToolCall(engine, call);
+      if (
+        call.name === "git_diff" &&
+        call.arguments.scope === "session"
+      ) {
+        const bounds = sessionGitDiffRuntimeBounds(
+          engine,
+          positiveInteger(call.arguments.max_bytes) ??
+            this.options.defaultDiffBytes ??
+            256 * 1024,
+        );
+        if (bounds.disabled === true) {
+          return {
+            outcome: "deny",
+            reasonCode: "DISCLOSURE_OPERATION_LIMIT_EXCEEDED",
+            explanation:
+              "Session diff disclosure is disabled because the effective per-operation byte ceiling cannot contain its bounded terminal-unavailable path sample.",
+            details: {
+              dimension: "bytes",
+              limit: bounds.policyCeiling,
+              requested:
+                SESSION_DIFF_UNAVAILABLE_TERMINAL_PATH_SAMPLE_BYTES +
+                bounds.requestedDiffBytes,
+            },
+          };
+        }
+      }
+      const effectiveCall = effectiveToolCall(
+        engine,
+        call,
+        this.options.defaultDiffBytes,
+      );
       const terminal =
         effectiveCall.name === "terminal_exec"
           ? terminalExecutionBounds(engine, effectiveCall, this.options.currentUsage())
@@ -486,6 +519,7 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
     let command: PolicyOperation["command"];
     let network: PolicyOperation["network"];
     let change: PolicyOperation["change"];
+    let additionalSerializedDisclosureBytes = 0;
 
     if (call.name === "read_file") {
       const byteCount = positiveInteger(call.arguments.max_bytes) ?? this.options.defaultReadBytes ?? 128 * 1024;
@@ -506,7 +540,15 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
       );
     } else if (call.name === "git_diff") {
       const byteCount = positiveInteger(call.arguments.max_bytes) ?? this.options.defaultDiffBytes ?? 256 * 1024;
-      disclosure = disclosureFact(this.classification, byteCount, 1);
+      if ((optionalString(call.arguments.scope) ?? "working_tree") === "session") {
+        additionalSerializedDisclosureBytes =
+          SESSION_DIFF_UNAVAILABLE_TERMINAL_PATH_SAMPLE_BYTES;
+      }
+      disclosure = disclosureFact(
+        this.classification,
+        byteCount + additionalSerializedDisclosureBytes,
+        1,
+      );
     } else if (call.name === "git_status") {
       disclosure = disclosureFact(this.classification, GIT_STATUS_RESULT_BYTES, 1);
     } else if (call.name === "run_command") {
@@ -575,8 +617,9 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
       0,
     );
     const plannedDisclosureBytes = plannedToolResultDisclosureBytes(
-      disclosure?.byte_count ?? 0,
+      (disclosure?.byte_count ?? 0) - additionalSerializedDisclosureBytes,
       pathBytes,
+      additionalSerializedDisclosureBytes,
     );
     if (!Number.isSafeInteger(usage.disclosed_bytes + plannedDisclosureBytes)) {
       throw new AgentError("BUDGET_EXCEEDED", "Projected disclosure usage is too large");
@@ -935,18 +978,77 @@ export function listFilesRuntimeBounds(engine: PolicyEngine): ListFilesRuntimeBo
 function effectiveToolCall(
   engine: PolicyEngine,
   call: NormalizedToolCall,
+  defaultDiffBytes?: number,
 ): NormalizedToolCall {
-  if (call.name !== "list_files") return call;
-  const bounds = listFilesRuntimeBounds(engine);
-  const requested = positiveInteger(call.arguments.max_results);
-  const applied = Math.min(requested ?? bounds.defaultResults, bounds.maxResults);
-  if (call.arguments.max_results === applied) return call;
+  if (call.name === "list_files") {
+    const bounds = listFilesRuntimeBounds(engine);
+    const requested = positiveInteger(call.arguments.max_results);
+    const applied = Math.min(requested ?? bounds.defaultResults, bounds.maxResults);
+    if (call.arguments.max_results === applied) return call;
+    return {
+      ...call,
+      arguments: {
+        ...call.arguments,
+        max_results: applied,
+      },
+    };
+  }
+  if (
+    call.name === "git_diff" &&
+    call.arguments.scope === "session"
+  ) {
+    const bounds = sessionGitDiffRuntimeBounds(
+      engine,
+      positiveInteger(call.arguments.max_bytes) ??
+        defaultDiffBytes ??
+        256 * 1024,
+    );
+    if (bounds.disabled === true) return call;
+    if (call.arguments.max_bytes === bounds.appliedDiffBytes) return call;
+    return {
+      ...call,
+      arguments: {
+        ...call.arguments,
+        max_bytes: bounds.appliedDiffBytes,
+      },
+    };
+  }
+  return call;
+}
+
+type SessionGitDiffRuntimeBounds = {
+  readonly policyCeiling: number;
+  readonly requestedDiffBytes: number;
+} & (
+  | {
+      readonly disabled: true;
+    }
+  | {
+      readonly disabled?: false;
+      readonly appliedDiffBytes: number;
+    }
+);
+
+function sessionGitDiffRuntimeBounds(
+  engine: PolicyEngine,
+  requestedDiffBytes: number,
+): SessionGitDiffRuntimeBounds {
+  const policyCeiling =
+    engine.getEffectiveDisclosureLimits().max_bytes_per_operation ??
+    Number.MAX_SAFE_INTEGER;
+  const availableDiffBytes =
+    policyCeiling - SESSION_DIFF_UNAVAILABLE_TERMINAL_PATH_SAMPLE_BYTES;
+  if (availableDiffBytes < 1) {
+    return {
+      policyCeiling,
+      requestedDiffBytes,
+      disabled: true,
+    };
+  }
   return {
-    ...call,
-    arguments: {
-      ...call.arguments,
-      max_results: applied,
-    },
+    policyCeiling,
+    requestedDiffBytes,
+    appliedDiffBytes: Math.min(requestedDiffBytes, availableDiffBytes),
   };
 }
 

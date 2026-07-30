@@ -882,6 +882,35 @@ test("bound before-image resolver validates the result chain and reconstructs ev
     assert.equal(clean.entry.bytes?.toString("utf8"), "clean HEAD\n");
   }
 
+  const unavailablePriorResolver =
+    persistence.createBeforeImageResolver({
+      resolveReferences: async () => ({
+        terminalResult: persisted.reference,
+        preObservation: pre,
+      }),
+      resolvePriorBaseline: async (
+        _mutation,
+        repositoryRelativePath,
+      ) =>
+        repositoryRelativePath === "retained.txt"
+          ? {
+              available: false,
+              reason: "bounded_out",
+            }
+          : undefined,
+    });
+  assert.deepEqual(
+    await unavailablePriorResolver(
+      mutation,
+      "retained.txt",
+    ),
+    {
+      available: false,
+      reason: "bounded_out",
+    },
+    "an unavailable earlier baseline must not fall through to the current terminal before-image",
+  );
+
   const corruptBlobResolver = persistence.createBeforeImageResolver({
     resolveReferences: async () => ({
       terminalResult: persisted.reference,

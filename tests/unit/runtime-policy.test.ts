@@ -21,6 +21,9 @@ import {
   CONTROL_PLANE_RESERVE_BYTES,
   plannedToolResultDisclosureBytes,
 } from "../../src/orchestrator/disclosure-budget.js";
+import {
+  SESSION_DIFF_UNAVAILABLE_TERMINAL_PATH_SAMPLE_BYTES,
+} from "../../src/repository/snapshot-diff.js";
 import { RepositoryBoundary } from "../../src/repository/boundary.js";
 import { CommandCatalog } from "../../src/tools/command-catalog.js";
 import { sha256 } from "../../src/shared/crypto.js";
@@ -167,6 +170,82 @@ test("layered runtime policy allows in-scope reads, patches, and catalog command
   assert.equal((await policy.authorize({ operationId: "op_test", name: "run_command", arguments: { command_id: "test" } })).outcome, "allow");
   assert.equal(policy.isPathInScope("src/a.txt"), true);
   assert.equal(policy.isPathInScope("README.md"), false);
+});
+
+test("session git_diff reserves its bounded terminal-unavailable path sample", async () => {
+  const { policy } = await harness();
+  const session = await policy.authorize({
+    operationId: "op_session_diff_reservation",
+    name: "git_diff",
+    arguments: { scope: "session", max_bytes: 1 },
+  });
+  assert.equal(session.outcome, "allow");
+  if (session.outcome !== "allow") return;
+  assert.equal(
+    session.plannedDisclosureBytes,
+    plannedToolResultDisclosureBytes(
+      1,
+      0,
+      SESSION_DIFF_UNAVAILABLE_TERMINAL_PATH_SAMPLE_BYTES,
+    ),
+  );
+
+  const workingTree = await policy.authorize({
+    operationId: "op_working_diff_reservation",
+    name: "git_diff",
+    arguments: { scope: "working_tree", max_bytes: 1 },
+  });
+  assert.equal(workingTree.outcome, "allow");
+  if (workingTree.outcome !== "allow") return;
+  assert.equal(
+    workingTree.plannedDisclosureBytes,
+    plannedToolResultDisclosureBytes(1),
+  );
+
+  const { policy: clampedPolicy } = await harness("auto", {
+    maxDisclosureBytes:
+      SESSION_DIFF_UNAVAILABLE_TERMINAL_PATH_SAMPLE_BYTES + 8,
+  });
+  const clamped = await clampedPolicy.authorize({
+    operationId: "op_session_diff_clamped",
+    name: "git_diff",
+    arguments: { scope: "session", max_bytes: 100 },
+  });
+  assert.equal(clamped.outcome, "allow");
+  if (clamped.outcome !== "allow") return;
+  assert.deepEqual(clamped.effectiveArguments, {
+    scope: "session",
+    max_bytes: 8,
+  });
+  assert.equal(
+    clamped.plannedDisclosureBytes,
+    plannedToolResultDisclosureBytes(
+      8,
+      0,
+      SESSION_DIFF_UNAVAILABLE_TERMINAL_PATH_SAMPLE_BYTES,
+    ),
+  );
+
+  const { policy: disabledPolicy } = await harness("auto", {
+    maxDisclosureBytes: 1,
+  });
+  const disabled = await disabledPolicy.authorize({
+    operationId: "op_session_diff_disabled",
+    name: "git_diff",
+    arguments: { scope: "session", max_bytes: 1 },
+  });
+  assert.equal(disabled.outcome, "deny");
+  if (disabled.outcome !== "deny") return;
+  assert.equal(
+    disabled.reasonCode,
+    "DISCLOSURE_OPERATION_LIMIT_EXCEEDED",
+  );
+  assert.deepEqual(disabled.details, {
+    dimension: "bytes",
+    limit: 1,
+    requested:
+      SESSION_DIFF_UNAVAILABLE_TERMINAL_PATH_SAMPLE_BYTES + 1,
+  });
 });
 
 test("default grants never advertise terminal execution in any existing mode", async () => {

@@ -6,7 +6,9 @@ import type {
 import type {
   IncompleteTerminalEvidence,
   TerminalRecoveryContext,
+  VerifiedTerminalResultEvidence,
 } from "../session/terminal-artifacts.js";
+import type { ArtifactReference } from "../session/artifact-store.js";
 
 export type ToolName = LocalToolName;
 
@@ -204,6 +206,11 @@ export interface ToolExecutor {
     readonly journalStatus?: "accepted" | "executing" | "completed" | "failed";
     readonly journalSafeResult?: unknown;
   }): Promise<IncompleteTerminalEvidence>;
+  inspectCompletedTerminalEvidence?(input: {
+    readonly operationId: string;
+    readonly requestHash: string;
+    readonly terminalResult: ArtifactReference;
+  }): Promise<VerifiedTerminalResultEvidence>;
   inspectCompletionState(): Promise<RepositoryCompletionState>;
 }
 

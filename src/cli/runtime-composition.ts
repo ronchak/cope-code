@@ -23,6 +23,16 @@ import {
   DEFAULT_REPOSITORY_EXCLUSIONS,
   RepositoryContext,
 } from "../repository/index.js";
+import { SnapshotDiffInspector } from "../repository/snapshot-diff.js";
+import type {
+  CheckpointFileSnapshot,
+  CheckpointSnapshot,
+} from "../repository/checkpoint.js";
+import type {
+  SessionMutationDiffRecord,
+  TerminalBeforeImageResolution,
+  TerminalSessionMutationDiffRecord,
+} from "../repository/snapshot-diff.js";
 import {
   ContentSecurity,
   DEFAULT_PROTECTED_RULES,
@@ -39,6 +49,7 @@ import { SessionArtifactStore } from "../session/artifact-store.js";
 import { CompletionHandoffStore } from "../session/completion-handoff-store.js";
 import { OperationJournal } from "../session/operation-journal.js";
 import { TerminalArtifactPersistence } from "../session/terminal-artifacts.js";
+import type { TerminalRecoveryContext } from "../session/terminal-artifacts.js";
 import type { SessionStore } from "../session/store.js";
 import {
   DEFAULT_BUDGET_LIMITS,
@@ -69,6 +80,7 @@ export interface ComposeRuntimeOptions {
   readonly onProgress?: (event: RuntimeProgressEvent) => void;
   readonly onTerminalOutput?: TerminalLiveOutput;
   readonly host: HostPlatform;
+  readonly recoveryContext?: TerminalRecoveryContext;
 }
 
 export interface ComposedRuntime {
@@ -219,33 +231,165 @@ export async function composeRuntime(options: ComposeRuntimeOptions): Promise<Co
   const artifacts = new SessionArtifactStore(
     path.join(sessionDirectory, "artifacts"),
   );
+  const terminalPersistence = new TerminalArtifactPersistence(artifacts);
+  const checkpointSnapshots = new Map<
+    string,
+    Promise<CheckpointSnapshot>
+  >();
+  const checkpointSnapshot = (
+    checkpointId: string,
+  ): Promise<CheckpointSnapshot> => {
+    const existing = checkpointSnapshots.get(checkpointId);
+    if (existing !== undefined) return existing;
+    const loaded = repository.checkpoints.snapshot(checkpointId);
+    checkpointSnapshots.set(checkpointId, loaded);
+    return loaded;
+  };
+  let terminalBeforeImage:
+    | ReturnType<TerminalArtifactPersistence["createBeforeImageResolver"]>
+    | undefined;
+  const resolveEarlierBaseline = async (
+    target: TerminalSessionMutationDiffRecord | undefined,
+    repositoryRelativePath: string,
+    signal?: AbortSignal,
+  ): Promise<
+    | {
+        readonly baselineId: string;
+        readonly entry: CheckpointFileSnapshot;
+      }
+    | Exclude<
+        TerminalBeforeImageResolution,
+        { readonly available: true }
+      >
+    | undefined
+  > => {
+    const mutation = earliestSessionBaselineMutation(
+      state.mutations,
+      target?.operationId,
+      repositoryRelativePath,
+      repository.boundary.pathKey.bind(repository.boundary),
+    );
+    if (mutation === undefined) return undefined;
+    const key = repository.boundary.pathKey(repositoryRelativePath);
+    if (mutation.kind !== "terminal") {
+      const snapshot = await checkpointSnapshot(mutation.checkpointId);
+      const entry = snapshot.entries.find(
+        (candidate) =>
+          repository.boundary.pathKey(candidate.path) === key,
+      );
+      if (entry === undefined) {
+        throw new AgentError(
+          "RECOVERY_REQUIRED",
+          "Earlier patch mutation lacks its checkpoint baseline",
+          { operationId: mutation.operationId },
+        );
+      }
+      return { baselineId: snapshot.id, entry };
+    }
+    const resolver = terminalBeforeImage;
+    if (resolver === undefined) return undefined;
+    const terminalMutation = sessionMutationDiffRecord(mutation);
+    if (terminalMutation.kind !== "terminal") return undefined;
+    const resolved = await resolver(
+      terminalMutation,
+      repositoryRelativePath,
+      signal,
+    );
+    return resolved.available
+      ? {
+          baselineId: resolved.baselineId,
+          entry: resolved.entry,
+        }
+      : resolved;
+  };
+  terminalBeforeImage = terminalPersistence.createBeforeImageResolver({
+    resolveReferences: async (mutation) => {
+      const record = state.mutations.find(
+        (candidate) =>
+          candidate.kind === "terminal" &&
+          candidate.operationId === mutation.operationId,
+      );
+      if (
+        record?.kind !== "terminal" ||
+        !("recordContract" in record) ||
+        record.recordContract !== "terminal-mutation/2"
+      ) {
+        return undefined;
+      }
+      return {
+        terminalResult: record.terminalResult,
+        preObservation: record.preObservation,
+      };
+    },
+    readGitBlob: async (objectId, signal) =>
+      readTerminalGitBlob(
+        repository,
+        objectId,
+        configuration.repository.limits.max_file_bytes,
+        signal,
+      ),
+    readHeadPath: async (head, repositoryRelativePath, signal) =>
+      readTerminalHeadPath(
+        repository,
+        head,
+        repositoryRelativePath,
+        configuration.repository.limits.max_file_bytes,
+        signal,
+      ),
+    resolvePriorBaseline: (mutation, repositoryRelativePath, signal) =>
+      resolveEarlierBaseline(mutation, repositoryRelativePath, signal),
+    pathKey: repository.boundary.pathKey.bind(repository.boundary),
+  });
+  const snapshotDiff = new SnapshotDiffInspector(
+    repository.boundary,
+    repository.checkpoints,
+    {
+      maxDiffBytes: configuration.repository.limits.max_diff_bytes,
+      maxFileBytes: configuration.repository.limits.max_file_bytes,
+      maxFiles: DEFAULT_MAX_CHECKPOINT_FILES,
+      isPathAllowed: (candidate) =>
+        repository.tools.isPathAllowed(candidate, "git_diff"),
+      resolveTerminalBeforeImage: terminalBeforeImage,
+    },
+  );
   const terminalExecutor = new TerminalExecutor({
     boundary: repository.boundary,
     process: processRunner,
-    persistence: new TerminalArtifactPersistence(artifacts),
+    persistence: terminalPersistence,
     host: options.host,
     contentProcessor: contentSecurity,
+    observer: repository.workspaceObserver,
     ...(options.onTerminalOutput === undefined
       ? {}
       : { onTerminalOutput: options.onTerminalOutput }),
   });
   const tools = new ToolHost({
     context: repository,
+    snapshotDiff,
     processRunner,
     terminalExecutor,
     policy: preauthorizedToolPolicy,
     resultProcessor: contentSecurity,
     completionPathScope: policy,
+    terminalBaseline: () => ({
+      paths: state.preExistingChanges,
+      ...(state.preExistingChangeStates === undefined
+        ? {}
+        : {
+            pathStateFingerprints:
+              state.preExistingChangeStates,
+          }),
+      hasReconstructibleBaseline: async (repositoryRelativePath) =>
+        isReconstructibleSessionBaseline(
+          await resolveEarlierBaseline(
+            undefined,
+            repositoryRelativePath,
+          ),
+        ),
+    }),
     sessionDiffState: () => ({
       ...(state.lastCheckpointId === undefined ? {} : { lastCheckpointId: state.lastCheckpointId }),
-      mutations: state.mutations.flatMap((mutation) =>
-        mutation.kind === "terminal"
-          ? []
-          : [{
-              checkpointId: mutation.checkpointId,
-              changedPaths: mutation.changedPaths,
-            }]
-      ),
+      mutations: state.mutations.map(sessionMutationDiffRecord),
     }),
   });
   const protocol = new CbaProtocolAdapter({
@@ -276,6 +420,8 @@ export async function composeRuntime(options: ComposeRuntimeOptions): Promise<Co
     ...(options.idFactory === undefined ? {} : { idFactory: options.idFactory }),
     ...(options.signal === undefined ? {} : { signal: options.signal }),
     artifacts,
+    recoveryContext:
+      options.recoveryContext ?? "ordinary_process_crash",
     completionHandoffs: new CompletionHandoffStore(
       path.join(sessionDirectory, "handoff"),
       state.sessionId,
@@ -284,6 +430,152 @@ export async function composeRuntime(options: ComposeRuntimeOptions): Promise<Co
     ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
   });
   return { runtime, audit, repository, disclosureLedger };
+}
+
+export function isReconstructibleSessionBaseline(
+  resolution:
+    | { readonly baselineId: string }
+    | { readonly available: false }
+    | undefined,
+): boolean {
+  return resolution !== undefined && !("available" in resolution);
+}
+
+export function sessionMutationDiffRecord(
+  mutation: SessionState["mutations"][number],
+): SessionMutationDiffRecord {
+  if (mutation.kind !== "terminal") {
+    return {
+      checkpointId: mutation.checkpointId,
+      changedPaths: mutation.changedPaths,
+    };
+  }
+  return {
+    kind: "terminal",
+    operationId: mutation.operationId,
+    changedPaths: mutation.changedPaths,
+    observationOutcome: mutation.observationOutcome,
+    renamedPaths: mutation.renamedPaths,
+    ...("recordContract" in mutation &&
+    mutation.recordContract === "terminal-mutation/2"
+      ? {
+          changedPathCount: mutation.changedPathCount,
+          pathFactsTruncated: mutation.pathFactsTruncated,
+        }
+      : {}),
+  };
+}
+
+export function earliestSessionBaselineMutation(
+  mutations: SessionState["mutations"],
+  targetOperationId: string | undefined,
+  repositoryRelativePath: string,
+  pathKey: (value: string) => string,
+): SessionState["mutations"][number] | undefined {
+  const targetIndex =
+    targetOperationId === undefined
+      ? mutations.length
+      : mutations.findIndex(
+          (mutation) =>
+            mutation.kind === "terminal" &&
+            mutation.operationId === targetOperationId,
+        );
+  const end = targetIndex < 0 ? mutations.length : targetIndex;
+  const key = pathKey(repositoryRelativePath);
+  return mutations
+    .slice(0, end)
+    .find(
+      (mutation) =>
+        mutation.changedPaths.some(
+          (candidate) => pathKey(candidate) === key,
+        ) ||
+        (
+          mutation.kind === "terminal" &&
+          (
+            mutation.observationOutcome ===
+              "protected_or_hidden_changed" ||
+            (
+              mutation.observationOutcome === "unknown" &&
+              mutation.changedPaths.length === 0
+            ) ||
+            (
+              "recordContract" in mutation &&
+              mutation.recordContract === "terminal-mutation/2" &&
+              mutation.changedPathCount >
+                mutation.changedPaths.length
+            )
+          )
+        ),
+    );
+}
+
+async function readTerminalGitBlob(
+  repository: RepositoryContext,
+  objectId: string,
+  maxBytes: number,
+  signal?: AbortSignal,
+): Promise<Buffer | undefined> {
+  try {
+    const result = await repository.git.readIsolated(
+      ["cat-file", "blob", objectId],
+      maxBytes,
+      signal,
+      true,
+    );
+    return result.truncated ? undefined : result.bytes;
+  } catch (error) {
+    if (error instanceof AgentError && error.code === "COMMAND_FAILED") {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+async function readTerminalHeadPath(
+  repository: RepositoryContext,
+  head: string,
+  repositoryRelativePath: string,
+  maxBytes: number,
+  signal?: AbortSignal,
+): Promise<
+  | {
+      readonly objectId: string;
+      readonly mode: number;
+      readonly bytes: Buffer;
+    }
+  | undefined
+> {
+  const tree = await repository.git.readIsolated(
+    ["ls-tree", "-z", head, "--", repositoryRelativePath],
+    64 * 1024,
+    signal,
+  );
+  if (tree.bytes.length === 0) return undefined;
+  const terminator = tree.bytes.indexOf(0);
+  const record =
+    terminator < 0 ? tree.bytes : tree.bytes.subarray(0, terminator);
+  const tab = record.indexOf(9);
+  if (tab < 0) return undefined;
+  const fields = record.subarray(0, tab).toString("utf8").split(" ");
+  const observedPath = record.subarray(tab + 1).toString("utf8");
+  const mode = Number.parseInt(fields[0] ?? "", 8);
+  const objectId = fields[2];
+  if (
+    fields[1] !== "blob" ||
+    observedPath !== repositoryRelativePath ||
+    !Number.isSafeInteger(mode) ||
+    objectId === undefined ||
+    !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/u.test(objectId)
+  ) {
+    return undefined;
+  }
+  const bytes = await readTerminalGitBlob(
+    repository,
+    objectId,
+    maxBytes,
+    signal,
+  );
+  return bytes === undefined ? undefined : { objectId, mode, bytes };
 }
 
 export function sessionBudgetLimits(effective: PolicyBudgetLimits): BudgetLimits {

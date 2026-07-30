@@ -319,6 +319,13 @@ export interface TerminalBeforeImageResolverOptions {
   ) => Promise<{
     readonly baselineId: string;
     readonly entry: CheckpointFileSnapshot;
+  } | {
+    readonly available: false;
+    readonly reason:
+      | "legacy_placeholder"
+      | "missing_evidence"
+      | "bounded_out"
+      | "unknown_observation";
   } | undefined>;
   /** RepositoryBoundary.pathKey on case-insensitive repositories. */
   readonly pathKey?: (repositoryRelativePath: string) => string;
@@ -1496,6 +1503,7 @@ async function resolveBeforeImage(
   );
   throwIfAborted(signal);
   if (prior !== undefined) {
+    if ("available" in prior) return prior;
     assertVerifiedPriorBaseline(
       prior,
       normalizedRequestedPath,

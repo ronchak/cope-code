@@ -656,3 +656,62 @@ test("ToolHost serves checkpoint and true session diffs without disclosing filte
   assert.equal(unsafeCompletion.hasConflicts, true);
   assert.match(unsafeCompletion.gitStatusSummary, /unavailable/iu);
 });
+
+test("ToolHost exposes bounded terminal-unavailable session diff facts", async () => {
+  const host = new ToolHost({
+    repository: {} as never,
+    git: {} as never,
+    patchEngine: {} as never,
+    processRunner: {} as never,
+    snapshotDiff: {
+      diffSession: async () => ({
+        contractVersion: "snapshot-diff.v1",
+        scope: "session",
+        baseline: "earliest-agent-checkpoint",
+        diff: "",
+        truncated: false,
+        outputBytes: 0,
+        sha256: sha256(""),
+        excludedCount: 0,
+        comparedFileCount: 0,
+        changedFileCount: 0,
+        limitBytes: 8_192,
+        unavailableTerminalPaths: [
+          {
+            path: "src/unavailable.ts",
+            reason: "bounded_out",
+          },
+        ],
+        unavailableTerminalPathCount: 3,
+        omittedTerminalPathCount: 2,
+        artifactOmittedTerminalPathCount: 2,
+      }),
+    } as never,
+    sessionDiffState: () => ({ mutations: [] }),
+    policy: { authorize: () => ({ outcome: "allow" }) },
+  });
+
+  const outcome = await host.dispatch({
+    operationId: "diff_terminal_unavailable",
+    name: "git_diff",
+    arguments: { scope: "session" },
+  });
+
+  assert.equal(outcome.status, "success");
+  assert.deepEqual(outcome.data.unavailableTerminalPaths, [
+    {
+      path: "src/unavailable.ts",
+      reason: "bounded_out",
+    },
+  ]);
+  assert.equal(outcome.data.unavailableTerminalPathCount, 3);
+  assert.equal(outcome.data.omittedTerminalPathCount, 2);
+  assert.equal(outcome.data.artifactOmittedTerminalPathCount, 2);
+  assert.equal(outcome.safeMetadata.unavailableTerminalPathCount, 3);
+  assert.equal(outcome.safeMetadata.omittedTerminalPathCount, 2);
+  assert.equal(
+    outcome.safeMetadata.artifactOmittedTerminalPathCount,
+    2,
+  );
+  assert.equal("unavailableTerminalPaths" in outcome.safeMetadata, false);
+});
