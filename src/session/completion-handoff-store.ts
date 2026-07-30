@@ -269,6 +269,34 @@ function redactVerification(
         : { checkpointId: verification.actual.checkpointId }),
       gitStatusSummary: redact(verification.actual.gitStatusSummary),
       repositoryFingerprint: verification.actual.repositoryFingerprint,
+      ...(verification.actual.work === undefined
+        ? {}
+        : {
+            work: {
+              patchChangedPaths:
+                verification.actual.work.patchChangedPaths.map(redact),
+              terminalChangedPaths:
+                verification.actual.work.terminalChangedPaths.map(redact),
+              terminalPreExistingTouchedPaths:
+                verification.actual.work.terminalPreExistingTouchedPaths.map(
+                  redact,
+                ),
+            },
+          }),
+      ...(verification.actual.terminal === undefined
+        ? {}
+        : {
+            terminal: {
+              processOutcomes:
+                verification.actual.terminal.processOutcomes.map((entry) => ({
+                  ...entry,
+                })),
+              limitations:
+                verification.actual.terminal.limitations.map((entry) => ({
+                  ...entry,
+                })),
+            },
+          }),
     },
   };
 }
@@ -380,10 +408,100 @@ function isCompletionVerification(value: unknown): value is CompletionVerificati
     (actual.checkpointId === undefined || typeof actual.checkpointId === "string") &&
     typeof actual.gitStatusSummary === "string" &&
     typeof actual.repositoryFingerprint === "string" &&
-    hasExactKeys(actual as unknown as Record<string, unknown>, [
+    (actual.work === undefined || isCompletionWork(actual.work)) &&
+    (actual.terminal === undefined || isCompletionTerminal(actual.terminal)) &&
+    hasRequiredAndOptionalKeys(actual as unknown as Record<string, unknown>, [
       "changedPaths", "agentChangedPaths", "preExistingPaths", "successfulCommands", "failedCommands",
-      "checkpointId", "gitStatusSummary", "repositoryFingerprint",
-    ], true);
+      "gitStatusSummary", "repositoryFingerprint",
+    ], ["checkpointId", "work", "terminal"]);
+}
+
+function isCompletionWork(
+  value: unknown,
+): value is NonNullable<CompletionVerification["actual"]["work"]> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const candidate = value as NonNullable<
+    CompletionVerification["actual"]["work"]
+  >;
+  return (
+    stringArray(candidate.patchChangedPaths) &&
+    stringArray(candidate.terminalChangedPaths) &&
+    stringArray(candidate.terminalPreExistingTouchedPaths) &&
+    hasExactKeys(candidate as unknown as Record<string, unknown>, [
+      "patchChangedPaths",
+      "terminalChangedPaths",
+      "terminalPreExistingTouchedPaths",
+    ])
+  );
+}
+
+function isCompletionTerminal(
+  value: unknown,
+): value is NonNullable<CompletionVerification["actual"]["terminal"]> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const candidate = value as NonNullable<
+    CompletionVerification["actual"]["terminal"]
+  >;
+  const processOutcomes = candidate.processOutcomes;
+  const limitations = candidate.limitations;
+  return (
+    Array.isArray(processOutcomes) &&
+    processOutcomes.every(
+      (entry) =>
+        entry !== null &&
+        typeof entry === "object" &&
+        typeof entry.operationId === "string" &&
+        [
+          "completed",
+          "completed_nonzero",
+          "spawn_failed",
+          "timed_out",
+          "cancelled",
+          "persistence_failed",
+          "indeterminate",
+          "unavailable",
+        ].includes(entry.outcome) &&
+        hasExactKeys(entry as unknown as Record<string, unknown>, [
+          "operationId",
+          "outcome",
+        ]),
+    ) &&
+    Array.isArray(limitations) &&
+    limitations.every(
+      (entry) =>
+        entry !== null &&
+        typeof entry === "object" &&
+        typeof entry.operationId === "string" &&
+        [
+          "none",
+          "observed",
+          "protected_or_hidden_changed",
+          "unknown",
+        ].includes(entry.observationOutcome) &&
+        Number.isSafeInteger(entry.unavailableBaselineCount) &&
+        entry.unavailableBaselineCount >= 0 &&
+        Number.isSafeInteger(entry.omittedPathEndpointTotal) &&
+        entry.omittedPathEndpointTotal >= 0 &&
+        typeof entry.pathFactsTruncated === "boolean" &&
+        typeof entry.legacyEvidence === "boolean" &&
+        hasExactKeys(entry as unknown as Record<string, unknown>, [
+          "operationId",
+          "observationOutcome",
+          "unavailableBaselineCount",
+          "omittedPathEndpointTotal",
+          "pathFactsTruncated",
+          "legacyEvidence",
+        ]),
+    ) &&
+    hasExactKeys(candidate as unknown as Record<string, unknown>, [
+      "processOutcomes",
+      "limitations",
+    ])
+  );
 }
 
 function stringArray(value: unknown): value is readonly string[] {

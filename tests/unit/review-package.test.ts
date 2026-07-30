@@ -17,6 +17,7 @@ import { sha256, stableJson } from "../../src/shared/crypto.js";
 import {
   DEFAULT_BUDGET_LIMITS,
   SESSION_SCHEMA_VERSION,
+  type FullTerminalMutationRecord,
   type SessionState,
   zeroBudgetUsage,
 } from "../../src/session/types.js";
@@ -288,4 +289,186 @@ test("review package rejects mismatched identities and free-form values in expor
     () => createReviewPackage({ state: unsafeState, ...evidence }),
     /mutation metadata is unsafe/,
   );
+});
+
+test("review package exports exact terminal totals, process outcomes, and limitations without source facts", async () => {
+  const operationId = "op-terminal-summary";
+  const terminal: FullTerminalMutationRecord = {
+    kind: "terminal",
+    recordContract: "terminal-mutation/2",
+    operationId,
+    changedPaths: [
+      "src/TERMINAL-SECRET-PATH.ts",
+      "private/SECOND-TERMINAL-SECRET.txt",
+    ],
+    changedLines: 17,
+    createdPaths: ["src/TERMINAL-SECRET-PATH.ts"],
+    updatedPaths: ["private/SECOND-TERMINAL-SECRET.txt"],
+    deletedPaths: [],
+    renamedPaths: [{
+      from: "private/RENAMED-SECRET-BEFORE.txt",
+      to: "private/RENAMED-SECRET-AFTER.txt",
+    }],
+    preExistingTouchedPaths: ["notes/USER-WORK-SECRET.txt"],
+    processOutcome: "timed_out",
+    createdTotal: 2,
+    updatedTotal: 3,
+    deletedTotal: 1,
+    renamedTotal: 1,
+    preExistingTouchedTotal: 2,
+    changedPathCount: 9,
+    pathEndpointTotal: 10,
+    omittedPathEndpointTotal: 5,
+    pathFactsTruncated: true,
+    pathFactsSha256: "9".repeat(64),
+    unavailableBaselineCount: 4,
+    completedAt: NOW,
+    observationOutcome: "unknown",
+    preObservation: {
+      kind: "terminal-pre-observation",
+      id: operationId,
+      bytes: 10,
+      sha256: "1".repeat(64),
+    },
+    postObservation: {
+      kind: "terminal-post-observation",
+      id: operationId,
+      bytes: 10,
+      sha256: "2".repeat(64),
+    },
+    terminalResult: {
+      kind: "terminal-result",
+      id: operationId,
+      bytes: 10,
+      sha256: "3".repeat(64),
+    },
+  };
+  const renameOnlyOperationId = "op-terminal-rename-only";
+  const renameOnly: FullTerminalMutationRecord = {
+    ...terminal,
+    operationId: renameOnlyOperationId,
+    changedPaths: [
+      "private/RENAME-ONLY-SECRET-BEFORE.txt",
+      "private/RENAME-ONLY-SECRET-AFTER.txt",
+    ],
+    changedLines: 0,
+    createdPaths: [],
+    updatedPaths: [],
+    deletedPaths: [],
+    renamedPaths: [{
+      from: "private/RENAME-ONLY-SECRET-BEFORE.txt",
+      to: "private/RENAME-ONLY-SECRET-AFTER.txt",
+    }],
+    preExistingTouchedPaths: [],
+    processOutcome: "completed",
+    createdTotal: 0,
+    updatedTotal: 0,
+    deletedTotal: 0,
+    renamedTotal: 1,
+    preExistingTouchedTotal: 0,
+    changedPathCount: 2,
+    pathEndpointTotal: 2,
+    omittedPathEndpointTotal: 0,
+    pathFactsTruncated: false,
+    pathFactsSha256: "8".repeat(64),
+    unavailableBaselineCount: 0,
+    preObservation: {
+      kind: "terminal-pre-observation",
+      id: renameOnlyOperationId,
+      bytes: 10,
+      sha256: "4".repeat(64),
+    },
+    postObservation: {
+      kind: "terminal-post-observation",
+      id: renameOnlyOperationId,
+      bytes: 10,
+      sha256: "5".repeat(64),
+    },
+    terminalResult: {
+      kind: "terminal-result",
+      id: renameOnlyOperationId,
+      bytes: 10,
+      sha256: "6".repeat(64),
+    },
+  };
+  const state = makeState({
+    completionAuthority: "observed",
+    mutations: [...makeState().mutations, terminal, renameOnly],
+    mutationSequence: 3,
+    pendingTerminalEffectOperationIds: [operationId],
+  });
+  const evidence = await makeVerifiedEvidence(state);
+
+  const reviewPackage = createReviewPackage({ state, ...evidence });
+
+  assert.equal(reviewPackage.body.session.completionAuthority, "observed");
+  assert.deepEqual(reviewPackage.body.counts, {
+    acceptanceCriteria: 1,
+    preExistingChanges: 1,
+    completedOperations: 2,
+    pendingOperations: 1,
+    mutations: 3,
+    patchMutations: 1,
+    terminalMutations: 2,
+    validations: 1,
+    pendingTerminalEffects: 1,
+  });
+  assert.deepEqual(reviewPackage.body.mutations[1], {
+    operationId,
+    kind: "terminal",
+    observationOutcome: "unknown",
+    changedFileCount: 7,
+    changedLines: 17,
+    terminal: {
+      processOutcome: "timed_out",
+      createdCount: 2,
+      updatedCount: 3,
+      deletedCount: 1,
+      renamedCount: 1,
+      preExistingTouchedCount: 2,
+      changedPathCount: 9,
+      pathEndpointCount: 10,
+      omittedPathEndpointCount: 5,
+      unavailableBaselineCount: 4,
+      pathFactsTruncated: true,
+      legacyEvidence: false,
+      limitationCodes: [
+        "non_clean_observation",
+        "path_facts_truncated",
+        "unavailable_baselines",
+      ],
+    },
+  });
+  assert.deepEqual(reviewPackage.body.mutations[2], {
+    operationId: renameOnlyOperationId,
+    kind: "terminal",
+    observationOutcome: "unknown",
+    changedFileCount: 1,
+    changedLines: 0,
+    terminal: {
+      processOutcome: "completed",
+      createdCount: 0,
+      updatedCount: 0,
+      deletedCount: 0,
+      renamedCount: 1,
+      preExistingTouchedCount: 0,
+      changedPathCount: 2,
+      pathEndpointCount: 2,
+      omittedPathEndpointCount: 0,
+      unavailableBaselineCount: 0,
+      pathFactsTruncated: false,
+      legacyEvidence: false,
+      limitationCodes: ["non_clean_observation"],
+    },
+  });
+  const serialized = JSON.stringify(reviewPackage);
+  for (const forbidden of [
+    "TERMINAL-SECRET-PATH",
+    "SECOND-TERMINAL-SECRET",
+    "RENAMED-SECRET",
+    "USER-WORK-SECRET",
+    "RENAME-ONLY-SECRET",
+  ]) {
+    assert.equal(serialized.includes(forbidden), false);
+  }
 });
