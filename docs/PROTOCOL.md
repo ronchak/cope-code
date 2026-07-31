@@ -30,8 +30,13 @@ Prose may appear outside the fence. The parser does not execute a protocol-looki
 M365 may render a fenced response as a read-only code-editor widget whose
 `innerText()` omits the Markdown fence. Cope reconstructs that presentation
 only when the correlated assistant response owns exactly one supported
-protocol widget with one exact `cba-agent/1` or legacy `cba/1` information
-banner and one eligible editor. Page evaluation returns bounded structural
+protocol widget whose single block-owned information banner carries exactly one
+boundary-safe `cba-agent/1` or legacy `cba/1` protocol label, plus one eligible
+editor. Provenance is the protocol label and its block ownership. Microsoft's
+explanatory sentence around that label is mutable UI prose: it is recorded as
+evidence, never enforced, so wording, punctuation, whitespace, capitalization,
+and localization changes do not make a well-formed response non-executable. A
+banner carrying more than one protocol label is ambiguous and stays inert. Page evaluation returns bounded structural
 facts; trusted host code validates numeric contiguous line indices, sorts them
 by index (from either zero or one), rejects ambiguity and standalone lines that
 could collide with the outer protocol wrapper, requires the fence label and
@@ -52,13 +57,21 @@ produce a source-free, non-repairable browser-capture diagnostic without
 consuming that budget.
 
 The `response-capture/v2` evidence contains only stable enums, versions,
-counts, line count, and byte length. It follows a completed response through
+counts, line count, byte length, and bounded banner provenance: the banner
+classification, its protocol-label count, whether the surrounding prose still
+matches the recorded baseline wording, and a 32-bit identifier of the
+label-masked, case- and whitespace-folded banner. That identifier makes a future
+Microsoft wording change visible in evidence and audit without recording any
+response content. It follows a completed response through
 audit and integrity-checked crash recovery. Separate correlation text
 reproduces the exact 0.1.8 legacy trimming and editor-order predicate so old
 response baselines do not silently rebind when normalized protocol content has
 a different display representation. `cope doctor` runs the same host
-normalizer against a fixed source-free fixture; it does not read or mutate a
-live conversation.
+normalizer against fixed source-free fixtures, covering reconstruction and the
+fail-closed banner branches; it does not read or mutate a live conversation. It
+does not open a browser or render DOM, so it cannot attest live M365 widget or
+banner compatibility — that seam is covered only by the installed-Chromium
+capture tests.
 
 The model-facing root is one of:
 

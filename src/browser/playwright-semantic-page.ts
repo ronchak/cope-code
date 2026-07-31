@@ -37,20 +37,35 @@ interface BrowserOperationTimeoutPoint {
   readonly elementIndex?: number;
 }
 
+/**
+ * Executable provenance is anchored to the exact supported protocol label that
+ * M365 renders inside a response-owned code block, never to the explanatory
+ * sentence Microsoft wraps around it. `baselineBanner` records the 0.1.9 English
+ * wording purely as a drift baseline for source-free diagnostics: it is reported,
+ * not enforced. Gating on the full sentence made every wording, punctuation,
+ * whitespace, capitalization, or localization change silently non-executable.
+ */
 const RESPONSE_PROTOCOL_DESCRIPTORS = [
   {
     version: "cba-agent/1",
-    banner: "cba-agent/1 isn’t fully supported. Syntax highlighting is based on Plain Text.",
+    baselineBanner:
+      "cba-agent/1 isn’t fully supported. Syntax highlighting is based on Plain Text.",
   },
   {
     version: "cba/1",
-    banner: "cba/1 isn’t fully supported. Syntax highlighting is based on Plain Text.",
+    baselineBanner: "cba/1 isn’t fully supported. Syntax highlighting is based on Plain Text.",
   },
 ] as const;
 
 interface PageProtocolBlockCapture {
   readonly version: string;
-  readonly bannerContract: "supported" | "unsupported_version" | "changed_supported_banner";
+  readonly bannerContract: "supported" | "unsupported_version" | "ambiguous_protocol_labels";
+  /** Count of boundary-safe protocol-family labels in the owning banner. */
+  readonly bannerTokenCount: number;
+  /** True when the banner prose still matches the recorded 0.1.9 baseline. */
+  readonly bannerMatchesBaseline: boolean;
+  /** Bounded, source-free identifier for the banner wording variant. */
+  readonly bannerVariant: string;
   readonly code: string;
   readonly editorCount: number;
   readonly bannerCount: number;
@@ -798,19 +813,50 @@ export class PlaywrightSemanticPage implements SemanticPage {
                         '[data-testid="message-bar-body-info"]',
                       ),
                     );
+                    // Boundary-safe, non-consuming so adjacent labels cannot mask
+                    // one another. Every protocol-family label in the banner is
+                    // counted; more than one is ambiguous provenance, not a pick.
+                    const protocolLabels = (value: string): readonly string[] =>
+                      Array.from(
+                        value.matchAll(
+                          /(?<![A-Za-z0-9._/-])((?:cba|cba-agent)\/[A-Za-z0-9._-]+)(?![A-Za-z0-9._/-])/gu,
+                        ),
+                        (match) => match[1] ?? "",
+                      );
+                    // Source-free identifier for the surrounding wording only: the
+                    // protocol label is masked and whitespace/case folded, so a
+                    // future Microsoft prose change is distinguishable in evidence
+                    // without ever recording response content.
+                    const bannerVariantId = (value: string): string => {
+                      const masked = value
+                        .replace(
+                          /(?<![A-Za-z0-9._/-])(?:cba|cba-agent)\/[A-Za-z0-9._-]+(?![A-Za-z0-9._/-])/gu,
+                          "{protocol}",
+                        )
+                        .replace(/\s+/gu, " ")
+                        .trim()
+                        .toLowerCase();
+                      let hash = 0x811c9dc5;
+                      for (let index = 0; index < masked.length; index += 1) {
+                        hash ^= masked.charCodeAt(index);
+                        hash = Math.imul(hash, 0x01000193) >>> 0;
+                      }
+                      return hash.toString(16).padStart(8, "0");
+                    };
                     const protocolBanner = (banner: HTMLElement): {
                       readonly version: string;
                       readonly value: string;
+                      readonly tokenCount: number;
+                      readonly matchesBaseline: boolean;
+                      readonly variant: string;
                       readonly bannerContract:
                         | "supported"
                         | "unsupported_version"
-                        | "changed_supported_banner";
+                        | "ambiguous_protocol_labels";
                     } | undefined => {
                       const value = banner.textContent?.trim() ?? "";
-                      const match =
-                        /(?:^|[^A-Za-z0-9._/-])((?:cba|cba-agent)\/[A-Za-z0-9._-]+)(?=$|[^A-Za-z0-9._/-])/u
-                          .exec(value);
-                      const version = match?.[1];
+                      const labels = protocolLabels(value);
+                      const version = labels[0];
                       if (version === undefined) return undefined;
                       const descriptor = input.descriptors.find((entry) =>
                         entry.version === version
@@ -818,11 +864,14 @@ export class PlaywrightSemanticPage implements SemanticPage {
                       return {
                         version,
                         value,
-                        bannerContract: descriptor === undefined
-                          ? "unsupported_version"
-                          : descriptor.banner === value
-                            ? "supported"
-                            : "changed_supported_banner",
+                        tokenCount: labels.length,
+                        matchesBaseline: descriptor?.baselineBanner === value,
+                        variant: bannerVariantId(value),
+                        bannerContract: labels.length !== 1
+                          ? "ambiguous_protocol_labels"
+                          : descriptor === undefined
+                            ? "unsupported_version"
+                            : "supported",
                       };
                     };
                     const familyBanners = allBanners
@@ -846,13 +895,19 @@ export class PlaywrightSemanticPage implements SemanticPage {
                         ) {
                           continue;
                         }
+                        // Same provenance rule as the executable path: exactly one
+                        // block-owned banner carrying exactly one `cba/1` label.
+                        // Matching the full 0.1.9 sentence here would let banner
+                        // prose drift silently rebind 0.1.8 correlation baselines
+                        // onto rendered text.
                         const exactLegacyBanners = Array.from(
                           codeBlock.querySelectorAll<HTMLElement>(
                             '[data-testid="message-bar-body-info"]',
                           ),
-                        ).filter((banner) =>
-                          banner.textContent?.trim() === legacyDescriptor.banner
-                        );
+                        ).filter((banner) => {
+                          const labels = protocolLabels(banner.textContent?.trim() ?? "");
+                          return labels.length === 1 && labels[0] === legacyDescriptor.version;
+                        });
                         if (exactLegacyBanners.length !== 1) continue;
                         const lines = Array.from(
                           editor.querySelectorAll<HTMLElement>("[data-line-index]"),
@@ -925,6 +980,9 @@ export class PlaywrightSemanticPage implements SemanticPage {
                       protocolBlocks.push({
                         version: banner.version,
                         bannerContract: banner.bannerContract,
+                        bannerTokenCount: banner.tokenCount,
+                        bannerMatchesBaseline: banner.matchesBaseline,
+                        bannerVariant: banner.variant,
                         code: contentBytes <= input.maximumProtocolBytes ? rawCode : "",
                         editorCount: editors.length,
                         bannerCount: ownedProtocolBanners.length,
@@ -1277,9 +1335,17 @@ function failedResponseCapture(renderedText: string): NormalizedResponseCapture 
 }
 
 /**
- * Read-only doctor probe for the host-side executable-envelope boundary.
- * This intentionally uses a fixed synthetic fixture: it neither opens a
- * conversation nor reads or submits any live chat content.
+ * Read-only doctor probe for the *host-side* executable-envelope boundary.
+ *
+ * Scope, stated precisely because an earlier version of this probe was read as
+ * broader than it is: this runs `normalizeResponseCapture` over fixed synthetic
+ * `PageProtocolBlockCapture` values. It verifies host reconstruction, dialect
+ * agreement, and the fail-closed classification branches. It does NOT open a
+ * browser, render DOM, or execute the in-page banner/editor extraction, so it
+ * cannot detect a live M365 widget or banner-wording change. Live DOM
+ * compatibility is covered only by the installed-Chromium capture tests.
+ *
+ * It neither opens a conversation nor reads or submits any live chat content.
  */
 export function probeResponseCaptureNormalizer(): ResponseCaptureEvidence {
   const code = JSON.stringify({
@@ -1287,25 +1353,34 @@ export function probeResponseCaptureNormalizer(): ResponseCaptureEvidence {
     phase: "discovering",
     summary: "capture contract probe",
   });
-  const normalized = normalizeResponseCapture({
-    renderedText: code,
-    codeBlockCount: 1,
-    editorCount: 1,
-    bannerCount: 1,
-    unownedProtocolFenceCount: 0,
-    legacyProtocolBlocks: [],
-    protocolBlocks: [{
-      version: "cba-agent/1",
-      bannerContract: "supported",
-      code,
+  const probeCapture = (
+    block: Partial<PageProtocolBlockCapture>,
+  ): NormalizedResponseCapture =>
+    normalizeResponseCapture({
+      renderedText: code,
+      codeBlockCount: 1,
       editorCount: 1,
       bannerCount: 1,
-      lineCount: 1,
-      lineIndicesValid: true,
-      contentBytes: Buffer.byteLength(code, "utf8"),
-      contentBoundExceeded: false,
-    }],
-  });
+      unownedProtocolFenceCount: 0,
+      legacyProtocolBlocks: [],
+      protocolBlocks: [{
+        version: "cba-agent/1",
+        bannerContract: "supported",
+        bannerTokenCount: 1,
+        bannerMatchesBaseline: true,
+        bannerVariant: "00000000",
+        code,
+        editorCount: 1,
+        bannerCount: 1,
+        lineCount: 1,
+        lineIndicesValid: true,
+        contentBytes: Buffer.byteLength(code, "utf8"),
+        contentBoundExceeded: false,
+        ...block,
+      }],
+    });
+
+  const normalized = probeCapture({});
   if (
     normalized.evidence.status !== "protocol_reconstructed" ||
     normalized.evidence.protocolVersion !== "cba-agent/1" ||
@@ -1313,16 +1388,52 @@ export function probeResponseCaptureNormalizer(): ResponseCaptureEvidence {
   ) {
     throw new Error("The response-capture normalizer failed its synthetic contract probe");
   }
+  // Banner provenance must stay decided by the protocol label, and must stay
+  // fail-closed when the label is unsupported or ambiguous. Drifted surrounding
+  // prose must remain executable.
+  const driftedProse = probeCapture({ bannerMatchesBaseline: false, bannerVariant: "deadbeef" });
+  if (driftedProse.evidence.status !== "protocol_reconstructed") {
+    throw new Error("The response-capture normalizer rejected a drifted banner variant");
+  }
+  const ambiguousLabels = probeCapture({
+    bannerContract: "ambiguous_protocol_labels",
+    bannerTokenCount: 2,
+  });
+  if (
+    ambiguousLabels.evidence.status !== "protocol_widget_ambiguous" ||
+    ambiguousLabels.evidence.reasonCode !== "PROTOCOL_WIDGET_BANNER_LABEL_AMBIGUOUS"
+  ) {
+    throw new Error("The response-capture normalizer accepted an ambiguous protocol banner");
+  }
+  const unsupported = probeCapture({
+    version: "cba-agent/2",
+    bannerContract: "unsupported_version",
+  });
+  if (
+    unsupported.evidence.status !== "model_protocol_malformed" ||
+    unsupported.evidence.protocolErrorCode !== "UNSUPPORTED_VERSION"
+  ) {
+    throw new Error("The response-capture normalizer accepted an unsupported protocol version");
+  }
   return normalized.evidence;
 }
 
 function normalizeResponseCapture(capture: PageResponseCapture): NormalizedResponseCapture {
+  // Banner provenance facts travel with every outcome so a future Microsoft
+  // wording change is visible in evidence instead of only in a pause reason.
+  const primaryBlock = capture.protocolBlocks[0];
   const sharedEvidence = {
     contractVersion: RESPONSE_CAPTURE_CONTRACT_VERSION,
     codeBlockCount: capture.codeBlockCount,
     protocolBlockCount: capture.protocolBlocks.length,
     editorCount: capture.editorCount,
     bannerCount: capture.bannerCount,
+    ...(primaryBlock === undefined ? {} : {
+      bannerContract: primaryBlock.bannerContract,
+      bannerTokenCount: primaryBlock.bannerTokenCount,
+      bannerMatchesBaseline: primaryBlock.bannerMatchesBaseline,
+      bannerVariant: primaryBlock.bannerVariant,
+    }),
   } as const;
   const renderedContentBytes = Buffer.byteLength(capture.renderedText, "utf8");
   const correlationText = v018ResponseCorrelationText(capture);
@@ -1360,20 +1471,22 @@ function normalizeResponseCapture(capture: PageResponseCapture): NormalizedRespo
     };
   }
 
-  const changedBanner = capture.protocolBlocks.find((block) =>
-    block.bannerContract === "changed_supported_banner"
+  // A single banner carrying more than one protocol-family label cannot
+  // establish which dialect owns the editor, so it stays non-executable.
+  const ambiguousLabelBlock = capture.protocolBlocks.find((block) =>
+    block.bannerContract === "ambiguous_protocol_labels"
   );
-  if (changedBanner !== undefined) {
+  if (ambiguousLabelBlock !== undefined) {
     return {
       text: capture.renderedText,
       correlationText,
       evidence: {
         ...sharedEvidence,
-        status: "unsupported_capture_contract",
-        protocolVersion: changedBanner.version,
-        reasonCode: "PROTOCOL_WIDGET_BANNER_CONTRACT_CHANGED",
-        lineCount: changedBanner.lineCount,
-        contentBytes: changedBanner.contentBytes,
+        status: "protocol_widget_ambiguous",
+        protocolVersion: ambiguousLabelBlock.version,
+        reasonCode: "PROTOCOL_WIDGET_BANNER_LABEL_AMBIGUOUS",
+        lineCount: ambiguousLabelBlock.lineCount,
+        contentBytes: ambiguousLabelBlock.contentBytes,
       },
     };
   }

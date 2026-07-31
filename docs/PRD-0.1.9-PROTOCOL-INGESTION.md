@@ -3,6 +3,16 @@
 Status: implementation complete in the PR; independent review and Windows live
 acceptance pending
 
+> **Erratum (0.1.10).** This document is retained as the historical record of
+> the 0.1.9 decision. Its treatment of the complete English M365 banner sentence
+> as an exact, immutable capture contract was wrong and caused a live outage of
+> the response path when Microsoft's surrounding prose changed. The immutable
+> provenance requirement is the exact supported protocol label and its block
+> ownership, not Microsoft's mutable explanatory sentence. See
+> [`ERRATUM-0.1.10-BANNER-PROVENANCE.md`](ERRATUM-0.1.10-BANNER-PROVENANCE.md).
+> Statements below about exact banner matching describe 0.1.9 as shipped, not
+> current behavior.
+
 Target: Cope 0.1.9
 
 Primary incident: a live Windows task on Cope 0.1.8 exhausted all four
@@ -382,6 +392,14 @@ identity and compatibility with existing baselines.
 
 Do not add fuzzy banner matching. A changed M365 banner is a UI contract change
 that must produce a typed recertification diagnostic.
+
+> **Superseded in 0.1.10.** This rule was applied to the whole banner sentence,
+> which made Microsoft's mutable prose an execution gate and broke the live
+> response path. The prohibition on fuzzy matching still holds for the protocol
+> *label*, which is still matched exactly with boundary assertions; a changed
+> surrounding sentence is now recorded as evidence rather than treated as a
+> contract change. See
+> [`ERRATUM-0.1.10-BANNER-PROVENANCE.md`](ERRATUM-0.1.10-BANNER-PROVENANCE.md).
 
 ### Slice 3: propagate typed capture and parser failures
 

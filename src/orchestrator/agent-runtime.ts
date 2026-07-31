@@ -5023,6 +5023,31 @@ function sanitizedCaptureEvidence(
     }
     capture[key] = value;
   }
+  // Optional, bounded, source-free banner provenance. Absent on responses that
+  // own no protocol widget; never fatal, so older evidence stays valid.
+  if (
+    evidence.bannerContract === "supported" ||
+    evidence.bannerContract === "unsupported_version" ||
+    evidence.bannerContract === "ambiguous_protocol_labels"
+  ) {
+    capture.bannerContract = evidence.bannerContract;
+  }
+  if (
+    typeof evidence.bannerTokenCount === "number" &&
+    Number.isSafeInteger(evidence.bannerTokenCount) &&
+    evidence.bannerTokenCount >= 0
+  ) {
+    capture.bannerTokenCount = evidence.bannerTokenCount;
+  }
+  if (typeof evidence.bannerMatchesBaseline === "boolean") {
+    capture.bannerMatchesBaseline = evidence.bannerMatchesBaseline;
+  }
+  if (
+    typeof evidence.bannerVariant === "string" &&
+    /^[0-9a-f]{8}$/u.test(evidence.bannerVariant)
+  ) {
+    capture.bannerVariant = evidence.bannerVariant;
+  }
   return capture;
 }
 
