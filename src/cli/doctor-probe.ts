@@ -1,7 +1,13 @@
 import { constants } from "node:fs";
-import { access, realpath } from "node:fs/promises";
+import { access, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 
+import type { RepositoryAgentConfig } from "../config/types.js";
+import {
+  assertValidPolicyDocument,
+  type PolicyDecision,
+  type PolicyDocument,
+} from "../policy/index.js";
 import {
   runHostProbe,
   type HostPlatform,
@@ -17,6 +23,276 @@ export interface DoctorProbeDependencies {
 
 export interface NpmDoctorProbeResult extends ProbeResult {
   readonly npmCli?: string;
+}
+
+export type TerminalToolDecisionField =
+  | "capabilities.tools.deny"
+  | "capabilities.tools.ask"
+  | "capabilities.tools.allow"
+  | "capabilities.tools.unmatched"
+  | "default_decision";
+
+export interface TerminalToolDecision {
+  readonly decision: PolicyDecision;
+  readonly field: TerminalToolDecisionField;
+}
+
+export interface DeveloperTerminalDoctorEvidence {
+  readonly repository_config: {
+    readonly file: string;
+    readonly schema_version: RepositoryAgentConfig["schema_version"];
+    readonly developer_terminal_enabled: boolean;
+  };
+  readonly repository_policy?: {
+    readonly policy_id: string;
+    readonly revision: string;
+    readonly field: TerminalToolDecisionField;
+    readonly decision: PolicyDecision;
+  };
+  readonly machine_policy: {
+    readonly status: "not_read" | "absent" | "unreadable" | "malformed" | "valid";
+    readonly path: string;
+    readonly error?: string;
+    readonly policy_id?: string;
+    readonly revision?: string;
+    readonly field?: TerminalToolDecisionField;
+    readonly decision?: PolicyDecision;
+  };
+}
+
+export interface DeveloperTerminalDoctorResult {
+  readonly ok: boolean;
+  readonly detail: string;
+  readonly evidence: DeveloperTerminalDoctorEvidence;
+}
+
+/**
+ * Resolve the terminal tool exactly as the runtime resolves a tool rule. The
+ * field is retained as evidence so doctor can explain which rule won without
+ * exposing the policy document itself.
+ */
+export function resolveTerminalToolDecision(policy: PolicyDocument): TerminalToolDecision {
+  const rules = policy.capabilities.tools;
+  if (rules?.deny?.includes("terminal_exec") === true) {
+    return { decision: "deny", field: "capabilities.tools.deny" };
+  }
+  if (rules?.ask?.includes("terminal_exec") === true) {
+    return { decision: "ask", field: "capabilities.tools.ask" };
+  }
+  if (rules?.allow?.includes("terminal_exec") === true) {
+    return { decision: "allow", field: "capabilities.tools.allow" };
+  }
+  if (rules?.unmatched !== undefined) {
+    return { decision: rules.unmatched, field: "capabilities.tools.unmatched" };
+  }
+  return { decision: policy.default_decision, field: "default_decision" };
+}
+
+/**
+ * Read-only, ordered diagnosis of terminal availability for a newly-created
+ * Developer (internal mode `auto`) session. The organization policy is not
+ * touched until the repository/session prerequisites and embedded repository
+ * policy have both allowed terminal_exec.
+ */
+export async function diagnoseDeveloperTerminal(input: {
+  readonly repositoryConfigFile: string;
+  readonly repositoryConfig: RepositoryAgentConfig;
+  readonly machinePolicyFile: string;
+}): Promise<DeveloperTerminalDoctorResult> {
+  const repositoryConfigEvidence = {
+    file: input.repositoryConfigFile,
+    schema_version: input.repositoryConfig.schema_version,
+    developer_terminal_enabled: input.repositoryConfig.developer_terminal.enabled,
+  } as const;
+  const notReadMachine = {
+    status: "not_read" as const,
+    path: input.machinePolicyFile,
+  };
+
+  if (input.repositoryConfig.schema_version === "cba-repository-config/1") {
+    return {
+      ok: false,
+      detail:
+        `Developer terminal unavailable: ${input.repositoryConfigFile} uses repository schema cba-repository-config/1, ` +
+        "so the session layer denies `terminal_exec` unconditionally for new sessions. " +
+        "The machine policy was not read for this check. " +
+        "If Developer mode is intended, run `cope init . --quick --force`; it overwrites `.cba/repository.json`, " +
+        "including custom commands, limits, grants, and completion settings, so back up and diff it first.",
+      evidence: {
+        repository_config: repositoryConfigEvidence,
+        machine_policy: notReadMachine,
+      },
+    };
+  }
+
+  if (!input.repositoryConfig.developer_terminal.enabled) {
+    return {
+      ok: false,
+      detail:
+        `Developer terminal unavailable: ${input.repositoryConfigFile} has developer_terminal.enabled=false; ` +
+        "the session layer denies `terminal_exec` for new sessions. The machine policy was not read for this check. " +
+        "If Developer mode is intended, optionally run `cope init . --quick --force`; it overwrites `.cba/repository.json`, " +
+        "including custom commands, limits, grants, and completion settings, so back up and diff it first.",
+      evidence: {
+        repository_config: repositoryConfigEvidence,
+        machine_policy: notReadMachine,
+      },
+    };
+  }
+
+  const repositoryDecision = resolveTerminalToolDecision(input.repositoryConfig.policy);
+  const repositoryPolicyEvidence = policyDecisionEvidence(input.repositoryConfig.policy, repositoryDecision);
+  if (repositoryDecision.decision !== "allow") {
+    return {
+      ok: false,
+      detail:
+        `Developer terminal unavailable: ${input.repositoryConfigFile}; ${repositoryDecision.field} selects decision ` +
+        `"${repositoryDecision.decision}" for terminal_exec (policy_id "${input.repositoryConfig.policy.policy_id}", ` +
+        `revision "${input.repositoryConfig.policy.revision}"). The machine policy was not read because the ` +
+        "repository layer already blocks an unconditional grant for a new Developer (`auto`) session.",
+      evidence: {
+        repository_config: repositoryConfigEvidence,
+        repository_policy: repositoryPolicyEvidence,
+        machine_policy: notReadMachine,
+      },
+    };
+  }
+
+  const machinePolicy = await readOrganizationPolicy(input.machinePolicyFile);
+  if (machinePolicy.status !== "valid") {
+    return {
+      ok: false,
+      detail: machinePolicy.detail,
+      evidence: {
+        repository_config: repositoryConfigEvidence,
+        repository_policy: repositoryPolicyEvidence,
+        machine_policy: machinePolicy.evidence,
+      },
+    };
+  }
+
+  const machineDecision = resolveTerminalToolDecision(machinePolicy.policy);
+  const machinePolicyEvidence = policyDecisionEvidence(machinePolicy.policy, machineDecision);
+  if (machineDecision.decision !== "allow") {
+    const askExplanation = machineDecision.decision === "ask"
+      ? " It requires approval and is not a denial, but it blocks an unconditional initial terminal grant."
+      : " It blocks an unconditional initial terminal grant.";
+    return {
+      ok: false,
+      detail:
+        `Developer terminal unavailable: ${input.machinePolicyFile}; ${machineDecision.field} selects decision ` +
+        `"${machineDecision.decision}" for terminal_exec (policy_id "${machinePolicy.policy.policy_id}", revision "${machinePolicy.policy.revision}").` +
+        askExplanation,
+      evidence: {
+        repository_config: repositoryConfigEvidence,
+        repository_policy: repositoryPolicyEvidence,
+        machine_policy: {
+          status: "valid",
+          path: input.machinePolicyFile,
+          ...machinePolicyEvidence,
+        },
+      },
+    };
+  }
+
+  return {
+    ok: true,
+    detail:
+      "Developer terminal available for a new Developer (`auto`) session: the repository v2 enable bit, " +
+      `embedded repository policy ${repositoryDecision.field} decision "allow", and machine policy ` +
+      `${input.machinePolicyFile} ${machineDecision.field} decision "allow" all allow terminal_exec ` +
+      `(repository policy_id "${input.repositoryConfig.policy.policy_id}" revision "${input.repositoryConfig.policy.revision}"; ` +
+      `machine policy_id "${machinePolicy.policy.policy_id}" revision "${machinePolicy.policy.revision}").`,
+    evidence: {
+      repository_config: repositoryConfigEvidence,
+      repository_policy: repositoryPolicyEvidence,
+      machine_policy: {
+        status: "valid",
+        path: input.machinePolicyFile,
+        ...machinePolicyEvidence,
+      },
+    },
+  };
+}
+
+function policyDecisionEvidence(
+  policy: PolicyDocument,
+  decision: TerminalToolDecision,
+): {
+  readonly policy_id: string;
+  readonly revision: string;
+  readonly field: TerminalToolDecisionField;
+  readonly decision: PolicyDecision;
+} {
+  return {
+    policy_id: policy.policy_id,
+    revision: policy.revision,
+    field: decision.field,
+    decision: decision.decision,
+  };
+}
+
+type MachinePolicyReadResult =
+  | {
+      readonly status: "valid";
+      readonly policy: PolicyDocument;
+    }
+  | {
+      readonly status: "absent" | "unreadable" | "malformed";
+      readonly detail: string;
+      readonly evidence: DeveloperTerminalDoctorEvidence["machine_policy"];
+    };
+
+async function readOrganizationPolicy(machinePolicyFile: string): Promise<MachinePolicyReadResult> {
+  let text: string;
+  try {
+    text = await readFile(machinePolicyFile, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return {
+        status: "absent",
+        detail:
+          `Developer terminal unavailable: machine policy file ${machinePolicyFile} is absent. ` +
+          "No machine policy decision was available for the initial terminal grant.",
+        evidence: { status: "absent", path: machinePolicyFile },
+      };
+    }
+    const message = boundedDiagnosticError(error);
+    return {
+      status: "unreadable",
+      detail:
+        `Developer terminal unavailable: machine policy file ${machinePolicyFile} could not be read: ${message}. ` +
+        "No machine policy decision was available for the initial terminal grant.",
+      evidence: { status: "unreadable", path: machinePolicyFile, error: message },
+    };
+  }
+
+  try {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(text) as unknown;
+    } catch {
+      throw new Error("Invalid JSON syntax");
+    }
+    assertValidPolicyDocument(raw);
+    if (raw.layer !== "organization") {
+      throw new Error(`Policy document has layer '${raw.layer}', expected organization`);
+    }
+    return { status: "valid", policy: raw };
+  } catch (error) {
+    const message = boundedDiagnosticError(error);
+    return {
+      status: "malformed",
+      detail:
+        `Developer terminal unavailable: machine policy file ${machinePolicyFile} was read but is malformed or not a valid ` +
+        `organization policy: ${message}. No machine policy decision was available for the initial terminal grant.`,
+      evidence: { status: "malformed", path: machinePolicyFile, error: message },
+    };
+  }
+}
+
+function boundedDiagnosticError(error: unknown): string {
+  return errorMessage(error).replace(/[\r\n]+/gu, " ").slice(0, 240);
 }
 
 /**

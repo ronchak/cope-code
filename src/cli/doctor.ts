@@ -6,6 +6,7 @@ import { RepositoryBoundary } from "../repository/index.js";
 import { errorMessage } from "../shared/errors.js";
 import type { CliCommand } from "./arguments.js";
 import {
+  diagnoseDeveloperTerminal,
   probeNpmVersion,
   runDoctorProbe,
   type DoctorProbeDependencies,
@@ -278,30 +279,77 @@ export async function executeDoctorCommand(
       detail: `device ${String(boundary.rootDevice)}; ${boundary.filesystemIdentity.caseSensitive ? "case-sensitive" : "case-insensitive"}; Unicode ${boundary.filesystemIdentity.unicodeNormalizationAliases ? "aliases normalized" : "forms distinct"}`,
       required: true,
     });
+    const configFile = path.join(boundary.root, ".cba", "repository.json");
     try {
-      const configFile = path.join(boundary.root, ".cba", "repository.json");
       const repositoryConfig = parseRepositoryConfig(
         JSON.parse(await readFile(configFile, "utf8")) as unknown,
       );
-      const developerTerminal = repositoryConfig.developer_terminal.enabled;
       checks.push({
         name: "Project setup",
         ok: true,
-        detail: `${configFile}; Developer terminal ${developerTerminal ? "enabled by project config (managed policy still applies)" : "disabled"}`,
-        summary: developerTerminal
-          ? "configured for Developer terminal; managed policy still applies"
-          : "configured; Developer terminal disabled",
+        detail: `${configFile}; schema ${repositoryConfig.schema_version}`,
+        summary: `configured; schema ${repositoryConfig.schema_version}`,
         evidence: {
           schema_version: repositoryConfig.schema_version,
-          developer_terminal_enabled: developerTerminal,
         },
         required: true,
       });
+
+      const terminal = await diagnoseDeveloperTerminal({
+        repositoryConfigFile: configFile,
+        repositoryConfig,
+        machinePolicyFile: paths.organizationPolicy,
+      });
+      checks.push({
+        name: "Developer terminal",
+        ok: terminal.ok,
+        detail: terminal.detail,
+        evidence: terminal.evidence,
+        required: false,
+      });
     } catch (error) {
       checks.push({ name: "Project setup", ok: false, detail: `Run cope in the project to create it. ${errorMessage(error)}`, required: true });
+      checks.push({
+        name: "Developer terminal",
+        ok: false,
+        detail:
+          `Unable to assess Developer terminal because ${configFile} could not be parsed. ` +
+          "The machine policy was not read for this check. " +
+          errorMessage(error),
+        evidence: {
+          repository_config: {
+            file: configFile,
+            status: "invalid",
+          },
+          machine_policy: {
+            status: "not_read",
+            path: paths.organizationPolicy,
+          },
+        },
+        required: false,
+      });
     }
   } catch (error) {
     checks.push({ name: "Project", ok: false, detail: `Open a Git project or standalone file. ${errorMessage(error)}`, required: true });
+    checks.push({
+      name: "Developer terminal",
+      ok: false,
+      detail:
+        "Unable to assess Developer terminal because the project repository could not be resolved. " +
+        "The machine policy was not read for this check. " +
+        errorMessage(error),
+      evidence: {
+        repository_config: {
+          file: path.join(path.resolve(command.repository), ".cba", "repository.json"),
+          status: "not_read",
+        },
+        machine_policy: {
+          status: "not_read",
+          path: paths.organizationPolicy,
+        },
+      },
+      required: false,
+    });
   }
 
   const ok = checks.every((check) => !check.required || check.ok);

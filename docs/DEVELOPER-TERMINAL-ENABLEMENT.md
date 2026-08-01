@@ -1,130 +1,91 @@
 # Enabling the Developer terminal on an existing installation
 
-Scope: this is an operator opt-in procedure. It is unrelated to the 0.1.10
-protocol-capture fix; a repository that cannot run `terminal_exec` is behaving
-as designed, not failing.
+The diagnostic is read-only. `cope doctor` does not widen a grant or write,
+rewrite, back up, regenerate, chmod, rename, or delete any policy file. The
+later operator steps are explicit human actions. There is no `cope policy
+upgrade` command.
 
-Cope never widens authority on your behalf. Nothing here happens automatically,
-and no step in this document is performed by the capture fix.
+## Step 1 — run doctor first
 
-## Where the denial actually comes from
-
-`terminal_exec` must be granted by all three policy layers. For a repository
-still on the legacy `cba-repository-config/1` schema, the block is at the
-**session** layer and is unconditional:
-
-```
-const terminalRequested =
-  input.mode === "auto" &&
-  configuration.repository.schema_version === REPOSITORY_CONFIG_VERSION && // v2 only
-  configuration.repository.developer_terminal.enabled;
-```
-
-A v1 repository config has no `developer_terminal` key at all — the loader
-fills in `enabled: false` — so the session grant is built with
-`tools.deny: ["terminal_exec"]` before any organization policy is consulted.
-
-That means the effective denial on a legacy repository is **not** evidence that
-your machine policy forbids the terminal. The two layers must be checked
-separately.
-
-## Step 1 — back up, then rewrite the repository config
-
-`cope init --force` **overwrites** `.cba/repository.json`. It re-runs validation
-command detection, so hand-tuned `commands`, `limits`, `grant_defaults`, and
-`completion` entries are replaced by generated defaults. Back it up first:
-
-```
-cp .cba/repository.json .cba/repository.json.bak
-cope init . --quick --force
-```
-
-Verified with the built 0.1.10 CLI in a disposable Git repository:
-
-```
-schema_version:     cba-repository-config/2
-developer_terminal: {"enabled": true}
-policy_id:          cope-project (revision 2)
-policy tools.allow: … run_command, terminal_exec, …
-```
-
-`--quick` selects the `standard` profile, which is what enables the terminal.
-`--inspect`-style setup (`writable_paths: []`) yields `enabled: false`.
-
-Diff the backup against the new file and reapply any custom commands or limits
-you needed:
-
-```
-diff .cba/repository.json.bak .cba/repository.json
-```
-
-`cope init` writes only inside the repository. It does not read, modify, or
-create anything in the machine state home.
-
-## Step 2 — check the machine (organization) policy separately
+Run the diagnostic from the project:
 
 ```
 cope doctor
 ```
 
-`Project setup` will now report *"Developer terminal enabled by project config
-(managed policy still applies)"*. That wording is deliberate: it confirms step 1
-only, and does not assert that the machine layer agrees.
+`Project setup` reports only the concrete `.cba/repository.json` file and its
+repository schema. The optional `Developer terminal` check evaluates a new
+Developer (`auto`) session in this order:
 
-To see the machine layer, inspect the policy directly:
+1. A `cba-repository-config/1` file means the session layer denies
+   `terminal_exec` unconditionally. The Developer-terminal check does not use
+   the machine policy to characterize this denial.
+2. A v2 file with `developer_terminal.enabled: false` has the same session
+   denial, and the Developer-terminal check does not evaluate a machine-policy
+   terminal decision.
+3. For v2 with `developer_terminal.enabled: true`, doctor resolves the embedded
+   repository policy. If it produces `ask` or `deny`, doctor names the winning
+   field, policy identity, and revision, and does not evaluate a machine-policy
+   terminal decision.
+4. Only when the v2 enable bit and embedded repository policy both allow does
+   the Developer-terminal check read and evaluate the exact organization-policy
+   path from the active state home.
+   It distinguishes an absent, unreadable, malformed, `ask`, `deny`, or
+   `allow` machine policy. An `ask` is not a denial, but it does not provide an
+   unconditional initial terminal grant.
+
+Tool-rule provenance follows runtime precedence exactly:
+`capabilities.tools.deny`, then `capabilities.tools.ask`, then
+`capabilities.tools.allow`, then `capabilities.tools.unmatched`, then
+`default_decision`. A missing `capabilities.tools` falls through to
+`default_decision`.
+
+The separate required `Browser setup` check continues to inspect overall
+machine configuration, including organization-policy validity. Therefore
+`not_read` in Developer-terminal evidence means “not read by this terminal
+decision check,” not that no other doctor check accessed the file.
+
+## Step 2 — follow a v1 or disabled-v2 diagnosis
+
+If doctor reports a v1 repository or
+`developer_terminal.enabled: false`, and Developer mode is intended, the
+documented repository remedy is:
 
 ```
-# Windows
-type "%LOCALAPPDATA%\CopilotBrowserAgent\config\organization-policy.json"
-# macOS
-cat ~/Library/Application\ Support/CopilotBrowserAgent/config/organization-policy.json
+cope init . --quick --force
 ```
 
-Read two fields — `default_decision` and `capabilities.tools`:
+Back up and diff the file first. `cope init . --quick --force` **overwrites**
+`.cba/repository.json`, including custom commands, limits, grants, and
+completion settings. The command is an explicit repository-local rewrite; it
+does not silently migrate an existing configuration.
 
-| Machine policy shape | Terminal after step 1 |
-| --- | --- |
-| `default_decision: "allow"`, no `tools.deny` (e.g. `cope-local-user`) | **allowed** — step 1 is sufficient |
-| `tools.deny` contains `terminal_exec` (the v1 `DEFAULT_ORGANIZATION_POLICY` shape) | **still blocked at the organization layer** |
-| `tools.allow` contains `terminal_exec` (`default-developer-organization`, revision 2) | **allowed** |
+The quick standard profile writes repository schema v2 with the Developer
+terminal enabled. Inspect and manual profiles keep the terminal disabled.
 
-Tool-rule precedence is `deny`, `ask`, `allow`, then `tools.unmatched`, then
-`default_decision`. An omission from `tools.allow` is therefore not by itself a
-denial, but `tools.ask`, or an `ask`/`deny` value in `tools.unmatched` or
-`default_decision`, still prevents an unconditional initial terminal grant.
+## Step 3 — address the machine policy only when doctor reports it
 
-## Step 3 — only if the machine layer blocks it
+If doctor reaches the machine layer, use the exact path and evidence it prints.
+The policy must be a valid organization-layer policy before its terminal
+decision can be reported. A machine `allow` is sufficient only together with
+the repository v2 enable bit and an embedded repository `allow` decision.
 
-`cope setup` deliberately **never rewrites an existing valid machine policy**.
-It generates one from the developer default only when the file is absent. There
-is therefore no in-product migration command for a persisted policy that denies
-`terminal_exec`, and this is intentional: silently widening a machine-wide
-policy would be an authority escalation.
+`cope setup` does not rewrite an existing valid machine policy. When the file is
+absent, setup may create a local Developer-capable policy as part of its normal
+human-run setup flow. There is no in-product migration for an existing valid
+machine policy that asks or denies `terminal_exec`.
 
-The supported opt-in is to remove the policy deliberately and let `cope setup`
-regenerate it, which requires an explicit human decision:
+If, and only if, you own the machine policy and have decided to replace it, the
+replacement remains an explicitly human-controlled procedure:
 
 ```
 # Back it up first — this is machine-wide authority.
-cp organization-policy.json organization-policy.json.bak
-rm organization-policy.json
+# Replace these placeholders with the exact path printed by cope doctor.
+cp "/exact/path/organization-policy.json" "/exact/path/organization-policy.json.bak"
+rm "/exact/path/organization-policy.json"
 cope setup
 ```
 
-The regenerated policy is `DEFAULT_DEVELOPER_ORGANIZATION_POLICY` with
-`policy_id: "cope-local-user"`, which allows `terminal_exec`.
-
-Do not do this on a machine whose policy is administrator-managed. If the
-policy was placed by an organization rather than by a previous `cope setup`,
-removing it substitutes local authority for managed authority. Escalate to
-whoever owns the policy instead.
-
-### Known UX gap
-
-For a user whose machine policy explicitly denies `terminal_exec`, the only
-path forward is manual file deletion outside the product. There is no
-`cope policy upgrade`-style command, no diagnostic that names the file and the
-offending field, and `cope doctor`'s "managed policy still applies" note does
-not tell the user whether their own policy is the blocker. That is a product
-gap worth tracking separately; it is not something the capture fix should
-paper over.
+Do not remove or replace an administrator-managed policy. If an organization
+placed it, ask the policy owner to change the policy instead; replacing it with
+local authority would override managed control.
