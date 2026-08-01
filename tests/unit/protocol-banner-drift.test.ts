@@ -393,7 +393,7 @@ test(
     );
 
     const adapter = new CbaProtocolAdapter();
-    for (const index of [7, 8, 9] as const) {
+    for (const index of [7, 8] as const) {
       assert.throws(
         () => adapter.parseModelTurn(observation.responses.elements[index]?.text ?? "", {
           taskId: "task_inert_protocol_examples",
@@ -402,5 +402,15 @@ test(
         ProtocolParseError,
       );
     }
+    // The raw fence is syntactically valid at the parser seam. It remains
+    // non-executable because capture evidence rejects its missing widget
+    // ownership and AgentRuntime consumes that evidence before parsing.
+    assert.equal(
+      adapter.parseModelTurn(observation.responses.elements[9]?.text ?? "", {
+        taskId: "task_inert_protocol_examples",
+        turnId: "turn_0009",
+      }).messages.length,
+      1,
+    );
   },
 );

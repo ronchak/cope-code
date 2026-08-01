@@ -326,7 +326,10 @@ class MalformedCaptureTransport extends QueueTransport {
 class UnownedFenceCaptureTransport extends QueueTransport {
   private receiveCalls = 0;
 
-  public constructor(validResponse: string) {
+  public constructor(
+    private readonly unownedFence: string,
+    validResponse: string,
+  ) {
     super([validResponse]);
   }
 
@@ -342,7 +345,7 @@ class UnownedFenceCaptureTransport extends QueueTransport {
       conversationId: "conversation_1",
       status: "completed",
       responseId: "response_unowned_fence",
-      content: "```cba-agent/1\nquoted but never executable\n```",
+      content: this.unownedFence,
       captureEvidence: {
         contractVersion: "response-capture/v2",
         status: "model_protocol_malformed",
@@ -5527,20 +5530,43 @@ test("runtime repairs an unowned quoted fence without parsing it as authority", 
     }),
     "```",
   ].join("\n");
-  const transport = new UnownedFenceCaptureTransport(validCompletion);
+  const unownedFence = [
+    "```cba-agent/1",
+    stableJson({
+      kind: "agent_progress",
+      phase: "discovering",
+      summary: "Parser-valid bytes without widget ownership.",
+    }),
+    "```",
+  ].join("\n");
+  const transport = new UnownedFenceCaptureTransport(unownedFence, validCompletion);
+  const protocolAdapter = new CbaProtocolAdapter();
+  const parsedInputs: string[] = [];
+  const parseModelTurn = protocolAdapter.parseModelTurn.bind(protocolAdapter);
+  protocolAdapter.parseModelTurn = (raw, expected) => {
+    parsedInputs.push(raw);
+    return parseModelTurn(raw, expected);
+  };
 
   const result = await runtimeForTest({
     root,
     state: localState,
     store,
     transport,
-    protocol: new CbaProtocolAdapter(),
+    protocol: protocolAdapter,
   }).run();
 
   assert.equal(result.status, "completed", result.reason);
   assert.equal(localState.budgetUsage.protocolRepairs, 1);
   assert.match(transport.submittedContents[1] ?? "", /"code":"MISSING_ENVELOPE"/u);
-  assert.doesNotMatch(transport.submittedContents[1] ?? "", /quoted but never executable/u);
+  assert.deepEqual(parsedInputs, [validCompletion]);
+  assert.equal(
+    new CbaProtocolAdapter().parseModelTurn(unownedFence, {
+      taskId: localState.taskId,
+      turnId: "turn_9999",
+    }).messages.length,
+    1,
+  );
 });
 
 test("runtime records source-free banner drift evidence in model-response audit", async () => {
