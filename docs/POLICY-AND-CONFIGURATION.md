@@ -24,6 +24,21 @@ For the personal-developer default, the generated organization and repository po
 
 Changing a persisted policy during an active session must not silently expand authority. Resume should either use the durable approved grant or require the user to begin a new session when the policy meaning changed.
 
+`cope doctor` reports Developer-terminal availability without changing policy.
+After parsing the concrete repository config, it short-circuits on a v1 schema,
+a disabled v2 `developer_terminal.enabled` bit, or a non-`allow` embedded
+repository decision; those branches mark the machine policy `not_read`. Only a
+v2-enabled repository whose embedded policy allows `terminal_exec` causes doctor
+to read the exact organization-policy path for the terminal decision. JSON
+output records the repository file/schema/enable bit, evaluated provenance, and
+machine status; machine policy identity, revision, field, and decision appear
+only after a valid machine policy was read by that check. The separate required
+Browser setup check still validates overall machine configuration. Doctor never
+changes grants or policy files. Tool rules resolve in `deny`, `ask`, `allow`,
+`unmatched`, then policy-default order. Strict validation rejects a tool listed
+in more than one explicit rule set, so a persisted conflict is malformed and
+has no reported policy decision.
+
 ## Runtime modes
 
 ### Inspect
