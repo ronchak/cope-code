@@ -362,6 +362,43 @@ class UnownedFenceCaptureTransport extends QueueTransport {
   }
 }
 
+class RenderedTextCaptureTransport extends QueueTransport {
+  private receiveCalls = 0;
+
+  public constructor(
+    private readonly prose: string,
+    validResponse: string,
+  ) {
+    super([validResponse]);
+  }
+
+  public override async receive(request: ReceiveRequest): Promise<ReceiveResult> {
+    this.receiveCalls += 1;
+    if (this.receiveCalls > 1) return super.receive(request);
+    return {
+      contractVersion: MODEL_TRANSPORT_CONTRACT_VERSION,
+      taskId: request.taskId,
+      turnId: request.turnId,
+      submissionId: request.submissionId,
+      observedAt: "2026-01-01T00:00:00.000Z",
+      conversationId: "conversation_1",
+      status: "completed",
+      responseId: "response_rendered_text",
+      content: this.prose,
+      captureEvidence: {
+        contractVersion: "response-capture/v2",
+        status: "rendered_text",
+        codeBlockCount: 0,
+        protocolBlockCount: 0,
+        editorCount: 0,
+        bannerCount: 0,
+        lineCount: 0,
+        contentBytes: Buffer.byteLength(this.prose, "utf8"),
+      },
+    };
+  }
+}
+
 class CompletedCaptureEvidenceTransport extends QueueTransport {
   public constructor(
     private readonly content: string,
@@ -5567,6 +5604,69 @@ test("runtime repairs an unowned quoted fence without parsing it as authority", 
     }).messages.length,
     1,
   );
+});
+
+test("runtime repairs a rendered_text prose response and completes", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-rendered-text-repair-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const prose = "This response is ordinary rendered prose.";
+  const validCompletion = [
+    "```cba-agent/1",
+    stableJson({
+      kind: "agent_intent",
+      intent: "complete_task",
+      arguments: {
+        summary: "Finished after repairing rendered prose.",
+        acceptance_criteria: [],
+        validation: [],
+        skipped_validation: [],
+        remaining_risks: [],
+        follow_up: [],
+      },
+      reason: "Submit the final completion report.",
+    }),
+    "```",
+  ].join("\n");
+  const transport = new RenderedTextCaptureTransport(prose, validCompletion);
+  const progress: import("../../src/orchestrator/agent-runtime.js").RuntimeProgressEvent[] = [];
+
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    transport,
+    protocol: new CbaProtocolAdapter(),
+    onProgress: (event) => { progress.push(event); },
+  }).run();
+
+  assert.equal(result.status, "completed", result.reason);
+  assert.equal(localState.budgetUsage.protocolRepairs, 1);
+  assert.match(transport.submittedContents[1] ?? "", /"code":"MISSING_ENVELOPE"/u);
+  assert.match(transport.submittedContents[1] ?? "", /"source_code":"MISSING_ENVELOPE"/u);
+  assert.doesNotMatch(transport.submittedContents[1] ?? "", /INVALID_MESSAGE/u);
+  assert.equal(
+    progress.some((event) =>
+      event.kind === "model" &&
+      event.detail.actionType === "protocol_repair" &&
+      event.detail.protocolCode === "MISSING_ENVELOPE" &&
+      event.detail.repairBudgetAvailable === true),
+    true,
+  );
+
+  const events = await AuditLog.verify(
+    path.join(root, "audit.jsonl"),
+    localState.sessionId,
+  );
+  const modelResponse = events.find((event) => event.type === "model.response");
+  assert.equal(
+    (modelResponse?.data.captureEvidence as Readonly<Record<string, unknown>> | undefined)
+      ?.status,
+    "rendered_text",
+  );
+  const protocolError = events.find((event) => event.type === "protocol.error");
+  assert.equal(protocolError?.data.protocolCode, "MISSING_ENVELOPE");
 });
 
 test("runtime records source-free banner drift evidence in model-response audit", async () => {

@@ -31,6 +31,7 @@ import type {
   ToolName,
   ToolOutcome,
 } from "./contracts.js";
+import { sanitizedCaptureEvidence } from "./response-capture-evidence.js";
 
 const MODEL_MESSAGE_TYPES = new Set<ProtocolMessage["message_type"]>([
   "tool_request",
@@ -40,6 +41,15 @@ const MODEL_MESSAGE_TYPES = new Set<ProtocolMessage["message_type"]>([
   "completion",
   "blocked",
 ]);
+
+const MODEL_PROTOCOL_CAPTURE_ERROR_MESSAGES = {
+  MISSING_ENVELOPE: "The model response quoted a protocol fence outside an owned protocol widget.",
+  MULTIPLE_ENVELOPES: "The captured model response contains more than one protocol envelope.",
+  UNSUPPORTED_VERSION: "The captured model response used an unsupported protocol version.",
+  EMPTY_ENVELOPE: "The captured model response contains an empty protocol envelope.",
+  INVALID_JSON: "The captured model response does not contain complete, valid JSON.",
+  SCHEMA_INVALID: "The captured model response body does not match its declared protocol dialect.",
+} as const;
 
 export interface CbaProtocolAdapterOptions {
   readonly seenOperationIds?: () => ReadonlySet<string>;
@@ -93,6 +103,7 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
       readonly captureEvidence?: Readonly<Record<string, unknown>>;
     },
   ): ParsedModelTurn {
+    const captureStatus = enforceOwnedReconstructedCapture(expected.captureEvidence);
     const actualBytes = Buffer.byteLength(raw, "utf8");
     if (actualBytes > DEFAULT_MAX_PROTOCOL_INPUT_BYTES) {
       throw new ProtocolParseError(
@@ -165,6 +176,17 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
           expectedTurnId: numericTurn,
         }];
       }
+    }
+    if (captureStatus === "rendered_text") {
+      throw new ProtocolParseError(
+        "INVALID_MESSAGE",
+        "Rendered-text capture evidence does not establish an owned reconstructed protocol widget.",
+        {
+          stage: "model_response_capture",
+          capture_ownership_failed: true,
+        },
+        false,
+      );
     }
     return {
       protocolVersion: "cba/1",
@@ -448,6 +470,45 @@ function parseTurnId(value: string): number {
     throw new AgentError("PROTOCOL_INVALID", `Invalid turn identifier '${value}'`);
   }
   return numeric;
+}
+
+function enforceOwnedReconstructedCapture(
+  evidence: Readonly<Record<string, unknown>> | undefined,
+): "rendered_text" | "protocol_reconstructed" | undefined {
+  if (evidence === undefined) return undefined;
+  const capture = sanitizedCaptureEvidence(evidence);
+  if (capture === undefined) {
+    throw new ProtocolParseError(
+      "INVALID_MESSAGE",
+      "Response capture evidence failed strict validation.",
+      {
+        stage: "model_response_capture",
+        capture_evidence_invalid: true,
+      },
+      false,
+    );
+  }
+  if (capture.status === "rendered_text" || capture.status === "protocol_reconstructed") {
+    return capture.status;
+  }
+  if (capture.status === "model_protocol_malformed") {
+    const protocolCode = capture.protocolErrorCode as keyof typeof MODEL_PROTOCOL_CAPTURE_ERROR_MESSAGES;
+    throw new ProtocolParseError(
+      protocolCode,
+      MODEL_PROTOCOL_CAPTURE_ERROR_MESSAGES[protocolCode],
+      { stage: "model_response_capture" },
+      true,
+    );
+  }
+  throw new ProtocolParseError(
+    "INVALID_MESSAGE",
+    "Capture evidence does not establish an owned reconstructed protocol widget.",
+    {
+      stage: "model_response_capture",
+      capture_ownership_failed: true,
+    },
+    false,
+  );
 }
 
 function strings(value: unknown): readonly string[] {
