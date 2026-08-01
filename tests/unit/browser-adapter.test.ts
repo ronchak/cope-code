@@ -234,6 +234,10 @@ test("an ambiguous protocol widget is non-repairable transport evidence", async 
         bannerCount: 1,
         lineCount: 2,
         contentBytes: 128,
+        bannerContract: "supported",
+        bannerTokenCount: 1,
+        bannerMatchesBaseline: false,
+        bannerVariant: "deadbeef",
       },
     };
   };
@@ -248,6 +252,10 @@ test("an ambiguous protocol widget is non-repairable transport evidence", async 
     assert.equal(response.diagnostic?.repairable, false);
     assert.equal(response.diagnostic?.actual?.capture_status, "protocol_widget_ambiguous");
     assert.equal(response.diagnostic?.actual?.protocol_version, "cba-agent/1");
+    assert.equal(response.diagnostic?.actual?.banner_contract, "supported");
+    assert.equal(response.diagnostic?.actual?.banner_protocol_label_count, 1);
+    assert.equal(response.diagnostic?.actual?.banner_matches_baseline, false);
+    assert.equal(response.diagnostic?.actual?.banner_variant, "deadbeef");
   }
 });
 

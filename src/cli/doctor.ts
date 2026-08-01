@@ -116,10 +116,12 @@ export async function executeDoctorCommand(
       ok: true,
       detail:
         `${evidence.contractVersion}; ${evidence.protocolVersion ?? "unknown protocol"} ` +
-        "host reconstruction verified with a synthetic source-free fixture",
+        "host reconstruction and fail-closed banner classification verified with a " +
+        "synthetic source-free fixture. This does not open a browser and does not " +
+        "verify live M365 widget or banner compatibility.",
       summary:
         `${evidence.contractVersion}; ${evidence.protocolVersion ?? "unknown protocol"} ` +
-        "host reconstruction verified",
+        "host normalizer verified (no live DOM check)",
       evidence,
       required: true,
     });

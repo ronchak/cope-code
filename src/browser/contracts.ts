@@ -99,6 +99,18 @@ export interface ResponseCaptureEvidence {
   readonly bannerCount: number;
   readonly lineCount: number;
   readonly contentBytes: number;
+  /**
+   * Source-free banner provenance, present when the response owns at least one
+   * protocol widget. These distinguish a Microsoft banner-wording change from a
+   * structural capture failure without recording any response content.
+   */
+  readonly bannerContract?: "supported" | "unsupported_version" | "ambiguous_protocol_labels";
+  /** Boundary-safe protocol-family labels found in the owning banner. */
+  readonly bannerTokenCount?: number;
+  /** False once Microsoft's explanatory wording drifts from the 0.1.9 baseline. */
+  readonly bannerMatchesBaseline?: boolean;
+  /** Stable 32-bit identifier of label-masked banner chrome, excluding eligible editors. */
+  readonly bannerVariant?: string;
 }
 
 export interface GroupSnapshot {

@@ -693,7 +693,7 @@ test("Chromium protocol widgets distinguish safe data, repairable format, and ca
               <p>The protocol banner is not owned by a code block.</p>
             </div>
           </div>
-          <div data-testid="copilot-message-reply-div" id="changed-banner">
+          <div data-testid="copilot-message-reply-div" id="localized-banner-prose">
             <div data-testid="markdown-reply">
               <div class="scriptor-component-code-block">
                 <div data-testid="message-bar-body-info">Die Sprache cba-agent/1 wird nicht vollständig unterstützt.</div>
@@ -800,8 +800,15 @@ test("Chromium protocol widgets distinguish safe data, repairable format, and ca
   assert.equal(evidence[2]?.protocolErrorCode, "MULTIPLE_ENVELOPES");
   assert.equal(evidence[3]?.status, "unsupported_capture_contract");
   assert.equal(evidence[3]?.reasonCode, "PROTOCOL_WIDGET_NOT_OWNED");
-  assert.equal(evidence[4]?.status, "unsupported_capture_contract");
-  assert.equal(evidence[4]?.reasonCode, "PROTOCOL_WIDGET_BANNER_CONTRACT_CHANGED");
+  // Provenance is the owned protocol label, not Microsoft's explanatory prose:
+  // localized wording around a single `cba-agent/1` label stays executable, and
+  // the drift is reported as evidence instead of blocking the response path.
+  assert.equal(evidence[4]?.status, "protocol_reconstructed");
+  assert.equal(evidence[4]?.protocolVersion, "cba-agent/1");
+  assert.equal(evidence[4]?.bannerContract, "supported");
+  assert.equal(evidence[4]?.bannerTokenCount, 1);
+  assert.equal(evidence[4]?.bannerMatchesBaseline, false);
+  assert.match(evidence[4]?.bannerVariant ?? "", /^[0-9a-f]{8}$/u);
   assert.equal(evidence[5]?.status, "model_protocol_malformed");
   assert.equal(evidence[5]?.reasonCode, "MODEL_PROTOCOL_DIALECT_MISMATCH");
   assert.equal(evidence[6]?.status, "model_protocol_malformed");
@@ -828,11 +835,14 @@ test("Chromium protocol widgets distinguish safe data, repairable format, and ca
     },
   );
   assert.equal(inlineFenceTurn.messages[0]?.type, "progress");
+  // The inline-fence widget and the localized-prose widget: both own exactly one
+  // supported protocol label, so both are executable. Every other widget here is
+  // unsupported, ambiguous, unowned, or malformed and stays non-executable.
   assert.equal(
     observation.responses.elements.filter((element) =>
       element.responseCapture?.status === "protocol_reconstructed"
     ).length,
-    1,
+    2,
   );
 
   await page.evaluate((intent) => {
