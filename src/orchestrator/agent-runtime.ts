@@ -5102,6 +5102,18 @@ function completedResponseCaptureIssue(
         banner_count: evidence.bannerCount,
         line_count: evidence.lineCount,
         content_bytes: evidence.contentBytes,
+        ...(evidence.bannerContract === undefined
+          ? {}
+          : { banner_contract: evidence.bannerContract }),
+        ...(evidence.bannerTokenCount === undefined
+          ? {}
+          : { banner_protocol_label_count: evidence.bannerTokenCount }),
+        ...(evidence.bannerMatchesBaseline === undefined
+          ? {}
+          : { banner_matches_baseline: evidence.bannerMatchesBaseline }),
+        ...(evidence.bannerVariant === undefined
+          ? {}
+          : { banner_variant: evidence.bannerVariant }),
       },
     },
   };

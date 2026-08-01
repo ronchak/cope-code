@@ -109,7 +109,7 @@ export interface ResponseCaptureEvidence {
   readonly bannerTokenCount?: number;
   /** False once Microsoft's explanatory wording drifts from the 0.1.9 baseline. */
   readonly bannerMatchesBaseline?: boolean;
-  /** Stable 32-bit identifier of the label-masked, case/whitespace-folded banner. */
+  /** Stable 32-bit identifier of label-masked banner chrome, excluding eligible editors. */
   readonly bannerVariant?: string;
 }
 

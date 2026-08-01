@@ -107,6 +107,23 @@ test(
         reply("glued", codeBlock("xcba-agent/1 isn’t fully supported.", agentBody)),
         // 8: underscore lookalike yields no label at all.
         reply("underscore", codeBlock("cba_agent/1 isn’t fully supported.", agentBody)),
+        // 9: punctuation-adjacent labels are both counted, not skipped as overlaps.
+        reply(
+          "punctuation-adjacent-labels",
+          codeBlock("cba-agent/1,cba/1 are not fully supported.", agentBody),
+        ),
+        // 10: labels glued without any boundary cannot manufacture ownership.
+        reply(
+          "glued-labels",
+          codeBlock("cba-agent/1cba/1 isn’t fully supported.", agentBody),
+        ),
+        // 11: a non-ASCII letter is identifier adjacency, not a safe boundary.
+        reply("unicode-letter-adjacent", codeBlock("écba-agent/1", agentBody)),
+        // 12: textContent joins a label split across descendant text nodes.
+        reply(
+          "split-text-nodes",
+          codeBlock("<span>cba-agent</span><span>/1</span> is displayed as text.", agentBody),
+        ),
       ].join(""),
     );
     const evidence = observation.responses.elements.map((element) => element.responseCapture);
@@ -137,6 +154,9 @@ test(
     assert.equal(evidence[3]?.status, "protocol_widget_ambiguous");
     assert.equal(evidence[3]?.reasonCode, "PROTOCOL_WIDGET_BANNER_LABEL_AMBIGUOUS");
     assert.equal(evidence[3]?.bannerTokenCount, 2);
+    assert.equal(evidence[9]?.status, "protocol_widget_ambiguous");
+    assert.equal(evidence[9]?.reasonCode, "PROTOCOL_WIDGET_BANNER_LABEL_AMBIGUOUS");
+    assert.equal(evidence[9]?.bannerTokenCount, 2);
 
     // Unsupported and lookalike labels stay non-executable.
     for (const index of [4, 5, 6] as const) {
@@ -149,16 +169,21 @@ test(
 
     // Boundary-glued and underscore lookalikes carry no protocol label, so the
     // widget is never treated as protocol-owned and the JSON stays inert.
-    for (const index of [7, 8] as const) {
+    for (const index of [7, 8, 10, 11] as const) {
       assert.equal(evidence[index]?.status, "rendered_text");
       assert.equal(evidence[index]?.protocolBlockCount, 0);
       assert.equal(evidence[index]?.bannerContract, undefined);
     }
 
-    // Exactly the three well-formed widgets are executable.
+    // A label split across DOM text nodes is still one exact supported label.
+    assert.equal(evidence[12]?.status, "protocol_reconstructed");
+    assert.equal(evidence[12]?.protocolVersion, "cba-agent/1");
+    assert.equal(evidence[12]?.bannerTokenCount, 1);
+
+    // Exactly the four well-formed widgets are executable.
     assert.equal(
       evidence.filter((entry) => entry?.status === "protocol_reconstructed").length,
-      3,
+      4,
     );
 
     // The drifted-prose response must reconstruct and parse end to end.
@@ -169,7 +194,7 @@ test(
     });
     assert.equal(turn.messages[0]?.type, "progress");
 
-    // Generic JSON whose shape merely resembles an intent is not authority.
+    // JSON under a malformed lookalike label is not authority.
     assert.throws(
       () =>
         adapter.parseModelTurn(observation.responses.elements[8]?.text ?? "", {
@@ -258,6 +283,66 @@ test(
             </div>
           `,
         ),
+        // 7: quoting the supported label in ordinary Markdown prose is inert.
+        reply(
+          "quoted-label-in-markdown",
+          "<p>Example protocol label: <code>cba-agent/1</code>.</p>",
+        ),
+        // 8: CBA-shaped JSON in a generic JSON widget is never authority.
+        reply("generic-json-widget", codeBlock("json is displayed as plain text.", agentBody)),
+        // 9: a raw protocol fence outside an owned widget fails closed.
+        reply(
+          "unowned-raw-fence",
+          `<pre>\`\`\`cba-agent/1\n${agentBody}\n\`\`\`</pre>`,
+        ),
+        // 10-11: even malformed nesting cannot feed editor bytes into banner
+        // provenance. Both bodies are valid but intentionally different.
+        reply(
+          "nested-editor-body-a",
+          `
+            <div class="scriptor-component-code-block">
+              <div data-testid="message-bar-body-info">
+                ${drifted}
+                <div role="textbox" aria-readonly="true" aria-label="Code editor">
+                  <div data-line-index="0">${agentBody}</div>
+                </div>
+              </div>
+            </div>
+          `,
+        ),
+        reply(
+          "nested-editor-body-b",
+          `
+            <div class="scriptor-component-code-block">
+              <div data-testid="message-bar-body-info">
+                ${drifted}
+                <div role="textbox" aria-readonly="true" aria-label="Code editor">
+                  <div data-line-index="0">${JSON.stringify({
+                    kind: "agent_progress",
+                    phase: "discovering",
+                    summary: "different editor bytes",
+                  })}</div>
+                </div>
+              </div>
+            </div>
+          `,
+        ),
+        // 12: removing a nested editor must not join chrome fragments into a
+        // protocol label that never existed contiguously outside the editor.
+        reply(
+          "editor-separated-label-fragments",
+          `
+            <div class="scriptor-component-code-block">
+              <div data-testid="message-bar-body-info">
+                <span>cba-agent</span>
+                <div role="textbox" aria-readonly="true" aria-label="Code editor">
+                  <div data-line-index="0">${agentBody}</div>
+                </div>
+                <span>/1</span>
+              </div>
+            </div>
+          `,
+        ),
       ].join(""),
     );
     const evidence = observation.responses.elements.map((element) => element.responseCapture);
@@ -275,6 +360,23 @@ test(
     assert.equal(evidence[4]?.protocolErrorCode, "MISSING_ENVELOPE");
     assert.equal(evidence[6]?.status, "protocol_widget_ambiguous");
     assert.equal(evidence[6]?.reasonCode, "PROTOCOL_WIDGET_LINE_INDEX_INVALID");
+    assert.equal(evidence[7]?.status, "rendered_text");
+    assert.equal(evidence[7]?.protocolBlockCount, 0);
+    assert.equal(evidence[8]?.status, "rendered_text");
+    assert.equal(evidence[8]?.protocolBlockCount, 0);
+    assert.equal(evidence[9]?.status, "model_protocol_malformed");
+    assert.equal(evidence[9]?.reasonCode, "MODEL_PROTOCOL_UNOWNED_FENCE");
+    assert.equal(evidence[9]?.protocolErrorCode, "MISSING_ENVELOPE");
+
+    // Banner evidence is identical when only nested editor bytes differ.
+    for (const index of [10, 11] as const) {
+      assert.equal(evidence[index]?.status, "protocol_reconstructed");
+      assert.equal(evidence[index]?.bannerMatchesBaseline, false);
+      assert.match(evidence[index]?.bannerVariant ?? "", /^[0-9a-f]{8}$/u);
+    }
+    assert.equal(evidence[10]?.bannerVariant, evidence[11]?.bannerVariant);
+    assert.equal(evidence[12]?.status, "rendered_text");
+    assert.equal(evidence[12]?.protocolBlockCount, 0);
 
     // Legacy cba/1 stays reconstructable, and the 0.1.8 correlation identity is
     // still the legacy envelope rather than rendered text, despite drifted prose.
@@ -289,5 +391,16 @@ test(
       observation.responses.elements[5]?.correlationText,
       `\`\`\`cba/1\n${legacyBody}\n\`\`\``,
     );
+
+    const adapter = new CbaProtocolAdapter();
+    for (const index of [7, 8, 9] as const) {
+      assert.throws(
+        () => adapter.parseModelTurn(observation.responses.elements[index]?.text ?? "", {
+          taskId: "task_inert_protocol_examples",
+          turnId: `turn_000${String(index)}`,
+        }),
+        ProtocolParseError,
+      );
+    }
   },
 );

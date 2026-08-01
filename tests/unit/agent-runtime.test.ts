@@ -5543,6 +5543,56 @@ test("runtime repairs an unowned quoted fence without parsing it as authority", 
   assert.doesNotMatch(transport.submittedContents[1] ?? "", /quoted but never executable/u);
 });
 
+test("runtime records source-free banner drift evidence in model-response audit", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cba-runtime-banner-drift-evidence-"));
+  const localState = state(root);
+  const store = new SessionStore(path.join(root, "state"));
+  await store.create(localState);
+  const artifacts = new SessionArtifactStore(
+    path.join(store.sessionDirectory(localState.sessionId), "artifacts"),
+  );
+  const completion = JSON.stringify([{
+    type: "complete_task",
+    operationId: "op_complete_banner_drift",
+    claim: {
+      summary: "Capture evidence persisted.",
+      acceptanceCriteria: [],
+      validation: [],
+      skippedValidation: [],
+      remainingRisks: [],
+      recommendedFollowUp: [],
+    },
+  }]);
+  const captureEvidence = {
+    contractVersion: "response-capture/v2",
+    status: "protocol_reconstructed",
+    protocolVersion: "cba-agent/1",
+    codeBlockCount: 1,
+    protocolBlockCount: 1,
+    editorCount: 1,
+    bannerCount: 1,
+    lineCount: 1,
+    contentBytes: Buffer.byteLength(completion),
+    bannerContract: "supported",
+    bannerTokenCount: 1,
+    bannerMatchesBaseline: false,
+    bannerVariant: "deadbeef",
+  } as const;
+  const result = await runtimeForTest({
+    root,
+    state: localState,
+    store,
+    artifacts,
+    transport: new CompletedCaptureEvidenceTransport(completion, captureEvidence),
+  }).run();
+
+  assert.equal(result.status, "completed", result.reason);
+  assert.equal(await artifacts.getOptional("response-capture", "turn_0001"), undefined);
+  const events = await AuditLog.verify(path.join(root, "audit.jsonl"), localState.sessionId);
+  const responseEvent = events.find((event) => event.type === "model.response");
+  assert.deepEqual(responseEvent?.data.captureEvidence, captureEvidence);
+});
+
 for (const protocolErrorCode of [undefined, "NOT_A_REAL_CODE"] as const) {
   test(`runtime rejects model-malformed capture evidence with ${
     protocolErrorCode === undefined ? "no protocol code" : "an unknown protocol code"
@@ -5604,7 +5654,7 @@ for (
     ["protocol_widget_incomplete", "PROTOCOL_WIDGET_LINES_PENDING"],
     ["protocol_widget_ambiguous", "PROTOCOL_WIDGET_BANNER_COUNT"],
     ["protocol_widget_capture_failed", "PROTOCOL_WIDGET_CAPTURE_FAILED"],
-    ["unsupported_capture_contract", "PROTOCOL_WIDGET_BANNER_CONTRACT_CHANGED"],
+    ["unsupported_capture_contract", "PROTOCOL_WIDGET_NOT_OWNED"],
   ] as const
 ) {
   test(`runtime never parses a completed response classified as ${captureStatus}`, async () => {
@@ -5642,6 +5692,10 @@ for (
         bannerCount: 1,
         lineCount: 1,
         contentBytes: Buffer.byteLength(executableCompletion),
+        bannerContract: "supported",
+        bannerTokenCount: 1,
+        bannerMatchesBaseline: false,
+        bannerVariant: "deadbeef",
       },
     );
 
@@ -5670,6 +5724,24 @@ for (
       (captureEvent?.data.actual as Readonly<Record<string, unknown>> | undefined)
         ?.capture_status,
       captureStatus,
+    );
+    assert.deepEqual(
+      captureEvent?.data.actual,
+      {
+        capture_status: captureStatus,
+        protocol_version: "cba-agent/1",
+        reason_code: reasonCode,
+        code_block_count: 1,
+        protocol_block_count: 1,
+        editor_count: 1,
+        banner_count: 1,
+        line_count: 1,
+        content_bytes: Buffer.byteLength(executableCompletion),
+        banner_contract: "supported",
+        banner_protocol_label_count: 1,
+        banner_matches_baseline: false,
+        banner_variant: "deadbeef",
+      },
     );
   });
 }
