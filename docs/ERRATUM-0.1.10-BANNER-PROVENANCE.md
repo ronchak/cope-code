@@ -6,6 +6,12 @@ Status: correction adopted in 0.1.10. The 0.1.9 PRD is left unedited as a
 record of what that release actually decided and shipped; this erratum states
 what is true now and why the earlier decision was wrong.
 
+Verification scope: the reported Windows/Edge failure and its reason code are
+known, but this worktree has not observed the current live M365 banner wording
+and has not passed live Windows/Edge acceptance. Installed-Chromium tests use
+synthetic DOM fixtures; they exercise the real extraction code without
+attesting the current service DOM or prose.
+
 ## What 0.1.9 specified
 
 The 0.1.9 PRD treats the complete English M365 information-banner sentence as
@@ -72,13 +78,17 @@ Executable provenance requires, unchanged in strictness:
 
 What changed is only this: the surrounding sentence is no longer an execution
 gate. It is recorded instead, as `bannerMatchesBaseline` plus `bannerVariant`,
-a 32-bit identifier of the label-masked, case- and whitespace-folded banner.
+a 32-bit identifier of the label-masked, case- and whitespace-folded vendor
+banner chrome. Eligible Code-editor descendants are removed before label
+classification and hashing, so editor/body bytes cannot affect either field.
 
 This is **not** fuzzy matching, and the 0.1.9 prohibition it appears to relax
 still holds in substance. The label itself is still matched exactly, with
 non-consuming boundary assertions on both sides, so `cba-agent/10`,
 `cba-agent/1.0`, `xcba-agent/1`, and `cba_agent/1` are all distinct from
-`cba-agent/1` and none of them is executable. JSON shape is still never capture
+`cba-agent/1` and none of them is executable. Unicode letters, numbers, and
+combining marks are also treated as identifier adjacency, while Unicode
+punctuation remains a valid separator. JSON shape is still never capture
 authority. What was removed is authority that Microsoft's prose never should
 have had.
 
@@ -98,11 +108,12 @@ Two conditions remain fail-closed and are unchanged or strengthened:
 
 A future Microsoft banner change is now visible without a live-response mystery.
 A response that still carries one owned supported label keeps executing, and the
-drift shows up as `bannerMatchesBaseline: false` with a changed `bannerVariant`
-in capture evidence, audit, and — when some other condition does force a pause —
-in the browser-capture diagnostic. If Microsoft ever removes the protocol label
-itself, that is a genuine contract change and the widget correctly stops being
-executable.
+drift shows up as `bannerMatchesBaseline: false` in capture evidence and audit.
+Normalized prose changes also change `bannerVariant`; case- or whitespace-only
+drift may intentionally retain the same folded variant. When some other condition
+does force a pause, both fields reach the browser-capture diagnostic. If Microsoft
+ever removes the protocol label itself, that is a genuine contract change and the
+widget correctly stops being executable.
 
 ## Scope note on `cope doctor`
 
@@ -110,6 +121,7 @@ executable.
 synthetic fixtures only. In 0.1.9 its wording implied broader verification than
 it performed. It now covers the fail-closed banner branches as well as
 reconstruction, and it states explicitly that it does not open a browser and
-does not verify live M365 widget or banner compatibility. Live DOM compatibility
-is covered only by the installed-Chromium capture tests
-(`npm run test:chromium-safety`).
+does not verify live M365 widget or banner compatibility. Installed-Chromium
+capture tests (`npm run test:chromium-safety`) render synthetic fixtures in a
+real browser and cover the in-page extraction seam, but they are not live M365
+acceptance.

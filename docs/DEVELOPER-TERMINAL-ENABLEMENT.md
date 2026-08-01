@@ -39,7 +39,7 @@ cp .cba/repository.json .cba/repository.json.bak
 cope init . --quick --force
 ```
 
-Verified result on 0.1.10:
+Verified with the built 0.1.10 CLI in a disposable Git repository:
 
 ```
 schema_version:     cba-repository-config/2
@@ -88,9 +88,10 @@ Read two fields — `default_decision` and `capabilities.tools`:
 | `tools.deny` contains `terminal_exec` (the v1 `DEFAULT_ORGANIZATION_POLICY` shape) | **still blocked at the organization layer** |
 | `tools.allow` contains `terminal_exec` (`default-developer-organization`, revision 2) | **allowed** |
 
-An omission from `tools.allow` is not by itself a denial: unmatched tools fall
-through to `default_decision`. Only an explicit `deny` entry, or a
-`default_decision` of `deny`/`ask`, blocks the tool.
+Tool-rule precedence is `deny`, `ask`, `allow`, then `tools.unmatched`, then
+`default_decision`. An omission from `tools.allow` is therefore not by itself a
+denial, but `tools.ask`, or an `ask`/`deny` value in `tools.unmatched` or
+`default_decision`, still prevents an unconditional initial terminal grant.
 
 ## Step 3 — only if the machine layer blocks it
 

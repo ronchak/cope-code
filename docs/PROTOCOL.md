@@ -60,9 +60,11 @@ The `response-capture/v2` evidence contains only stable enums, versions,
 counts, line count, byte length, and bounded banner provenance: the banner
 classification, its protocol-label count, whether the surrounding prose still
 matches the recorded baseline wording, and a 32-bit identifier of the
-label-masked, case- and whitespace-folded banner. That identifier makes a future
-Microsoft wording change visible in evidence and audit without recording any
-response content. It follows a completed response through
+label-masked, case- and whitespace-folded vendor banner chrome. Eligible editor
+descendants are removed before classification and hashing, so response-body
+bytes cannot enter banner provenance. That identifier makes a future Microsoft
+wording change visible in evidence and audit without recording any response
+content. It follows a completed response through
 audit and integrity-checked crash recovery. Separate correlation text
 reproduces the exact 0.1.8 legacy trimming and editor-order predicate so old
 response baselines do not silently rebind when normalized protocol content has
@@ -70,8 +72,9 @@ a different display representation. `cope doctor` runs the same host
 normalizer against fixed source-free fixtures, covering reconstruction and the
 fail-closed banner branches; it does not read or mutate a live conversation. It
 does not open a browser or render DOM, so it cannot attest live M365 widget or
-banner compatibility — that seam is covered only by the installed-Chromium
-capture tests.
+banner compatibility. Installed-Chromium capture tests exercise the in-page
+extraction seam against synthetic DOM fixtures in a real browser; they also do
+not constitute live M365 acceptance.
 
 The model-facing root is one of:
 

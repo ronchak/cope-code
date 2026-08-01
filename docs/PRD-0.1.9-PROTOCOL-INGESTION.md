@@ -5,10 +5,11 @@ acceptance pending
 
 > **Erratum (0.1.10).** This document is retained as the historical record of
 > the 0.1.9 decision. Its treatment of the complete English M365 banner sentence
-> as an exact, immutable capture contract was wrong and caused a live outage of
-> the response path when Microsoft's surrounding prose changed. The immutable
-> provenance requirement is the exact supported protocol label and its block
-> ownership, not Microsoft's mutable explanatory sentence. See
+> as an exact, immutable capture contract was wrong and caused a live response
+> outage when the captured banner failed that full-sentence equality check. The
+> exact current service wording was not retained or observed in this worktree.
+> The immutable provenance requirement is the exact supported protocol label
+> and its block ownership, not Microsoft's mutable explanatory sentence. See
 > [`ERRATUM-0.1.10-BANNER-PROVENANCE.md`](ERRATUM-0.1.10-BANNER-PROVENANCE.md).
 > Statements below about exact banner matching describe 0.1.9 as shipped, not
 > current behavior.
