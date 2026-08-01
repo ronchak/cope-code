@@ -31,6 +31,7 @@ import type {
   ToolName,
   ToolOutcome,
 } from "./contracts.js";
+import { sanitizedCaptureEvidence } from "./response-capture-evidence.js";
 
 const MODEL_MESSAGE_TYPES = new Set<ProtocolMessage["message_type"]>([
   "tool_request",
@@ -102,7 +103,7 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
       readonly captureEvidence?: Readonly<Record<string, unknown>>;
     },
   ): ParsedModelTurn {
-    enforceOwnedReconstructedCapture(expected.captureEvidence);
+    const captureStatus = enforceOwnedReconstructedCapture(expected.captureEvidence);
     const actualBytes = Buffer.byteLength(raw, "utf8");
     if (actualBytes > DEFAULT_MAX_PROTOCOL_INPUT_BYTES) {
       throw new ProtocolParseError(
@@ -175,6 +176,17 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
           expectedTurnId: numericTurn,
         }];
       }
+    }
+    if (captureStatus === "rendered_text") {
+      throw new ProtocolParseError(
+        "INVALID_MESSAGE",
+        "Rendered-text capture evidence does not establish an owned reconstructed protocol widget.",
+        {
+          stage: "model_response_capture",
+          capture_ownership_failed: true,
+        },
+        false,
+      );
     }
     return {
       protocolVersion: "cba/1",
@@ -462,22 +474,25 @@ function parseTurnId(value: string): number {
 
 function enforceOwnedReconstructedCapture(
   evidence: Readonly<Record<string, unknown>> | undefined,
-): void {
-  if (evidence === undefined) return;
-  if (
-    evidence.contractVersion === "response-capture/v2" &&
-    evidence.status === "protocol_reconstructed"
-  ) {
-    return;
+): "rendered_text" | "protocol_reconstructed" | undefined {
+  if (evidence === undefined) return undefined;
+  const capture = sanitizedCaptureEvidence(evidence);
+  if (capture === undefined) {
+    throw new ProtocolParseError(
+      "INVALID_MESSAGE",
+      "Response capture evidence failed strict validation.",
+      {
+        stage: "model_response_capture",
+        capture_evidence_invalid: true,
+      },
+      false,
+    );
   }
-  const code = evidence.protocolErrorCode;
-  if (
-    evidence.contractVersion === "response-capture/v2" &&
-    evidence.status === "model_protocol_malformed" &&
-    typeof code === "string" &&
-    Object.hasOwn(MODEL_PROTOCOL_CAPTURE_ERROR_MESSAGES, code)
-  ) {
-    const protocolCode = code as keyof typeof MODEL_PROTOCOL_CAPTURE_ERROR_MESSAGES;
+  if (capture.status === "rendered_text" || capture.status === "protocol_reconstructed") {
+    return capture.status;
+  }
+  if (capture.status === "model_protocol_malformed") {
+    const protocolCode = capture.protocolErrorCode as keyof typeof MODEL_PROTOCOL_CAPTURE_ERROR_MESSAGES;
     throw new ProtocolParseError(
       protocolCode,
       MODEL_PROTOCOL_CAPTURE_ERROR_MESSAGES[protocolCode],

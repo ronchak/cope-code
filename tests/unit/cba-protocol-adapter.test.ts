@@ -296,6 +296,119 @@ test("CBA adapter rejects an unowned captured fence when the runtime gate is byp
   assert.equal(withReconstructedEvidence.messages[0]?.type, "progress");
 });
 
+test("CBA adapter preserves runtime semantics for every capture evidence status", () => {
+  const adapter = new CbaProtocolAdapter();
+  const expected = {
+    taskId: "task_12345678",
+    turnId: "turn_0001",
+  } as const;
+  const plainProse = "This is ordinary rendered prose.";
+  const progressBody =
+    '{"kind":"agent_progress","phase":"discovering","summary":"Progress update."}';
+  const progressFence = [
+    "```cba-agent/1",
+    progressBody,
+    "```",
+  ].join("\n");
+  const evidence = (
+    status: string,
+    raw: string,
+    extra: Readonly<Record<string, unknown>> = {},
+  ): Readonly<Record<string, unknown>> => ({
+    contractVersion: "response-capture/v2",
+    status,
+    codeBlockCount: 0,
+    protocolBlockCount: 0,
+    editorCount: 0,
+    bannerCount: 0,
+    lineCount: 0,
+    contentBytes: Buffer.byteLength(raw, "utf8"),
+    ...extra,
+  });
+  const parseError = (
+    raw: string,
+    captureEvidence?: Readonly<Record<string, unknown>>,
+  ): ProtocolParseError => {
+    try {
+      adapter.parseModelTurn(raw, {
+        ...expected,
+        ...(captureEvidence === undefined ? {} : { captureEvidence }),
+      });
+    } catch (error) {
+      assert.ok(error instanceof ProtocolParseError);
+      return error;
+    }
+    assert.fail("expected a protocol parse failure");
+  };
+
+  const withoutEvidence = parseError(plainProse);
+  assert.equal(withoutEvidence.protocolCode, "MISSING_ENVELOPE");
+  assert.equal(withoutEvidence.repairable, true);
+
+  const renderedText = parseError(
+    plainProse,
+    evidence("rendered_text", plainProse),
+  );
+  assert.equal(renderedText.protocolCode, "MISSING_ENVELOPE");
+  assert.equal(renderedText.repairable, true);
+
+  const reconstructed = adapter.parseModelTurn(progressFence, {
+    ...expected,
+    captureEvidence: evidence("protocol_reconstructed", progressFence, {
+      protocolVersion: "cba-agent/1",
+      codeBlockCount: 1,
+      protocolBlockCount: 1,
+      editorCount: 1,
+      bannerCount: 1,
+      lineCount: 1,
+      contentBytes: Buffer.byteLength(progressBody, "utf8"),
+    }),
+  });
+  assert.equal(reconstructed.messages.length, 1);
+  assert.equal(reconstructed.messages[0]?.type, "progress");
+
+  const malformed = parseError(
+    progressFence,
+    evidence("model_protocol_malformed", progressFence, {
+      protocolErrorCode: "MISSING_ENVELOPE",
+      codeBlockCount: 1,
+      editorCount: 1,
+    }),
+  );
+  assert.equal(malformed.protocolCode, "MISSING_ENVELOPE");
+  assert.equal(malformed.repairable, true);
+  assert.equal(malformed.details.stage, "model_response_capture");
+  assert.equal(malformed.details.capture_evidence, undefined);
+
+  const renderedFence = parseError(
+    progressFence,
+    evidence("rendered_text", progressFence),
+  );
+  assert.equal(renderedFence.protocolCode, "INVALID_MESSAGE");
+  assert.equal(renderedFence.repairable, false);
+  assert.equal(renderedFence.details.capture_ownership_failed, true);
+
+  for (const status of [
+    "protocol_widget_incomplete",
+    "protocol_widget_ambiguous",
+    "protocol_widget_capture_failed",
+    "unsupported_capture_contract",
+  ]) {
+    const error = parseError(progressFence, evidence(status, progressFence));
+    assert.equal(error.protocolCode, "INVALID_MESSAGE", status);
+    assert.equal(error.repairable, false, status);
+    assert.equal(error.details.capture_ownership_failed, true, status);
+  }
+
+  const invalidEvidence = parseError(progressFence, {
+    contractVersion: "response-capture/v2",
+    status: "protocol_reconstructed",
+  });
+  assert.equal(invalidEvidence.protocolCode, "INVALID_MESSAGE");
+  assert.equal(invalidEvidence.repairable, false);
+  assert.equal(invalidEvidence.details.capture_evidence_invalid, true);
+});
+
 test("legacy task and turn identity are rebound only for marker-proven live turns", () => {
   const legacy = serializeProtocolEnvelope({
     protocol: "cba/1",
