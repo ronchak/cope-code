@@ -41,6 +41,15 @@ const MODEL_MESSAGE_TYPES = new Set<ProtocolMessage["message_type"]>([
   "blocked",
 ]);
 
+const MODEL_PROTOCOL_CAPTURE_ERROR_MESSAGES = {
+  MISSING_ENVELOPE: "The model response quoted a protocol fence outside an owned protocol widget.",
+  MULTIPLE_ENVELOPES: "The captured model response contains more than one protocol envelope.",
+  UNSUPPORTED_VERSION: "The captured model response used an unsupported protocol version.",
+  EMPTY_ENVELOPE: "The captured model response contains an empty protocol envelope.",
+  INVALID_JSON: "The captured model response does not contain complete, valid JSON.",
+  SCHEMA_INVALID: "The captured model response body does not match its declared protocol dialect.",
+} as const;
+
 export interface CbaProtocolAdapterOptions {
   readonly seenOperationIds?: () => ReadonlySet<string>;
   readonly pathKey?: (value: string) => string;
@@ -93,6 +102,7 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
       readonly captureEvidence?: Readonly<Record<string, unknown>>;
     },
   ): ParsedModelTurn {
+    enforceOwnedReconstructedCapture(expected.captureEvidence);
     const actualBytes = Buffer.byteLength(raw, "utf8");
     if (actualBytes > DEFAULT_MAX_PROTOCOL_INPUT_BYTES) {
       throw new ProtocolParseError(
@@ -448,6 +458,42 @@ function parseTurnId(value: string): number {
     throw new AgentError("PROTOCOL_INVALID", `Invalid turn identifier '${value}'`);
   }
   return numeric;
+}
+
+function enforceOwnedReconstructedCapture(
+  evidence: Readonly<Record<string, unknown>> | undefined,
+): void {
+  if (evidence === undefined) return;
+  if (
+    evidence.contractVersion === "response-capture/v2" &&
+    evidence.status === "protocol_reconstructed"
+  ) {
+    return;
+  }
+  const code = evidence.protocolErrorCode;
+  if (
+    evidence.contractVersion === "response-capture/v2" &&
+    evidence.status === "model_protocol_malformed" &&
+    typeof code === "string" &&
+    Object.hasOwn(MODEL_PROTOCOL_CAPTURE_ERROR_MESSAGES, code)
+  ) {
+    const protocolCode = code as keyof typeof MODEL_PROTOCOL_CAPTURE_ERROR_MESSAGES;
+    throw new ProtocolParseError(
+      protocolCode,
+      MODEL_PROTOCOL_CAPTURE_ERROR_MESSAGES[protocolCode],
+      { stage: "model_response_capture" },
+      true,
+    );
+  }
+  throw new ProtocolParseError(
+    "INVALID_MESSAGE",
+    "Capture evidence does not establish an owned reconstructed protocol widget.",
+    {
+      stage: "model_response_capture",
+      capture_ownership_failed: true,
+    },
+    false,
+  );
 }
 
 function strings(value: unknown): readonly string[] {

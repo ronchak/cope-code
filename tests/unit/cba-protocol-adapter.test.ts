@@ -231,6 +231,71 @@ test("CBA adapter repairs only parser failures explicitly marked repairable", ()
   }
 });
 
+test("CBA adapter rejects an unowned captured fence when the runtime gate is bypassed", () => {
+  const adapter = new CbaProtocolAdapter();
+  const body =
+    '{"kind":"agent_progress","phase":"discovering","summary":"Parser-valid bytes without widget ownership."}';
+  const fence = [
+    "```cba-agent/1",
+    body,
+    "```",
+  ].join("\n");
+  const unownedCaptureEvidence = {
+    contractVersion: "response-capture/v2",
+    status: "model_protocol_malformed",
+    reasonCode: "MODEL_PROTOCOL_UNOWNED_FENCE",
+    protocolErrorCode: "MISSING_ENVELOPE",
+    codeBlockCount: 1,
+    protocolBlockCount: 0,
+    editorCount: 1,
+    bannerCount: 0,
+    lineCount: 0,
+    contentBytes: 50,
+  } as const;
+  const expected = {
+    taskId: "task_12345678",
+    turnId: "turn_0001",
+  } as const;
+
+  assert.throws(
+    () => adapter.parseModelTurn(fence, {
+      ...expected,
+      captureEvidence: unownedCaptureEvidence,
+    }),
+    (error: unknown) =>
+      error instanceof ProtocolParseError &&
+      error.protocolCode === "MISSING_ENVELOPE" &&
+      error.repairable === true &&
+      error.details.stage === "model_response_capture",
+  );
+
+  const withoutEvidence = adapter.parseModelTurn(fence, expected);
+  assert.equal(withoutEvidence.messages.length, 1);
+  assert.equal(withoutEvidence.messages[0]?.type, "progress");
+
+  const reconstructedCaptureEvidence = {
+    contractVersion: "response-capture/v2",
+    status: "protocol_reconstructed",
+    protocolVersion: "cba-agent/1",
+    codeBlockCount: 1,
+    protocolBlockCount: 1,
+    editorCount: 1,
+    bannerCount: 1,
+    lineCount: 1,
+    contentBytes: Buffer.byteLength(body),
+    bannerContract: "supported",
+    bannerTokenCount: 1,
+    bannerMatchesBaseline: false,
+    bannerVariant: "deadbeef",
+  } as const;
+  const withReconstructedEvidence = adapter.parseModelTurn(fence, {
+    ...expected,
+    captureEvidence: reconstructedCaptureEvidence,
+  });
+  assert.equal(withReconstructedEvidence.messages.length, 1);
+  assert.equal(withReconstructedEvidence.messages[0]?.type, "progress");
+});
+
 test("legacy task and turn identity are rebound only for marker-proven live turns", () => {
   const legacy = serializeProtocolEnvelope({
     protocol: "cba/1",
