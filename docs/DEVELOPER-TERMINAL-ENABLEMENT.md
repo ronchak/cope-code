@@ -38,7 +38,9 @@ Tool-rule provenance follows runtime precedence exactly:
 `capabilities.tools.deny`, then `capabilities.tools.ask`, then
 `capabilities.tools.allow`, then `capabilities.tools.unmatched`, then
 `default_decision`. A missing `capabilities.tools` falls through to
-`default_decision`.
+`default_decision`. Strict policy validation rejects a tool that appears in
+more than one of the `allow`, `ask`, and `deny` lists, so doctor reports a
+persisted conflict as malformed rather than assigning it a decision.
 
 The separate required `Browser setup` check continues to inspect overall
 machine configuration, including organization-policy validity. Therefore

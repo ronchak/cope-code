@@ -34,7 +34,10 @@ output records the repository file/schema/enable bit, evaluated provenance, and
 machine status; machine policy identity, revision, field, and decision appear
 only after a valid machine policy was read by that check. The separate required
 Browser setup check still validates overall machine configuration. Doctor never
-changes grants or policy files.
+changes grants or policy files. Tool rules resolve in `deny`, `ask`, `allow`,
+`unmatched`, then policy-default order. Strict validation rejects a tool listed
+in more than one explicit rule set, so a persisted conflict is malformed and
+has no reported policy decision.
 
 ## Runtime modes
 

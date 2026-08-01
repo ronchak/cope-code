@@ -7,11 +7,16 @@ import test from "node:test";
 
 import { LEGACY_REPOSITORY_CONFIG_VERSION, REPOSITORY_CONFIG_VERSION } from "../../src/config/types.js";
 import { executeDoctorCommand } from "../../src/cli/doctor.js";
+import { resolveTerminalToolDecision } from "../../src/cli/doctor-probe.js";
 import { configurationPaths } from "../../src/cli/onboarding.js";
 import {
   DEFAULT_DEVELOPER_ORGANIZATION_POLICY,
   DEFAULT_DEVELOPER_REPOSITORY_POLICY,
   DEFAULT_REPOSITORY_POLICY,
+  PolicyEngine,
+  createDefaultSessionGrant,
+  validatePolicyDocument,
+  zeroPolicyBudgetUsage,
   type PolicyDocument,
 } from "../../src/policy/index.js";
 import { DEFAULT_GIT_EXECUTABLE } from "../../src/repository/boundary.js";
@@ -300,6 +305,149 @@ test("doctor reports machine ask provenance without calling it a denial", async 
   assert.equal(machine.decision, "ask");
   assert.equal(machine.policy_id, "machine-ask");
   assert.equal(machine.revision, "12");
+});
+
+test("terminal resolver pins deny, ask, and explicit-rule provenance precedence", () => {
+  const cases: readonly {
+    readonly name: string;
+    readonly policy: PolicyDocument;
+    readonly decision: "allow" | "ask" | "deny";
+    readonly field: string;
+    readonly valid: boolean;
+  }[] = [
+    {
+      name: "deny wins over allow",
+      policy: policyWithTerminalRules(
+        DEFAULT_DEVELOPER_ORGANIZATION_POLICY,
+        { deny: ["terminal_exec"], allow: ["terminal_exec"] },
+      ),
+      decision: "deny",
+      field: "capabilities.tools.deny",
+      valid: false,
+    },
+    {
+      name: "ask wins over allow",
+      policy: policyWithTerminalRules(
+        DEFAULT_DEVELOPER_ORGANIZATION_POLICY,
+        { ask: ["terminal_exec"], allow: ["terminal_exec"] },
+      ),
+      decision: "ask",
+      field: "capabilities.tools.ask",
+      valid: false,
+    },
+    {
+      name: "explicit allow wins over unmatched deny",
+      policy: policyWithTerminalRules(
+        DEFAULT_DEVELOPER_ORGANIZATION_POLICY,
+        { allow: ["terminal_exec"], unmatched: "deny" },
+      ),
+      decision: "allow",
+      field: "capabilities.tools.allow",
+      valid: true,
+    },
+  ];
+
+  for (const entry of cases) {
+    assert.deepEqual(
+      resolveTerminalToolDecision(entry.policy),
+      { decision: entry.decision, field: entry.field },
+      entry.name,
+    );
+    assert.equal(validatePolicyDocument(entry.policy).valid, entry.valid, entry.name);
+  }
+});
+
+test("terminal resolver agrees with PolicyEngine across valid tool-rule combinations", () => {
+  const decisions = ["allow", "ask", "deny"] as const;
+  const cases: {
+    readonly name: string;
+    readonly policy: PolicyDocument;
+    readonly field: string;
+  }[] = [];
+
+  for (const explicit of decisions) {
+    for (const unmatched of decisions) {
+      cases.push({
+        name: `${explicit} rule with ${unmatched} unmatched`,
+        policy: policyWithTerminalRules(
+          DEFAULT_DEVELOPER_ORGANIZATION_POLICY,
+          { [explicit]: ["terminal_exec"], unmatched },
+        ),
+        field: `capabilities.tools.${explicit}`,
+      });
+    }
+  }
+  for (const unmatched of decisions) {
+    cases.push({
+      name: `unmatched ${unmatched}`,
+      policy: policyWithTerminalRules(DEFAULT_DEVELOPER_ORGANIZATION_POLICY, { unmatched }),
+      field: "capabilities.tools.unmatched",
+    });
+  }
+  for (const defaultDecision of decisions) {
+    cases.push({
+      name: `default ${defaultDecision}`,
+      policy: policyWithoutTerminalRules(DEFAULT_DEVELOPER_ORGANIZATION_POLICY, defaultDecision),
+      field: "default_decision",
+    });
+  }
+
+  const session = createDefaultSessionGrant({
+    grant_id: "grant_doctor_terminal_precedence",
+    task_id: "task_doctor_terminal_precedence",
+    repository_root: process.cwd(),
+    mode: "auto",
+    readable_paths: ["**"],
+    writable_paths: ["**"],
+    enable_terminal_exec: true,
+  });
+
+  for (const entry of cases) {
+    assert.equal(validatePolicyDocument(entry.policy).valid, true, entry.name);
+    const resolved = resolveTerminalToolDecision(entry.policy);
+    const effective = new PolicyEngine({
+      organization: entry.policy,
+      repository: DEFAULT_DEVELOPER_REPOSITORY_POLICY,
+      session,
+    }).evaluate({
+      tool: "terminal_exec",
+      projected_usage: zeroPolicyBudgetUsage(),
+      planned_disclosure_bytes: 0,
+    });
+    const engineCheck = effective.checks.find(
+      (check) => check.layer === "organization" && check.dimension === "tool",
+    );
+
+    assert.ok(engineCheck, `${entry.name}: PolicyEngine omitted the organization tool check`);
+    assert.equal(resolved.decision, engineCheck.decision, entry.name);
+    assert.equal(resolved.field, entry.field, entry.name);
+  }
+});
+
+test("doctor reports persisted overlapping terminal rules as malformed", async (context) => {
+  const fixture = await createFixture(context);
+  await writeRepositoryConfig(fixture, repositoryConfig({
+    schema_version: REPOSITORY_CONFIG_VERSION,
+    developer_terminal_enabled: true,
+    policy: DEFAULT_DEVELOPER_REPOSITORY_POLICY,
+  }));
+  await writeMachinePolicy(fixture, policyWithTerminalRules(
+    DEFAULT_DEVELOPER_ORGANIZATION_POLICY,
+    { deny: ["terminal_exec"], allow: ["terminal_exec"] },
+    { policy_id: "machine-conflict", revision: "3" },
+  ));
+
+  const check = await runDoctor(fixture);
+  const machine = machineEvidence(check);
+
+  assert.equal(check.ok, false);
+  assert.match(check.detail, /malformed or not a valid organization policy/u);
+  assert.match(String(machine.error), /appears in both allow and deny/u);
+  assert.equal(machine.status, "malformed");
+  assert.equal(machine.path, fixture.machinePolicyFile);
+  assert.equal("field" in machine, false);
+  assert.equal("decision" in machine, false);
+  assert.equal("policy_id" in machine, false);
 });
 
 async function createFixture(context: test.TestContext): Promise<Fixture> {
