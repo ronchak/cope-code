@@ -60,6 +60,41 @@ preserving the exact authority of existing configurations and sessions.
 - `cope doctor` reports the repository schema and Developer enable bit while
   reminding operators that managed policy still applies.
 
+## Protocol-widget provenance and ownership
+
+- Executable capture now depends on exactly one response-block-owned banner
+  carrying exactly one boundary-safe `cba-agent/1` or `cba/1` label. The
+  surrounding Microsoft explanatory prose is recorded as drift evidence, not
+  treated as execution authority.
+- Capture evidence records `bannerContract`, `bannerTokenCount`,
+  `bannerMatchesBaseline`, and `bannerVariant`. A banner containing multiple
+  protocol labels now fails closed as
+  `PROTOCOL_WIDGET_BANNER_LABEL_AMBIGUOUS`; the former
+  `PROTOCOL_WIDGET_BANNER_CONTRACT_CHANGED` reason is retired.
+- The protocol adapter independently enforces owned, reconstructed capture
+  evidence before parsing, so acceptance no longer depends only on runtime call
+  order. Capture-evidence sanitization is shared across this boundary and review
+  export, while ordinary rendered-prose repair behavior remains available.
+
+## Developer-terminal diagnosis
+
+- `cope doctor` now identifies the first layer that prevents an unconditional
+  `terminal_exec` grant. It reports the concrete file, field, decision, policy
+  ID, and revision for repository and machine-policy decisions.
+- The diagnostic distinguishes absent, unreadable, and malformed machine policy
+  from explicit `ask` or `deny` decisions. It is read-only and does not change
+  configuration, policy, or session authority.
+
+## Acceptance operations and review evidence
+
+- A Windows/Edge live-acceptance runbook now defines the operator procedure and
+  bounded evidence record. Adding the runbook is not live acceptance: current
+  M365 banner wording and live Windows/Edge behavior remain unverified.
+- `cope export-review` now emits `body.capture` containing the newest strictly
+  sanitized capture evidence, or an explicit `not_recorded` state. Response
+  content, prompts, credentials, and identity data are not added to the review
+  package by this field.
+
 ## Deliberate limits
 
 The Developer terminal is one-shot only. It has no stdin, PTY, persistent

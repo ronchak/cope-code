@@ -51,7 +51,7 @@ Any `FAIL` or `PENDING` P0 row is a no-go.
 
 | ID | P | Gate and threshold | Required evidence | Status |
 | --- | --- | --- | --- | --- |
-| OFF-01 | P0 | Clean `npm ci`, TypeScript build, unit tests, and end-to-end fixture loop pass from lockfile. | signed CI/terminal record and immutable revision | PENDING immutable/reviewed evidence |
+| OFF-01 | P0 | Clean `npm ci`, TypeScript build, unit tests, and end-to-end fixture loop pass from lockfile. | signed CI/terminal record and immutable revision | PENDING release-owner review; a local terminal record and unsigned preview bundles exist for an immutable candidate, but signed CI evidence remains absent |
 | OFF-02 | P0 | Replay transport rejects order, correlation, version, and content-digest drift. | transport tests | PENDING review |
 | OFF-03 | P0 | Parser rejects missing/multiple/nested/truncated/oversized/wrong-version/wrong-task/wrong-turn/duplicate/invalid-batch adversarial cases. | adversarial corpus results | PENDING review |
 | OFF-04 | P0 | Organization/repository/session precedence and every allow/ask/deny dimension pass; no grant overrides higher deny. | policy tests | PENDING review |
