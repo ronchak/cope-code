@@ -429,6 +429,8 @@ function Get-BoundedReviewRecord {
         "export-review", $SessionId, "--json", "--output", $ReviewFile, "--state-home", $StateHome
     )
     $Review = $null
+    $Capture = $null
+    $CaptureState = $null
     $Exported =
         $Call.exitCode -eq 0 -and
         $null -ne $Call.json -and
@@ -438,18 +440,25 @@ function Get-BoundedReviewRecord {
     if ($Exported -and (Test-Path -LiteralPath $ReviewFile -PathType Leaf)) {
         try {
             $Review = Get-Content -LiteralPath $ReviewFile -Raw | ConvertFrom-Json
+            $Capture = $Review.body.capture
+            $CaptureState = if ($null -ne $Capture) { [string]$Capture.state } else { $null }
             $Parsed =
                 $null -ne $Review -and
                 [string]$Review.version -eq "cba-review-package/1" -and
                 $null -ne $Review.body -and
                 $null -ne $Review.body.session -and
                 [string]$Review.body.session.sessionId -eq $SessionId -and
-                [string]$Review.integrity.algorithm -eq "sha256"
+                [string]$Review.integrity.algorithm -eq "sha256" -and
+                $CaptureState -in @("not_recorded", "recorded") -and
+                ($CaptureState -ne "recorded" -or $null -ne $Capture.evidence)
         } catch {
             $Review = $null
             $Parsed = $false
         }
     }
+
+    $RecordedCapture = $Parsed -and $CaptureState -eq "recorded"
+    $CaptureEvidence = if ($RecordedCapture) { $Capture.evidence } else { $null }
 
     return [pscustomobject]@{
         exitCode = $Call.exitCode
@@ -460,6 +469,22 @@ function Get-BoundedReviewRecord {
             version = if ($Parsed) { [string]$Review.version } else { $null }
             sessionId = if ($Parsed) { [string]$Review.body.session.sessionId } else { $SessionId }
             status = if ($Parsed) { [string]$Review.body.session.status } else { $null }
+            captureState = if ($Parsed) { $CaptureState } else { $null }
+            captureContractVersion = if ($RecordedCapture) { [string]$CaptureEvidence.contractVersion } else { $null }
+            captureStatus = if ($RecordedCapture) { [string]$CaptureEvidence.status } else { $null }
+            captureProtocolVersion = if ($RecordedCapture -and $null -ne $CaptureEvidence.protocolVersion) { [string]$CaptureEvidence.protocolVersion } else { $null }
+            captureReasonCode = if ($RecordedCapture -and $null -ne $CaptureEvidence.reasonCode) { [string]$CaptureEvidence.reasonCode } else { $null }
+            captureProtocolErrorCode = if ($RecordedCapture -and $null -ne $CaptureEvidence.protocolErrorCode) { [string]$CaptureEvidence.protocolErrorCode } else { $null }
+            codeBlockCount = if ($RecordedCapture) { $CaptureEvidence.codeBlockCount } else { $null }
+            protocolBlockCount = if ($RecordedCapture) { $CaptureEvidence.protocolBlockCount } else { $null }
+            editorCount = if ($RecordedCapture) { $CaptureEvidence.editorCount } else { $null }
+            bannerCount = if ($RecordedCapture) { $CaptureEvidence.bannerCount } else { $null }
+            lineCount = if ($RecordedCapture) { $CaptureEvidence.lineCount } else { $null }
+            contentBytes = if ($RecordedCapture) { $CaptureEvidence.contentBytes } else { $null }
+            bannerContract = if ($RecordedCapture -and $null -ne $CaptureEvidence.bannerContract) { [string]$CaptureEvidence.bannerContract } else { $null }
+            bannerTokenCount = if ($RecordedCapture) { $CaptureEvidence.bannerTokenCount } else { $null }
+            bannerMatchesBaseline = if ($RecordedCapture) { $CaptureEvidence.bannerMatchesBaseline } else { $null }
+            bannerVariant = if ($RecordedCapture -and $null -ne $CaptureEvidence.bannerVariant) { [string]$CaptureEvidence.bannerVariant } else { $null }
             turns = if ($Parsed) { $Review.body.budgets.usage.turns } else { $null }
             operations = if ($Parsed) { $Review.body.budgets.usage.operations } else { $null }
             completedOperations = if ($Parsed) { $Review.body.counts.completedOperations } else { $null }
@@ -513,7 +538,7 @@ if ($ResumeReadyById[$ProtocolSession]) {
 }
 ```
 
-The audit projection deliberately omits `finalEventHash`. The review projection includes only the listed version, session, status, count, budget, mutation, validation, audit-count, and integrity-algorithm fields; it omits `bodySha256` and all other hashes. Do not print the review file or the raw command responses.
+The audit projection deliberately omits `finalEventHash`. The review projection includes only the listed version, session, status, count, budget, mutation, validation, audit-count, integrity-algorithm, and sanitized capture fields; it omits `bodySha256` and all other hashes. Do not print the review file or the raw command responses.
 
 ### 2. Developer-terminal scenario
 
@@ -553,9 +578,9 @@ These are the fields the currently supported source-free commands can truthfully
 | `cope sessions` | `status`, resumability, recovery disposition, and recovery reason for a session | No banner or capture fields. The raw form also contains the objective and repository root; do not share it. |
 | `cope status` | Turns, `budgets.usage.operations`, mutation/validation/pending counts, `pauseReason`, and failure code/message | No structured capture object; none of `bannerContract`, `bannerTokenCount`, `bannerMatchesBaseline`, `bannerVariant`, `protocolErrorCode`, or a classification branch. A `reasonCode` may survive only inside free-form `pauseReason` or the failure message. This runbook emits only the whitelisted capture code extracted from those strings and the structurally safe failure code; it never emits either string. |
 | `cope verify-audit` | Validity, session ID, audit event count, final hash, and disclosure-ledger validity | Verifies integrity but emits no events or capture fields. The runbook omits the final hash from share output. |
-| `cope export-review` | Source-free counts, budgets, mutation/validation metadata, and an audit summary | Deliberately omits raw audit events and therefore all capture fields, classification branches, `reasonCode`, and `protocolErrorCode`. The runbook also omits the review body hash and all other hashes from share output. |
+| `cope export-review` | Source-free counts, budgets, mutation/validation metadata, audit summary, and the newest strictly sanitized capture evidence; `capture.state` explicitly reports `recorded` or `not_recorded` | Exposes no raw audit events or response content. The runbook omits the review body hash and all other hashes from share output. |
 
-The genuine gap is that the current supported source-free commands cannot export banner drift or classification details. Do not propose a new command and do not inspect raw audit or review material. A post-run `budgets.usage.operations > 0` proves that this session durably registered at least one normalized operation selected from a model response; it does not prove that the operation succeeded. To attribute that fact to this resume, require `postOperations > preOperations`. A zero or unchanged operation count cannot prove that the current response path executed.
+The capture-evidence surfacing gap is closed for `cope export-review`: it reports the newest eligible `model.response` or `protocol.error` capture evidence after strict shared sanitization, or explicitly reports `capture.state=not_recorded` when no eligible event carries capture evidence. It still exposes no raw audit events or response content. Do not inspect raw audit or review material. A post-run `budgets.usage.operations > 0` proves that this session durably registered at least one normalized operation selected from a model response; it does not prove that the operation succeeded. To attribute that fact to this resume, require `postOperations > preOperations`. A zero or unchanged operation count cannot prove that the current response path executed.
 
 ## Verdict rules
 
@@ -566,8 +591,12 @@ Keep response-path execution separate from scenario completion/status.
 | `postOperations > preOperations` and `postOperations > 0` | **PASS** for current response-path execution only: a normalized operation was durably registered. Preserve its outcome and the separate scenario completion/status facts. |
 | Operation count increased plus `status = completed` | Current response path executed and the scenario completed. |
 | Operation count increased plus `status = paused` or `failed` | Current response path executed, but a later or additional failure remains; use the bounded code/status to name it. |
+| `postOperations = 0` or `postOperations = preOperations`, plus `captureState = not_recorded` | **INCONCLUSIVE**; no new operation and no recorded capture evidence establish this response path. |
+| No operation was added, and recorded capture evidence has a failing classification/reason (`captureStatus` or its bounded reason/error code) | **NEEDS INVESTIGATION**; report the exact bounded `captureStatus`, `captureReasonCode`, and/or `captureProtocolErrorCode`. |
+| No operation was added, `captureState = recorded`, `bannerMatchesBaseline = false`, and `bannerVariant` is present | **NEEDS INVESTIGATION — BANNER_BASELINE_CHANGED**; report that exact nameable cause plus the exact 8-hex `bannerVariant`. Do not claim Microsoft wording or any cause beyond baseline mismatch. |
+| `captureState = recorded` and `bannerMatchesBaseline = true` | The operator may state that baseline banner drift was not observed for that capture; preserve any other failure classification or reason. |
 | `postOperations = 0` plus a capture/protocol diagnostic code | No operation was registered; report the exact bounded code and **NEEDS INVESTIGATION**. |
-| `postOperations = 0` without a capture diagnostic code | **INCONCLUSIVE**, not pass. |
+| `postOperations = 0` without a capture diagnostic code or recorded capture evidence | **INCONCLUSIVE**, not pass. |
 | `postOperations > 0` but `postOperations = preOperations` | The session has prior operation evidence, but this resume did not add any; current response-path execution is **INCONCLUSIVE**. |
 | Developer terminal doctor check false | Terminal scenario **NOT RUN**; readiness is blocked at the locally reported layer. The protocol scenario may still run if required doctor checks pass. |
 | A bounded status command is nonzero, `verify-audit` is invalid, or `export-review` fails or cannot be parsed as the matching package | **EVIDENCE INVALID/INCOMPLETE**, even if the UI appeared successful. |
@@ -620,6 +649,22 @@ protocol:
   reviewStatus: <status|not-run>
   reviewOperations: <number|not-run>
   reviewAuditEventCount: <number|not-run>
+  captureState: <recorded|not_recorded|unavailable|not-run>
+  captureContractVersion: <response-capture/v2|unavailable|not-run>
+  captureStatus: <status|unavailable|not-run>
+  captureProtocolVersion: <protocol version|unavailable|not-run>
+  captureReasonCode: <code|unavailable|not-run>
+  captureProtocolErrorCode: <code|unavailable|not-run>
+  codeBlockCount: <number|unavailable|not-run>
+  protocolBlockCount: <number|unavailable|not-run>
+  editorCount: <number|unavailable|not-run>
+  bannerCount: <number|unavailable|not-run>
+  lineCount: <number|unavailable|not-run>
+  contentBytes: <number|unavailable|not-run>
+  bannerContract: <supported|unsupported_version|ambiguous_protocol_labels|unavailable|not-run>
+  bannerTokenCount: <number|unavailable|not-run>
+  bannerMatchesBaseline: <true|false|unavailable|not-run>
+  bannerVariant: <8-hex|unavailable|not-run>
 
 terminal:
   sessionId: session_fdd1d48c-a7ef-4e26-a341-a5f1b9a1a9a5
@@ -649,6 +694,22 @@ terminal:
   reviewStatus: <status|not-run>
   reviewOperations: <number|not-run>
   reviewAuditEventCount: <number|not-run>
+  captureState: <recorded|not_recorded|unavailable|not-run>
+  captureContractVersion: <response-capture/v2|unavailable|not-run>
+  captureStatus: <status|unavailable|not-run>
+  captureProtocolVersion: <protocol version|unavailable|not-run>
+  captureReasonCode: <code|unavailable|not-run>
+  captureProtocolErrorCode: <code|unavailable|not-run>
+  codeBlockCount: <number|unavailable|not-run>
+  protocolBlockCount: <number|unavailable|not-run>
+  editorCount: <number|unavailable|not-run>
+  bannerCount: <number|unavailable|not-run>
+  lineCount: <number|unavailable|not-run>
+  contentBytes: <number|unavailable|not-run>
+  bannerContract: <supported|unsupported_version|ambiguous_protocol_labels|unavailable|not-run>
+  bannerTokenCount: <number|unavailable|not-run>
+  bannerMatchesBaseline: <true|false|unavailable|not-run>
+  bannerVariant: <8-hex|unavailable|not-run>
 
 verdict:
   protocolResponsePath: <PASS|NEEDS INVESTIGATION|INCONCLUSIVE|NOT RUN>
@@ -660,6 +721,6 @@ verdict:
 
 ## Limitations and escalation
 
-The PM/author cannot run live Windows/Edge acceptance. The current service wording is unknown and irrelevant to the operation-count pass rule. Record the capture-evidence surfacing gap above for CTO decision; make no code change in this stream without approval.
+The PM/author cannot run live Windows/Edge acceptance. The structured capture-evidence surfacing gap is closed: `export-review` now provides the newest strictly sanitized capture evidence or `not_recorded`. No live Windows/Edge service wording has been seen, and this runbook makes no GO/NO-GO decision. Do not claim Microsoft wording or causation from the bounded banner fields.
 
 Retain the unique temporary evidence directory locally until the CTO confirms receipt. Then remove it according to local handling policy. Do not upload it and do not paste entire files.

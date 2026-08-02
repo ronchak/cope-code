@@ -20,8 +20,28 @@ import { SessionStore } from "../../src/session/store.js";
 const NOW = "2026-07-17T12:00:00.000Z";
 const INTERNAL_RECOVERY_OPERATION_ID =
   "_cope_internal_budget_recovery_disclosed_bytes_turn_0002";
+const VALID_CAPTURE_EVIDENCE = {
+  contractVersion: "response-capture/v2",
+  status: "protocol_reconstructed",
+  protocolVersion: "cba-agent/1",
+  reasonCode: "CAPTURE_RECONSTRUCTED",
+  codeBlockCount: 1,
+  protocolBlockCount: 1,
+  editorCount: 1,
+  bannerCount: 1,
+  lineCount: 1,
+  contentBytes: 64,
+  bannerContract: "supported",
+  bannerTokenCount: 1,
+  bannerMatchesBaseline: true,
+  bannerVariant: "cafebabe",
+  rawResponseContent: "CLI-RAW-CAPTURE-SECRET",
+  auditTaint: "CLI-AUDIT-CAPTURE-TAINT",
+} as const;
 
-async function createSessionFixture(): Promise<{
+async function createSessionFixture(
+  captureEvidence: unknown = VALID_CAPTURE_EVIDENCE,
+): Promise<{
   readonly root: string;
   readonly repository: string;
   readonly stateHome: string;
@@ -81,6 +101,11 @@ async function createSessionFixture(): Promise<{
     operationId: INTERNAL_RECOVERY_OPERATION_ID,
     data: { kind: "capability", decision: "allow_session" },
   });
+  await audit.append({
+    type: "model.response",
+    taskId: state.taskId,
+    data: { captureEvidence },
+  });
   const disclosures = new DisclosureLedger(state.sessionId, {
     outputFile: path.join(sessionDirectory, "disclosures.jsonl"),
     clock: { now: () => new Date(NOW) },
@@ -124,6 +149,31 @@ test("export-review writes an atomic private source-free package to the session 
   const serialized = await readFile(filename, "utf8");
   const reviewPackage = JSON.parse(serialized) as ReviewPackage;
   assert.equal(verifyReviewPackage(reviewPackage), true);
+  assert.equal(reviewPackage.body.capture.state, "recorded");
+  if (reviewPackage.body.capture.state !== "recorded") {
+    throw new Error("expected recorded capture evidence");
+  }
+  assert.equal(reviewPackage.body.capture.evidence.bannerMatchesBaseline, true);
+  assert.equal(reviewPackage.body.capture.evidence.bannerVariant, "cafebabe");
+  assert.deepEqual(reviewPackage.body.capture, {
+    state: "recorded",
+    evidence: {
+      contractVersion: "response-capture/v2",
+      status: "protocol_reconstructed",
+      protocolVersion: "cba-agent/1",
+      reasonCode: "CAPTURE_RECONSTRUCTED",
+      codeBlockCount: 1,
+      protocolBlockCount: 1,
+      editorCount: 1,
+      bannerCount: 1,
+      lineCount: 1,
+      contentBytes: 64,
+      bannerContract: "supported",
+      bannerTokenCount: 1,
+      bannerMatchesBaseline: true,
+      bannerVariant: "cafebabe",
+    },
+  });
   for (const forbidden of [
     fixture.repository,
     "PRIVATE-NAME",
@@ -133,6 +183,8 @@ test("export-review writes an atomic private source-free package to the session 
     "AUDIT-PRIVATE-PATH",
     "MODEL-CONTENT-SECRET",
     "DISCLOSURE-PRIVATE-PATH",
+    "CLI-RAW-CAPTURE-SECRET",
+    "CLI-AUDIT-CAPTURE-TAINT",
   ]) {
     assert.equal(serialized.includes(forbidden), false, `review package leaked ${forbidden}`);
   }
@@ -158,6 +210,22 @@ test("export-review writes an atomic private source-free package to the session 
     0,
   );
   assert.equal(verifyReviewPackage(JSON.parse(await readFile(customFile, "utf8")) as ReviewPackage), true);
+});
+
+test("export-review fails closed for invalid capture evidence", async (context) => {
+  const fixture = await createSessionFixture({
+    ...VALID_CAPTURE_EVIDENCE,
+    contentBytes: -1,
+  });
+  context.after(async () => rm(fixture.root, { recursive: true, force: true }));
+
+  await assert.rejects(
+    executeCommand(
+      parseCliArguments(["export-review", fixture.sessionId, "--state-home", fixture.stateHome]),
+      { stdout: { write: () => undefined }, stderr: { write: () => undefined } },
+    ),
+    /Review-package capture evidence failed strict validation/,
+  );
 });
 
 test("export-review rejects a corrupt audit chain", async (context) => {
