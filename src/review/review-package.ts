@@ -3,6 +3,7 @@ import {
   DISCLOSURE_LEDGER_VERSION,
   type DisclosureRecord,
 } from "../security/disclosure-ledger.js";
+import { sanitizedCaptureEvidence } from "../orchestrator/response-capture-evidence.js";
 import { sha256, stableJson } from "../shared/crypto.js";
 import { AgentError } from "../shared/errors.js";
 import { isJournalOperationId, isOperationId } from "../shared/operation-id.js";
@@ -30,6 +31,10 @@ const DISCLOSURE_SOURCES = [
 ] as const;
 
 type DisclosureSource = DisclosureRecord["source"];
+type SanitizedCaptureEvidence = NonNullable<ReturnType<typeof sanitizedCaptureEvidence>>;
+type ReviewPackageCapture =
+  | { readonly state: "not_recorded" }
+  | { readonly state: "recorded"; readonly evidence: SanitizedCaptureEvidence };
 
 export interface ReviewPackageInput {
   /** A SessionState already loaded through SessionStore's validation boundary. */
@@ -65,6 +70,7 @@ export interface ReviewPackageBody {
     readonly updatedAt: string;
     readonly completedAt?: string;
   };
+  readonly capture: ReviewPackageCapture;
   readonly repository: {
     /** SHA-256 repository-state fingerprint. The repository root is never exported. */
     readonly fingerprintSha256: string;
@@ -185,6 +191,7 @@ export function createReviewPackage(input: ReviewPackageInput): ReviewPackage {
   assertSafeSessionState(input.state);
   const auditFinalHash = verifyAuditEvents(input.auditEvents, input.state);
   const disclosureFinalHash = verifyDisclosureRecords(input.disclosureRecords, input.state);
+  const capture = reviewPackageCapture(input.auditEvents);
 
   const sourceCounts = Object.fromEntries(DISCLOSURE_SOURCES.map((source) => [source, 0])) as Record<
     DisclosureSource,
@@ -224,6 +231,7 @@ export function createReviewPackage(input: ReviewPackageInput): ReviewPackage {
       updatedAt: state.updatedAt,
       ...(state.completedAt === undefined ? {} : { completedAt: state.completedAt }),
     },
+    capture,
     repository: {
       fingerprintSha256: HASH_PATTERN.test(state.repositoryFingerprintAtStart)
         ? state.repositoryFingerprintAtStart
@@ -321,6 +329,40 @@ export function createReviewPackage(input: ReviewPackageInput): ReviewPackage {
       bodySha256: sha256(stableJson(body)),
     },
   };
+}
+
+function reviewPackageCapture(events: readonly AuditEvent[]): ReviewPackageCapture {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (
+      event === undefined ||
+      (event.type !== "model.response" && event.type !== "protocol.error") ||
+      !Object.prototype.hasOwnProperty.call(event.data, "captureEvidence")
+    ) {
+      continue;
+    }
+
+    const rawEvidence = event.data.captureEvidence;
+    if (!isRecord(rawEvidence)) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Review-package capture evidence failed strict validation",
+      );
+    }
+    const sanitized = sanitizedCaptureEvidence(rawEvidence);
+    if (sanitized === undefined) {
+      throw new AgentError(
+        "RECOVERY_REQUIRED",
+        "Review-package capture evidence failed strict validation",
+      );
+    }
+    return { state: "recorded", evidence: sanitized };
+  }
+  return { state: "not_recorded" };
+}
+
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function terminalReviewFacts(

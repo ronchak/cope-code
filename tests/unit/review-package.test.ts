@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { AuditLog } from "../../src/audit/audit-log.js";
-import type { AuditEvent } from "../../src/audit/types.js";
+import type { AuditEvent, AuditEventInput } from "../../src/audit/types.js";
 import {
   createReviewPackage,
   REVIEW_PACKAGE_VERSION,
@@ -14,6 +14,7 @@ import {
 } from "../../src/review/review-package.js";
 import { DisclosureLedger, type DisclosureRecord } from "../../src/security/disclosure-ledger.js";
 import { sha256, stableJson } from "../../src/shared/crypto.js";
+import { AgentError } from "../../src/shared/errors.js";
 import {
   DEFAULT_BUDGET_LIMITS,
   SESSION_SCHEMA_VERSION,
@@ -92,7 +93,10 @@ function makeState(overrides: Partial<SessionState> = {}): SessionState {
   };
 }
 
-async function makeVerifiedEvidence(state: SessionState): Promise<{
+async function makeVerifiedEvidence(
+  state: SessionState,
+  additionalAuditEvents: readonly AuditEventInput[] = [],
+): Promise<{
   readonly auditEvents: readonly AuditEvent[];
   readonly disclosureRecords: readonly DisclosureRecord[];
 }> {
@@ -121,6 +125,9 @@ async function makeVerifiedEvidence(state: SessionState): Promise<{
       operationId: INTERNAL_RECOVERY_OPERATION_ID,
       data: { kind: "capability", decision: "allow_once" },
     });
+  }
+  for (const event of additionalAuditEvents) {
+    await audit.append(event);
   }
   const auditEvents = await AuditLog.verify(auditFile, state.sessionId);
 
@@ -165,6 +172,7 @@ test("review package is deterministic, integrity protected, and contains only sa
   assert.equal(first.version, REVIEW_PACKAGE_VERSION);
   assert.equal(first.integrity.bodySha256, sha256(stableJson(first.body)));
   assert.equal(verifyReviewPackage(first), true);
+  assert.deepEqual(first.body.capture, { state: "not_recorded" });
   assert.deepEqual(first.body.mutations, [
     {
       operationId: "op-edit",
@@ -220,6 +228,213 @@ test("review package is deterministic, integrity protected, and contains only sa
   };
   tampered.body.counts.mutations += 1;
   assert.equal(verifyReviewPackage(tampered), false);
+});
+
+test("review package records reconstructed capture evidence with only sanitized fields", async () => {
+  const state = makeState();
+  const evidence = await makeVerifiedEvidence(state, [{
+    type: "model.response",
+    taskId: state.taskId,
+    data: {
+      captureEvidence: {
+        contractVersion: "response-capture/v2",
+        status: "protocol_reconstructed",
+        protocolVersion: "cba-agent/1",
+        reasonCode: "CAPTURE_RECONSTRUCTED",
+        codeBlockCount: 1,
+        protocolBlockCount: 1,
+        editorCount: 2,
+        bannerCount: 1,
+        lineCount: 3,
+        contentBytes: 128,
+        bannerContract: "supported",
+        bannerTokenCount: 2,
+        bannerMatchesBaseline: true,
+        bannerVariant: "cafebabe",
+        rawResponseContent: "RAW-RESPONSE-CAPTURE-SECRET",
+        auditTaint: "AUDIT-CAPTURE-TAINT",
+      },
+    },
+  }]);
+
+  const reviewPackage = createReviewPackage({ state, ...evidence });
+  assert.equal(reviewPackage.body.capture.state, "recorded");
+  if (reviewPackage.body.capture.state !== "recorded") {
+    throw new Error("expected recorded capture evidence");
+  }
+  assert.equal(reviewPackage.body.capture.evidence.bannerMatchesBaseline, true);
+  assert.equal(reviewPackage.body.capture.evidence.bannerVariant, "cafebabe");
+  assert.deepEqual(reviewPackage.body.capture, {
+    state: "recorded",
+    evidence: {
+      contractVersion: "response-capture/v2",
+      status: "protocol_reconstructed",
+      protocolVersion: "cba-agent/1",
+      reasonCode: "CAPTURE_RECONSTRUCTED",
+      codeBlockCount: 1,
+      protocolBlockCount: 1,
+      editorCount: 2,
+      bannerCount: 1,
+      lineCount: 3,
+      contentBytes: 128,
+      bannerContract: "supported",
+      bannerTokenCount: 2,
+      bannerMatchesBaseline: true,
+      bannerVariant: "cafebabe",
+    },
+  });
+  const serialized = JSON.stringify(reviewPackage);
+  assert.equal(serialized.includes("RAW-RESPONSE-CAPTURE-SECRET"), false);
+  assert.equal(serialized.includes("AUDIT-CAPTURE-TAINT"), false);
+});
+
+test("review package chooses the newest failing protocol classification over an earlier reconstruction", async () => {
+  const state = makeState();
+  const evidence = await makeVerifiedEvidence(state, [
+    {
+      type: "model.response",
+      taskId: state.taskId,
+      data: {
+        captureEvidence: {
+          contractVersion: "response-capture/v2",
+          status: "protocol_reconstructed",
+          protocolVersion: "cba-agent/1",
+          reasonCode: "CAPTURE_RECONSTRUCTED",
+          codeBlockCount: 1,
+          protocolBlockCount: 1,
+          editorCount: 1,
+          bannerCount: 1,
+          lineCount: 1,
+          contentBytes: 64,
+          bannerContract: "supported",
+          bannerTokenCount: 1,
+          bannerMatchesBaseline: true,
+          bannerVariant: "cafebabe",
+          earlierCaptureTaint: "EARLIER-CAPTURE-TAINT",
+        },
+      },
+    },
+    {
+      type: "protocol.error",
+      taskId: state.taskId,
+      data: {
+        captureEvidence: {
+          contractVersion: "response-capture/v2",
+          status: "model_protocol_malformed",
+          protocolVersion: "cba-agent/1",
+          reasonCode: "MODEL_PROTOCOL_INVALID_CAPTURE",
+          protocolErrorCode: "SCHEMA_INVALID",
+          codeBlockCount: 1,
+          protocolBlockCount: 1,
+          editorCount: 1,
+          bannerCount: 1,
+          lineCount: 2,
+          contentBytes: 96,
+          bannerContract: "supported",
+          bannerTokenCount: 1,
+          bannerMatchesBaseline: false,
+          bannerVariant: "deadbeef",
+          responseContent: "LATEST-RAW-CAPTURE-SECRET",
+          auditTaint: "LATEST-AUDIT-CAPTURE-TAINT",
+        },
+      },
+    },
+  ]);
+
+  const reviewPackage = createReviewPackage({ state, ...evidence });
+  assert.equal(reviewPackage.body.capture.state, "recorded");
+  if (reviewPackage.body.capture.state !== "recorded") {
+    throw new Error("expected recorded capture evidence");
+  }
+  assert.equal(reviewPackage.body.capture.evidence.bannerMatchesBaseline, false);
+  assert.equal(reviewPackage.body.capture.evidence.bannerVariant, "deadbeef");
+  assert.deepEqual(reviewPackage.body.capture, {
+    state: "recorded",
+    evidence: {
+      contractVersion: "response-capture/v2",
+      status: "model_protocol_malformed",
+      protocolVersion: "cba-agent/1",
+      reasonCode: "MODEL_PROTOCOL_INVALID_CAPTURE",
+      protocolErrorCode: "SCHEMA_INVALID",
+      codeBlockCount: 1,
+      protocolBlockCount: 1,
+      editorCount: 1,
+      bannerCount: 1,
+      lineCount: 2,
+      contentBytes: 96,
+      bannerContract: "supported",
+      bannerTokenCount: 1,
+      bannerMatchesBaseline: false,
+      bannerVariant: "deadbeef",
+    },
+  });
+  const serialized = JSON.stringify(reviewPackage);
+  assert.equal(serialized.includes("EARLIER-CAPTURE-TAINT"), false);
+  assert.equal(serialized.includes("LATEST-RAW-CAPTURE-SECRET"), false);
+  assert.equal(serialized.includes("LATEST-AUDIT-CAPTURE-TAINT"), false);
+});
+
+test("review package fails closed when the newest capture-bearing event fails strict validation", async () => {
+  const state = makeState();
+  const invalidEvidence = await makeVerifiedEvidence(state, [
+    {
+      type: "model.response",
+      taskId: state.taskId,
+      data: {
+        captureEvidence: {
+          contractVersion: "response-capture/v2",
+          status: "protocol_reconstructed",
+          codeBlockCount: 1,
+          protocolBlockCount: 1,
+          editorCount: 1,
+          bannerCount: 1,
+          lineCount: 1,
+          contentBytes: 64,
+          bannerMatchesBaseline: true,
+          bannerVariant: "cafebabe",
+        },
+      },
+    },
+    {
+      type: "protocol.error",
+      taskId: state.taskId,
+      data: {
+        captureEvidence: {
+          contractVersion: "response-capture/v2",
+          status: "protocol_reconstructed",
+          codeBlockCount: 1,
+          protocolBlockCount: 1,
+          editorCount: 1,
+          bannerCount: 1,
+          lineCount: 1,
+          contentBytes: -1,
+          bannerMatchesBaseline: false,
+          bannerVariant: "deadbeef",
+        },
+      },
+    },
+  ]);
+
+  assert.throws(
+    () => createReviewPackage({ state, ...invalidEvidence }),
+    (error: unknown) =>
+      error instanceof AgentError &&
+      error.code === "RECOVERY_REQUIRED" &&
+      error.message === "Review-package capture evidence failed strict validation",
+  );
+
+  const nonRecordEvidence = await makeVerifiedEvidence(state, [{
+    type: "model.response",
+    taskId: state.taskId,
+    data: { captureEvidence: "not-a-capture-record" },
+  }]);
+  assert.throws(
+    () => createReviewPackage({ state, ...nonRecordEvidence }),
+    (error: unknown) =>
+      error instanceof AgentError &&
+      error.code === "RECOVERY_REQUIRED" &&
+      error.message === "Review-package capture evidence failed strict validation",
+  );
 });
 
 test("review package accepts local recovery IDs in journal and audit metadata", async () => {
