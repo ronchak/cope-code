@@ -7,6 +7,7 @@ import {
   ProtocolParseError,
   TOOL_REGISTRY,
   parseProtocolEnvelope,
+  parseModelFacingEnvelope,
   serializeProtocolEnvelope,
 } from "../../src/protocol/index.js";
 
@@ -25,6 +26,7 @@ test("CBA adapter renders bootstrap and normalizes a typed tool request", () => 
       command_ids: [],
       disclosure_classifications: ["internal"],
       network: "deny",
+      execution_environment: { platform: "win32", shell: "cmd.exe", cwd: "." },
       budget_recovery: {
         disclosed_bytes: {
           current_limit: 2_000_000,
@@ -36,7 +38,8 @@ test("CBA adapter renders bootstrap and normalizes a typed tool request", () => 
     },
     budgetSummary: { limits: { maxTurns: 10, maxOperations: 20 } },
   });
-  assert.match(bootstrap, /only software-engineering reasoning component/);
+  assert.match(bootstrap, /You provide software-engineering judgment; Cope executes the listed tools/);
+  assert.match(bootstrap, /"execution_environment":\{"cwd":"\.","platform":"win32","shell":"cmd\.exe"\}/u);
   assert.match(bootstrap, /"iterations"|"turns"/);
   assert.match(bootstrap, new RegExp(MODEL_FACING_PROTOCOL_VERSION.replace("/", "\\/"), "u"));
   assert.doesNotMatch(bootstrap, /Use task_id|operation_id values/u);
@@ -510,4 +513,72 @@ test("model-facing harness results expose operation references without transport
   assert.match(rendered, /"retry_allowed":true/u);
   assert.match(rendered, /"max_results":20/u);
   assert.doesNotMatch(rendered, /task_private|"task_id"|"turn_id"|"message_id"/u);
+});
+
+test("a bootstrap can drive an observation then an answer without repeated protocol instructions", () => {
+  const adapter = new CbaProtocolAdapter();
+  const bootstrap = adapter.renderBootstrap({
+    sessionId: "session_relay",
+    taskId: "task_relay",
+    objective: "Report repository status",
+    acceptanceCriteria: [],
+    policySummary: { mode: "inspect", tools: ["git_status", "complete_task"] },
+    budgetSummary: {},
+  });
+  const example = /```cba-agent\/1\n[^]*?\n```/u.exec(bootstrap)?.[0];
+  assert.ok(example);
+  const request = adapter.parseModelTurn(example, { taskId: "task_relay", turnId: "turn_0001" });
+  const action = request.messages[0];
+  assert.equal(action?.type, "tool_request");
+  if (action?.type !== "tool_request") return;
+  const call = action.calls[0];
+  assert.ok(call);
+  assert.equal(call.name, "git_status");
+  const result = adapter.renderToolOutcomes({
+    taskId: "task_relay",
+    priorTurnId: "turn_0001",
+    outcomes: [{ operationId: call.operationId, tool: call.name, status: "success", data: { clean: true }, safeMetadata: {} }],
+  });
+  assert.match(result, /"clean":true/u);
+  assert.doesNotMatch(result, /reminder|agent_answer|arguments_schema/u);
+  const answerExample = /For informational work, emit (\{[^\n]+?\})\./u.exec(bootstrap)?.[1];
+  assert.ok(answerExample, "bootstrap must specify an answer before any tool result arrives");
+  assert.equal(parseModelFacingEnvelope(`\`\`\`cba-agent/1\n${answerExample}\n\`\`\``).kind, "agent_answer");
+  const answer = JSON.parse(answerExample) as Record<string, unknown>;
+  answer.content_markdown = "The working tree is clean.";
+  answer.basis = { tool_result_refs: [call.operationId] };
+  const finalTurn = adapter.parseModelTurn(`\`\`\`cba-agent/1\n${JSON.stringify(answer)}\n\`\`\``, { taskId: "task_relay", turnId: "turn_0002" });
+  assert.equal(finalTurn.messages[0]?.type, "complete_task");
+});
+
+test("decisions stay concise while actual repair messages explain the relay and request shape", () => {
+  const adapter = new CbaProtocolAdapter();
+  const decision = adapter.renderUserDecision({ taskId: "task_relay", priorTurnId: "turn_0001", requestId: "op_input", kind: "user_input", decision: { answer: "Continue" } });
+  assert.match(decision, /"answer":"Continue"/u);
+  assert.doesNotMatch(decision, /reminder|agent_answer|arguments_schema/u);
+  const repair = adapter.renderProtocolError({ taskId: "task_relay", priorTurnId: "turn_0001", code: "SCHEMA_INVALID", message: "Missing reason.", repairAttempt: 1, details: { missing: ["reason"] } });
+  assert.match(repair, /cba-agent\/1 reminder/u);
+  assert.match(repair, /Cope executes it locally/u);
+  assert.match(repair, /kind='agent_intent'/u);
+  assert.match(repair, /"missing":\["reason"\]/u);
+  const rejected = adapter.renderCompletionRejected({
+    taskId: "task_relay",
+    priorTurnId: "turn_0002",
+    operationId: "op_complete",
+    verification: {
+      accepted: false,
+      reasons: ["Validation needed"],
+      actual: {
+        changedPaths: [],
+        agentChangedPaths: [],
+        preExistingPaths: [],
+        successfulCommands: [],
+        failedCommands: [],
+        gitStatusSummary: "clean",
+        repositoryFingerprint: "0".repeat(64),
+      },
+    },
+  });
+  assert.match(rejected, /cba-agent\/1 reminder/u);
+  assert.match(rejected, /Validation needed/u);
 });

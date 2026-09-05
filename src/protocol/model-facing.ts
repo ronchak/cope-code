@@ -102,6 +102,8 @@ export function parseModelFacingEnvelope(
 export function renderModelFacingReminder(): string {
   return [
     `${MODEL_FACING_PROTOCOL_VERSION} reminder: machine actions use exactly one complete \`\`\`${MODEL_FACING_PROTOCOL_VERSION} fenced JSON object.`,
+    "Write the request as chat text; Cope executes it locally and returns the result. Native Copilot tool access is not needed.",
+    "For a tool request use kind='agent_intent', intent set to a granted tool name, arguments matching its schema, and reason explaining the action. Then wait for the result.",
     "Do not provide task, turn, message, or operation IDs; Cope adds those deterministically.",
     `For a final informational response use ${stableJson({
       kind: "agent_answer",

@@ -7,6 +7,7 @@ import {
   extractCbaEnvelope,
 } from "../protocol/parser.js";
 import { AgentError } from "../shared/errors.js";
+import { ASSISTANT_MESSAGE_SELECTORS, USER_MESSAGE_SELECTORS } from "./config.js";
 import {
   RESPONSE_CAPTURE_CONTRACT_VERSION,
   toRegExp,
@@ -754,6 +755,31 @@ export class PlaywrightSemanticPage implements SemanticPage {
           () => item.isVisible(),
         ));
         if (!visible) continue;
+        if (group.signal === "throttled" || group.signal === "service-error") {
+          // These signals may use page-wide text locators in existing saved
+          // configurations. A task about rate limits, or a quoted error in a
+          // tool result, is conversation content rather than service state.
+          const serviceOwned = await traceOperation(
+            trace,
+            traceKey,
+            point("locator.serviceOwnership", index),
+            () => item.evaluate((node, selectors) => {
+              if (!(node instanceof HTMLElement)) return false;
+              if (node.closest(selectors.user) !== null || node.closest(
+                'textarea, input, [contenteditable="true"], [role="textbox"], ' +
+                'pre, code, .scriptor-component-code-block, [data-testid="markdown-reply"]',
+              ) !== null) return false;
+              if (node.closest(selectors.assistant) === null) return true;
+              // M365 may put a genuine service alert inside an assistant
+              // envelope. Preserve explicit service UI outside rendered prose.
+              return node.closest('[role="alert"], [role="status"]') !== null;
+            }, {
+              assistant: ASSISTANT_MESSAGE_SELECTORS.join(", "),
+              user: USER_MESSAGE_SELECTORS.join(", "),
+            }),
+          );
+          if (!serviceOwned) continue;
+        }
         const requiresActionability =
           group.signal === "composer" ||
           group.signal === "send" ||
@@ -1269,7 +1295,24 @@ export class PlaywrightSemanticPage implements SemanticPage {
 }
 
 function textMatcher(value: string | TextPattern): string | RegExp {
-  return typeof value === "string" ? value : toRegExp(value);
+  if (typeof value === "string") return value;
+  // Playwright serializes this expression into a selector and later appends
+  // `>> nth=N`. Raw quotes (for example in "couldn't respond") can make its
+  // selector tokenizer consume that suffix as regex flags. Hex escapes retain
+  // the expression's meaning without introducing selector quote delimiters.
+  const expression = toRegExp(value);
+  // Consume escape pairs together: \' and ' both mean a quote in non-Unicode
+  // patterns, while \\' means a literal backslash followed by a quote.
+  const selectorSource = expression.source.replace(/\\[\s\S]|['"]/gu, (token) => {
+    const character = token.startsWith("\\") ? token.slice(1) : token;
+    if (character === "'") return "\\x27";
+    if (character === '"') return "\\x22";
+    return token;
+  });
+  return new RegExp(
+    selectorSource,
+    expression.flags,
+  );
 }
 
 interface BrowserOperationTracePoint {

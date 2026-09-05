@@ -82,6 +82,9 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
         command_ids: strings(summary.command_ids),
         disclosure_classifications: strings(summary.disclosure_classifications),
         network: decision(summary.network),
+        ...(isRecord(summary.execution_environment)
+          ? { execution_environment: summary.execution_environment }
+          : {}),
         ...(isRecord(summary.operation_limits)
           ? { operation_limits: summary.operation_limits }
           : {}),
@@ -202,7 +205,7 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
   }
 
   public renderToolOutcomes(input: Parameters<ProtocolAdapter["renderToolOutcomes"]>[0]): string {
-    return withReminder({
+    return renderHarnessMessage({
       kind: "harness_tool_results",
       results: input.outcomes.map(modelToolResult),
     });
@@ -213,7 +216,7 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
     const code = (PROTOCOL_ERROR_CODES as readonly string[]).includes(requestedCode)
       ? requestedCode
       : "INVALID_MESSAGE";
-    return withReminder({
+    return renderHarnessMessage({
       kind: "harness_protocol_error",
       error: {
         code,
@@ -227,11 +230,11 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
           ...(input.details ?? {}),
         },
       },
-    });
+    }, true);
   }
 
   public renderUserDecision(input: Parameters<ProtocolAdapter["renderUserDecision"]>[0]): string {
-    return withReminder({
+    return renderHarnessMessage({
       kind: "harness_decision",
       operation_ref: input.requestId,
       request_kind: input.kind,
@@ -240,7 +243,7 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
   }
 
   public renderCompletionRejected(input: Parameters<ProtocolAdapter["renderCompletionRejected"]>[0]): string {
-    return withReminder({
+    return renderHarnessMessage({
       kind: "harness_completion_rejected",
       operation_ref: input.operationId,
       error: {
@@ -251,7 +254,7 @@ export class CbaProtocolAdapter implements ProtocolAdapter {
           actual: input.verification.actual,
         },
       },
-    });
+    }, true);
   }
 }
 
@@ -450,16 +453,16 @@ function retryAllowed(outcome: ToolOutcome): boolean {
       isRecord(outcome.data.details.retry_with);
 }
 
-function withReminder(
+function renderHarnessMessage(
   payload: Readonly<Record<string, unknown>>,
+  repair = false,
 ): string {
   return [
     "COPE HARNESS MESSAGE — cba-agent/1",
     "<authoritative_harness_message_json>",
     stableJson(payload),
     "</authoritative_harness_message_json>",
-    "",
-    renderProtocolReminder(),
+    ...(repair ? ["", renderProtocolReminder()] : []),
   ].join("\n");
 }
 

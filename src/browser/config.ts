@@ -72,14 +72,14 @@ export const DEFAULT_BROWSER_WAITS: BrowserWaitConfig = Object.freeze({
 
 const PROTECTION_ACCESSIBLE_NAME_PATTERN =
   "^(?:enterprise data protection|commercial data protection)$";
-const ASSISTANT_MESSAGE_SELECTORS = [
+export const ASSISTANT_MESSAGE_SELECTORS = [
   '[data-testid="copilot-message-reply-div"]',
   '[data-content="ai-message"]',
   '[data-author="assistant"]',
   '[data-testid*="assistant" i][data-testid*="message" i]',
   '[data-testid*="response" i][data-testid*="message" i]',
 ] as const;
-const USER_MESSAGE_SELECTORS = [
+export const USER_MESSAGE_SELECTORS = [
   '[data-testid="chatQuestion"]',
   '[data-content="user-message"]',
   '[data-author="user"]',

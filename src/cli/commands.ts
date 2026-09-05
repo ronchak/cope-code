@@ -285,6 +285,7 @@ async function runNewSession(
       pathKey: boundary.pathKey.bind(boundary),
     });
     const initialPolicy = new LayeredRuntimePolicy({
+      host,
       engine,
       boundary,
       commandCatalog: new CommandCatalog(configuration.repository.commands),
