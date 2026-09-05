@@ -172,6 +172,7 @@ export async function composeRuntime(options: ComposeRuntimeOptions): Promise<Co
     pathKey: repository.boundary.pathKey.bind(repository.boundary),
   });
   const policy = new LayeredRuntimePolicy({
+    host: options.host,
     engine,
     boundary: repository.boundary,
     commandCatalog,

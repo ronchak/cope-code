@@ -2,7 +2,8 @@
   "sourceFiles": [
     "tests/unit/playwright-identity-ambiguity.test.ts",
     "tests/unit/playwright-native-dialog-race.test.ts",
-    "tests/unit/protocol-banner-drift.test.ts"
+    "tests/unit/protocol-banner-drift.test.ts",
+    "tests/unit/playwright-service-signal.test.ts"
   ],
-  "expectedTestCount": 18
+  "expectedTestCount": 19
 }

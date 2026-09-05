@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { CURRENT_HOST_PLATFORM, resolveTerminalLaunch, type HostPlatform } from "../platform/index.js";
 import {
   PolicyEngine,
   DEFAULT_POLICY_BUDGETS,
@@ -60,6 +61,8 @@ interface TerminalExecutionBounds {
 }
 
 export interface LayeredRuntimePolicyOptions {
+  readonly host?: HostPlatform;
+  readonly environment?: NodeJS.ProcessEnv;
   readonly engine: PolicyEngine;
   readonly boundary: RepositoryBoundary;
   readonly commandCatalog: CommandCatalog;
@@ -104,6 +107,19 @@ export class LayeredRuntimePolicy implements RuntimePolicy {
     ].filter((entry): entry is string => entry !== undefined);
     return {
       mode: grant.mode,
+      ...(terminalActive
+        ? {
+            execution_environment: {
+              platform: (this.options.host ?? CURRENT_HOST_PLATFORM).platform,
+              shell: resolveTerminalLaunch(
+                this.options.host ?? CURRENT_HOST_PLATFORM,
+                { mode: "shell", command: "echo" },
+                this.options.environment ?? process.env,
+              ).executable,
+              cwd: ".",
+            },
+          }
+        : {}),
       tools: grant.capabilities.tools?.allow ?? [],
       readable_paths: grant.capabilities.paths?.read?.allow ?? [],
       writable_paths: grant.capabilities.paths?.write?.allow ?? [],

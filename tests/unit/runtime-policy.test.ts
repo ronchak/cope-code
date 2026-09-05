@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { selectHostPlatform, resolveTerminalLaunch, type HostPlatform } from "../../src/platform/index.js";
 import {
   DEFAULT_DEVELOPER_ORGANIZATION_POLICY,
   DEFAULT_DEVELOPER_REPOSITORY_POLICY,
@@ -45,6 +46,8 @@ async function harness(
     readonly budgets?: Readonly<Partial<Record<BudgetMetric, number>>>;
     readonly currentUsage?: PolicyBudgetUsage;
     readonly terminalEnabled?: boolean;
+    readonly host?: HostPlatform;
+    readonly environment?: NodeJS.ProcessEnv;
   } = {},
 ) {
   const root = await mkdtemp(path.join(tmpdir(), "cba-policy-adapter-"));
@@ -110,6 +113,8 @@ async function harness(
     ? DEFAULT_DEVELOPER_REPOSITORY_POLICY
     : DEFAULT_REPOSITORY_POLICY;
   const policy = new LayeredRuntimePolicy({
+    ...(options.host === undefined ? {} : { host: options.host }),
+    ...(options.environment === undefined ? {} : { environment: options.environment }),
     engine: new PolicyEngine({
       organization,
       repository,
@@ -219,6 +224,7 @@ test("default grants never advertise terminal execution in any existing mode", a
   for (const mode of ["inspect", "edit", "auto"] as const) {
     const { policy } = await harness(mode);
     const summary = policy.summarize();
+    assert.equal(summary.execution_environment, undefined);
     assert.equal(
       Array.isArray(summary.tools) && summary.tools.includes("terminal_exec"),
       false,
@@ -234,6 +240,36 @@ test("default grants never advertise terminal execution in any existing mode", a
     });
     assert.doesNotMatch(bootstrap, /terminal_exec/u, mode);
     assert.doesNotMatch(bootstrap, /terminal-exec\/1/u, mode);
+  }
+});
+
+test("terminal bootstrap identifies the shell the executor will actually launch", async () => {
+  for (const [platform, environment] of [
+    ["win32", { COMSPEC: "C:\\Windows\\System32\\cmd.exe", SHELL: "/bin/bash" }],
+    ["win32", {}],
+    ["darwin", { SHELL: "/bin/zsh" }],
+    ["darwin", {}],
+  ] as const) {
+    const host = selectHostPlatform(platform);
+    const { root, policy } = await harness("auto", { terminalEnabled: true, host, environment });
+    try {
+      const bootstrap = new CbaProtocolAdapter().renderBootstrap({
+        sessionId: "session_shell",
+        taskId: "task_shell",
+        objective: "Run the project's tests.",
+        acceptanceCriteria: [],
+        policySummary: policy.summarize(),
+        budgetSummary: {},
+      });
+      const envelope = JSON.parse(bootstrap.split("<authoritative_operating_envelope_json>\n")[1]!.split("\n</authoritative_operating_envelope_json>")[0]!);
+      assert.deepEqual(envelope.policy.execution_environment, {
+        platform,
+        shell: resolveTerminalLaunch(host, { mode: "shell", command: "npm test" }, environment).executable,
+        cwd: ".",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   }
 });
 
